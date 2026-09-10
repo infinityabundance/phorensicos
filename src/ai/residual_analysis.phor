@@ -1,0 +1,847 @@
+// file: residual_analysis.phor
+// purpose: Residual analysis engine for pattern recognition, anomaly
+//          detection, drift analysis, similarity scoring, trend detection,
+//          and report generation. All analysis is deterministic and
+//          produces court-verifiable results with full residual recording.
+// evidence: RESIDUAL-ANALYSIS-ARCH-001 through RESIDUAL-ANALYSIS-ARCH-240
+// residual: Every analysis step, score, and classification is recorded
+//           for forensic traceability and court presentation.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+use core::serialization::*
+
+// ──────────────────────────────────────────────
+// Analysis Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_AI_BASE           : Word64 = 0x8000
+const DIAG_RESIDUAL_ANALYSIS : Word64 = DIAG_AI_BASE | 0x0100
+
+const ANALYZER_MAX_SAMPLES      : u32 = 4096
+const ANALYZER_PATTERN_CAP      : u32 = 128
+const ANALYZER_FEATURE_CAP      : u32 = 32
+const ANALYZER_RESIDUAL_LOG     : u32 = 64
+const ANALYZER_NAME_CAP         : u32 = 32
+const ANALYZER_REPORT_CAP       : u32 = 2048
+const ANALYZER_CLUSTER_CAP      : u32 = 16
+const ANALYZER_HISTOGRAM_BUCKETS: u32 = 32
+const ANALYZER_TREND_DEPTH      : u32 = 64
+const ANALYZER_SIMILARITY_CAP   : u32 = 256
+const ANALYZER_DRIFT_WINDOW     : u32 = 128
+
+// ──────────────────────────────────────────────
+// Analysis Result Types
+// ──────────────────────────────────────────────
+pub type AnalysisScore : u16 = struct {
+    value: Word16,
+}
+
+impl AnalysisScore {
+    pub fn new(v: Word16) -> AnalysisScore
+        effects: [deterministic]
+    {
+        AnalysisScore { value: v }
+    }
+
+    pub fn from_u16(v: u16) -> AnalysisScore
+        effects: [deterministic]
+    {
+        AnalysisScore { value: Word16::from_u16(v) }
+    }
+
+    pub fn value(self) -> u16
+        effects: [deterministic]
+    {
+        self.value.to_u16()
+    }
+
+    pub fn normalize(self) -> u8
+        effects: [deterministic]
+    {
+        let v: u16 = self.value.to_u16()
+        if v >= 10000 { 255 }
+        else { (v / 39) as u8 }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Data Point for Analysis
+// ──────────────────────────────────────────────
+pub type DataPoint : struct {
+    timestamp: Word64,
+    value: Word64,
+    label: FixedString[ANALYZER_NAME_CAP],
+    source: FixedString[ANALYZER_NAME_CAP],
+    category: u8,
+    confidence: u8,
+}
+
+impl DataPoint {
+    pub fn new(ts: Word64, val: Word64, lbl: FixedString[ANALYZER_NAME_CAP]) -> DataPoint
+        effects: [deterministic]
+    {
+        DataPoint {
+            timestamp: ts,
+            value: val,
+            label: lbl,
+            source: FixedString::new(),
+            category: 0,
+            confidence: 100,
+        }
+    }
+
+    pub fn with_source(ts: Word64, val: Word64, lbl: FixedString[ANALYZER_NAME_CAP], src: FixedString[ANALYZER_NAME_CAP]) -> DataPoint
+        effects: [deterministic]
+    {
+        let mut dp: DataPoint = DataPoint::new(ts, val, lbl)
+        dp.source = src
+        dp
+    }
+}
+
+// ──────────────────────────────────────────────
+// Pattern Definition
+// ──────────────────────────────────────────────
+pub type AnalysisPattern : struct {
+    id: Word16,
+    name: FixedString[ANALYZER_NAME_CAP],
+    expected_mean: Word64,
+    expected_stddev: Word64,
+    min_value: Word64,
+    max_value: Word64,
+    pattern_type: u8,
+    confidence_threshold: u8,
+    match_count: Word64,
+    last_matched: Word64,
+}
+
+impl AnalysisPattern {
+    pub fn new(pid: Word16, pname: FixedString[ANALYZER_NAME_CAP], mean: Word64, stddev: Word64, ptype: u8) -> AnalysisPattern
+        effects: [deterministic]
+    {
+        AnalysisPattern {
+            id: pid,
+            name: pname,
+            expected_mean: mean,
+            expected_stddev: stddev,
+            min_value: Word64::zero(),
+            max_value: Word64::max_value(),
+            pattern_type: ptype,
+            confidence_threshold: 70,
+            match_count: Word64::zero(),
+            last_matched: Word64::zero(),
+        }
+    }
+
+    pub fn set_bounds(self: ref mut, minv: Word64, maxv: Word64)
+        effects: [deterministic]
+    {
+        self.min_value = minv
+        self.max_value = maxv
+    }
+
+    pub fn matches(self, value: Word64) -> bool
+        effects: [deterministic]
+    {
+        value.gte(self.min_value) && value.lte(self.max_value)
+    }
+
+    pub def match_probability(self, value: Word64) -> u8
+        effects: [deterministic]
+    {
+        if !self.matches(value) {
+            return 0
+        }
+        if self.expected_stddev.is_zero() {
+            return 100
+        }
+        let diff: Word64 = if value.gt(self.expected_mean) {
+            value.sub(self.expected_mean)
+        } else {
+            self.expected_mean.sub(value)
+        }
+        let stddevs: Word64 = diff.div(self.expected_stddev)
+        let stddev_val: u64 = stddevs.to_u64()
+        if stddev_val > 10 { 5 }
+        else if stddev_val > 5 { 20 }
+        else if stddev_val > 3 { 50 }
+        else if stddev_val > 2 { 70 }
+        else if stddev_val > 1 { 85 }
+        else { 100 }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Feature Vector
+// ──────────────────────────────────────────────
+pub type FeatureVector : struct {
+    features: FixedArray[Word64, ANALYZER_FEATURE_CAP],
+    feature_count: u32,
+    label: FixedString[ANALYZER_NAME_CAP],
+}
+
+impl FeatureVector {
+    pub fn new(lbl: FixedString[ANALYZER_NAME_CAP]) -> FeatureVector
+        effects: [deterministic]
+    {
+        FeatureVector {
+            features: FixedArray::new(),
+            feature_count: 0,
+            label: lbl,
+        }
+    }
+
+    pub fn add_feature(self: ref mut, val: Word64) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.feature_count >= ANALYZER_FEATURE_CAP {
+            return Result::Err(bounds_capacity_exceeded(ANALYZER_FEATURE_CAP))
+        }
+        let r: Result<(), BoundsError> = self.features.set(self.feature_count, val)
+        if r.is_ok() {
+            self.feature_count = self.feature_count + 1
+        }
+        r
+    }
+
+    pub fn get_feature(self, index: u32) -> Result[Word64, BoundsError>
+        effects: [deterministic]
+    {
+        if index >= self.feature_count {
+            return Result::Err(bounds_index_out_of_range(index, self.feature_count))
+        }
+        self.features.get(index)
+    }
+
+    pub fn euclidean_distance(self, other: FeatureVector) -> Word64
+        effects: [deterministic]
+    {
+        let min_count: u32 = if self.feature_count < other.feature_count {
+            self.feature_count
+        } else {
+            other.feature_count
+        }
+        let mut sum_sq: Word64 = Word64::zero()
+        for i in 0..min_count {
+            let a: Word64 = match self.features.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::zero(),
+            }
+            let b: Word64 = match other.features.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::zero(),
+            }
+            let diff: Word64 = if a.gt(b) { a.sub(b) } else { b.sub(a) }
+            sum_sq = sum_sq.add(diff.mul(diff))
+        }
+        sum_sq.sqrt()
+    }
+
+    pub fn cosine_similarity(self, other: FeatureVector) -> u16
+        effects: [deterministic]
+    {
+        let min_count: u32 = if self.feature_count < other.feature_count {
+            self.feature_count
+        } else {
+            other.feature_count
+        }
+        let mut dot_product: Word64 = Word64::zero()
+        let mut mag_a: Word64 = Word64::zero()
+        let mut mag_b: Word64 = Word64::zero()
+        for i in 0..min_count {
+            let a: Word64 = match self.features.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::zero(),
+            }
+            let b: Word64 = match other.features.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::zero(),
+            }
+            dot_product = dot_product.add(a.mul(b))
+            mag_a = mag_a.add(a.mul(a))
+            mag_b = mag_b.add(b.mul(b))
+        }
+        let mag_a_sqrt: Word64 = mag_a.sqrt()
+        let mag_b_sqrt: Word64 = mag_b.sqrt()
+        let product: Word64 = mag_a_sqrt.mul(mag_b_sqrt)
+        if product.is_zero() {
+            return 0
+        }
+        let similarity: Word64 = dot_product.mul(Word64::from_u64(10000)).div(product)
+        similarity.to_u64() as u16
+    }
+}
+
+// ──────────────────────────────────────────────
+// Similarity Score
+// ──────────────────────────────────────────────
+pub type SimilarityResult : struct {
+    source_index: u32,
+    target_index: u32,
+    similarity: u16,
+    distance: Word64,
+}
+
+impl SimilarityResult {
+    pub fn new(src: u32, tgt: u32, sim: u16, dist: Word64) -> SimilarityResult
+        effects: [deterministic]
+    {
+        SimilarityResult {
+            source_index: src,
+            target_index: tgt,
+            similarity: sim,
+            distance: dist,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Drift Analysis
+// ──────────────────────────────────────────────
+pub type DriftAnalysis : struct {
+    window_size: u32,
+    baseline_mean: Word64,
+    current_mean: Word64,
+    drift_magnitude: Word64,
+    drift_percentage: Word64,
+    is_significant: bool,
+    trend_direction: i8,
+    samples_in_window: u32,
+}
+
+impl DriftAnalysis {
+    pub fn new(window: u32) -> DriftAnalysis
+        effects: [deterministic]
+    {
+        DriftAnalysis {
+            window_size: if window > ANALYZER_DRIFT_WINDOW { ANALYZER_DRIFT_WINDOW } else { window },
+            baseline_mean: Word64::zero(),
+            current_mean: Word64::zero(),
+            drift_magnitude: Word64::zero(),
+            drift_percentage: Word64::zero(),
+            is_significant: false,
+            trend_direction: 0,
+            samples_in_window: 0,
+        }
+    }
+
+    pub fn compute(self: ref mut, baseline: FixedArray[Word64, ANALYZER_DRIFT_WINDOW], baseline_count: u32, current: FixedArray[Word64, ANALYZER_DRIFT_WINDOW], current_count: u32)
+        effects: [deterministic]
+    {
+        self.baseline_mean = self.compute_mean(baseline, baseline_count)
+        self.current_mean = self.compute_mean(current, current_count)
+        if self.baseline_mean.gt(self.current_mean) {
+            self.drift_magnitude = self.baseline_mean.sub(self.current_mean)
+            self.trend_direction = -1
+        } else {
+            self.drift_magnitude = self.current_mean.sub(self.baseline_mean)
+            self.trend_direction = 1
+        }
+        if !self.baseline_mean.is_zero() {
+            self.drift_percentage = self.drift_magnitude.mul(Word64::from_u64(1000)).div(self.baseline_mean)
+        }
+        self.is_significant = self.drift_percentage.gt(Word64::from_u64(50))
+        self.samples_in_window = current_count
+    }
+
+    fn compute_mean(self, data: FixedArray[Word64, ANALYZER_DRIFT_WINDOW], count: u32) -> Word64
+        effects: [deterministic]
+    {
+        if count == 0 {
+            return Word64::zero()
+        }
+        let mut sum: Word64 = Word64::zero()
+        for i in 0..count {
+            let val: Word64 = match data.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::zero(),
+            }
+            sum = sum.add(val)
+        }
+        sum.div(Word64::from_u64(count as u64))
+    }
+}
+
+// ──────────────────────────────────────────────
+// Trend Detection
+// ──────────────────────────────────────────────
+pub type TrendAnalysis : struct {
+    slope: Word64,
+    intercept: Word64,
+    correlation: u16,
+    trend_type: u8,
+    confidence: u8,
+}
+
+impl TrendAnalysis {
+    pub fn new() -> TrendAnalysis
+        effects: [deterministic]
+    {
+        TrendAnalysis {
+            slope: Word64::zero(),
+            intercept: Word64::zero(),
+            correlation: 0,
+            trend_type: 0,
+            confidence: 0,
+        }
+    }
+
+    pub fn compute_linear(self: ref mut, data: FixedArray[DataPoint, ANALYZER_TREND_DEPTH], count: u32)
+        effects: [deterministic]
+    {
+        if count < 2 {
+            self.confidence = 0
+            return
+        }
+        let n: Word64 = Word64::from_u64(count as u64)
+        let mut sum_x: Word64 = Word64::zero()
+        let mut sum_y: Word64 = Word64::zero()
+        let mut sum_xy: Word64 = Word64::zero()
+        let mut sum_xx: Word64 = Word64::zero()
+        let mut sum_yy: Word64 = Word64::zero()
+
+        for i in 0..count {
+            let dp: DataPoint = match data.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let x: Word64 = Word64::from_u64(i as u64)
+            let y: Word64 = dp.value
+            sum_x = sum_x.add(x)
+            sum_y = sum_y.add(y)
+            sum_xy = sum_xy.add(x.mul(y))
+            sum_xx = sum_xx.add(x.mul(x))
+            sum_yy = sum_yy.add(y.mul(y))
+        }
+
+        let denom: Word64 = n.mul(sum_xx).sub(sum_x.mul(sum_x))
+        if denom.is_zero() {
+            self.confidence = 0
+            return
+        }
+        self.slope = n.mul(sum_xy).sub(sum_x.mul(sum_y)).div(denom)
+        self.intercept = sum_y.sub(self.slope.mul(sum_x)).div(n)
+
+        // Correlation coefficient (Pearson)
+        let numer: Word64 = n.mul(sum_xy).sub(sum_x.mul(sum_y))
+        let denom_sqrt: Word64 = (n.mul(sum_xx).sub(sum_x.mul(sum_x))).mul(n.mul(sum_yy).sub(sum_y.mul(sum_y))).sqrt()
+        if denom_sqrt.is_zero() {
+            self.correlation = 0
+        } else {
+            let r: Word64 = numer.mul(Word64::from_u64(10000)).div(denom_sqrt)
+            self.correlation = r.to_u64() as u16
+        }
+
+        // Determine trend type
+        if self.slope.gt(Word64::from_u64(10)) {
+            self.trend_type = 1 // Upward
+        } else if self.slope.lt(Word64::from_u64(10)) {
+            self.trend_type = 2 // Downward
+        } else {
+            self.trend_type = 0 // Stable
+        }
+
+        self.confidence = if self.correlation > 8000 { 90 }
+            else if self.correlation > 6000 { 70 }
+            else if self.correlation > 4000 { 50 }
+            else { 30 }
+    }
+
+    pub fn project(self, steps: u32) -> Word64
+        effects: [deterministic]
+    {
+        let step_val: Word64 = Word64::from_u64(steps as u64)
+        self.intercept.add(self.slope.mul(step_val))
+    }
+}
+
+// ──────────────────────────────────────────────
+// Histogram for Distribution Analysis
+// ──────────────────────────────────────────────
+pub type Histogram : struct {
+    buckets: FixedArray[u32, ANALYZER_HISTOGRAM_BUCKETS],
+    bucket_count: u32,
+    min_val: Word64,
+    max_val: Word64,
+    bucket_width: Word64,
+    total_samples: u32,
+}
+
+impl Histogram {
+    pub fn new(buckets: u32, minv: Word64, maxv: Word64) -> Histogram
+        effects: [deterministic]
+    {
+        let bcount: u32 = if buckets > ANALYZER_HISTOGRAM_BUCKETS { ANALYZER_HISTOGRAM_BUCKETS } else { buckets }
+        let width: Word64 = if bcount > 0 {
+            maxv.sub(minv).div(Word64::from_u64(bcount as u64))
+        } else {
+            Word64::zero()
+        }
+        Histogram {
+            buckets: FixedArray::new(),
+            bucket_count: bcount,
+            min_val: minv,
+            max_val: maxv,
+            bucket_width: width,
+            total_samples: 0,
+        }
+    }
+
+    pub fn add_sample(self: ref mut, value: Word64)
+        effects: [deterministic]
+    {
+        if self.bucket_width.is_zero() {
+            return
+        }
+        let mut bucket_idx: u32 = 0
+        if value.gt(self.min_val) {
+            let offset: Word64 = value.sub(self.min_val)
+            bucket_idx = offset.div(self.bucket_width).to_u64() as u32
+        }
+        if bucket_idx >= self.bucket_count {
+            bucket_idx = self.bucket_count - 1
+        }
+        let existing: u32 = match self.buckets.get(bucket_idx) {
+            Result::Ok(v) => v,
+            Result::Err(_) => 0,
+        }
+        let _ = self.buckets.set(bucket_idx, existing + 1)
+        self.total_samples = self.total_samples + 1
+    }
+
+    pub fn mode_bucket(self) -> u32
+        effects: [deterministic]
+    {
+        let mut max_count: u32 = 0
+        let mut mode: u32 = 0
+        for i in 0..self.bucket_count {
+            let count: u32 = match self.buckets.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => 0,
+            }
+            if count > max_count {
+                max_count = count
+                mode = i
+            }
+        }
+        mode
+    }
+
+    pub fn is_uniform(self) -> bool
+        effects: [deterministic]
+    {
+        if self.total_samples < 10 {
+            return true
+        }
+        let expected: u32 = self.total_samples / self.bucket_count
+        let tolerance: u32 = expected / 2
+        for i in 0..self.bucket_count {
+            let count: u32 = match self.buckets.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => 0,
+            }
+            let diff: u32 = if count > expected { count - expected } else { expected - count }
+            if diff > tolerance {
+                return false
+            }
+        }
+        true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Residual Analysis Engine (Main)
+// ──────────────────────────────────────────────
+pub type ResidualAnalysisEngine : struct {
+    samples: FixedArray[DataPoint, ANALYZER_MAX_SAMPLES],
+    sample_count: u32,
+    patterns: FixedArray[AnalysisPattern, ANALYZER_PATTERN_CAP],
+    pattern_count: u32,
+    next_pattern_id: Word16,
+    baselines: FixedArray[Word64, ANALYZER_DRIFT_WINDOW],
+    baseline_count: u32,
+    drift: DriftAnalysis,
+    trend: TrendAnalysis,
+    histogram: Histogram,
+    name: FixedString[ANALYZER_NAME_CAP],
+    residuals: FixedArray[DataPoint, ANALYZER_RESIDUAL_LOG],
+}
+
+impl ResidualAnalysisEngine {
+    pub fn new(engine_name: FixedString[ANALYZER_NAME_CAP]) -> ResidualAnalysisEngine
+        effects: [deterministic, residual]
+    {
+        let mut engine: ResidualAnalysisEngine = ResidualAnalysisEngine {
+            samples: FixedArray::new(),
+            sample_count: 0,
+            patterns: FixedArray::new(),
+            pattern_count: 0,
+            next_pattern_id: Word16::from_u16(1),
+            baselines: FixedArray::new(),
+            baseline_count: 0,
+            drift: DriftAnalysis::new(ANALYZER_DRIFT_WINDOW),
+            trend: TrendAnalysis::new(),
+            histogram: Histogram::new(ANALYZER_HISTOGRAM_BUCKETS, Word64::zero(), Word64::from_u64(1000000)),
+            name: engine_name,
+            residuals: FixedArray::new(),
+        }
+        residual emit {
+            ai_op: "analysis.engine.init",
+            name: engine_name,
+            max_samples: ANALYZER_MAX_SAMPLES as u64,
+            max_patterns: ANALYZER_PATTERN_CAP as u64,
+        }
+        engine
+    }
+
+    pub fn add_sample(en: ref mut ResidualAnalysisEngine, dp: DataPoint) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if en.sample_count >= ANALYZER_MAX_SAMPLES {
+            return Result::Err(bounds_capacity_exceeded(ANALYZER_MAX_SAMPLES))
+        }
+        let r: Result<(), BoundsError> = en.samples.set(en.sample_count, dp)
+        if r.is_ok() {
+            en.sample_count = en.sample_count + 1
+            en.histogram.add_sample(dp.value)
+        }
+        r
+    }
+
+    pub fn register_pattern(en: ref mut ResidualAnalysisEngine, pname: FixedString[ANALYZER_NAME_CAP], mean: Word64, stddev: Word64, ptype: u8) -> Result[Word16, BoundsError>
+        effects: [deterministic]
+    {
+        if en.pattern_count >= ANALYZER_PATTERN_CAP {
+            return Result::Err(bounds_capacity_exceeded(ANALYZER_PATTERN_CAP))
+        }
+        let pid: Word16 = en.next_pattern_id
+        en.next_pattern_id = Word16::from_u16(en.next_pattern_id.to_u16() + 1)
+        let pattern: AnalysisPattern = AnalysisPattern::new(pid, pname, mean, stddev, ptype)
+        let r: Result<(), BoundsError> = en.patterns.set(en.pattern_count, pattern)
+        if r.is_ok() {
+            en.pattern_count = en.pattern_count + 1
+        }
+        Result::Ok(pid)
+    }
+
+    pub fn detect_anomalies(en: ref ResidualAnalysisEngine) -> FixedArray[u32, ANALYZER_SAMPLES]
+        effects: [deterministic, residual]
+    {
+        let mut anomalies: FixedArray[u32, ANALYZER_MAX_SAMPLES] = FixedArray::new()
+        let mut count: u32 = 0
+        for i in 0..en.sample_count {
+            let dp: DataPoint = match en.samples.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let mut matches_any: bool = false
+            for j in 0..en.pattern_count {
+                let pattern: AnalysisPattern = match en.patterns.get(j) {
+                    Result::Ok(p) => p,
+                    Result::Err(_) => continue,
+                }
+                if pattern.matches(dp.value) {
+                    matches_any = true
+                }
+            }
+            if !matches_any {
+                if count < ANALYZER_MAX_SAMPLES {
+                    let _ = anomalies.set(count, i)
+                    count = count + 1
+                }
+            }
+        }
+        residual emit {
+            ai_op: "anomaly.detection",
+            samples_analyzed: en.sample_count as u64,
+            anomalies_found: count as u64,
+        }
+        anomalies
+    }
+
+    pub fn compute_similarity(en: ref ResidualAnalysisEngine, a_index: u32, b_index: u32) -> u16
+        effects: [deterministic]
+    {
+        let dp_a: DataPoint = match en.samples.get(a_index) {
+            Result::Ok(v) => v,
+            Result::Err(_) => return 0,
+        }
+        let dp_b: DataPoint = match en.samples.get(b_index) {
+            Result::Ok(v) => v,
+            Result::Err(_) => return 0,
+        }
+        let diff: Word64 = if dp_a.value.gt(dp_b.value) {
+            dp_a.value.sub(dp_b.value)
+        } else {
+            dp_b.value.sub(dp_a.value)
+        }
+        let max_val: Word64 = if dp_a.value.gt(dp_b.value) { dp_a.value } else { dp_b.value }
+        if max_val.is_zero() {
+            return 10000
+        }
+        let ratio: Word64 = diff.mul(Word64::from_u64(10000)).div(max_val)
+        let sim: u64 = 10000 - ratio.to_u64()
+        sim as u16
+    }
+
+    pub fn compute_drift(en: ref mut ResidualAnalysisEngine)
+        effects: [deterministic, residual]
+    {
+        if en.sample_count < 2 {
+            return
+        }
+        let half: u32 = en.sample_count / 2
+        let mut first_half: FixedArray[Word64, ANALYZER_DRIFT_WINDOW] = FixedArray::new()
+        let mut first_count: u32 = 0
+        let mut second_half: FixedArray[Word64, ANALYZER_DRIFT_WINDOW] = FixedArray::new()
+        let mut second_count: u32 = 0
+
+        for i in 0..half {
+            let dp: DataPoint = match en.samples.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if first_count < ANALYZER_DRIFT_WINDOW {
+                let _ = first_half.set(first_count, dp.value)
+                first_count = first_count + 1
+            }
+        }
+        for i in half..en.sample_count {
+            let dp: DataPoint = match en.samples.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if second_count < ANALYZER_DRIFT_WINDOW {
+                let _ = second_half.set(second_count, dp.value)
+                second_count = second_count + 1
+            }
+        }
+
+        en.drift.compute(first_half, first_count, second_half, second_count)
+        residual emit {
+            ai_op: "drift.analysis",
+            baseline_mean: en.drift.baseline_mean.to_u64(),
+            current_mean: en.drift.current_mean.to_u64(),
+            drift_pct: en.drift.drift_percentage.to_u64(),
+            significant: if en.drift.is_significant { 1 } else { 0 },
+        }
+    }
+
+    pub fn detect_trends(en: ref mut ResidualAnalysisEngine)
+        effects: [deterministic, residual]
+    {
+        en.trend.compute_linear(en.samples, en.sample_count)
+        residual emit {
+            ai_op: "trend.analysis",
+            slope: en.trend.slope.to_u64(),
+            correlation: en.trend.correlation as u64,
+            confidence: en.trend.confidence as u64,
+            trend_type: en.trend.trend_type as u64,
+        }
+    }
+
+    pub fn generate_report(en: ref ResidualAnalysisEngine) -> FixedString[ANALYZER_REPORT_CAP]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[ANALYZER_REPORT_CAP] = FixedString::new()
+        report.append(FixedString[32]::from_slice("Residual Analysis Report\n"))
+        report.append(FixedString[32]::from_slice("========================\n"))
+        report.append(FixedString[16]::from_slice("Engine: "))
+        report.append(en.name)
+        report.append(FixedString[16]::from_slice("\nSamples: "))
+        report.append_u64(en.sample_count as u64)
+        report.append(FixedString[16]::from_slice("\nPatterns: "))
+        report.append_u64(en.pattern_count as u64)
+        report.append(FixedString[16]::from_slice("\n\nDrift Analysis:\n"))
+        report.append(FixedString[16]::from_slice("  Baseline mean: "))
+        report.append_u64(en.drift.baseline_mean.to_u64())
+        report.append(FixedString[16]::from_slice("\n  Current mean: "))
+        report.append_u64(en.drift.current_mean.to_u64())
+        report.append(FixedString[16]::from_slice("\n  Drift %: "))
+        report.append_u64(en.drift.drift_percentage.to_u64())
+        report.append(FixedString[16]::from_slice("\n  Significant: "))
+        report.append(if en.drift.is_significant { FixedString[4]::from_slice("YES") } else { FixedString[3]::from_slice("No") })
+
+        report.append(FixedString[16]::from_slice("\n\nTrend Analysis:\n"))
+        report.append(FixedString[16]::from_slice("  Slope: "))
+        report.append_u64(en.trend.slope.to_u64())
+        report.append(FixedString[16]::from_slice("\n  Correlation: "))
+        report.append_u64(en.trend.correlation as u64)
+        report.append(FixedString[16]::from_slice("\n  Confidence: "))
+        report.append_u64(en.trend.confidence as u64)
+
+        let anomalies: FixedArray[u32, ANALYZER_MAX_SAMPLES] = en.detect_anomalies()
+        let mut anomaly_count: u32 = 0
+        for i in 0..ANALYZER_MAX_SAMPLES {
+            let a: u32 = match anomalies.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if a > 0 { anomaly_count = anomaly_count + 1 }
+        }
+        report.append(FixedString[16]::from_slice("\n\nAnomalies: "))
+        report.append_u64(anomaly_count as u64)
+
+        report.append(FixedString[16]::from_slice("\n\nDistribution:\n"))
+        report.append(FixedString[16]::from_slice("  Mode bucket: "))
+        report.append_u64(en.histogram.mode_bucket() as u64)
+        report.append(FixedString[16]::from_slice("\n  Uniform: "))
+        report.append(if en.histogram.is_uniform() { FixedString[4]::from_slice("yes") } else { FixedString[3]::from_slice("no") })
+        report
+    }
+
+    pub fn flush_residuals(en: ref mut ResidualAnalysisEngine)
+        effects: [residual]
+    {
+        residual emit {
+            ai_op: "analysis.residuals.flushed",
+            name: en.name,
+            total_samples: en.sample_count as u64,
+            total_patterns: en.pattern_count as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Analysis Configuration
+// ──────────────────────────────────────────────
+pub fn configure_analysis(engine: ref mut ResidualAnalysisEngine, min_val: Word64, max_val: Word64, buckets: u32)
+    effects: [deterministic]
+{
+    engine.histogram = Histogram::new(buckets, min_val, max_val)
+}
+
+pub fn record_as_residual(en: ref mut ResidualAnalysisEngine, dp: DataPoint)
+    effects: [deterministic, residual]
+{
+    residual emit {
+        ai_op: "analysis.data_point",
+        timestamp: dp.timestamp.to_u64(),
+        value: dp.value.to_u64(),
+        label: dp.label,
+        source: dp.source,
+        confidence: dp.confidence as u64,
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module Entry Point
+// ──────────────────────────────────────────────
+pub fn init_residual_analysis(name: FixedString[ANALYZER_NAME_CAP]) -> ResidualAnalysisEngine
+    effects: [deterministic, residual]
+{
+    let engine: ResidualAnalysisEngine = ResidualAnalysisEngine::new(name)
+    residual emit {
+        ai_op: "residual_analysis.init",
+        name: name,
+        max_samples: ANALYZER_MAX_SAMPLES as u64,
+        pattern_capacity: ANALYZER_PATTERN_CAP as u64,
+        feature_capacity: ANALYZER_FEATURE_CAP as u64,
+    }
+    engine
+}

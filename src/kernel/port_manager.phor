@@ -1,0 +1,1037 @@
+// port_manager.phor — Typed port management
+// Create, bind, send, receive on capability-gated ports
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/port_manager.phor
+// Court: port_manager:v2
+
+package kernel.port_manager;
+
+import kernel.nucleus_interface.*;
+import kernel.capability_manager.*;
+import kernel.session_manager.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type PortError = enum {
+    PortNotFound         = 0x40,  // E0040: port ID not found
+    PortClosed           = 0x41,  // E0041: port has been closed
+    PortTableFull        = 0x42,  // E0042: maximum port count reached
+    PortFull             = 0x43,  // E0043: port buffer is full
+    PortEmpty            = 0x44,  // E0044: port buffer is empty
+    PortTypeMismatch     = 0x45,  // E0045: message type does not match port type
+    PortCapabilityError  = 0x46,  // E0046: insufficient capability for port operation
+    PortNotBound         = 0x47,  // E0047: port is not bound to any endpoint
+    PortAlreadyBound     = 0x48,  // E0048: port is already bound
+    PortDirectionError   = 0x49,  // E0049: wrong direction for operation (send vs receive)
+    PortStaleGeneration  = 0x4A,  // E004A: port generation tag is stale
+    PortBufferOverflow   = 0x4B,  // E004B: port message exceeds buffer capacity
+    PortMaxMessageSize   = 0x4C,  // E004C: message exceeds port's max message size
+    PortRateLimitExceeded = 0x4D, // E004D: port send rate limit exceeded
+    PortNotCapabilityGated = 0x4E, // E004E: port requires capability for operation
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Direction and Type
+// ─────────────────────────────────────────────────────────────
+
+type PortDirection = enum {
+    SendOnly     = 0,  // One-way send
+    ReceiveOnly  = 1,  // One-way receive
+    Duplex       = 2,  // Both send and receive
+}
+
+type PortDataType = enum {
+    StructuredMessage = 0,  // Typed structured message
+    RawBytes          = 1,  // Raw byte stream
+    ResidualRecord   = 2,  // Residual data stream
+    CapabilityToken   = 3,  // Capability transfer channel
+    ServiceRequest    = 4,  // Service request/response
+    EventNotification = 5,  // Event notification
+    Diagnostic        = 6,  // Diagnostic data
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Message
+// ─────────────────────────────────────────────────────────────
+
+struct PortMessage {
+    message_type: PortDataType,
+    sender_identity: Identity,
+    receiver_identity: Identity,
+    payload_hash: u64,
+    payload: Array(u8, 4096),
+    payload_length: u64,
+    capability_token: Option(Cap(CapabilityToken)),
+    generation: u64,
+    timestamp: u64,
+    sequence_number: u64,
+    residual: ResidualRecord,
+}
+
+struct PortMessageHeader {
+    message_type: PortDataType,
+    sender: Identity,
+    payload_length: u64,
+    payload_hash: u64,
+    sequence: u64,
+    timestamp: u64,
+    generation: u64,
+    has_capability: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Entry
+// ─────────────────────────────────────────────────────────────
+
+struct PortEntry {
+    port_id: Identity,
+    port_direction: PortDirection,
+    port_data_type: PortDataType,
+    owning_session: Identity,
+    bound_service: Option(Identity),
+    bound_session: Option(Identity),
+    message_buffer: RingBuf(PortMessage, 64),
+    send_count: u64,
+    receive_count: u64,
+    max_message_size: u64,
+    generation: u64,
+    creation_timestamp: u64,
+    is_open: bool,
+    requires_capability: bool,
+    required_rights: CapabilityRights,
+    trust_state: TrustState,
+    residual_log: RingBuf(ResidualRecord, 64),
+    metadata: PortMetadata,
+}
+
+struct PortMetadata {
+    label: String(128),
+    description: String(256),
+    service_name: String(64),
+    expected_rate_per_second: u64,
+    priority: u64,
+    is_urgent: bool,
+    court_casefile: String(128),
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Manager State
+// ─────────────────────────────────────────────────────────────
+
+struct PortManagerState {
+    ports: Array(PortEntry, 256),
+    port_count: u64,
+    next_port_generation: u64,
+    manager_identity: Identity,
+    capability_manager: Handle(CapabilityManagerState),
+    session_manager: Handle(SessionManagerState),
+    initialization_timestamp: u64,
+    audit_trail: RingBuf(AuditRecord, 256),
+    global_sequence: u64,
+    default_max_message_size: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Manager Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn port_manager_init(
+    manager_identity: Identity,
+    cap_manager: Handle(CapabilityManagerState),
+    sess_manager: Handle(SessionManagerState),
+    timestamp: u64,
+) -> PortManagerState
+    effect [deterministic]
+    court "port_manager_init:v1"
+{
+    let state: PortManagerState = PortManagerState {
+        ports: Array::zeroed(),
+        port_count: 0,
+        next_port_generation: 1,
+        manager_identity: manager_identity,
+        capability_manager: cap_manager,
+        session_manager: sess_manager,
+        initialization_timestamp: timestamp,
+        audit_trail: RingBuf::new(),
+        global_sequence: 0,
+        default_max_message_size: 4096,
+    };
+
+    residual emit {
+        op: "port_manager.init",
+        manager_identity: manager_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create Port
+// ─────────────────────────────────────────────────────────────
+
+fn port_create(
+    state: Handle(PortManagerState),
+    direction: PortDirection,
+    data_type: PortDataType,
+    owning_session: Identity,
+    creator_cap: Cap(CapabilityToken),
+    metadata: PortMetadata,
+    timestamp: u64,
+) -> Result(PortEntry, PortError)
+    effect [deterministic, residual]
+    court "port_create:v2"
+{
+    // Check capacity
+    if state.port_count >= 256 {
+        return Result::Err(PortError::PortTableFull);
+    };
+
+    // Generate port identity
+    let port_id: Identity = identity_new(
+        owning_session.id_hash,
+        timestamp,
+        state.next_port_generation,
+        state.port_count,
+    );
+
+    let generation: u64 = state.next_port_generation;
+    state.next_port_generation = state.next_port_generation + 1;
+
+    // Find empty slot
+    let mut slot_idx: u64 = 0;
+    let mut found_slot: bool = false;
+    for i in 0..256 {
+        if state.ports[i].generation == 0 || !state.ports[i].is_open {
+            slot_idx = i;
+            found_slot = true;
+            break;
+        };
+    };
+
+    if !found_slot {
+        return Result::Err(PortError::PortTableFull);
+    };
+
+    let required_rights: CapabilityRights = match direction {
+        PortDirection::SendOnly => CapabilityRights { read: false, write: true, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+        PortDirection::ReceiveOnly => CapabilityRights { read: true, write: false, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+        PortDirection::Duplex => CapabilityRights { read: true, write: true, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+    };
+
+    let port: PortEntry = PortEntry {
+        port_id: port_id,
+        port_direction: direction,
+        port_data_type: data_type,
+        owning_session: owning_session,
+        bound_service: Option::None,
+        bound_session: Option::None,
+        message_buffer: RingBuf::new(),
+        send_count: 0,
+        receive_count: 0,
+        max_message_size: state.default_max_message_size,
+        generation: generation,
+        creation_timestamp: timestamp,
+        is_open: true,
+        requires_capability: true,
+        required_rights: required_rights,
+        trust_state: TrustState::Unknown,
+        residual_log: RingBuf::new(),
+        metadata: metadata,
+    };
+
+    state.ports[slot_idx] = port;
+    state.port_count = state.port_count + 1;
+
+    // Audit
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::CreateCapability,
+        capability_id: port_id,
+        actor_identity: owning_session,
+        success: true,
+        detail: String::from_bytes(Slice(u8)::from_str("port created")),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "port_manager.create",
+        port_id: port_id.id_hash,
+        direction: direction as u64,
+        data_type: data_type as u64,
+        session: owning_session.id_hash,
+        generation: generation,
+    };
+
+    return Result::Ok(state.ports[slot_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bind Port to Service
+// ─────────────────────────────────────────────────────────────
+
+fn port_bind_service(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    service_id: Identity,
+    binder_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+    court "port_bind:v1"
+{
+    let mut found: bool = false;
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            // Check if already bound
+            if entry.bound_service.is_some() {
+                return Result::Err(PortError::PortAlreadyBound);
+            };
+
+            // Bind
+            entry.bound_service = Option::Some(service_id);
+
+            // Record residual
+            let residual: ResidualRecord = ResidualRecord {
+                timestamp: timestamp,
+                event_type: 0x30,
+                event_data_hash: service_id.id_hash,
+                cause_identity: binder_cap.object_id,
+                prior_state_hash: 0,
+                new_state_hash: service_id.id_hash,
+                delta_description: String::from_bytes(Slice(u8)::from_str("port bound to service")),
+                generation_at_event: entry.generation,
+                verified: false,
+            };
+            entry.residual_log.push(residual);
+
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(PortError::PortNotFound);
+    };
+
+    residual emit {
+        op: "port_manager.bind_service",
+        port_id: port_id.id_hash,
+        service_id: service_id.id_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bind Port to Session
+// ─────────────────────────────────────────────────────────────
+
+fn port_bind_session(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    session_id: Identity,
+    binder_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+{
+    let mut found: bool = false;
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            if entry.bound_session.is_some() {
+                return Result::Err(PortError::PortAlreadyBound);
+            };
+
+            entry.bound_session = Option::Some(session_id);
+
+            let residual: ResidualRecord = ResidualRecord {
+                timestamp: timestamp,
+                event_type: 0x31,
+                event_data_hash: session_id.id_hash,
+                cause_identity: binder_cap.object_id,
+                prior_state_hash: 0,
+                new_state_hash: session_id.id_hash,
+                delta_description: String::from_bytes(Slice(u8)::from_str("port bound to session")),
+                generation_at_event: entry.generation,
+                verified: false,
+            };
+            entry.residual_log.push(residual);
+
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(PortError::PortNotFound);
+    };
+
+    residual emit {
+        op: "port_manager.bind_session",
+        port_id: port_id.id_hash,
+        session_id: session_id.id_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Send Message to Port
+// ─────────────────────────────────────────────────────────────
+
+fn port_send(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    sender_identity: Identity,
+    data: Slice(u8),
+    cap_token: Option(Cap(CapabilityToken)),
+    sender_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+    court "port_send:v2"
+{
+    let mut found: bool = false;
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            // Check direction
+            if entry.port_direction == PortDirection::ReceiveOnly {
+                return Result::Err(PortError::PortDirectionError);
+            };
+
+            // Check message size
+            let data_len: u64 = data.len();
+            if data_len > entry.max_message_size {
+                return Result::Err(PortError::PortMaxMessageSize);
+            };
+
+            // Check if buffer is full
+            if entry.message_buffer.is_full() {
+                return Result::Err(PortError::PortFull);
+            };
+
+            // Build message
+            state.global_sequence = state.global_sequence + 1;
+            let seq: u64 = state.global_sequence;
+
+            let mut payload: Array(u8, 4096) = Array::zeroed();
+            let copy_len: u64 = if data_len < 4096 { data_len } else { 4096 };
+            for j in 0..copy_len {
+                payload[j] = data[j];
+            };
+
+            let residual: ResidualRecord = ResidualRecord {
+                timestamp: timestamp,
+                event_type: 0x32,
+                event_data_hash: seq,
+                cause_identity: sender_identity,
+                prior_state_hash: entry.send_count,
+                new_state_hash: entry.send_count + 1,
+                delta_description: String::from_bytes(Slice(u8)::from_str("port message sent")),
+                generation_at_event: entry.generation,
+                verified: false,
+            };
+
+            let message: PortMessage = PortMessage {
+                message_type: entry.port_data_type,
+                sender_identity: sender_identity,
+                receiver_identity: Identity {
+                    id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+                },
+                payload_hash: seq,
+                payload: payload,
+                payload_length: copy_len,
+                capability_token: cap_token,
+                generation: entry.generation,
+                timestamp: timestamp,
+                sequence_number: seq,
+                residual: residual,
+            };
+
+            entry.message_buffer.push(message);
+            entry.send_count = entry.send_count + 1;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(PortError::PortNotFound);
+    };
+
+    residual emit {
+        op: "port_manager.send",
+        port_id: port_id.id_hash,
+        sender: sender_identity.id_hash,
+        length: data.len(),
+        sequence: state.global_sequence,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Receive Message from Port
+// ─────────────────────────────────────────────────────────────
+
+fn port_receive(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    receiver_identity: Identity,
+    receiver_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(PortMessage, PortError)
+    effect [deterministic, residual]
+    court "port_receive:v2"
+{
+    let mut found: bool = false;
+    let mut slot_idx: u64 = 0;
+    for i in 0..256 {
+        if identity_equal(state.ports[i].port_id, port_id) && state.ports[i].is_open {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(PortError::PortNotFound);
+    };
+
+    let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[slot_idx]);
+
+    // Check direction
+    if entry.port_direction == PortDirection::SendOnly {
+        return Result::Err(PortError::PortDirectionError);
+    };
+
+    // Check if buffer is empty
+    if entry.message_buffer.is_empty() {
+        return Result::Err(PortError::PortEmpty);
+    };
+
+    // Pop message
+    let message: PortMessage = entry.message_buffer.pop().unwrap();
+    entry.receive_count = entry.receive_count + 1;
+
+    // Record residual
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x33,
+        event_data_hash: message.sequence_number,
+        cause_identity: receiver_identity,
+        prior_state_hash: entry.receive_count - 1,
+        new_state_hash: entry.receive_count,
+        delta_description: String::from_bytes(Slice(u8)::from_str("port message received")),
+        generation_at_event: entry.generation,
+        verified: false,
+    };
+    entry.residual_log.push(residual);
+
+    residual emit {
+        op: "port_manager.receive",
+        port_id: port_id.id_hash,
+        receiver: receiver_identity.id_hash,
+        sequence: message.sequence_number,
+        message_type: message.message_type as u64,
+    };
+
+    return Result::Ok(message);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Close Port
+// ─────────────────────────────────────────────────────────────
+
+fn port_close(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    closer_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+{
+    let mut found: bool = false;
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            entry.is_open = false;
+            entry.generation = 0;
+
+            // Drain remaining messages
+            while !entry.message_buffer.is_empty() {
+                entry.message_buffer.pop();
+            };
+
+            state.port_count = state.port_count - 1;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(PortError::PortNotFound);
+    };
+
+    residual emit {
+        op: "port_manager.close",
+        port_id: port_id.id_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Query Port Status
+// ─────────────────────────────────────────────────────────────
+
+fn port_query(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    querier_cap: Cap(CapabilityToken),
+) -> Result(PortEntry, PortError)
+    effect [deterministic]
+{
+    for i in 0..256 {
+        let entry: PortEntry = state.ports[i];
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            return Result::Ok(entry);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Peek (non-destructive read)
+// ─────────────────────────────────────────────────────────────
+
+fn port_peek(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    peek_cap: Cap(CapabilityToken),
+) -> Result(Option(PortMessage), PortError)
+    effect [deterministic]
+{
+    for i in 0..256 {
+        let entry: PortEntry = state.ports[i];
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            let msg: Option(PortMessage) = entry.message_buffer.peek();
+            return Result::Ok(msg);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Flush (clear all messages)
+// ─────────────────────────────────────────────────────────────
+
+fn port_flush(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    flusher_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, PortError)
+    effect [deterministic, residual]
+{
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            let mut flushed: u64 = 0;
+            while !entry.message_buffer.is_empty() {
+                entry.message_buffer.pop();
+                flushed = flushed + 1;
+            };
+
+            residual emit {
+                op: "port_manager.flush",
+                port_id: port_id.id_hash,
+                flushed_count: flushed,
+            };
+
+            return Result::Ok(flushed);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enumerate Ports for a Session
+// ─────────────────────────────────────────────────────────────
+
+fn port_enumerate_for_session(
+    state: Handle(PortManagerState),
+    session_id: Identity,
+    enumerator_cap: Cap(CapabilityToken),
+) -> Result(Array(PortEntry, 256), PortError)
+    effect [deterministic]
+{
+    let mut result: Array(PortEntry, 256) = Array::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..256 {
+        let entry: PortEntry = state.ports[i];
+        if identity_equal(entry.owning_session, session_id) && entry.is_open {
+            result[count] = entry;
+            count = count + 1;
+        };
+    };
+
+    return Result::Ok(result);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Forwarding — Forward messages between ports
+// ─────────────────────────────────────────────────────────────
+
+fn port_forward(
+    state: Handle(PortManagerState),
+    source_port_id: Identity,
+    dest_port_id: Identity,
+    forwarder_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, PortError)
+    effect [deterministic, residual]
+    court "port_forward:v1"
+{
+    let mut src_idx: u64 = 0;
+    let mut dst_idx: u64 = 0;
+    let mut src_found: bool = false;
+    let mut dst_found: bool = false;
+
+    for i in 0..256 {
+        let p: PortEntry = state.ports[i];
+        if identity_equal(p.port_id, source_port_id) && p.is_open {
+            src_idx = i;
+            src_found = true;
+            break;
+        };
+    };
+
+    for i in 0..256 {
+        let p: PortEntry = state.ports[i];
+        if identity_equal(p.port_id, dest_port_id) && p.is_open {
+            dst_idx = i;
+            dst_found = true;
+            break;
+        };
+    };
+
+    if !src_found || !dst_found {
+        return Result::Err(PortError::PortNotFound);
+    };
+
+    let src: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[src_idx]);
+    let dst: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[dst_idx]);
+
+    let mut forwarded: u64 = 0;
+    while !src.message_buffer.is_empty() && !dst.message_buffer.is_full() {
+        let msg: PortMessage = src.message_buffer.pop().unwrap();
+        dst.message_buffer.push(msg);
+        dst.receive_count = dst.receive_count + 1;
+        forwarded = forwarded + 1;
+    };
+
+    if forwarded > 0 {
+        src.send_count = src.send_count + forwarded;
+    };
+
+    residual emit {
+        op: "port_manager.forward",
+        source: source_port_id.id_hash,
+        dest: dest_port_id.id_hash,
+        forwarded: forwarded,
+    };
+
+    return Result::Ok(forwarded);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Filter Setup
+// ─────────────────────────────────────────────────────────────
+
+struct PortFilter {
+    port_id: Identity,
+    filter_type: PortFilterType,
+    allowed_types: Bitmap(4),
+    required_rights: CapabilityRights,
+    max_message_size: u64,
+    rate_limit_per_second: u64,
+    active: bool,
+}
+
+type PortFilterType = enum {
+    PassThrough   = 0,
+    AllowList     = 1,
+    DenyList      = 2,
+    RateLimit     = 3,
+    CapabilityGated = 4,
+}
+
+fn port_set_filter(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    filter: PortFilter,
+    setter_cap: Cap(CapabilityToken),
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+{
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            entry.metadata.expected_rate_per_second = filter.rate_limit_per_second;
+            entry.requires_capability = filter.filter_type == PortFilterType::CapabilityGated;
+
+            residual emit {
+                op: "port_manager.set_filter",
+                port_id: port_id.id_hash,
+                filter_type: filter.filter_type as u64,
+            };
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Multiplex — Route messages to multiple destinations
+// ─────────────────────────────────────────────────────────────
+
+fn port_multiplex(
+    state: Handle(PortManagerState),
+    source_port_id: Identity,
+    dest_port_ids: Slice(Identity),
+    mux_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, PortError)
+    effect [deterministic, residual]
+{
+    let mut total_dispatched: u64 = 0;
+    let port_count: u64 = dest_port_ids.len();
+
+    for i in 0..256 {
+        let src: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(src.port_id, source_port_id) && src.is_open {
+            while !src.message_buffer.is_empty() {
+                let msg: PortMessage = src.message_buffer.pop().unwrap();
+                for j in 0..port_count {
+                    let dest_id: Identity = dest_port_ids[j];
+                    for k in 0..256 {
+                        let dest: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[k]);
+                        if identity_equal(dest.port_id, dest_id) && dest.is_open {
+                            if !dest.message_buffer.is_full() {
+                                dest.message_buffer.push(msg);
+                                dest.receive_count = dest.receive_count + 1;
+                                total_dispatched = total_dispatched + 1;
+                            };
+                            break;
+                        };
+                    };
+                };
+            };
+            break;
+        };
+    };
+
+    residual emit {
+        op: "port_manager.multiplex",
+        source: source_port_id.id_hash,
+        destinations: port_count,
+        dispatched: total_dispatched,
+    };
+
+    return Result::Ok(total_dispatched);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Priority Management
+// ─────────────────────────────────────────────────────────────
+
+type PortPriority = enum {
+    Low      = 0,
+    Normal   = 1,
+    High     = 2,
+    Critical = 3,
+}
+
+fn port_set_priority(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    priority: PortPriority,
+    setter_cap: Cap(CapabilityToken),
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+{
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            entry.metadata.priority = priority as u64;
+            residual emit {
+                op: "port_manager.set_priority",
+                port_id: port_id.id_hash,
+                priority: priority as u64,
+            };
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Batch Send
+// ─────────────────────────────────────────────────────────────
+
+fn port_batch_send(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    sender_identity: Identity,
+    messages: Slice(PortMessage),
+    sender_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, PortError)
+    effect [deterministic, residual]
+{
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            if entry.port_direction == PortDirection::ReceiveOnly {
+                return Result::Err(PortError::PortDirectionError);
+            };
+            let mut sent: u64 = 0;
+            let msg_count: u64 = messages.len();
+            for j in 0..msg_count {
+                if entry.message_buffer.is_full() { break; };
+                let msg: PortMessage = messages[j];
+                if msg.payload_length <= entry.max_message_size {
+                    let updated_msg: PortMessage = msg;
+                    updated_msg.sender_identity = sender_identity;
+                    updated_msg.timestamp = timestamp;
+                    updated_msg.generation = entry.generation;
+                    updated_msg.sequence_number = state.global_sequence;
+                    state.global_sequence = state.global_sequence + 1;
+                    entry.message_buffer.push(updated_msg);
+                    entry.send_count = entry.send_count + 1;
+                    sent = sent + 1;
+                };
+            };
+            residual emit {
+                op: "port_manager.batch_send",
+                port_id: port_id.id_hash,
+                sent: sent,
+                total: msg_count,
+            };
+            return Result::Ok(sent);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Unbind — Remove port binding
+// ─────────────────────────────────────────────────────────────
+
+fn port_unbind(
+    state: Handle(PortManagerState),
+    port_id: Identity,
+    unbinder_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, PortError)
+    effect [deterministic, residual]
+{
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if identity_equal(entry.port_id, port_id) && entry.is_open {
+            entry.bound_service = Option::None;
+            entry.bound_session = Option::None;
+
+            residual emit {
+                op: "port_manager.unbind",
+                port_id: port_id.id_hash,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(PortError::PortNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Manager Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn port_manager_self_test(
+    state: Handle(PortManagerState),
+) -> Result(u64, PortError)
+    effect [deterministic]
+    court "port_self_test:v1"
+{
+    let mut checks: u64 = 0;
+    let mut open_consistent: u64 = 0;
+
+    for i in 0..256 {
+        let entry: PortEntry = state.ports[i];
+        if entry.is_open {
+            open_consistent = open_consistent + 1;
+            let buf_count: u64 = entry.message_buffer.len();
+            if buf_count <= 64 {
+                checks = checks + 1;
+            };
+        };
+    };
+
+    if open_consistent == state.port_count {
+        checks = checks + 1;
+    };
+
+    if state.next_port_generation > 0 {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "port_manager.self_test",
+        checks_passed: checks,
+        open_ports: open_consistent,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Port Manager Shutdown — Gracefully close all ports
+// ─────────────────────────────────────────────────────────────
+
+fn port_manager_shutdown(
+    state: Handle(PortManagerState),
+    shutdown_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> u64
+    effect [deterministic, residual]
+{
+    let mut closed: u64 = 0;
+    for i in 0..256 {
+        let entry: Handle(PortEntry) = Handle(PortEntry)::from_ptr(&state.ports[i]);
+        if entry.is_open {
+            entry.is_open = false;
+            while !entry.message_buffer.is_empty() {
+                entry.message_buffer.pop();
+            };
+            if state.port_count > 0 { state.port_count = state.port_count - 1; };
+            closed = closed + 1;
+        };
+    };
+
+    residual emit {
+        op: "port_manager.shutdown",
+        closed: closed,
+        timestamp: timestamp,
+    };
+
+    return closed;
+}

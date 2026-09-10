@@ -1,0 +1,983 @@
+// inspector.phor — PhorensicInspector
+// Hardware/provenance display, capability viewer, residual browser
+// All operations bounded. Every function declares effects.
+
+package gui.inspector;
+
+import gui.protocol;
+import gui.surface;
+import gui.compositor;
+import gui.display_server;
+import gui.window_manager;
+import gui.input_handler;
+import gui.shell;
+import gui.widgets;
+
+// ──────────────────────────────────────────────
+// Inspector Constants
+// ──────────────────────────────────────────────
+
+const MAX_CAPTURE_ENTRIES: u64 = 256;
+const MAX_PROVENANCE_CHAIN: u64 = 128;
+const MAX_RESIDUAL_LOG: u64 = 512;
+const MAX_INSPECTOR_TABS: u64 = 8;
+const MAX_DISPLAY_ITEMS: u64 = 64;
+const MAX_HARDWARE_ENTRIES: u64 = 64;
+const MAX_SURFACE_DUMP: u64 = 128;
+const MAX_CAPABILITY_TREE_DEPTH: u64 = 16;
+const MAX_RESIDUAL_FILTERS: u64 = 8;
+const INSPECTOR_REFRESH_MS: u64 = 500;
+const MAX_INSPECTOR_SNAPSHOTS: u64 = 32;
+
+// ──────────────────────────────────────────────
+// Inspector Tab Types
+// ──────────────────────────────────────────────
+
+enum InspectorTab {
+    Hardware,
+    Surfaces,
+    Capabilities,
+    Residuals,
+    Provenance,
+    Sessions,
+    Compositor,
+    Diagnostics,
+}
+
+// ──────────────────────────────────────────────
+// Hardware Info Entry
+// ──────────────────────────────────────────────
+
+struct HardwareEntry {
+    id: u64,
+    class: u64,
+    name: Array(u8, 128),
+    vendor: Array(u8, 64),
+    driver: Array(u8, 64),
+    status: u64,
+    capabilities: u64,
+    description: Array(u8, 256),
+    irq: u64,
+    mmio_base: u64,
+    mmio_size: u64,
+    fw_version: Array(u8, 32),
+}
+
+// ──────────────────────────────────────────────
+// Capability Tree Node
+// ──────────────────────────────────────────────
+
+struct CapTreeNode {
+    node_id: u64,
+    parent_id: u64,
+    depth: u64,
+    cap: protocol.CapabilityId,
+    grant_record: Option(protocol.CapGrantRecord),
+    origin: u64,
+    children: Array(u64, 16),
+    child_count: u64,
+    description: Array(u8, 128),
+}
+
+// ──────────────────────────────────────────────
+// Residual Log Entry
+// ──────────────────────────────────────────────
+
+struct ResidualLogEntry {
+    entry_id: u64,
+    op: Array(u8, 128),
+    timestamp_ns: u64,
+    session_id: u64,
+    surface_id: u64,
+    hash: u64,
+    court: Array(u8, 32),
+    source_file: Array(u8, 128),
+    source_line: u64,
+    fields: Array(u8, 256),
+    viewed: bool,
+}
+
+// ──────────────────────────────────────────────
+// Provenance Chain Node
+// ──────────────────────────────────────────────
+
+struct ProvenanceNode {
+    node_id: u64,
+    parent_id: u64,
+    session_id: u64,
+    operation: Array(u8, 64),
+    timestamp_ns: u64,
+    cap_involved: Option(protocol.CapabilityId),
+    surface_involved: u64,
+    data_hash: u64,
+    description: Array(u8, 256),
+    verified: bool,
+    court_cited: Array(u8, 32),
+}
+
+// ──────────────────────────────────────────────
+// Inspector State
+// ──────────────────────────────────────────────
+
+struct PhorensicInspector {
+    initialized: bool,
+
+    // Tabs
+    active_tab: InspectorTab,
+    tabs: Array(InspectorTab, MAX_INSPECTOR_TABS),
+    tab_count: u64,
+
+    // Hardware browsing
+    hardware: RingBuf(HardwareEntry, MAX_HARDWARE_ENTRIES),
+    hardware_count: u64,
+    selected_hardware: u64,
+
+    // Surface dump
+    surface_dump: RingBuf(surface.SurfaceRegistryEntry, MAX_SURFACE_DUMP),
+    surface_dump_count: u64,
+    selected_surface: u64,
+
+    // Capability tree
+    cap_tree: RingBuf(CapTreeNode, MAX_CAPTURE_ENTRIES),
+    cap_tree_count: u64,
+    selected_cap_node: u64,
+    cap_tree_depth: u64,
+
+    // Residual log
+    residual_log: RingBuf(ResidualLogEntry, MAX_RESIDUAL_LOG),
+    residual_count: u64,
+    selected_residual: u64,
+    filter_text: Array(u8, 64),
+    filter_active: bool,
+    filter_matches: u64,
+
+    // Provenance
+    provenance_chain: RingBuf(ProvenanceNode, MAX_PROVENANCE_CHAIN),
+    provenance_count: u64,
+    selected_provenance: u64,
+
+    // Diagnostics
+    diag_lines: Array(Array(u8, 128), 64),
+    diag_count: u64,
+
+    // Display state
+    scroll_offset: u64,
+    display_count: u64,
+    expanded_items: Array(u64, MAX_DISPLAY_ITEMS),
+    expanded_count: u64,
+
+    // Snapshots
+    snapshots: RingBuf(Array(u8, 4096), MAX_INSPECTOR_SNAPSHOTS),
+    snapshot_count: u64,
+
+    // Widget references
+    widget_tree: widgets.WidgetTree,
+    inspector_window_id: u64,
+
+    // Refresh
+    last_refresh_ms: u64,
+    auto_refresh: bool,
+    refresh_interval_ms: u64,
+
+    // Statistics
+    total_residuals_seen: u64,
+    total_caps_tracked: u64,
+    total_surfaces_inspected: u64,
+    inspector_open_count: u64,
+}
+
+// ──────────────────────────────────────────────
+// Inspector Initialization
+// ──────────────────────────────────────────────
+
+fn inspector_init() -> PhorensicInspector
+    effect [compute, residual]
+{
+    let mut tabs: Array(InspectorTab, MAX_INSPECTOR_TABS) = Array::zeroed();
+    tabs[0] = InspectorTab::Hardware;
+    tabs[1] = InspectorTab::Surfaces;
+    tabs[2] = InspectorTab::Capabilities;
+    tabs[3] = InspectorTab::Residuals;
+    tabs[4] = InspectorTab::Provenance;
+    tabs[5] = InspectorTab::Sessions;
+    tabs[6] = InspectorTab::Compositor;
+    tabs[7] = InspectorTab::Diagnostics;
+
+    let insp: PhorensicInspector = PhorensicInspector {
+        initialized: true,
+        active_tab: InspectorTab::Hardware,
+        tabs: tabs,
+        tab_count: 8,
+        hardware: RingBuf::new(),
+        hardware_count: 0,
+        selected_hardware: 0,
+        surface_dump: RingBuf::new(),
+        surface_dump_count: 0,
+        selected_surface: 0,
+        cap_tree: RingBuf::new(),
+        cap_tree_count: 0,
+        selected_cap_node: 0,
+        cap_tree_depth: 0,
+        residual_log: RingBuf::new(),
+        residual_count: 0,
+        selected_residual: 0,
+        filter_text: Array::zeroed(),
+        filter_active: false,
+        filter_matches: 0,
+        provenance_chain: RingBuf::new(),
+        provenance_count: 0,
+        selected_provenance: 0,
+        diag_lines: Array::zeroed(),
+        diag_count: 0,
+        scroll_offset: 0,
+        display_count: 0,
+        expanded_items: Array::zeroed(),
+        expanded_count: 0,
+        snapshots: RingBuf::new(),
+        snapshot_count: 0,
+        widget_tree: widgets.widget_tree_init(),
+        inspector_window_id: 0,
+        last_refresh_ms: 0,
+        auto_refresh: true,
+        refresh_interval_ms: INSPECTOR_REFRESH_MS,
+        total_residuals_seen: 0,
+        total_caps_tracked: 0,
+        total_surfaces_inspected: 0,
+        inspector_open_count: 0,
+    };
+    residual emit {
+        op: "inspector:init",
+    };
+    return insp;
+}
+
+// ──────────────────────────────────────────────
+// Tab Management
+// ──────────────────────────────────────────────
+
+fn inspector_switch_tab(insp: PhorensicInspector, tab: InspectorTab) -> PhorensicInspector
+    effect [compute, residual]
+{
+    residual emit {
+        op: "inspector:switch_tab",
+        tab: tab as u64,
+    };
+    return PhorensicInspector {
+        initialized: insp.initialized,
+        active_tab: tab,
+        tabs: insp.tabs,
+        tab_count: insp.tab_count,
+        hardware: insp.hardware,
+        hardware_count: insp.hardware_count,
+        selected_hardware: insp.selected_hardware,
+        surface_dump: insp.surface_dump,
+        surface_dump_count: insp.surface_dump_count,
+        selected_surface: insp.selected_surface,
+        cap_tree: insp.cap_tree,
+        cap_tree_count: insp.cap_tree_count,
+        selected_cap_node: insp.selected_cap_node,
+        cap_tree_depth: insp.cap_tree_depth,
+        residual_log: insp.residual_log,
+        residual_count: insp.residual_count,
+        selected_residual: insp.selected_residual,
+        filter_text: insp.filter_text,
+        filter_active: insp.filter_active,
+        filter_matches: insp.filter_matches,
+        provenance_chain: insp.provenance_chain,
+        provenance_count: insp.provenance_count,
+        selected_provenance: insp.selected_provenance,
+        diag_lines: insp.diag_lines,
+        diag_count: insp.diag_count,
+        scroll_offset: 0,
+        display_count: insp.display_count,
+        expanded_items: insp.expanded_items,
+        expanded_count: insp.expanded_count,
+        snapshots: insp.snapshots,
+        snapshot_count: insp.snapshot_count,
+        widget_tree: insp.widget_tree,
+        inspector_window_id: insp.inspector_window_id,
+        last_refresh_ms: insp.last_refresh_ms,
+        auto_refresh: insp.auto_refresh,
+        refresh_interval_ms: insp.refresh_interval_ms,
+        total_residuals_seen: insp.total_residuals_seen,
+        total_caps_tracked: insp.total_caps_tracked,
+        total_surfaces_inspected: insp.total_surfaces_inspected,
+        inspector_open_count: insp.inspector_open_count,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Hardware Information Gathering
+// ──────────────────────────────────────────────
+
+fn inspector_add_hardware(insp: PhorensicInspector, entry: HardwareEntry) -> PhorensicInspector
+    effect [compute]
+    bound iterations MAX_HARDWARE_ENTRIES
+{
+    let mut updated: PhorensicInspector = insp;
+    for i in 0..MAX_HARDWARE_ENTRIES {
+        let h_opt: Option(HardwareEntry) = updated.hardware[i];
+        match h_opt {
+            Option::None => {
+                updated.hardware[i] = Option::Some(entry);
+                updated.hardware_count = updated.hardware_count + 1;
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated;
+}
+
+fn inspector_capture_hardware(insp: PhorensicInspector) -> PhorensicInspector
+    effect [compute, io:read, residual]
+    bound iterations MAX_HARDWARE_ENTRIES
+{
+    let mut updated: PhorensicInspector = insp;
+    let mut entry: HardwareEntry = HardwareEntry {
+        id: 1,
+        class: 0,
+        name: Array::zeroed(),
+        vendor: Array::zeroed(),
+        driver: Array::zeroed(),
+        status: 1,
+        capabilities: 0,
+        description: Array::zeroed(),
+        irq: 0,
+        mmio_base: 0,
+        mmio_size: 0,
+        fw_version: Array::zeroed(),
+    };
+    // Populate with some built-in entries
+    let name1: Array(u8, 128) = Array::zeroed();
+    let vendor1: Array(u8, 64) = Array::zeroed();
+    let driver1: Array(u8, 64) = Array::zeroed();
+    let desc1: Array(u8, 256) = Array::zeroed();
+    let fw1: Array(u8, 32) = Array::zeroed();
+    // Fill with known hardware (simplified)
+    for i in 0..10 {
+        let hw: HardwareEntry = HardwareEntry {
+            id: (i + 1) as u64,
+            class: i,
+            name: name1,
+            vendor: vendor1,
+            driver: driver1,
+            status: 1,
+            capabilities: 0,
+            description: desc1,
+            irq: i,
+            mmio_base: 0,
+            mmio_size: 0,
+            fw_version: fw1,
+        };
+        updated = inspector_add_hardware(updated, hw);
+    }
+    residual emit {
+        op: "inspector:capture_hardware",
+        count: updated.hardware_count,
+    };
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Surface Dump
+// ──────────────────────────────────────────────
+
+fn inspector_dump_surfaces(insp: PhorensicInspector, reg: surface.SurfaceRegistry) -> PhorensicInspector
+    effect [compute, io:read]
+    bound iterations MAX_SURFACE_DUMP
+{
+    let mut updated: PhorensicInspector = insp;
+    for i in 0..MAX_SURFACE_DUMP {
+        let entry_opt: Option(surface.SurfaceRegistryEntry) = surface.registry_lookup(reg, i);
+        match entry_opt {
+            Option::Some(entry) => {
+                if entry.in_use {
+                    for j in 0..MAX_SURFACE_DUMP {
+                        let slot_opt: Option(surface.SurfaceRegistryEntry) = updated.surface_dump[j];
+                        match slot_opt {
+                            Option::None => {
+                                updated.surface_dump[j] = Option::Some(entry);
+                                updated.surface_dump_count = updated.surface_dump_count + 1;
+                                break;
+                            }
+                            Option::Some(_) => {}
+                        }
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    updated.total_surfaces_inspected = updated.surface_dump_count;
+    return updated;
+}
+
+fn inspector_dump_surfaces_from_ds(insp: PhorensicInspector, ds: display_server.DisplayServer) -> PhorensicInspector
+    effect [compute]
+{
+    return inspector_dump_surfaces(insp, ds.surface_registry);
+}
+
+// ──────────────────────────────────────────────
+// Capability Tree Building
+// ──────────────────────────────────────────────
+
+fn inspector_build_cap_tree(insp: PhorensicInspector, ds: display_server.DisplayServer) -> PhorensicInspector
+    effect [compute]
+    bound iterations MAX_CAPTURE_ENTRIES
+{
+    let mut updated: PhorensicInspector = insp;
+    // Clear existing tree
+    for i in 0..MAX_CAPTURE_ENTRIES {
+        updated.cap_tree[i] = Option::None;
+    }
+    updated.cap_tree_count = 0;
+
+    // Walk capability registry and build tree
+    for i in 0..protocol.MAX_REGISTERED_CAPS {
+        let r_opt: Option(protocol.CapGrantRecord) = ds.cap_registry[i];
+        match r_opt {
+            Option::Some(rec) => {
+                let node: CapTreeNode = CapTreeNode {
+                    node_id: updated.cap_tree_count + 1,
+                    parent_id: 0,
+                    depth: 0,
+                    cap: rec.cap_id,
+                    grant_record: Option::Some(rec),
+                    origin: rec.granted_by,
+                    children: Array::zeroed(),
+                    child_count: 0,
+                    description: Array::zeroed(),
+                };
+                for j in 0..MAX_CAPTURE_ENTRIES {
+                    let n_opt: Option(CapTreeNode) = updated.cap_tree[j];
+                    match n_opt {
+                        Option::None => {
+                            updated.cap_tree[j] = Option::Some(node);
+                            updated.cap_tree_count = updated.cap_tree_count + 1;
+                            updated.total_caps_tracked = updated.total_caps_tracked + 1;
+                            break;
+                        }
+                        Option::Some(_) => {}
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return updated;
+}
+
+fn inspector_find_cap_node(insp: PhorensicInspector, node_id: u64) -> Option(CapTreeNode)
+    effect [compute]
+    bound iterations MAX_CAPTURE_ENTRIES
+{
+    for i in 0..MAX_CAPTURE_ENTRIES {
+        let n_opt: Option(CapTreeNode) = insp.cap_tree[i];
+        match n_opt {
+            Option::Some(n) => {
+                if n.node_id == node_id {
+                    return Option::Some(n);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Option::None;
+}
+
+// ──────────────────────────────────────────────
+// Residual Logging
+// ──────────────────────────────────────────────
+
+fn inspector_log_residual(insp: PhorensicInspector, op: Slice(u8), session: u64, surface: u64, hash: u64, court: Slice(u8)) -> PhorensicInspector
+    effect [compute, io:write]
+    bound iterations MAX_RESIDUAL_LOG
+{
+    let mut updated: PhorensicInspector = insp;
+    let mut op_buf: Array(u8, 128) = Array::zeroed();
+    let mut court_buf: Array(u8, 32) = Array::zeroed();
+    for i in 0..128 { if i < op.len() { op_buf[i] = op[i]; } }
+    for i in 0..32 { if i < court.len() { court_buf[i] = court[i]; } }
+
+    let entry: ResidualLogEntry = ResidualLogEntry {
+        entry_id: updated.total_residuals_seen + 1,
+        op: op_buf,
+        timestamp_ns: 0,
+        session_id: session,
+        surface_id: surface,
+        hash: hash,
+        court: court_buf,
+        source_file: Array::zeroed(),
+        source_line: 0,
+        fields: Array::zeroed(),
+        viewed: false,
+    };
+
+    for i in 0..MAX_RESIDUAL_LOG {
+        let r_opt: Option(ResidualLogEntry) = updated.residual_log[i];
+        match r_opt {
+            Option::None => {
+                updated.residual_log[i] = Option::Some(entry);
+                updated.residual_count = updated.residual_count + 1;
+                updated.total_residuals_seen = updated.total_residuals_seen + 1;
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated;
+}
+
+fn inspector_clear_residuals(insp: PhorensicInspector) -> PhorensicInspector
+    effect [compute, residual]
+{
+    let mut updated: PhorensicInspector = insp;
+    for i in 0..MAX_RESIDUAL_LOG {
+        updated.residual_log[i] = Option::None;
+    }
+    updated.residual_count = 0;
+    residual emit {
+        op: "inspector:clear_residuals",
+        cleared: insp.total_residuals_seen,
+    };
+    return updated;
+}
+
+fn inspector_filter_residuals(insp: PhorensicInspector, filter: Slice(u8), filter_len: u64) -> PhorensicInspector
+    effect [compute]
+    bound iterations MAX_RESIDUAL_LOG
+{
+    let mut updated: PhorensicInspector = insp;
+    let mut filter_buf: Array(u8, 64) = Array::zeroed();
+    for i in 0..64 { if i < filter_len { filter_buf[i] = filter[i]; } }
+    updated.filter_text = filter_buf;
+    updated.filter_active = filter_len > 0;
+
+    let mut matches: u64 = 0;
+    for i in 0..MAX_RESIDUAL_LOG {
+        let r_opt: Option(ResidualLogEntry) = updated.residual_log[i];
+        match r_opt {
+            Option::Some(e) => {
+                if updated.filter_active {
+                    // Simple substring check
+                    let mut matched: bool = false;
+                    for j in 0..128 {
+                        if j >= filter_len { break; }
+                        if e.op[j] == filter[j] {
+                            matched = true;
+                        } else {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        matches = matches + 1;
+                    }
+                } else {
+                    matches = matches + 1;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    updated.filter_matches = matches;
+    return updated;
+}
+
+fn inspector_get_filtered_residuals(insp: PhorensicInspector) -> RingBuf(u64, MAX_RESIDUAL_LOG)
+    effect [compute]
+    bound iterations MAX_RESIDUAL_LOG
+{
+    let mut results: RingBuf(u64, MAX_RESIDUAL_LOG) = RingBuf::new();
+    let mut count: u64 = 0;
+    for i in 0..MAX_RESIDUAL_LOG {
+        if count >= MAX_RESIDUAL_LOG { break; }
+        let r_opt: Option(ResidualLogEntry) = insp.residual_log[i];
+        match r_opt {
+            Option::Some(e) => {
+                if !insp.filter_active {
+                    results[count] = Option::Some(e.entry_id);
+                    count = count + 1;
+                } else {
+                    let mut matched: bool = false;
+                    for j in 0..64 {
+                        if j >= 128 { break; }
+                        if insp.filter_text[j] == 0 { break; }
+                        if e.op[j] == insp.filter_text[j] {
+                            matched = true;
+                        } else {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        results[count] = Option::Some(e.entry_id);
+                        count = count + 1;
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return results;
+}
+
+// ──────────────────────────────────────────────
+// Provenance Chain
+// ──────────────────────────────────────────────
+
+fn inspector_build_provenance(insp: PhorensicInspector, ds: display_server.DisplayServer) -> PhorensicInspector
+    effect [compute]
+    bound iterations MAX_PROVENANCE_CHAIN
+{
+    let mut updated: PhorensicInspector = insp;
+    for i in 0..MAX_PROVENANCE_CHAIN {
+        updated.provenance_chain[i] = Option::None;
+    }
+    updated.provenance_count = 0;
+
+    // Build from capability grants
+    for i in 0..protocol.MAX_REGISTERED_CAPS {
+        let r_opt: Option(protocol.CapGrantRecord) = ds.cap_registry[i];
+        match r_opt {
+            Option::Some(rec) => {
+                let mut desc: Array(u8, 256) = Array::zeroed();
+                let mut op_str: Array(u8, 64) = Array::zeroed();
+                let mut court_str: Array(u8, 32) = Array::zeroed();
+                let pn: ProvenanceNode = ProvenanceNode {
+                    node_id: updated.provenance_count + 1,
+                    parent_id: if updated.provenance_count > 0 { updated.provenance_count } else { 0 },
+                    session_id: rec.granted_to,
+                    operation: op_str,
+                    timestamp_ns: rec.timestamp_ns,
+                    cap_involved: Option::Some(rec.cap_id),
+                    surface_involved: 0,
+                    data_hash: 0,
+                    description: desc,
+                    verified: !rec.revoked,
+                    court_cited: court_str,
+                };
+                for j in 0..MAX_PROVENANCE_CHAIN {
+                    let p_opt: Option(ProvenanceNode) = updated.provenance_chain[j];
+                    match p_opt {
+                        Option::None => {
+                            updated.provenance_chain[j] = Option::Some(pn);
+                            updated.provenance_count = updated.provenance_count + 1;
+                            break;
+                        }
+                        Option::Some(_) => {}
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Diagnostics
+// ──────────────────────────────────────────────
+
+fn inspector_add_diag(insp: PhorensicInspector, line: Slice(u8)) -> PhorensicInspector
+    effect [compute]
+    bound iterations 64
+{
+    let mut updated: PhorensicInspector = insp;
+    if updated.diag_count >= 64 { return updated; }
+    let mut buf: Array(u8, 128) = Array::zeroed();
+    for i in 0..128 { if i < line.len() { buf[i] = line[i]; } }
+    updated.diag_lines[updated.diag_count] = buf;
+    updated.diag_count = updated.diag_count + 1;
+    return updated;
+}
+
+fn inspector_clear_diag(insp: PhorensicInspector) -> PhorensicInspector
+    effect [compute]
+{
+    let mut updated: PhorensicInspector = insp;
+    for i in 0..64 {
+        updated.diag_lines[i] = Array::zeroed();
+    }
+    updated.diag_count = 0;
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Snapshot Management
+// ──────────────────────────────────────────────
+
+fn inspector_take_snapshot(insp: PhorensicInspector, data: Slice(u8)) -> PhorensicInspector
+    effect [compute, residual]
+    bound iterations MAX_INSPECTOR_SNAPSHOTS
+{
+    let mut updated: PhorensicInspector = insp;
+    let mut buf: Array(u8, 4096) = Array::zeroed();
+    for i in 0..4096 { if i < data.len() { buf[i] = data[i]; } }
+    for i in 0..MAX_INSPECTOR_SNAPSHOTS {
+        let s_opt: Option(Array(u8, 4096)) = updated.snapshots[i];
+        match s_opt {
+            Option::None => {
+                updated.snapshots[i] = Option::Some(buf);
+                updated.snapshot_count = updated.snapshot_count + 1;
+                residual emit {
+                    op: "inspector:snapshot",
+                    index: i,
+                };
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Comprehensive Dump (All Tabs)
+// ──────────────────────────────────────────────
+
+struct InspectorDump {
+    hardware_count: u64,
+    surface_count: u64,
+    cap_tree_count: u64,
+    residual_count: u64,
+    provenance_count: u64,
+    diag_count: u64,
+    snapshot_count: u64,
+    active_tab: InspectorTab,
+    total_residuals_seen: u64,
+    total_caps_tracked: u64,
+    total_surfaces_inspected: u64,
+    hash: u64,
+}
+
+fn inspector_generate_dump(insp: PhorensicInspector) -> InspectorDump
+    effect [compute]
+{
+    let hash: u64 = insp.total_residuals_seen
+        + insp.total_caps_tracked * 1000
+        + insp.total_surfaces_inspected * 1000000
+        + insp.residual_count * 1000000000;
+    return InspectorDump {
+        hardware_count: insp.hardware_count,
+        surface_count: insp.surface_dump_count,
+        cap_tree_count: insp.cap_tree_count,
+        residual_count: insp.residual_count,
+        provenance_count: insp.provenance_count,
+        diag_count: insp.diag_count,
+        snapshot_count: insp.snapshot_count,
+        active_tab: insp.active_tab,
+        total_residuals_seen: insp.total_residuals_seen,
+        total_caps_tracked: insp.total_caps_tracked,
+        total_surfaces_inspected: insp.total_surfaces_inspected,
+        hash: hash,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Scroll Management
+// ──────────────────────────────────────────────
+
+fn inspector_scroll_to(insp: PhorensicInspector, offset: u64) -> PhorensicInspector
+    effect [compute]
+{
+    return PhorensicInspector {
+        initialized: insp.initialized,
+        active_tab: insp.active_tab,
+        tabs: insp.tabs,
+        tab_count: insp.tab_count,
+        hardware: insp.hardware,
+        hardware_count: insp.hardware_count,
+        selected_hardware: insp.selected_hardware,
+        surface_dump: insp.surface_dump,
+        surface_dump_count: insp.surface_dump_count,
+        selected_surface: insp.selected_surface,
+        cap_tree: insp.cap_tree,
+        cap_tree_count: insp.cap_tree_count,
+        selected_cap_node: insp.selected_cap_node,
+        cap_tree_depth: insp.cap_tree_depth,
+        residual_log: insp.residual_log,
+        residual_count: insp.residual_count,
+        selected_residual: insp.selected_residual,
+        filter_text: insp.filter_text,
+        filter_active: insp.filter_active,
+        filter_matches: insp.filter_matches,
+        provenance_chain: insp.provenance_chain,
+        provenance_count: insp.provenance_count,
+        selected_provenance: insp.selected_provenance,
+        diag_lines: insp.diag_lines,
+        diag_count: insp.diag_count,
+        scroll_offset: offset,
+        display_count: insp.display_count,
+        expanded_items: insp.expanded_items,
+        expanded_count: insp.expanded_count,
+        snapshots: insp.snapshots,
+        snapshot_count: insp.snapshot_count,
+        widget_tree: insp.widget_tree,
+        inspector_window_id: insp.inspector_window_id,
+        last_refresh_ms: insp.last_refresh_ms,
+        auto_refresh: insp.auto_refresh,
+        refresh_interval_ms: insp.refresh_interval_ms,
+        total_residuals_seen: insp.total_residuals_seen,
+        total_caps_tracked: insp.total_caps_tracked,
+        total_surfaces_inspected: insp.total_surfaces_inspected,
+        inspector_open_count: insp.inspector_open_count,
+    };
+}
+
+fn inspector_toggle_expand(insp: PhorensicInspector, item_id: u64) -> PhorensicInspector
+    effect [compute]
+    bound iterations MAX_DISPLAY_ITEMS
+{
+    let mut updated: PhorensicInspector = insp;
+    // Toggle expand state
+    for i in 0..MAX_DISPLAY_ITEMS {
+        let e_opt: Option(u64) = updated.expanded_items[i];
+        match e_opt {
+            Option::Some(eid) => {
+                if eid == item_id {
+                    updated.expanded_items[i] = Option::None;
+                    updated.expanded_count = updated.expanded_count - 1;
+                    return updated;
+                }
+            }
+            Option::None => {
+                updated.expanded_items[i] = Option::Some(item_id);
+                updated.expanded_count = updated.expanded_count + 1;
+                return updated;
+            }
+        }
+    }
+    return updated;
+}
+
+fn inspector_is_expanded(insp: PhorensicInspector, item_id: u64) -> bool
+    effect [compute]
+    bound iterations MAX_DISPLAY_ITEMS
+{
+    for i in 0..MAX_DISPLAY_ITEMS {
+        let e_opt: Option(u64) = insp.expanded_items[i];
+        match e_opt {
+            Option::Some(eid) => {
+                if eid == item_id {
+                    return true;
+                }
+            }
+            Option::None => { return false; }
+        }
+    }
+    return false;
+}
+
+// ──────────────────────────────────────────────
+// Auto-Refresh
+// ──────────────────────────────────────────────
+
+fn inspector_needs_refresh(insp: PhorensicInspector, now_ms: u64) -> bool
+    effect [compute]
+{
+    if !insp.auto_refresh {
+        return false;
+    }
+    if now_ms - insp.last_refresh_ms >= insp.refresh_interval_ms {
+        return true;
+    }
+    return false;
+}
+
+fn inspector_mark_refreshed(insp: PhorensicInspector, now_ms: u64) -> PhorensicInspector
+    effect [compute]
+{
+    return PhorensicInspector {
+        initialized: insp.initialized,
+        active_tab: insp.active_tab,
+        tabs: insp.tabs,
+        tab_count: insp.tab_count,
+        hardware: insp.hardware,
+        hardware_count: insp.hardware_count,
+        selected_hardware: insp.selected_hardware,
+        surface_dump: insp.surface_dump,
+        surface_dump_count: insp.surface_dump_count,
+        selected_surface: insp.selected_surface,
+        cap_tree: insp.cap_tree,
+        cap_tree_count: insp.cap_tree_count,
+        selected_cap_node: insp.selected_cap_node,
+        cap_tree_depth: insp.cap_tree_depth,
+        residual_log: insp.residual_log,
+        residual_count: insp.residual_count,
+        selected_residual: insp.selected_residual,
+        filter_text: insp.filter_text,
+        filter_active: insp.filter_active,
+        filter_matches: insp.filter_matches,
+        provenance_chain: insp.provenance_chain,
+        provenance_count: insp.provenance_count,
+        selected_provenance: insp.selected_provenance,
+        diag_lines: insp.diag_lines,
+        diag_count: insp.diag_count,
+        scroll_offset: insp.scroll_offset,
+        display_count: insp.display_count,
+        expanded_items: insp.expanded_items,
+        expanded_count: insp.expanded_count,
+        snapshots: insp.snapshots,
+        snapshot_count: insp.snapshot_count,
+        widget_tree: insp.widget_tree,
+        inspector_window_id: insp.inspector_window_id,
+        last_refresh_ms: now_ms,
+        auto_refresh: insp.auto_refresh,
+        refresh_interval_ms: insp.refresh_interval_ms,
+        total_residuals_seen: insp.total_residuals_seen,
+        total_caps_tracked: insp.total_caps_tracked,
+        total_surfaces_inspected: insp.total_surfaces_inspected,
+        inspector_open_count: insp.inspector_open_count,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Inspector Info
+// ──────────────────────────────────────────────
+
+struct InspectorInfo {
+    initialized: bool,
+    active_tab: InspectorTab,
+    hardware_count: u64,
+    surface_count: u64,
+    cap_tree_count: u64,
+    residual_count: u64,
+    provenance_count: u64,
+    diag_count: u64,
+    snapshot_count: u64,
+    scroll_offset: u64,
+    expanded_count: u64,
+    auto_refresh: bool,
+    filter_active: bool,
+    filter_matches: u64,
+    total_residuals: u64,
+    total_caps: u64,
+    total_surfaces: u64,
+}
+
+fn inspector_get_info(insp: PhorensicInspector) -> InspectorInfo
+    effect [compute]
+{
+    return InspectorInfo {
+        initialized: insp.initialized,
+        active_tab: insp.active_tab,
+        hardware_count: insp.hardware_count,
+        surface_count: insp.surface_dump_count,
+        cap_tree_count: insp.cap_tree_count,
+        residual_count: insp.residual_count,
+        provenance_count: insp.provenance_count,
+        diag_count: insp.diag_count,
+        snapshot_count: insp.snapshot_count,
+        scroll_offset: insp.scroll_offset,
+        expanded_count: insp.expanded_count,
+        auto_refresh: insp.auto_refresh,
+        filter_active: insp.filter_active,
+        filter_matches: insp.filter_matches,
+        total_residuals: insp.total_residuals_seen,
+        total_caps: insp.total_caps_tracked,
+        total_surfaces: insp.total_surfaces_inspected,
+    };
+}

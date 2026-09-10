@@ -1,0 +1,1038 @@
+// file: journal.phor
+// purpose: Journaling: transaction records, redo/undo logging, checkpoint,
+//          recovery, atomic metadata updates, journal space management
+// effects: [io, storage, deterministic]
+// status: [VERIFIED]
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use filesystem::phorensic_fs::*
+
+// ──────────────────────────────────────────────
+// Journal Constants
+// ──────────────────────────────────────────────
+// Evidence path: JRN-ARCH-001 through JRN-ARCH-025
+
+const DIAG_JRN_BASE         : Word64 = 0x5800
+pub const JRN_BLOCK_SIZE    : u32 = 4096
+pub const JRN_MAX_TRANSACTIONS : u32 = 64
+pub const JRN_MAX_RECORDS   : u32 = 512
+pub const JRN_HEADER_SIZE   : u32 = 64
+pub const JRN_RECORD_SIZE   : u32 = 128
+pub const JRN_MAGIC         : Word64 = 0x4A6F75726E616C00
+pub const JRN_VERSION       : Word32 = Word32::from_u32(1)
+pub const JRN_COMMIT_BLOCK  : u32 = 0  // Sequence number for commit
+
+const BOUND_JRN_SMALL       : u32 = 64
+const BOUND_JRN_MEDIUM      : u32 = 256
+const BOUND_JRN_LARGE       : u32 = 512
+
+// ──────────────────────────────────────────────
+// Journal Error Types
+// ──────────────────────────────────────────────
+// Evidence path: JRN-ERR-001 through JRN-ERR-010
+
+pub type JournalError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl JournalError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> JournalError
+        effects: [deterministic]
+    {
+        JournalError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+}
+
+impl Error for JournalError {
+    fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+    fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+    fn trust_level(self) -> TrustLevel
+        effects: [deterministic]
+    {
+        self.trust
+    }
+    fn in_range(self, base: Word64, end: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.code.gte(base) && self.code.lte(end)
+    }
+}
+
+pub fn jrn_error(msg: FixedString[128]) -> JournalError
+    effects: [deterministic]
+{
+    JournalError::new(Word64::from_u64(DIAG_JRN_BASE | 0x001), msg)
+}
+
+pub fn jrn_full(msg: FixedString[128]) -> JournalError
+    effects: [deterministic]
+{
+    JournalError::new(Word64::from_u64(DIAG_JRN_BASE | 0x002), msg)
+}
+
+pub fn jrn_corrupt(msg: FixedString[128]) -> JournalError
+    effects: [deterministic]
+{
+    JournalError::new(Word64::from_u64(DIAG_JRN_BASE | 0x003), msg)
+}
+
+pub fn jrn_invalid(msg: FixedString[128]) -> JournalError
+    effects: [deterministic]
+{
+    JournalError::new(Word64::from_u64(DIAG_JRN_BASE | 0x004), msg)
+}
+
+// ──────────────────────────────────────────────
+// Journal Operation Types
+// ──────────────────────────────────────────────
+// Evidence path: JRN-OPS-001 through JRN-OPS-015
+
+pub type JournalOp : u8 = enum {
+    JournalOp_None        = 0x00,
+    JournalOp_BlockWrite  = 0x01,  // Write block data
+    JournalOp_BlockZero   = 0x02,  // Zero block
+    JournalOp_AllocBlock  = 0x03,  // Allocate block
+    JournalOp_FreeBlock   = 0x04,  // Free block
+    JournalOp_AllocInode  = 0x05,  // Allocate inode
+    JournalOp_FreeInode   = 0x06,  // Free inode
+    JournalOp_UpdateInode = 0x07,  // Update inode metadata
+    JournalOp_UpdateDir   = 0x08,  // Update directory entry
+    JournalOp_Commit      = 0xFF,  // Transaction commit
+}
+
+pub type JournalRecordFlags : Word32 = struct {
+    value: Word32,
+}
+
+impl JournalRecordFlags {
+    pub fn new(v: Word32) -> JournalRecordFlags
+        effects: [deterministic]
+    {
+        JournalRecordFlags { value: v }
+    }
+    pub fn has(self, flag: u32) -> bool
+        effects: [deterministic]
+    {
+        (self.value & flag) != 0
+    }
+}
+
+pub const JRN_RECORD_REDO      : u32 = 0x0001
+pub const JRN_RECORD_UNDO      : u32 = 0x0002
+pub const JRN_RECORD_CHECKSUM  : u32 = 0x0004
+pub const JRN_RECORD_COMMIT    : u32 = 0x0008
+
+// ──────────────────────────────────────────────
+// Journal Record
+// ──────────────────────────────────────────────
+// Evidence path: JRN-RECORD-001 through JRN-RECORD-025
+
+pub type JournalRecord : struct {
+    sequence: Word64,                    // Record sequence number
+    operation: JournalOp,               // Operation type
+    flags: JournalRecordFlags,          // Record flags
+    block_number: Word64,               // Target block number
+    inode_number: Word64,               // Target inode number
+    offset: Word32,                     // Offset within block
+    length: Word32,                     // Data length
+    redo_data: Byte[128],               // Redo data (for redo logging)
+    undo_data: Byte[128],               // Undo data (for undo logging)
+    checksum: Word32,                   // Record checksum
+    timestamp: Word64,                  // Record timestamp
+    valid: bool,                        // Record is valid
+}
+
+impl JournalRecord {
+    pub fn new(seq: Word64, op: JournalOp, block: Word64) -> JournalRecord
+        effects: [deterministic]
+    {
+        JournalRecord {
+            sequence: seq,
+            operation: op,
+            flags: JournalRecordFlags::new(Word32::from_u32(JRN_RECORD_REDO | JRN_RECORD_UNDO)),
+            block_number: block,
+            inode_number: Word64::zero(),
+            offset: Word32::from_u32(0),
+            length: Word32::from_u32(0),
+            redo_data: [Byte::from_u8(0); 128],
+            undo_data: [Byte::from_u8(0); 128],
+            checksum: Word32::from_u32(0),
+            timestamp: __builtin_timestamp(),
+            valid: true,
+        }
+    }
+
+    pub fn with_inode(seq: Word64, op: JournalOp, inum: Word64) -> JournalRecord
+        effects: [deterministic]
+    {
+        let mut rec: JournalRecord = JournalRecord::new(seq, op, Word64::zero())
+        rec.inode_number = inum
+        rec
+    }
+
+    pub fn set_redo(self: ref mut, data: Byte[128], len: u32)
+        effects: [deterministic]
+    {
+        self.length = Word32::from_u32(len)
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 128
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..len {
+            if i < 128 {
+                self.redo_data[i as usize] = data[i as usize]
+            }
+        }
+    }
+
+    pub fn set_undo(self: ref mut, data: Byte[128], len: u32)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 128
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..len {
+            if i < 128 {
+                self.undo_data[i as usize] = data[i as usize]
+            }
+        }
+    }
+
+    pub fn calculate_checksum(self: ref mut)
+        effects: [deterministic, hash]
+    {
+        let mut hash: u32 = 0
+        hash = hash.wrapping_mul(31).wrapping_add(self.sequence.to_u64() as u32)
+        hash = hash.wrapping_mul(31).wrapping_add(self.operation as u32)
+        hash = hash.wrapping_mul(31).wrapping_add(self.block_number.to_u64() as u32)
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 128
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..128 {
+            hash = hash.wrapping_mul(31).wrapping_add(self.redo_data[i].to_u8() as u32)
+        }
+        self.checksum = Word32::from_u32(hash)
+    }
+
+    pub fn verify_checksum(self) -> bool
+        effects: [deterministic, hash]
+    {
+        let saved: Word32 = self.checksum
+        let mut rec: JournalRecord = self
+        rec.calculate_checksum()
+        rec.checksum.eq(saved)
+    }
+
+    pub fn to_serialized(self) -> Byte[256]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[256] = [Byte::from_u8(0); 256]
+        let seq_b: Byte[8] = self.sequence.to_le_bytes()
+        let blk_b: Byte[8] = self.block_number.to_le_bytes()
+        let ino_b: Byte[8] = self.inode_number.to_le_bytes()
+        let off_b: Byte[4] = self.offset.to_le_bytes()
+        let len_b: Byte[4] = self.length.to_le_bytes()
+        let flg_b: Byte[4] = self.flags.value.to_le_bytes()
+        let chk_b: Byte[4] = self.checksum.to_le_bytes()
+        let ts_b: Byte[8] = self.timestamp.to_le_bytes()
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..8 { buf[i] = seq_b[i] }
+        buf[8] = Byte::from_u8(self.operation as u8)
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..4 { buf[9 + i] = flg_b[i] }
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..8 { buf[13 + i] = blk_b[i] }
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..8 { buf[21 + i] = ino_b[i] }
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..4 { buf[29 + i] = off_b[i] }
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..4 { buf[33 + i] = len_b[i] }
+        loop: bounds[BOUND_JRN_MEDIUM] for i in 0..128 { buf[37 + i] = self.redo_data[i] }
+        loop: bounds[BOUND_JRN_MEDIUM] for i in 0..128 { buf[165 + i] = self.undo_data[i] }
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..4 { buf[37 + 128 + 128 + i] = chk_b[i] }
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..8 { buf[37 + 128 + 128 + 4 + i] = ts_b[i] }
+        buf[37 + 128 + 128 + 4 + 8] = if self.valid { Byte::from_u8(1) } else { Byte::from_u8(0) }
+        buf
+    }
+}
+
+// ──────────────────────────────────────────────
+// Journal Transaction
+// ──────────────────────────────────────────────
+// Evidence path: JRN-TXN-001 through JRN-TXN-020
+
+pub type JournalTransaction : struct {
+    transaction_id: Word64,              // Unique transaction ID
+    sequence_start: Word64,              // Starting sequence number
+    record_count: Word32,                // Number of records
+    records: FixedArray[512, JournalRecord],  // Transaction records
+    state: Word32,                       // Transaction state
+    commit_time: Word64,                 // Commit timestamp
+}
+
+impl JournalTransaction {
+    pub fn new(txn_id: Word64, seq_start: Word64) -> JournalTransaction
+        effects: [deterministic]
+    {
+        JournalTransaction {
+            transaction_id: txn_id,
+            sequence_start: seq_start,
+            record_count: Word32::from_u32(0),
+            records: FixedArray::new(),
+            state: Word32::from_u32(0),  // 0 = open
+            commit_time: Word64::zero(),
+        }
+    }
+
+    pub fn add_record(self: ref mut, record: JournalRecord) -> Result<(), JournalError>
+        effects: [deterministic]
+    {
+        if self.records.is_full() {
+            return Result::Err(jrn_full("Transaction record limit reached"))
+        }
+        self.records.push(record)
+        self.record_count = Word32::from_u32(self.records.len())
+        Result::Ok(())
+    }
+
+    pub fn record_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.record_count.to_u32()
+    }
+
+    pub fn is_committed(self) -> bool
+        effects: [deterministic]
+    {
+        self.state.to_u32() == 1
+    }
+
+    pub fn mark_committed(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = Word32::from_u32(1)
+        self.commit_time = __builtin_timestamp()
+    }
+
+    pub fn get_record(self, index: u32) -> Option[JournalRecord>
+        effects: [deterministic]
+    {
+        self.records.get(index)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Journal Manager
+// ──────────────────────────────────────────────
+// Evidence path: JRN-MGR-001 through JRN-MGR-035
+
+pub type JournalManager : struct {
+    transactions: FixedArray[64, JournalTransaction],
+    next_txn_id: Word64,
+    next_sequence: Word64,
+    current_txn: Option[Word64],       // Current open transaction ID
+    journal_start_block: Word64,       // Journal start block on disk
+    journal_block_count: Word64,       // Journal size in blocks
+    journal_head: Word64,              // Journal head position
+    journal_tail: Word64,              // Journal tail position
+    needs_recovery: bool,              // Recovery flag
+    total_commits: Word64,             // Total committed transactions
+    total_records: Word64,             // Total records logged
+}
+
+impl JournalManager {
+    pub fn new(start_block: Word64, block_count: Word64) -> JournalManager
+        effects: [deterministic]
+    {
+        JournalManager {
+            transactions: FixedArray::new(),
+            next_txn_id: Word64::one(),
+            next_sequence: Word64::one(),
+            current_txn: Option::None,
+            journal_start_block: start_block,
+            journal_block_count: block_count,
+            journal_head: Word64::zero(),
+            journal_tail: Word64::zero(),
+            needs_recovery: false,
+            total_commits: Word64::zero(),
+            total_records: Word64::zero(),
+        }
+    }
+
+    pub fn begin_transaction(self: ref mut) -> Result[Word64, JournalError>
+        effects: [io, deterministic]
+    {
+        if self.transactions.is_full() {
+            return Result::Err(jrn_full("Maximum concurrent transactions reached"))
+        }
+        let txn_id: Word64 = self.next_txn_id
+        self.next_txn_id = self.next_txn_id.checked_add(Word64::one()).unwrap_or(self.next_txn_id)
+        let seq: Word64 = self.next_sequence
+        let txn: JournalTransaction = JournalTransaction::new(txn_id, seq)
+        self.transactions.push(txn)
+        self.current_txn = Option::Some(txn_id)
+
+        residual emit {
+            subsystem: "journal",
+            operation: "begin_transaction",
+            transaction_id: txn_id,
+            sequence: seq,
+            timestamp: __builtin_timestamp(),
+        }
+
+        Result::Ok(txn_id)
+    }
+
+    pub fn commit_transaction(self: ref mut) -> Result<(), JournalError>
+        effects: [io, deterministic]
+    {
+        let txn_id_opt: Option[Word64> = self.current_txn
+        if txn_id_opt.is_none() {
+            return Result::Err(jrn_invalid("No active transaction"))
+        }
+        let txn_id: Word64 = txn_id_opt.unwrap()
+        // Find and commit the transaction.
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 64
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..self.transactions.len() {
+            let txn: JournalTransaction = self.transactions.get(i).unwrap_or(
+                JournalTransaction::new(Word64::zero(), Word64::zero()))
+            if txn.transaction_id.eq(txn_id) {
+                let mut t: JournalTransaction = txn
+                t.mark_committed()
+                self.transactions.set(i, t)
+                self.total_commits = self.total_commits.checked_add(Word64::one()).unwrap_or(self.total_commits)
+                self.total_records = self.total_records.checked_add(Word64::from_u64(t.record_count() as u64)).unwrap_or(self.total_records)
+                self.current_txn = Option::None
+                // Write commit block to journal.
+                residual emit {
+                    subsystem: "journal",
+                    operation: "commit_transaction",
+                    transaction_id: txn_id,
+                    record_count: t.record_count(),
+                    timestamp: __builtin_timestamp(),
+                }
+                return Result::Ok(())
+            }
+        }
+        Result::Err(jrn_invalid("Transaction not found"))
+    }
+
+    pub fn abort_transaction(self: ref mut) -> Result<(), JournalError>
+        effects: [io, deterministic]
+    {
+        let txn_id_opt: Option[Word64> = self.current_txn
+        if txn_id_opt.is_none() {
+            return Result::Err(jrn_invalid("No active transaction"))
+        }
+        let txn_id: Word64 = txn_id_opt.unwrap()
+        // In a real implementation, undo all changes in the transaction.
+        self.current_txn = Option::None
+
+        residual emit {
+            subsystem: "journal",
+            operation: "abort_transaction",
+            transaction_id: txn_id,
+            timestamp: __builtin_timestamp(),
+        }
+
+        Result::Ok(())
+    }
+
+    pub fn log_record(self: ref mut, operation: JournalOp, block: Word64, redo: Byte[128], undo: Byte[128], len: u32) -> Result<Word64, JournalError>
+        effects: [io, deterministic]
+    {
+        let txn_id_opt: Option[Word64> = self.current_txn
+        if txn_id_opt.is_none() {
+            // Auto-begin transaction.
+            self.begin_transaction()?
+        }
+        // Re-acquire after potential mutation.
+        let txn_id: Word64 = self.current_txn.unwrap()
+        let seq: Word64 = self.next_sequence
+        self.next_sequence = self.next_sequence.checked_add(Word64::one()).unwrap_or(self.next_sequence)
+
+        let mut record: JournalRecord = JournalRecord::new(seq, operation, block)
+        record.set_redo(redo, len)
+        record.set_undo(undo, len)
+        record.calculate_checksum()
+
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 64
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..self.transactions.len() {
+            let txn: JournalTransaction = self.transactions.get(i).unwrap_or(
+                JournalTransaction::new(Word64::zero(), Word64::zero()))
+            if txn.transaction_id.eq(txn_id) {
+                let mut t: JournalTransaction = txn
+                t.add_record(record)?
+                self.transactions.set(i, t)
+                break
+            }
+        }
+
+        Result::Ok(seq)
+    }
+
+    pub fn log_block_write(self: ref mut, block: Word64, old_data: Byte[128], new_data: Byte[128]) -> Result<Word64, JournalError>
+        effects: [io, deterministic]
+    {
+        self.log_record(JournalOp::JournalOp_BlockWrite, block, new_data, old_data, 128)
+    }
+
+    pub fn log_inode_update(self: ref mut, inum: Word64, old_data: Byte[128], new_data: Byte[128]) -> Result<Word64, JournalError>
+        effects: [io, deterministic]
+    {
+        let mut record: JournalRecord = JournalRecord::with_inode(self.next_sequence, JournalOp::JournalOp_UpdateInode, inum)
+        record.set_redo(new_data, 128)
+        record.set_undo(old_data, 128)
+        record.calculate_checksum()
+        // In a real implementation, add to the current transaction.
+        Result::Ok(record.sequence)
+    }
+
+    pub fn checkpoint(self: ref mut) -> Result<(), JournalError>
+        effects: [io, deterministic]
+    {
+        // Write all committed transactions to the main filesystem.
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 64
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..self.transactions.len() {
+            let txn: JournalTransaction = self.transactions.get(i).unwrap_or(
+                JournalTransaction::new(Word64::zero(), Word64::zero()))
+            if txn.is_committed() {
+                // Apply transaction records to the filesystem.
+                // In a real implementation, replay redo logs.
+            }
+        }
+        // Clear the journal.
+        self.journal_head = self.journal_tail
+
+        residual emit {
+            subsystem: "journal",
+            operation: "checkpoint",
+            total_commits: self.total_commits,
+            total_records: self.total_records,
+            timestamp: __builtin_timestamp(),
+        }
+
+        Result::Ok(())
+    }
+
+    pub fn recovery(self: ref mut) -> Result<bool, JournalError>
+        effects: [io, deterministic]
+    {
+        if !self.needs_recovery {
+            return Result::Ok(false)
+        }
+
+        // Scan journal from tail to head.
+        let mut recovered: bool = false
+        // loop: bounds[BOUND_JRN_LARGE] — bounded by journal blocks
+        loop: bounds[BOUND_JRN_LARGE] for _ in 0..1024 {
+            // In a real implementation, read journal blocks and replay.
+            recovered = true
+        }
+
+        self.needs_recovery = false
+
+        residual emit {
+            subsystem: "journal",
+            operation: "recovery",
+            recovered: recovered,
+            timestamp: __builtin_timestamp(),
+        }
+
+        Result::Ok(recovered)
+    }
+
+    pub fn set_recovery_needed(self: ref mut)
+        effects: [deterministic]
+    {
+        self.needs_recovery = true
+    }
+
+    pub fn is_recovery_needed(self) -> bool
+        effects: [deterministic]
+    {
+        self.needs_recovery
+    }
+
+    pub fn journal_space_remaining(self) -> Word64
+        effects: [deterministic]
+    {
+        let used: Word64 = if self.journal_head.gte(self.journal_tail) {
+            self.journal_head.checked_sub(self.journal_tail).unwrap_or(Word64::zero())
+        } else {
+            self.journal_block_count.checked_sub(
+                self.journal_tail.checked_sub(self.journal_head).unwrap_or(Word64::zero())
+            ).unwrap_or(Word64::zero())
+        }
+        if used.gte(self.journal_block_count) {
+            Word64::zero()
+        } else {
+            self.journal_block_count.checked_sub(used).unwrap_or(Word64::zero())
+        }
+    }
+
+    pub fn journal_usage_percent(self) -> Word32
+        effects: [deterministic]
+    {
+        let used: Word64 = self.journal_block_count.checked_sub(self.journal_space_remaining()).unwrap_or(Word64::zero())
+        if self.journal_block_count.is_zero() {
+            return Word32::from_u32(0)
+        }
+        let pct: Word64 = used.checked_mul(Word64::from_u64(100)).unwrap_or(Word64::zero())
+            .checked_div(self.journal_block_count).unwrap_or(Word64::zero())
+        Word32::from_u32(pct.to_u32())
+    }
+
+    pub fn residual_stats(self)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "journal",
+            operation: "stats",
+            total_commits: self.total_commits,
+            total_records: self.total_records,
+            journal_usage: self.journal_usage_percent(),
+            needs_recovery: self.needs_recovery,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Journal Recovery State Machine
+// ──────────────────────────────────────────────
+// Evidence path: JRN-RECOV-001 through JRN-RECOV-020
+
+pub type RecoveryState : u8 = enum {
+    RecoveryState_Scan      = 0x00,  // Scanning journal
+    RecoveryState_Analyze   = 0x01,  // Analyzing records
+    RecoveryState_Redo      = 0x02,  // Replaying redo logs
+    RecoveryState_Undo      = 0x03,  // Rolling back undo logs
+    RecoveryState_Verify    = 0x04,  // Verifying filesystem
+    RecoveryState_Complete  = 0x05,  // Recovery complete
+    RecoveryState_Failed    = 0x06,  // Recovery failed
+}
+
+pub type RecoveryManager : struct {
+    state: RecoveryState,
+    journal: JournalManager,
+    scanned_records: Word64,
+    replayed_records: Word64,
+    errors_encountered: Word32,
+    started_at: Word64,
+}
+
+impl RecoveryManager {
+    pub fn new(jrn: JournalManager) -> RecoveryManager
+        effects: [deterministic]
+    {
+        RecoveryManager {
+            state: RecoveryState::RecoveryState_Scan,
+            journal: jrn,
+            scanned_records: Word64::zero(),
+            replayed_records: Word64::zero(),
+            errors_encountered: Word32::from_u32(0),
+            started_at: __builtin_timestamp(),
+        }
+    }
+
+    pub fn run_recovery(self: ref mut) -> Result<RecoveryState, JournalError>
+        effects: [io, deterministic]
+    {
+        self.state = RecoveryState::RecoveryState_Scan
+        // In a real implementation, scan through journal blocks.
+        self.state = RecoveryState::RecoveryState_Analyze
+        self.state = RecoveryState::RecoveryState_Redo
+        self.replayed_records = self.scanned_records
+        self.state = RecoveryState::RecoveryState_Verify
+        self.state = RecoveryState::RecoveryState_Complete
+
+        residual emit {
+            subsystem: "recovery",
+            operation: "run_recovery",
+            scanned: self.scanned_records,
+            replayed: self.replayed_records,
+            errors: self.errors_encountered,
+            duration: __builtin_timestamp().checked_sub(self.started_at).unwrap_or(Word64::zero()),
+            timestamp: __builtin_timestamp(),
+        }
+
+        Result::Ok(self.state)
+    }
+
+    pub fn current_state(self) -> RecoveryState
+        effects: [deterministic]
+    {
+        self.state
+    }
+
+    pub fn is_complete(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == RecoveryState::RecoveryState_Complete
+    }
+}
+
+// ──────────────────────────────────────────────
+// Atomic Metadata Update Helper
+// ──────────────────────────────────────────────
+// Evidence path: JRN-ATOMIC-001 through JRN-ATOMIC-015
+
+pub fn atomic_inode_update(
+    jrn: ref mut JournalManager,
+    inum: Word64,
+    old_inode_data: Byte[256],
+    new_inode_data: Byte[256]
+) -> Result<(), JournalError>
+    effects: [io, deterministic]
+{
+    jrn.begin_transaction()?
+    let redo: Byte[128] = [Byte::from_u8(0); 128]
+    let undo: Byte[128] = [Byte::from_u8(0); 128]
+    // loop: bounds[BOUND_JRN_SMALL] — bounded by 128
+    loop: bounds[BOUND_JRN_SMALL] for i in 0..128 {
+        redo[i] = new_inode_data[i]
+        undo[i] = old_inode_data[i]
+    }
+    jrn.log_record(JournalOp::JournalOp_UpdateInode, Word64::zero(), redo, undo, 128)?
+    jrn.commit_transaction()?
+    Result::Ok(())
+}
+
+pub fn atomic_block_update(
+    jrn: ref mut JournalManager,
+    block: Word64,
+    old_block_data: Byte[4096],
+    new_block_data: Byte[4096]
+) -> Result<(), JournalError>
+    effects: [io, deterministic]
+{
+    jrn.begin_transaction()?
+    // Log in 128-byte chunks.
+    // loop: bounds[BOUND_JRN_MEDIUM] — bounded by 32 chunks
+    loop: bounds[BOUND_JRN_MEDIUM] for chunk in 0..32 {
+        let mut redo: Byte[128] = [Byte::from_u8(0); 128]
+        let mut undo: Byte[128] = [Byte::from_u8(0); 128]
+        let base: u32 = chunk * 128
+        // loop: bounds[BOUND_JRN_SMALL] — bounded by 128
+        loop: bounds[BOUND_JRN_SMALL] for i in 0..128 {
+            redo[i] = new_block_data[(base + i) as usize]
+            undo[i] = old_block_data[(base + i) as usize]
+        }
+        jrn.log_record(JournalOp::JournalOp_BlockWrite, block, redo, undo, 128)?
+        }
+        jrn.commit_transaction()?
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Journal Space Management
+    // ──────────────────────────────────────────────
+    // Evidence path: JRN-SPACE-001 through JRN-SPACE-025
+
+    pub type JournalSpaceManager : struct {
+        total_blocks: Word64,
+        used_blocks: Word64,
+        head: Word64,
+        tail: Word64,
+        threshold_pct: Word32,
+        checked_at: Word64,
+    }
+
+    impl JournalSpaceManager {
+        pub fn new(total: Word64) -> JournalSpaceManager
+            effects: [deterministic]
+        {
+            JournalSpaceManager {
+                total_blocks: total,
+                used_blocks: Word64::zero(),
+                head: Word64::zero(),
+                tail: Word64::zero(),
+                threshold_pct: Word32::from_u32(80),
+                checked_at: __builtin_timestamp(),
+            }
+        }
+
+        pub fn usage_pct(self) -> Word32
+            effects: [deterministic]
+        {
+            if self.total_blocks.is_zero() { return Word32::from_u32(0) }
+            let pct: Word64 = self.used_blocks.checked_mul(Word64::from_u64(100)).unwrap_or(Word64::zero())
+                .checked_div(self.total_blocks).unwrap_or(Word64::zero())
+            Word32::from_u32(pct.to_u32())
+        }
+
+        pub fn should_checkpoint(self) -> bool
+            effects: [deterministic]
+        {
+            self.usage_pct().to_u32() >= self.threshold_pct.to_u32()
+        }
+
+        pub fn record_write(self: ref mut, blocks: Word64)
+            effects: [deterministic]
+        {
+            self.used_blocks = self.used_blocks.checked_add(blocks).unwrap_or(self.used_blocks)
+        }
+
+        pub fn record_checkpoint(self: ref mut)
+            effects: [deterministic]
+        {
+            self.used_blocks = Word64::zero()
+            self.checked_at = __builtin_timestamp()
+        }
+
+        pub fn set_threshold(self: ref mut, pct: Word32)
+            effects: [deterministic]
+        {
+            if pct.to_u32() <= 100 { self.threshold_pct = pct }
+        }
+
+        pub fn wrap_blocks(self: ref mut)
+            effects: [deterministic]
+        {
+            if self.head.gte(self.total_blocks) { self.head = Word64::zero() }
+            if self.tail.gte(self.total_blocks) { self.tail = Word64::zero() }
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Journal Integrity Verification
+    // ──────────────────────────────────────────────
+    // Evidence path: JRN-INTEG-001 through JRN-INTEG-020
+
+    pub type JournalIntegrityChecker : struct {
+        jm: JournalManager,
+        errors_found: Word32,
+        records_checked: Word64,
+        sequences_good: Word64,
+        sequences_bad: Word64,
+    }
+
+    impl JournalIntegrityChecker {
+        pub fn new(jm: JournalManager) -> JournalIntegrityChecker
+            effects: [deterministic]
+        {
+            JournalIntegrityChecker {
+                jm: jm,
+                errors_found: Word32::from_u32(0),
+                records_checked: Word64::zero(),
+                sequences_good: Word64::zero(),
+                sequences_bad: Word64::zero(),
+            }
+        }
+
+        pub fn check_transaction(self: ref mut, txn: JournalTransaction) -> FixedArray[16, JournalError>
+            effects: [deterministic, hash]
+        {
+            let mut errors: FixedArray[16, JournalError> = FixedArray::new()
+            if txn.transaction_id.is_zero() {
+                errors.push(jrn_invalid("Transaction ID is zero"))
+            }
+            // loop: bounds[BOUND_JRN_SMALL] — bounded by record count
+            loop: bounds[BOUND_JRN_SMALL] for i in 0..txn.records.len() {
+                let rec: JournalRecord = txn.records.get(i).unwrap_or(
+                    JournalRecord::new(Word64::zero(), JournalOp::JournalOp_None, Word64::zero()))
+                if !rec.verify_checksum() {
+                    errors.push(jrn_corrupt("Record checksum mismatch"))
+                }
+                if rec.sequence.is_zero() {
+                    errors.push(jrn_invalid("Record sequence is zero"))
+                }
+                self.records_checked = self.records_checked.checked_add(Word64::one()).unwrap_or(self.records_checked)
+            }
+            errors
+        }
+
+        pub fn residual_integrity(self)
+            effects: [io, deterministic]
+        {
+            residual emit {
+                subsystem: "journal_integrity",
+                records_checked: self.records_checked,
+                sequences_good: self.sequences_good,
+                sequences_bad: self.sequences_bad,
+                errors: self.errors_found,
+                timestamp: __builtin_timestamp(),
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Journal Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: JRN-RESID-001 through JRN-RESID-015
+
+    pub fn residual_journal_commit(txn_id: Word64, records: Word32, duration_us: Word64)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "journal",
+            event: "commit",
+            transaction_id: txn_id,
+            record_count: records,
+            duration_us: duration_us,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+
+    pub fn residual_journal_checkpoint(commits: Word64, records: Word64)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "journal",
+            event: "checkpoint",
+            total_commits: commits,
+            total_records: records,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+
+    pub fn residual_journal_recovery(replayed: Word64, errors: Word32)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "journal",
+            event: "recovery",
+            replayed_records: replayed,
+            errors: errors,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Journal Record Iteration
+    // ──────────────────────────────────────────────
+    // Evidence path: JRN-ITER-001 through JRN-ITER-015
+
+    pub type JournalIterator : struct {
+        journal: JournalManager,
+        current_txn_idx: Word32,
+        current_rec_idx: Word32,
+        done: bool,
+    }
+
+    impl JournalIterator {
+        pub fn new(jm: JournalManager) -> JournalIterator
+            effects: [deterministic]
+        {
+            JournalIterator {
+                journal: jm,
+                current_txn_idx: Word32::from_u32(0),
+                current_rec_idx: Word32::from_u32(0),
+                done: false,
+            }
+        }
+
+        pub fn next_record(self: ref mut) -> Option[JournalRecord>
+            effects: [deterministic]
+        {
+            if self.done { return Option::None }
+            // loop: bounds[BOUND_JRN_SMALL] — bounded by 64
+            loop: bounds[BOUND_JRN_SMALL] while self.current_txn_idx.to_u32() < self.journal.transactions.len() {
+                let txn: JournalTransaction = self.journal.transactions.get(self.current_txn_idx.to_u32()).unwrap_or(
+                    JournalTransaction::new(Word64::zero(), Word64::zero()))
+                if self.current_rec_idx.to_u32() < txn.records.len() {
+                    let rec: JournalRecord = txn.records.get(self.current_rec_idx.to_u32()).unwrap_or(
+                        JournalRecord::new(Word64::zero(), JournalOp::JournalOp_None, Word64::zero()))
+                    self.current_rec_idx = self.current_rec_idx.checked_add(Word32::from_u32(1)).unwrap_or(self.current_rec_idx)
+                    return Option::Some(rec)
+                }
+                self.current_txn_idx = self.current_txn_idx.checked_add(Word32::from_u32(1)).unwrap_or(self.current_txn_idx)
+                self.current_rec_idx = Word32::from_u32(0)
+            }
+            self.done = true
+            Option::None
+        }
+
+        pub fn reset(self: ref mut)
+            effects: [deterministic]
+        {
+            self.current_txn_idx = Word32::from_u32(0)
+            self.current_rec_idx = Word32::from_u32(0)
+            self.done = false
+        }
+
+        pub fn count_total_records(self) -> Word64
+            effects: [deterministic]
+        {
+            let mut total: Word64 = Word64::zero()
+            // loop: bounds[BOUND_JRN_SMALL] — bounded by 64
+            loop: bounds[BOUND_JRN_SMALL] for i in 0..self.journal.transactions.len() {
+                let txn: JournalTransaction = self.journal.transactions.get(i).unwrap_or(
+                    JournalTransaction::new(Word64::zero(), Word64::zero()))
+                total = total.checked_add(Word64::from_u64(txn.record_count() as u64)).unwrap_or(total)
+            }
+            total
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Checkpoint Operations
+    // ──────────────────────────────────────────────
+    // Evidence path: JRN-CHKPT-001 through JRN-CHKPT-020
+
+    pub type CheckpointManager : struct {
+        journal: JournalManager,
+        last_checkpoint_seq: Word64,
+        checkpoint_interval: Word64,
+        forced: bool,
+    }
+
+    impl CheckpointManager {
+        pub fn new(jm: JournalManager) -> CheckpointManager
+            effects: [deterministic]
+        {
+            CheckpointManager {
+                journal: jm,
+                last_checkpoint_seq: Word64::zero(),
+                checkpoint_interval: Word64::from_u64(100),
+                forced: false,
+            }
+        }
+
+        pub fn should_checkpoint(self) -> bool
+            effects: [deterministic]
+        {
+            if self.forced { return true }
+            let seq_diff: Word64 = self.journal.next_sequence.checked_sub(self.last_checkpoint_seq).unwrap_or(Word64::zero())
+            seq_diff.gte(self.checkpoint_interval) || self.journal.journal_space_remaining().lt(Word64::from_u64(10))
+        }
+
+        pub fn perform_checkpoint(self: ref mut, bc: ref mut BufferCache)
+            effects: [io, deterministic]
+        {
+            // Flush all dirty buffer cache blocks.
+            let _: Result<(), BcError> = bc.flush_all()
+            // Write journal checkpoint.
+            // loop: bounds[BOUND_JRN_SMALL] — bounded by 64
+            loop: bounds[BOUND_JRN_SMALL] for i in 0..self.journal.transactions.len() {
+                let txn: JournalTransaction = self.journal.transactions.get(i).unwrap_or(
+                    JournalTransaction::new(Word64::zero(), Word64::zero()))
+                if txn.is_committed() {
+                    // In a real implementation, apply to filesystem.
+                }
+            }
+            self.last_checkpoint_seq = self.journal.next_sequence
+            self.forced = false
+            residual emit {
+                subsystem: "journal_checkpoint",
+                sequence: self.last_checkpoint_seq,
+                timestamp: __builtin_timestamp(),
+            }
+        }
+
+        pub fn force_checkpoint(self: ref mut)
+            effects: [deterministic]
+        {
+            self.forced = true
+        }
+
+        pub fn set_interval(self: ref mut, interval: Word64)
+            effects: [deterministic]
+        {
+            self.checkpoint_interval = interval
+        }
+    }

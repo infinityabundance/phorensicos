@@ -1,0 +1,825 @@
+// ============================================================================
+// observation.phor — Foreign Code Observation: Capture, Classify, Trace
+// ============================================================================
+// Observation is the first active stage in the porting pipeline. Foreign
+// code is executed in a dialect cage and all observable behavior is
+// captured, classified, and traced. Every syscall, memory access,
+// capability check, and dialect boundary crossing is recorded.
+// ============================================================================
+
+package "phorensic:observation:v1.0";
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+type ObservationError = enum {
+    CaptureFailed = 0x01,
+    ClassificationFailed = 0x02,
+    TraceFailed = 0x03,
+    ClassifierNotFound = 0x04,
+    OperationNotRecognized = 0x05,
+    BufferOverflow = 0x06,
+    TraceDiscontinuity = 0x07,
+    InvalidOperationSequence = 0x08,
+    ObservationLimitExceeded = 0x09,
+    InternalError = 0xFF,
+}
+
+// ============================================================================
+// Core Types
+// ============================================================================
+
+type Hash256 = struct {
+    bytes: Array[u8, 32],
+}
+
+type FixedString[cap: u64] = struct {
+    len: u64,
+    data: Array[u8, cap],
+}
+
+// ============================================================================
+// Observation Operation Record
+// ============================================================================
+
+type ObservationOp = struct {
+    op_index: u64,
+    op_name: FixedString[128],
+    op_class: OpClass,
+    foreign_signature: FixedString[256],
+    arguments_hash: Hash256,
+    result_hash: Hash256,
+    effects: Array[FixedString[64], 8],
+    effect_count: u64,
+    capability_used: FixedString[128],
+    capability_granted: bool,
+    timestamp: u64,
+    duration_us: u64,
+    memory_access_start: u64,
+    memory_access_end: u64,
+    residual_hash: Hash256,
+}
+
+type OpClass = enum {
+    Syscall = 0x01,
+    LibraryCall = 0x02,
+    MemoryAccess = 0x03,
+    CapabilityCheck = 0x04,
+    DialectBoundary = 0x05,
+    IOperation = 0x06,
+    Computation = 0x07,
+    Threading = 0x08,
+    IPC = 0x09,
+    Networking = 0x0A,
+    Timing = 0x0B,
+    Unknown = 0xFF,
+}
+
+// ============================================================================
+// Trace Entry
+// ============================================================================
+
+type TraceEntry = struct {
+    trace_index: u64,
+    op_index: u64,
+    parent_op_index: u64,
+    trace_type: TraceType,
+    data_hash: Hash256,
+    timestamp: u64,
+    sequence_number: u64,
+}
+
+type TraceType = enum {
+    Entry = 0x01,
+    Exit = 0x02,
+    Call = 0x03,
+    Return = 0x04,
+    MemoryRead = 0x05,
+    MemoryWrite = 0x06,
+    CapabilityAcquire = 0x07,
+    CapabilityRelease = 0x08,
+    DialectEnter = 0x09,
+    DialectLeave = 0x0A,
+    SyncPoint = 0x0B,
+    AsyncPoint = 0x0C,
+    Error = 0x0D,
+    Unknown = 0xFF,
+}
+
+// ============================================================================
+// Classification Result
+// ============================================================================
+
+type ClassificationResult = struct {
+    op_name: FixedString[128],
+    op_class: OpClass,
+    dialect_family: FixedString[64],
+    confidence: u64,
+    is_known: bool,
+    alternative_classifications: Array[OpClass, 4],
+    alternative_count: u64,
+}
+
+// ============================================================================
+// Observation Session
+// ============================================================================
+
+type ObservationSession = struct {
+    session_id: Hash256,
+    cage_id: Hash256,
+    execution_id: u64,
+    operations: Array[ObservationOp, 4096],
+    operation_count: u64,
+    trace: Array[TraceEntry, 8192],
+    trace_count: u64,
+    entry_point: FixedString[256],
+    arguments_hash: Hash256,
+    started_at: u64,
+    ended_at: u64,
+    operation_limit: u64,
+    is_complete: bool,
+    residual_bundle_hash: Hash256,
+    classification_cache: Array[ClassificationResult, 256],
+    cache_count: u64,
+    generation: u64,
+}
+
+// ============================================================================
+// Create Observation Session
+// ============================================================================
+
+fn create_observation_session(cage_id: Hash256, entry: &FixedString[256], args_hash: Hash256, operation_limit: u64) -> ObservationSession
+    effects: [compute]
+{
+    let empty_ops: Array[ObservationOp, 4096] = Array[ObservationOp, 4096]::zeroed();
+    let empty_trace: Array[TraceEntry, 8192] = Array[TraceEntry, 8192]::zeroed();
+    let empty_cache: Array[ClassificationResult, 256] = Array[ClassificationResult, 256]::zeroed();
+    let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+
+    return ObservationSession {
+        session_id: zero_hash,
+        cage_id: cage_id,
+        execution_id: 0,
+        operations: empty_ops,
+        operation_count: 0,
+        trace: empty_trace,
+        trace_count: 0,
+        entry_point: *entry,
+        arguments_hash: args_hash,
+        started_at: kernel.tick_count(),
+        ended_at: 0,
+        operation_limit: operation_limit,
+        is_complete: false,
+        residual_bundle_hash: zero_hash,
+        classification_cache: empty_cache,
+        cache_count: 0,
+        generation: 1,
+    };
+}
+
+// ============================================================================
+// Capture Operation
+// ============================================================================
+// Captures a single foreign operation during cage execution.
+
+fn capture_operation(session: &mut ObservationSession, op_name: &FixedString[128], foreign_sig: &FixedString[256], args_hash: Hash256, result_hash: Hash256, effects: &Array[FixedString[64], 8], effect_count: u64, cap_used: &FixedString[128]) -> Result[u64, ObservationError]
+    effects: [compute, residual]
+{
+    if session.operation_count >= 4096 {
+        return Err(ObservationError::BufferOverflow);
+    }
+
+    let op_index: u64 = session.operation_count;
+
+    // Classify the operation
+    let classification: ClassificationResult = classify_operation(op_name, foreign_sig);
+
+    let op: ObservationOp = ObservationOp {
+        op_index: op_index,
+        op_name: *op_name,
+        op_class: classification.op_class,
+        foreign_signature: *foreign_sig,
+        arguments_hash: args_hash,
+        result_hash: result_hash,
+        effects: *effects,
+        effect_count: effect_count,
+        capability_used: *cap_used,
+        capability_granted: false,
+        timestamp: kernel.tick_count(),
+        duration_us: 0,
+        memory_access_start: 0,
+        memory_access_end: 0,
+        residual_hash: hash_observation_data(op_name.data, op_name.len),
+    };
+
+    session.operations[session.operation_count] = op;
+    session.operation_count = session.operation_count + 1;
+
+    // Add to classification cache if not already present
+    if !is_op_in_cache(session, op_name) && session.cache_count < 256 {
+        session.classification_cache[session.cache_count] = classification;
+        session.cache_count = session.cache_count + 1;
+    }
+
+    @emit_residual("observation.capture", "operation_captured", op_index);
+
+    return Ok(op_index);
+}
+
+// ============================================================================
+// Classify Operation
+// ============================================================================
+
+fn classify_operation(op_name: &FixedString[128], foreign_sig: &FixedString[256]) -> ClassificationResult
+    effects: [compute]
+{
+    let mut op_class: OpClass = OpClass::Unknown;
+    let mut confidence: u64 = 50;
+    let mut is_known: bool = true;
+    let empty_alts: Array[OpClass, 4] = Array[OpClass, 4]::zeroed();
+
+    // Classify based on operation name patterns
+    if op_name.len >= 3 {
+        if (op_name.data[0] == 'o' as u8 && op_name.data[1] == 'p' as u8 && op_name.data[2] == 'e' as u8) ||
+           (op_name.data[0] == 'r' as u8 && op_name.data[1] == 'e' as u8 && op_name.data[2] == 'a' as u8) ||
+           (op_name.data[0] == 'w' as u8 && op_name.data[1] == 'r' as u8 && op_name.data[2] == 'i' as u8) ||
+           (op_name.data[0] == 'c' as u8 && op_name.data[1] == 'l' as u8 && op_name.data[2] == 'o' as u8) ||
+           (op_name.data[0] == 'f' as u8 && op_name.data[1] == 'c' as u8 && op_name.data[2] == 'n' as u8) ||
+           (op_name.data[0] == 'l' as u8 && op_name.data[1] == 's' as u8 && op_name.data[2] == 'e' as u8) {
+            op_class = OpClass::Syscall;
+            confidence = 80;
+        } elif (op_name.data[0] == 'm' as u8 && op_name.data[1] == 'a' as u8 && op_name.data[2] == 'l' as u8) ||
+                (op_name.data[0] == 'f' as u8 && op_name.data[1] == 'r' as u8 && op_name.data[2] == 'e' as u8) ||
+                (op_name.data[0] == 'm' as u8 && op_name.data[1] == 'm' as u8 && op_name.data[2] == 'c' as u8) ||
+                (op_name.data[0] == 'r' as u8 && op_name.data[1] == 'e' as u8 && op_name.data[2] == 'a' as u8) {
+            op_class = OpClass::LibraryCall;
+            confidence = 75;
+        } elif (op_name.data[0] == 's' as u8 && op_name.data[1] == 'o' as u8 && op_name.data[2] == 'c' as u8) ||
+                (op_name.data[0] == 'b' as u8 && op_name.data[1] == 'i' as u8 && op_name.data[2] == 'n' as u8) ||
+                (op_name.data[0] == 'c' as u8 && op_name.data[1] == 'o' as u8 && op_name.data[2] == 'n' as u8) ||
+                (op_name.data[0] == 's' as u8 && op_name.data[1] == 'e' as u8 && op_name.data[2] == 'n' as u8) {
+            op_class = OpClass::Networking;
+            confidence = 70;
+        } elif (op_name.data[0] == 'f' as u8 && op_name.data[1] == 'o' as u8 && op_name.data[2] == 'r' as u8) ||
+                (op_name.data[0] == 'w' as u8 && op_name.data[1] == 'a' as u8 && op_name.data[2] == 'i' as u8) ||
+                (op_name.data[0] == 'c' as u8 && op_name.data[1] == 'l' as u8 && op_name.data[2] == 'o' as u8) {
+            op_class = OpClass::Timing;
+            confidence = 75;
+        } elif (op_name.data[0] == 'p' as u8 && op_name.data[1] == 'i' as u8 && op_name.data[2] == 'p' as u8) ||
+                (op_name.data[0] == 's' as u8 && op_name.data[1] == 'e' as u8 && op_name.data[2] == 'm' as u8) ||
+                (op_name.data[0] == 's' as u8 && op_name.data[1] == 'h' as u8 && op_name.data[2] == 'm' as u8) {
+            op_class = OpClass::IPC;
+            confidence = 65;
+        } elif (op_name.data[0] == 'm' as u8 && op_name.data[1] == 'm' as u8 && op_name.data[2] == 'a' as u8) ||
+                (op_name.data[0] == 'm' as u8 && op_name.data[1] == 'p' as u8 && op_name.data[2] == 'r' as u8) ||
+                (op_name.data[0] == 'b' as u8 && op_name.data[1] == 'r' as u8 && op_name.data[2] == 'k' as u8) {
+            op_class = OpClass::MemoryAccess;
+            confidence = 80;
+        } elif (op_name.data[0] == 't' as u8 && op_name.data[1] == 'h' as u8 && op_name.data[2] == 'r' as u8) ||
+                (op_name.data[0] == 'p' as u8 && op_name.data[1] == 't' as u8 && op_name.data[2] == 'h' as u8) ||
+                (op_name.data[0] == 'c' as u8 && op_name.data[1] == 'l' as u8 && op_name.data[2] == 'o' as u8) {
+            op_class = OpClass::Threading;
+            confidence = 60;
+        } else {
+            op_class = OpClass::Computation;
+            confidence = 30;
+            is_known = false;
+        }
+    }
+
+    return ClassificationResult {
+        op_name: *op_name,
+        op_class: op_class,
+        dialect_family: FixedString[64]::from_literal("foreign"),
+        confidence: confidence,
+        is_known: is_known,
+        alternative_classifications: empty_alts,
+        alternative_count: 0,
+    };
+}
+
+// ============================================================================
+// Check if Operation is in Classification Cache
+// ============================================================================
+
+fn is_op_in_cache(session: &ObservationSession, op_name: &FixedString[128]) -> bool
+    effects: [compute]
+{
+    for i in 0..session.cache_count {
+        if session.classification_cache[i].op_name == *op_name {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Trace Operation
+// ============================================================================
+// Adds a trace entry for a captured operation.
+
+fn trace_operation(session: &mut ObservationSession, op_index: u64, parent_op_index: u64, trace_type: TraceType, data_hash: Hash256) -> Result[u64, ObservationError]
+    effects: [compute, residual]
+{
+    if session.trace_count >= 8192 {
+        return Err(ObservationError::BufferOverflow);
+    }
+
+    let trace_entry: TraceEntry = TraceEntry {
+        trace_index: session.trace_count,
+        op_index: op_index,
+        parent_op_index: parent_op_index,
+        trace_type: trace_type,
+        data_hash: data_hash,
+        timestamp: kernel.tick_count(),
+        sequence_number: session.trace_count,
+    };
+
+    session.trace[session.trace_count] = trace_entry;
+    session.trace_count = session.trace_count + 1;
+
+    @emit_residual("observation.trace", "trace_entry_added", session.trace_count);
+
+    return Ok(session.trace_count);
+}
+
+// ============================================================================
+// Set Operation Duration
+// ============================================================================
+
+fn set_operation_duration(session: &mut ObservationSession, op_index: u64, duration_us: u64) -> Result[(), ObservationError]
+    effects: [compute]
+{
+    if op_index >= session.operation_count {
+        return Err(ObservationError::OperationNotRecognized);
+    }
+
+    session.operations[op_index].duration_us = duration_us;
+    return Ok(());
+}
+
+// ============================================================================
+// Set Capability Granted
+// ============================================================================
+
+fn set_capability_granted(session: &mut ObservationSession, op_index: u64, granted: bool) -> Result[(), ObservationError]
+    effects: [compute]
+{
+    if op_index >= session.operation_count {
+        return Err(ObservationError::OperationNotRecognized);
+    }
+
+    session.operations[op_index].capability_granted = granted;
+    return Ok(());
+}
+
+// ============================================================================
+// Get Operation By Index
+// ============================================================================
+
+fn get_observation_op(session: &ObservationSession, op_index: u64) -> Result[&ObservationOp, ObservationError]
+    effects: [compute]
+{
+    if op_index >= session.operation_count {
+        return Err(ObservationError::OperationNotRecognized);
+    }
+    return Ok(session.operations[op_index]);
+}
+
+// ============================================================================
+// Get Operations By Class
+// ============================================================================
+
+fn get_operations_by_class(session: &ObservationSession, op_class: OpClass) -> Result[Array[ObservationOp, 4096], ObservationError]
+    effects: [compute]
+{
+    let mut results: Array[ObservationOp, 4096] = Array[ObservationOp, 4096]::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..session.operation_count {
+        if session.operations[i].op_class == op_class {
+            if count < 4096 {
+                results[count] = session.operations[i];
+                count = count + 1;
+            }
+        }
+    }
+
+    return Ok(results);
+}
+
+// ============================================================================
+// Get Trace By Operation
+// ============================================================================
+
+fn get_trace_for_operation(session: &ObservationSession, op_index: u64) -> Result[Array[TraceEntry, 8192], ObservationError]
+    effects: [compute]
+{
+    let mut results: Array[TraceEntry, 8192] = Array[TraceEntry, 8192]::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..session.trace_count {
+        if session.trace[i].op_index == op_index {
+            if count < 8192 {
+                results[count] = session.trace[i];
+                count = count + 1;
+            }
+        }
+    }
+
+    return Ok(results);
+}
+
+// ============================================================================
+// Finalize Observation Session
+// ============================================================================
+// Computes the residual bundle hash and marks the session as complete.
+
+fn finalize_observation_session(session: &mut ObservationSession) -> Result[Hash256, ObservationError]
+    effects: [compute, residual]
+{
+    let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    let mut bundle_hash: Hash256 = zero_hash;
+
+    // Hash all operations into the bundle
+    for i in 0..session.operation_count {
+        bundle_hash = hash_combine(bundle_hash, session.operations[i].residual_hash);
+    }
+
+    // Hash all trace entries into the bundle
+    for i in 0..session.trace_count {
+        bundle_hash = hash_combine(bundle_hash, session.trace[i].data_hash);
+    }
+
+    session.residual_bundle_hash = bundle_hash;
+    session.ended_at = kernel.tick_count();
+    session.is_complete = true;
+
+    @emit_residual("observation.finalize", "session_finalized", bundle_hash);
+
+    return Ok(bundle_hash);
+}
+
+// ============================================================================
+// Get Observation Statistics
+// ============================================================================
+
+type ObservationStats = struct {
+    total_operations: u64,
+    total_trace_entries: u64,
+    syscall_count: u64,
+    library_call_count: u64,
+    memory_access_count: u64,
+    capability_check_count: u64,
+    dialect_boundary_count: u64,
+    io_count: u64,
+    computation_count: u64,
+    threading_count: u64,
+    ipc_count: u64,
+    networking_count: u64,
+    timing_count: u64,
+    unknown_count: u64,
+    unique_classifications: u64,
+    total_duration_us: u64,
+}
+
+fn get_observation_stats(session: &ObservationSession) -> ObservationStats
+    effects: [compute]
+{
+    let mut syscall: u64 = 0;
+    let mut libcall: u64 = 0;
+    let mut mem: u64 = 0;
+    let mut cap: u64 = 0;
+    let mut dialect: u64 = 0;
+    let mut io: u64 = 0;
+    let mut compute: u64 = 0;
+    let mut threading: u64 = 0;
+    let mut ipc: u64 = 0;
+    let mut net: u64 = 0;
+    let mut timing: u64 = 0;
+    let mut unknown: u64 = 0;
+    let mut total_dur: u64 = 0;
+
+    for i in 0..session.operation_count {
+        match session.operations[i].op_class {
+            OpClass::Syscall => syscall = syscall + 1,
+            OpClass::LibraryCall => libcall = libcall + 1,
+            OpClass::MemoryAccess => mem = mem + 1,
+            OpClass::CapabilityCheck => cap = cap + 1,
+            OpClass::DialectBoundary => dialect = dialect + 1,
+            OpClass::IOperation => io = io + 1,
+            OpClass::Computation => compute = compute + 1,
+            OpClass::Threading => threading = threading + 1,
+            OpClass::IPC => ipc = ipc + 1,
+            OpClass::Networking => net = net + 1,
+            OpClass::Timing => timing = timing + 1,
+            OpClass::Unknown => unknown = unknown + 1,
+        }
+        total_dur = total_dur + session.operations[i].duration_us;
+    }
+
+    return ObservationStats {
+        total_operations: session.operation_count,
+        total_trace_entries: session.trace_count,
+        syscall_count: syscall,
+        library_call_count: libcall,
+        memory_access_count: mem,
+        capability_check_count: cap,
+        dialect_boundary_count: dialect,
+        io_count: io,
+        computation_count: compute,
+        threading_count: threading,
+        ipc_count: ipc,
+        networking_count: net,
+        timing_count: timing,
+        unknown_count: unknown,
+        unique_classifications: session.cache_count,
+        total_duration_us: total_dur,
+    };
+}
+
+// ============================================================================
+// Hash Helpers
+// ============================================================================
+
+fn hash_observation_data(data: &Array[u8, 128], len: u64) -> Hash256
+    effects: [compute]
+{
+    let mut result: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    let hash_len: u64 = if len < 128 { len } else { 128 };
+    for i in 0..hash_len {
+        let idx: u64 = i & 31;
+        result.bytes[idx] = result.bytes[idx] ^ data[i];
+    }
+    return result;
+}
+
+fn hash_combine(a: Hash256, b: Hash256) -> Hash256
+    effects: [compute]
+{
+    let mut result: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    for i in 0..32 {
+        result.bytes[i] = a.bytes[i] ^ b.bytes[i];
+    }
+    return result;
+}
+
+// ============================================================================
+// Export Session as Portable Bundle
+// ============================================================================
+// Exports the observation session data as a portable bundle for court
+// submission or cross-system transfer.
+
+type ObservationBundle = struct {
+    bundle_id: Hash256,
+    session_id: Hash256,
+    cage_id: Hash256,
+    entry_point: FixedString[256],
+    operations: Array[ObservationOp, 4096],
+    operation_count: u64,
+    trace: Array[TraceEntry, 8192],
+    trace_count: u64,
+    stats: ObservationStats,
+    bundle_hash: Hash256,
+    exported_at: u64,
+}
+
+fn export_observation_bundle(session: &ObservationSession) -> ObservationBundle
+    effects: [compute]
+{
+    let stats: ObservationStats = get_observation_stats(session);
+    let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    let mut bundle_hash: Hash256 = zero_hash;
+
+    bundle_hash = hash_combine(bundle_hash, session.session_id);
+    bundle_hash = hash_combine(bundle_hash, hash_from_u64(session.operation_count));
+    bundle_hash = hash_combine(bundle_hash, hash_from_u64(session.trace_count));
+
+    return ObservationBundle {
+        bundle_id: bundle_hash,
+        session_id: session.session_id,
+        cage_id: session.cage_id,
+        entry_point: session.entry_point,
+        operations: session.operations,
+        operation_count: session.operation_count,
+        trace: session.trace,
+        trace_count: session.trace_count,
+        stats: stats,
+        bundle_hash: bundle_hash,
+        exported_at: kernel.tick_count(),
+    };
+}
+
+// ============================================================================
+// Detect Repeated Operations
+// ============================================================================
+// Detects operations that appear multiple times in the observation,
+// indicating a pattern that may be a candidate for translation.
+
+type RepeatedOpPattern = struct {
+    op_name: FixedString[128],
+    occurrence_count: u64,
+    first_index: u64,
+    last_index: u64,
+    average_duration_us: u64,
+    total_duration_us: u64,
+}
+
+fn detect_repeated_operations(session: &ObservationSession) -> Result[Array[RepeatedOpPattern, 256], ObservationError]
+    effects: [compute]
+{
+    let mut patterns: Array[RepeatedOpPattern, 256] = Array[RepeatedOpPattern, 256]::zeroed();
+    let mut pattern_count: u64 = 0;
+
+    for i in 0..session.operation_count {
+        let op: ObservationOp = session.operations[i];
+        let mut found: bool = false;
+
+        for p in 0..pattern_count {
+            if patterns[p].op_name == op.op_name {
+                patterns[p].occurrence_count = patterns[p].occurrence_count + 1;
+                patterns[p].last_index = i;
+                patterns[p].total_duration_us = patterns[p].total_duration_us + op.duration_us;
+                patterns[p].average_duration_us = patterns[p].total_duration_us / patterns[p].occurrence_count;
+                found = true;
+                break;
+            }
+        }
+
+        if !found && pattern_count < 256 {
+            patterns[pattern_count] = RepeatedOpPattern {
+                op_name: op.op_name,
+                occurrence_count: 1,
+                first_index: i,
+                last_index: i,
+                average_duration_us: op.duration_us,
+                total_duration_us: op.duration_us,
+            };
+            pattern_count = pattern_count + 1;
+        }
+    }
+
+    let result: Array[RepeatedOpPattern, 256] = patterns;
+    return Ok(result);
+}
+
+// ============================================================================
+// Detect Operation Sequence Pattern
+// ============================================================================
+// Detects recurring sequences of operations (common idiom detection).
+
+type OpSequencePattern = struct {
+    operation_names: Array[FixedString[128], 16],
+    sequence_length: u64,
+    occurrence_count: u64,
+    sequence_hash: Hash256,
+}
+
+fn detect_operation_sequences(session: &ObservationSession, sequence_length: u64) -> Result[Array[OpSequencePattern, 64], ObservationError]
+    effects: [compute]
+{
+    let mut patterns: Array[OpSequencePattern, 64] = Array[OpSequencePattern, 64]::zeroed();
+    let mut pattern_count: u64 = 0;
+
+    if sequence_length == 0 || sequence_length > 16 {
+        return Ok(patterns);
+    }
+
+    let max_start: u64 = if session.operation_count > sequence_length {
+        session.operation_count - sequence_length
+    } else {
+        0
+    };
+
+    for start in 0..max_start {
+        // Compute hash for this sequence
+        let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+        let mut seq_hash: Hash256 = zero_hash;
+        let mut names: Array[FixedString[128], 16] = Array[FixedString[128], 16]::zeroed();
+
+        for j in 0..sequence_length {
+            names[j] = session.operations[start + j].op_name;
+            seq_hash = hash_combine(seq_hash, session.operations[start + j].residual_hash);
+        }
+
+        let mut found: bool = false;
+        for p in 0..pattern_count {
+            if patterns[p].sequence_hash == seq_hash {
+                patterns[p].occurrence_count = patterns[p].occurrence_count + 1;
+                found = true;
+                break;
+            }
+        }
+
+        if !found && pattern_count < 64 {
+            patterns[pattern_count] = OpSequencePattern {
+                operation_names: names,
+                sequence_length: sequence_length,
+                occurrence_count: 1,
+                sequence_hash: seq_hash,
+            };
+            pattern_count = pattern_count + 1;
+        }
+    }
+
+    return Ok(patterns);
+}
+
+// ============================================================================
+// Hash from u64
+// ============================================================================
+
+fn hash_from_u64(val: u64) -> Hash256
+    effects: [compute]
+{
+    let mut result: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    let mut tmp: u64 = val;
+    for i in 0..8 {
+        result.bytes[i] = (tmp & 0xFF) as u8;
+        tmp = tmp >> 8;
+    }
+    return result;
+}
+
+// ============================================================================
+// Observation Filtering
+// ============================================================================
+// Filters observed operations by a set of criteria.
+
+type ObservationFilter = struct {
+    include_classes: Array[bool, 12],
+    min_duration_us: u64,
+    max_duration_us: u64,
+    require_capability: bool,
+    require_result: bool,
+}
+
+fn filter_operations(session: &ObservationSession, filter: &ObservationFilter) -> Result[Array[ObservationOp, 4096], ObservationError]
+    effects: [compute]
+{
+    let mut results: Array[ObservationOp, 4096] = Array[ObservationOp, 4096]::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..session.operation_count {
+        let op: ObservationOp = session.operations[i];
+        let class_idx: u64 = op.op_class as u64;
+
+        // Apply class filter
+        if class_idx < 12 && !filter.include_classes[class_idx] {
+            continue;
+        }
+
+        // Apply duration filters
+        if op.duration_us < filter.min_duration_us {
+            continue;
+        }
+        if filter.max_duration_us > 0 && op.duration_us > filter.max_duration_us {
+            continue;
+        }
+
+        // Apply capability filter
+        if filter.require_capability && op.capability_used.len == 0 {
+            continue;
+        }
+
+        if count < 4096 {
+            results[count] = op;
+            count = count + 1;
+        }
+    }
+
+    return Ok(results);
+}
+
+// ============================================================================
+// Session Validation
+// ============================================================================
+// Validates an observation session's internal consistency.
+
+fn validate_observation_session(session: &ObservationSession) -> bool
+    effects: [compute]
+{
+    // Check that trace entries reference valid operations
+    for i in 0..session.trace_count {
+        if session.trace[i].op_index >= session.operation_count {
+            return false;
+        }
+    }
+
+    // Check that operation indices are sequential
+    for i in 1..session.operation_count {
+        if session.operations[i].op_index != session.operations[i - 1].op_index + 1 {
+            return false;
+        }
+    }
+
+    // Check timestamps are non-decreasing
+    for i in 1..session.trace_count {
+        if session.trace[i].timestamp < session.trace[i - 1].timestamp {
+            return false;
+        }
+    }
+
+    return true;
+}

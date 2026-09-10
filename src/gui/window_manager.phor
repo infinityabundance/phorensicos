@@ -1,0 +1,1222 @@
+// window_manager.phor — Phorensic WindowManager
+// Surface enumeration, configure, focus, z-order, decoration
+// Separate component communicating with compositor via capability-gated protocol.
+// All operations bounded. Every function declares effects.
+
+package gui.window_manager;
+
+import gui.protocol;
+import gui.surface;
+
+// ──────────────────────────────────────────────
+// Window Manager Constants
+// ──────────────────────────────────────────────
+
+const MAX_WINDOWS: u64 = 1024;
+const MAX_STACK_DEPTH: u64 = 1024;
+const MAX_DECORATION_COLORS: u64 = 16;
+const MAX_CONFIGURE_OPS: u64 = 256;
+const MAX_WM_SURFACES: u64 = 128;
+const MAX_FOCUS_HISTORY: u64 = 64;
+const DEFAULT_DECORATION_HEIGHT: u32 = 32;
+const DEFAULT_BORDER_WIDTH: u32 = 4;
+const MIN_WINDOW_WIDTH: u32 = 100;
+const MIN_WINDOW_HEIGHT: u32 = 80;
+const MAX_TITLE_LENGTH: u64 = 256;
+
+// ──────────────────────────────────────────────
+// Stacking Layer (z-order tiers)
+// ──────────────────────────────────────────────
+
+enum StackingLayer {
+    Desktop,
+    Dock,
+    Panel,
+    Normal(u64),
+    Overlay(u64),
+    Popup(u64),
+    Modal(u64),
+    Tooltip(u64),
+    Splash,
+    LockScreen,
+    Cursor,
+}
+
+// ──────────────────────────────────────────────
+// Window Manager State
+// ──────────────────────────────────────────────
+
+struct WindowManager {
+    initialized: bool,
+
+    // Surface tracking
+    windows: RingBuf(surface.WindowSurface, MAX_WINDOWS),
+    window_count: u64,
+
+    // Focus management
+    focused_surface_id: u64,
+    focus_timestamp: u64,
+    focus_history: RingBuf(u64, MAX_FOCUS_HISTORY),
+    history_depth: u64,
+
+    // Z-order / stacking
+    stacking_order: RingBuf(u64, MAX_STACK_DEPTH),
+    stack_depth: u64,
+    next_stacking_id: u64,
+
+    // Decoration
+    decoration_style: protocol.DecorationStyle,
+    decoration_enabled: bool,
+
+    // Configuration
+    pending_configures: RingBuf(protocol.SurfaceConfiguration, MAX_CONFIGURE_OPS),
+    configure_count: u64,
+    configure_serial: u64,
+
+    // Policy flags
+    allow_fullscreen: bool,
+    allow_minimize: bool,
+    allow_maximize: bool,
+    allow_resize: bool,
+    allow_move: bool,
+    focus_follows_mouse: bool,
+    click_to_focus: bool,
+    raise_on_click: bool,
+
+    // Window rules
+    default_width: u32,
+    default_height: u32,
+    min_width: u32,
+    min_height: u32,
+    max_width: u32,
+    max_height: u32,
+
+    // Statistics
+    created_count: u64,
+    destroyed_count: u64,
+    configure_count_total: u64,
+    focus_change_count: u64,
+    stack_change_count: u64,
+}
+
+// ──────────────────────────────────────────────
+// Initialization
+// ──────────────────────────────────────────────
+
+fn wm_init(default_w: u32, default_h: u32) -> WindowManager
+    effect [compute, residual]
+{
+    let decor_style: protocol.DecorationStyle = protocol.DecorationStyle {
+        title_bar_height: DEFAULT_DECORATION_HEIGHT,
+        border_width: DEFAULT_BORDER_WIDTH,
+        corner_radius: 4,
+        shadow_size: 8,
+        colors: Array::zeroed(),
+        font_size: 14,
+        font_name: Array::zeroed(),
+    };
+    let wm: WindowManager = WindowManager {
+        initialized: true,
+        windows: RingBuf::new(),
+        window_count: 0,
+        focused_surface_id: 0,
+        focus_timestamp: 0,
+        focus_history: RingBuf::new(),
+        history_depth: 0,
+        stacking_order: RingBuf::new(),
+        stack_depth: 0,
+        next_stacking_id: 1,
+        decoration_style: decor_style,
+        decoration_enabled: true,
+        pending_configures: RingBuf::new(),
+        configure_count: 0,
+        configure_serial: 0,
+        allow_fullscreen: true,
+        allow_minimize: true,
+        allow_maximize: true,
+        allow_resize: true,
+        allow_move: true,
+        focus_follows_mouse: false,
+        click_to_focus: true,
+        raise_on_click: true,
+        default_width: default_w,
+        default_height: default_h,
+        min_width: MIN_WINDOW_WIDTH,
+        min_height: MIN_WINDOW_HEIGHT,
+        max_width: 7680,
+        max_height: 4320,
+        created_count: 0,
+        destroyed_count: 0,
+        configure_count_total: 0,
+        focus_change_count: 0,
+        stack_change_count: 0,
+    };
+    residual emit {
+        op: "wm:init",
+        default_width: default_w,
+        default_height: default_h,
+    };
+    return wm;
+}
+
+// ──────────────────────────────────────────────
+// Window Registration
+// ──────────────────────────────────────────────
+
+fn wm_register_window(wm: WindowManager, ws: surface.WindowSurface) -> Result(WindowManager, u64)
+    effect [compute, residual]
+    bound iterations MAX_WINDOWS
+{
+    let mut updated: WindowManager = wm;
+    for i in 0..MAX_WINDOWS {
+        let w_opt: Option(surface.WindowSurface) = updated.windows[i];
+        match w_opt {
+            Option::None => {
+                updated.windows[i] = Option::Some(ws);
+                updated.window_count = updated.window_count + 1;
+                updated.created_count = updated.created_count + 1;
+                // Add to stacking order
+                let sid: u64 = updated.next_stacking_id;
+                updated.next_stacking_id = updated.next_stacking_id + 1;
+                let stacked: surface.WindowSurface = surface.WindowSurface {
+                    common: ws.common,
+                    title: ws.title,
+                    app_id: ws.app_id,
+                    decorated: ws.decorated,
+                    decoration_extents: ws.decoration_extents,
+                    window_state: ws.window_state,
+                    minimized: ws.minimized,
+                    maximized: ws.maximized,
+                    fullscreen: ws.fullscreen,
+                    resizing: ws.resizing,
+                    transient_for: ws.transient_for,
+                    parent_id: ws.parent_id,
+                    min_size: ws.min_size,
+                    max_size: ws.max_size,
+                    stacking_order: sid,
+                    pid: ws.pid,
+                    configured_serial: ws.configured_serial,
+                    ack_pending: ws.ack_pending,
+                    subsurfaces: ws.subsurfaces,
+                    last_configure: ws.last_configure,
+                };
+                updated.windows[i] = Option::Some(stacked);
+                // Push to stack
+                for j in 0..MAX_STACK_DEPTH {
+                    let s_opt: Option(u64) = updated.stacking_order[j];
+                    match s_opt {
+                        Option::None => {
+                            updated.stacking_order[j] = Option::Some(ws.common.id);
+                            updated.stack_depth = updated.stack_depth + 1;
+                            break;
+                        }
+                        Option::Some(_) => {}
+                    }
+                }
+                residual emit {
+                    op: "wm:register",
+                    surface_id: ws.common.id,
+                    stacking_order: sid,
+                };
+                return Result::Ok(updated);
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return Result::Err(1); // no window slots
+}
+
+fn wm_unregister_window(wm: WindowManager, surface_id: u64) -> Result(WindowManager, u64)
+    effect [compute, residual]
+    bound iterations MAX_WINDOWS
+{
+    let mut updated: WindowManager = wm;
+    for i in 0..MAX_WINDOWS {
+        let w_opt: Option(surface.WindowSurface) = updated.windows[i];
+        match w_opt {
+            Option::Some(ws) => {
+                if ws.common.id == surface_id {
+                    updated.windows[i] = Option::None;
+                    updated.window_count = updated.window_count - 1;
+                    updated.destroyed_count = updated.destroyed_count + 1;
+                    // Remove from stacking order
+                    for j in 0..MAX_STACK_DEPTH {
+                        let s_opt: Option(u64) = updated.stacking_order[j];
+                        match s_opt {
+                            Option::Some(sid) => {
+                                if sid == surface_id {
+                                    updated.stacking_order[j] = Option::None;
+                                    updated.stack_depth = updated.stack_depth - 1;
+                                    break;
+                                }
+                            }
+                            Option::None => {}
+                        }
+                    }
+                    // Clear focus if focused
+                    if updated.focused_surface_id == surface_id {
+                        updated.focused_surface_id = 0;
+                        // Pop from focus history
+                        for j in 0..MAX_FOCUS_HISTORY {
+                            let f_opt: Option(u64) = updated.focus_history[j];
+                            match f_opt {
+                                Option::Some(fid) => {
+                                    if fid == surface_id {
+                                        updated.focus_history[j] = Option::None;
+                                        updated.history_depth = updated.history_depth - 1;
+                                        break;
+                                    }
+                                }
+                                Option::None => {}
+                            }
+                        }
+                    }
+                    residual emit {
+                        op: "wm:unregister",
+                        surface_id: surface_id,
+                    };
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2); // window not found
+}
+
+fn wm_find_window(wm: WindowManager, surface_id: u64) -> Option(surface.WindowSurface)
+    effect [compute]
+    bound iterations MAX_WINDOWS
+{
+    for i in 0..MAX_WINDOWS {
+        let w_opt: Option(surface.WindowSurface) = wm.windows[i];
+        match w_opt {
+            Option::Some(ws) => {
+                if ws.common.id == surface_id {
+                    return Option::Some(ws);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Option::None;
+}
+
+fn wm_update_window(wm: WindowManager, ws: surface.WindowSurface) -> Result(WindowManager, u64)
+    effect [compute]
+    bound iterations MAX_WINDOWS
+{
+    let mut updated: WindowManager = wm;
+    for i in 0..MAX_WINDOWS {
+        let w_opt: Option(surface.WindowSurface) = updated.windows[i];
+        match w_opt {
+            Option::Some(existing) => {
+                if existing.common.id == ws.common.id {
+                    updated.windows[i] = Option::Some(ws);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2);
+}
+
+// ──────────────────────────────────────────────
+// Focus Management
+// ──────────────────────────────────────────────
+
+fn wm_set_focus(wm: WindowManager, surface_id: u64, now: u64) -> (WindowManager, Option(surface.WindowSurface))
+    effect [compute, residual]
+    bound iterations MAX_WINDOWS
+{
+    let mut updated: WindowManager = wm;
+    let mut focused: Option(surface.WindowSurface) = Option::None;
+
+    // Unfocus current
+    if updated.focused_surface_id > 0 && updated.focused_surface_id != surface_id {
+        let old_focus_opt: Option(surface.WindowSurface) = wm_find_window(updated, updated.focused_surface_id);
+        match old_focus_opt {
+            Option::Some(old) => {
+                let unfocused: surface.WindowSurface = surface.WindowSurface {
+                    common: surface.surface_set_visible(old.common, true),
+                    title: old.title,
+                    app_id: old.app_id,
+                    decorated: old.decorated,
+                    decoration_extents: old.decoration_extents,
+                    window_state: old.window_state,
+                    minimized: old.minimized,
+                    maximized: old.maximized,
+                    fullscreen: old.fullscreen,
+                    resizing: old.resizing,
+                    transient_for: old.transient_for,
+                    parent_id: old.parent_id,
+                    min_size: old.min_size,
+                    max_size: old.max_size,
+                    stacking_order: old.stacking_order,
+                    pid: old.pid,
+                    configured_serial: old.configured_serial,
+                    ack_pending: old.ack_pending,
+                    subsurfaces: old.subsurfaces,
+                    last_configure: old.last_configure,
+                };
+                let res = wm_update_window(updated, unfocused);
+                match res {
+                    Result::Ok(w) => { updated = w; }
+                    Result::Err(_) => {}
+                }
+                // Add to focus history
+                for j in 0..MAX_FOCUS_HISTORY {
+                    let h_opt: Option(u64) = updated.focus_history[j];
+                    match h_opt {
+                        Option::None => {
+                            updated.focus_history[j] = Option::Some(updated.focused_surface_id);
+                            updated.history_depth = updated.history_depth + 1;
+                            break;
+                        }
+                        Option::Some(_) => {}
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+
+    // Focus new
+    if surface_id > 0 {
+        let new_focus_opt: Option(surface.WindowSurface) = wm_find_window(updated, surface_id);
+        match new_focus_opt {
+            Option::Some(ws) => {
+                focused = Option::Some(ws);
+                updated.focused_surface_id = surface_id;
+                updated.focus_timestamp = now;
+                updated.focus_change_count = updated.focus_change_count + 1;
+
+                // Raise to top of stacking order
+                updated = wm_raise_to_top(updated, surface_id);
+
+                residual emit {
+                    op: "wm:focus",
+                    surface_id: surface_id,
+                    timestamp: now,
+                };
+            }
+            Option::None => {
+                // surface not found or not a window
+            }
+        }
+    } else {
+        updated.focused_surface_id = 0;
+    }
+
+    return (updated, focused);
+}
+
+fn wm_get_focus(wm: WindowManager) -> u64
+    effect [compute]
+{
+    return wm.focused_surface_id;
+}
+
+fn wm_focus_previous(wm: WindowManager) -> (WindowManager, u64)
+    effect [compute, residual]
+    bound iterations MAX_FOCUS_HISTORY
+{
+    let mut updated: WindowManager = wm;
+    // Find most recent non-focused surface in history
+    for i in 0..MAX_FOCUS_HISTORY {
+        let fid: u64 = 0;
+        for j in 0..MAX_FOCUS_HISTORY {
+            let h_opt: Option(u64) = updated.focus_history[j];
+            match h_opt {
+                Option::Some(id) => {
+                    if id != updated.focused_surface_id {
+                        fid = id;
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+        if fid > 0 {
+            let (new_wm, _) = wm_set_focus(updated, fid, 0);
+            updated = new_wm;
+            return (updated, fid);
+        }
+    }
+    return (updated, 0);
+}
+
+// ──────────────────────────────────────────────
+// Z-Order / Stacking
+// ──────────────────────────────────────────────
+
+fn wm_raise_to_top(wm: WindowManager, surface_id: u64) -> WindowManager
+    effect [compute]
+    bound iterations MAX_STACK_DEPTH
+{
+    let mut updated: WindowManager = wm;
+    // Remove from current position
+    let mut temp_stack: RingBuf(u64, MAX_STACK_DEPTH) = RingBuf::new();
+    let mut temp_idx: u64 = 0;
+    for i in 0..MAX_STACK_DEPTH {
+        let s_opt: Option(u64) = updated.stacking_order[i];
+        match s_opt {
+            Option::Some(id) => {
+                if id != surface_id {
+                    temp_stack[temp_idx] = Option::Some(id);
+                    temp_idx = temp_idx + 1;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    // Push to top
+    temp_stack[temp_idx] = Option::Some(surface_id);
+    temp_idx = temp_idx + 1;
+    // Copy back
+    for i in 0..MAX_STACK_DEPTH {
+        updated.stacking_order[i] = temp_stack[i];
+    }
+    updated.stack_depth = temp_idx;
+    updated.stack_change_count = updated.stack_change_count + 1;
+    return updated;
+}
+
+fn wm_lower_to_bottom(wm: WindowManager, surface_id: u64) -> WindowManager
+    effect [compute]
+    bound iterations MAX_STACK_DEPTH
+{
+    let mut updated: WindowManager = wm;
+    let mut temp_stack: RingBuf(u64, MAX_STACK_DEPTH) = RingBuf::new();
+    let mut temp_idx: u64 = 0;
+    // Push to bottom first
+    temp_stack[temp_idx] = Option::Some(surface_id);
+    temp_idx = temp_idx + 1;
+    for i in 0..MAX_STACK_DEPTH {
+        let s_opt: Option(u64) = updated.stacking_order[i];
+        match s_opt {
+            Option::Some(id) => {
+                if id != surface_id {
+                    temp_stack[temp_idx] = Option::Some(id);
+                    temp_idx = temp_idx + 1;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    for i in 0..MAX_STACK_DEPTH {
+        updated.stacking_order[i] = temp_stack[i];
+    }
+    updated.stack_depth = temp_idx;
+    updated.stack_change_count = updated.stack_change_count + 1;
+    return updated;
+}
+
+fn wm_place_below(wm: WindowManager, surface_id: u64, below_id: u64) -> WindowManager
+    effect [compute]
+    bound iterations MAX_STACK_DEPTH
+{
+    let mut updated: WindowManager = wm;
+    let mut temp_stack: RingBuf(u64, MAX_STACK_DEPTH) = RingBuf::new();
+    let mut temp_idx: u64 = 0;
+    for i in 0..MAX_STACK_DEPTH {
+        let s_opt: Option(u64) = updated.stacking_order[i];
+        match s_opt {
+            Option::Some(id) => {
+                if id == below_id {
+                    temp_stack[temp_idx] = Option::Some(id);
+                    temp_idx = temp_idx + 1;
+                    temp_stack[temp_idx] = Option::Some(surface_id);
+                    temp_idx = temp_idx + 1;
+                } else if id != surface_id {
+                    temp_stack[temp_idx] = Option::Some(id);
+                    temp_idx = temp_idx + 1;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    for i in 0..MAX_STACK_DEPTH {
+        updated.stacking_order[i] = temp_stack[i];
+    }
+    updated.stack_depth = temp_idx;
+    updated.stack_change_count = updated.stack_change_count + 1;
+    return updated;
+}
+
+fn wm_get_stacking_order(wm: WindowManager) -> RingBuf(u64, MAX_STACK_DEPTH)
+    effect [compute]
+{
+    let mut order: RingBuf(u64, MAX_STACK_DEPTH) = RingBuf::new();
+    for i in 0..MAX_STACK_DEPTH {
+        order[i] = wm.stacking_order[i];
+    }
+    return order;
+}
+
+// ──────────────────────────────────────────────
+// Configuration Transactions
+// ──────────────────────────────────────────────
+
+fn wm_begin_configure(wm: WindowManager, surface_id: u64) -> (WindowManager, protocol.SurfaceConfiguration)
+    effect [compute]
+{
+    let mut updated: WindowManager = wm;
+    updated.configure_serial = updated.configure_serial + 1;
+    let cfg: protocol.SurfaceConfiguration = protocol.SurfaceConfiguration {
+        surface_id: surface_id,
+        fields: Array::zeroed(),
+        serial: updated.configure_serial,
+        committed: false,
+    };
+    return (updated, cfg);
+}
+
+fn wm_configure_position(wm: WindowManager, cfg: protocol.SurfaceConfiguration, x: i32, y: i32) -> protocol.SurfaceConfiguration
+    effect [compute]
+{
+    let mut updated_cfg: protocol.SurfaceConfiguration = cfg;
+    for i in 0..32 {
+        let f_opt: Option(protocol.ConfigureField) = updated_cfg.fields[i];
+        match f_opt {
+            Option::None => {
+                updated_cfg.fields[i] = Option::Some(protocol.ConfigureField::Position(protocol.make_point(x, y)));
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated_cfg;
+}
+
+fn wm_configure_size(wm: WindowManager, cfg: protocol.SurfaceConfiguration, w: u32, h: u32) -> protocol.SurfaceConfiguration
+    effect [compute]
+{
+    let mut updated_cfg: protocol.SurfaceConfiguration = cfg;
+    for i in 0..32 {
+        let f_opt: Option(protocol.ConfigureField) = updated_cfg.fields[i];
+        match f_opt {
+            Option::None => {
+                updated_cfg.fields[i] = Option::Some(protocol.ConfigureField::Size(protocol.make_size(w, h)));
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated_cfg;
+}
+
+fn wm_configure_state(wm: WindowManager, cfg: protocol.SurfaceConfiguration, state: protocol.WindowState) -> protocol.SurfaceConfiguration
+    effect [compute]
+{
+    let mut updated_cfg: protocol.SurfaceConfiguration = cfg;
+    let state_val: u64 = match state {
+        protocol.WindowState::Normal => { 0 }
+        protocol.WindowState::Minimized => { 1 }
+        protocol.WindowState::Maximized => { 2 }
+        protocol.WindowState::Fullscreen => { 3 }
+        _ => { 0 }
+    };
+    for i in 0..32 {
+        let f_opt: Option(protocol.ConfigureField) = updated_cfg.fields[i];
+        match f_opt {
+            Option::None => {
+                updated_cfg.fields[i] = Option::Some(protocol.ConfigureField::State(state_val));
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated_cfg;
+}
+
+fn wm_send_configure(wm: WindowManager, cfg: protocol.SurfaceConfiguration) -> (WindowManager, bool)
+    effect [compute, residual]
+    bound iterations MAX_CONFIGURE_OPS
+{
+    let mut updated: WindowManager = wm;
+    let committed: protocol.SurfaceConfiguration = protocol.SurfaceConfiguration {
+        surface_id: cfg.surface_id,
+        fields: cfg.fields,
+        serial: cfg.serial,
+        committed: true,
+    };
+    for i in 0..MAX_CONFIGURE_OPS {
+        let p_opt: Option(protocol.SurfaceConfiguration) = updated.pending_configures[i];
+        match p_opt {
+            Option::None => {
+                updated.pending_configures[i] = Option::Some(committed);
+                updated.configure_count = updated.configure_count + 1;
+                updated.configure_count_total = updated.configure_count_total + 1;
+                residual emit {
+                    op: "wm:configure",
+                    surface_id: cfg.surface_id,
+                    serial: cfg.serial,
+                };
+                return (updated, true);
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return (updated, false);
+}
+
+fn wm_ack_configure(wm: WindowManager, surface_id: u64, serial: u64) -> WindowManager
+    effect [compute, residual]
+    bound iterations MAX_CONFIGURE_OPS
+{
+    let mut updated: WindowManager = wm;
+    for i in 0..MAX_CONFIGURE_OPS {
+        let cfg_opt: Option(protocol.SurfaceConfiguration) = updated.pending_configures[i];
+        match cfg_opt {
+            Option::Some(cfg) => {
+                if cfg.surface_id == surface_id && cfg.serial == serial {
+                    updated.pending_configures[i] = Option::None;
+                    updated.configure_count = updated.configure_count - 1;
+                    residual emit {
+                        op: "wm:ack_configure",
+                        surface_id: surface_id,
+                        serial: serial,
+                    };
+                    break;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    // Update window state
+    match wm_find_window(updated, surface_id) {
+        Option::Some(ws) => {
+            let acked: surface.WindowSurface = surface.window_ack_configure(ws);
+            let res = wm_update_window(updated, acked);
+            match res {
+                Result::Ok(w) => { updated = w; }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Window Operations
+// ──────────────────────────────────────────────
+
+fn wm_move_window(wm: WindowManager, surface_id: u64, new_pos: protocol.Point) -> (WindowManager, Option(surface.WindowSurface))
+    effect [compute, residual]
+{
+    let mut updated: WindowManager = wm;
+    match wm_find_window(updated, surface_id) {
+        Option::Some(ws) => {
+            let moved: surface.WindowSurface = surface.WindowSurface {
+                common: surface.surface_set_position(ws.common, new_pos),
+                title: ws.title,
+                app_id: ws.app_id,
+                decorated: ws.decorated,
+                decoration_extents: ws.decoration_extents,
+                window_state: ws.window_state,
+                minimized: ws.minimized,
+                maximized: ws.maximized,
+                fullscreen: ws.fullscreen,
+                resizing: ws.resizing,
+                transient_for: ws.transient_for,
+                parent_id: ws.parent_id,
+                min_size: ws.min_size,
+                max_size: ws.max_size,
+                stacking_order: ws.stacking_order,
+                pid: ws.pid,
+                configured_serial: ws.configured_serial,
+                ack_pending: ws.ack_pending,
+                subsurfaces: ws.subsurfaces,
+                last_configure: ws.last_configure,
+            };
+            let res = wm_update_window(updated, moved);
+            match res {
+                Result::Ok(w) => {
+                    updated = w;
+                    residual emit {
+                        op: "wm:move",
+                        surface_id: surface_id,
+                        x: new_pos.x,
+                        y: new_pos.y,
+                    };
+                    return (updated, Option::Some(moved));
+                }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    return (updated, Option::None);
+}
+
+fn wm_resize_window(wm: WindowManager, surface_id: u64, new_size: protocol.Size) -> (WindowManager, Option(surface.WindowSurface))
+    effect [compute, residual]
+{
+    let mut updated: WindowManager = wm;
+    // Clamp size
+    let clamped_w: u32 = if new_size.width < updated.min_width { updated.min_width }
+        else if new_size.width > updated.max_width { updated.max_width }
+        else { new_size.width };
+    let clamped_h: u32 = if new_size.height < updated.min_height { updated.min_height }
+        else if new_size.height > updated.max_height { updated.max_height }
+        else { new_size.height };
+    let clamped: protocol.Size = protocol.make_size(clamped_w, clamped_h);
+
+    match wm_find_window(updated, surface_id) {
+        Option::Some(ws) => {
+            let resized: surface.WindowSurface = surface.WindowSurface {
+                common: surface.surface_set_size(ws.common, clamped),
+                title: ws.title,
+                app_id: ws.app_id,
+                decorated: ws.decorated,
+                decoration_extents: ws.decoration_extents,
+                window_state: ws.window_state,
+                minimized: ws.minimized,
+                maximized: ws.maximized,
+                fullscreen: ws.fullscreen,
+                resizing: ws.resizing,
+                transient_for: ws.transient_for,
+                parent_id: ws.parent_id,
+                min_size: ws.min_size,
+                max_size: ws.max_size,
+                stacking_order: ws.stacking_order,
+                pid: ws.pid,
+                configured_serial: ws.configured_serial,
+                ack_pending: ws.ack_pending,
+                subsurfaces: ws.subsurfaces,
+                last_configure: ws.last_configure,
+            };
+            let res = wm_update_window(updated, resized);
+            match res {
+                Result::Ok(w) => {
+                    updated = w;
+                    residual emit {
+                        op: "wm:resize",
+                        surface_id: surface_id,
+                        width: clamped_w,
+                        height: clamped_h,
+                    };
+                    return (updated, Option::Some(resized));
+                }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    return (updated, Option::None);
+}
+
+fn wm_minimize_window(wm: WindowManager, surface_id: u64) -> (WindowManager, Option(surface.WindowSurface))
+    effect [compute, residual]
+{
+    let mut updated: WindowManager = wm;
+    match wm_find_window(updated, surface_id) {
+        Option::Some(ws) => {
+            let minimized: surface.WindowSurface = surface.WindowSurface {
+                common: surface.surface_set_visible(ws.common, false),
+                title: ws.title,
+                app_id: ws.app_id,
+                decorated: ws.decorated,
+                decoration_extents: ws.decoration_extents,
+                window_state: ws.window_state,
+                minimized: true,
+                maximized: false,
+                fullscreen: false,
+                resizing: false,
+                transient_for: ws.transient_for,
+                parent_id: ws.parent_id,
+                min_size: ws.min_size,
+                max_size: ws.max_size,
+                stacking_order: ws.stacking_order,
+                pid: ws.pid,
+                configured_serial: ws.configured_serial,
+                ack_pending: ws.ack_pending,
+                subsurfaces: ws.subsurfaces,
+                last_configure: ws.last_configure,
+            };
+            let res = wm_update_window(updated, minimized);
+            match res {
+                Result::Ok(w) => {
+                    updated = w;
+                    residual emit {
+                        op: "wm:minimize",
+                        surface_id: surface_id,
+                    };
+                    return (updated, Option::Some(minimized));
+                }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    return (updated, Option::None);
+}
+
+fn wm_maximize_window(wm: WindowManager, surface_id: u64, output_rect: protocol.Rectangle) -> (WindowManager, Option(surface.WindowSurface))
+    effect [compute, residual]
+{
+    let mut updated: WindowManager = wm;
+    match wm_find_window(updated, surface_id) {
+        Option::Some(ws) => {
+            let max_size: protocol.Size = protocol.make_size(output_rect.width, output_rect.height);
+            let max_pos: protocol.Point = protocol.make_point(output_rect.x, output_rect.y);
+            let maximized: surface.WindowSurface = surface.WindowSurface {
+                common: surface.surface_set_position(surface.surface_set_size(ws.common, max_size), max_pos),
+                title: ws.title,
+                app_id: ws.app_id,
+                decorated: ws.decorated,
+                decoration_extents: ws.decoration_extents,
+                window_state: ws.window_state,
+                minimized: false,
+                maximized: true,
+                fullscreen: false,
+                resizing: false,
+                transient_for: ws.transient_for,
+                parent_id: ws.parent_id,
+                min_size: ws.min_size,
+                max_size: ws.max_size,
+                stacking_order: ws.stacking_order,
+                pid: ws.pid,
+                configured_serial: ws.configured_serial,
+                ack_pending: ws.ack_pending,
+                subsurfaces: ws.subsurfaces,
+                last_configure: ws.last_configure,
+            };
+            let res = wm_update_window(updated, maximized);
+            match res {
+                Result::Ok(w) => {
+                    updated = w;
+                    residual emit {
+                        op: "wm:maximize",
+                        surface_id: surface_id,
+                    };
+                    return (updated, Option::Some(maximized));
+                }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    return (updated, Option::None);
+}
+
+fn wm_restore_window(wm: WindowManager, surface_id: u64, pos: protocol.Point, sz: protocol.Size) -> (WindowManager, Option(surface.WindowSurface))
+    effect [compute, residual]
+{
+    let mut updated: WindowManager = wm;
+    match wm_find_window(updated, surface_id) {
+        Option::Some(ws) => {
+            let restored: surface.WindowSurface = surface.WindowSurface {
+                common: surface.surface_set_position(surface.surface_set_visible(surface.surface_set_size(ws.common, sz), true), pos),
+                title: ws.title,
+                app_id: ws.app_id,
+                decorated: ws.decorated,
+                decoration_extents: ws.decoration_extents,
+                window_state: ws.window_state,
+                minimized: false,
+                maximized: false,
+                fullscreen: false,
+                resizing: false,
+                transient_for: ws.transient_for,
+                parent_id: ws.parent_id,
+                min_size: ws.min_size,
+                max_size: ws.max_size,
+                stacking_order: ws.stacking_order,
+                pid: ws.pid,
+                configured_serial: ws.configured_serial,
+                ack_pending: ws.ack_pending,
+                subsurfaces: ws.subsurfaces,
+                last_configure: ws.last_configure,
+            };
+            let res = wm_update_window(updated, restored);
+            match res {
+                Result::Ok(w) => {
+                    updated = w;
+                    residual emit {
+                        op: "wm:restore",
+                        surface_id: surface_id,
+                    };
+                    return (updated, Option::Some(restored));
+                }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    return (updated, Option::None);
+}
+
+fn wm_close_window(wm: WindowManager, surface_id: u64) -> (WindowManager, bool)
+    effect [compute, residual]
+{
+    let mut updated: WindowManager = wm;
+    let found: bool = false;
+    match wm_find_window(updated, surface_id) {
+        Option::Some(_) => {
+            let res = wm_unregister_window(updated, surface_id);
+            match res {
+                Result::Ok(w) => {
+                    updated = w;
+                    found = true;
+                }
+                Result::Err(_) => {}
+            }
+        }
+        Option::None => {}
+    }
+    residual emit {
+        op: "wm:close",
+        surface_id: surface_id,
+        success: found,
+    };
+    return (updated, found);
+}
+
+// ──────────────────────────────────────────────
+// Decoration
+// ──────────────────────────────────────────────
+
+fn wm_set_decoration_style(wm: WindowManager, style: protocol.DecorationStyle) -> WindowManager
+    effect [compute, residual]
+{
+    residual emit {
+        op: "wm:decoration_style",
+        title_bar_height: style.title_bar_height,
+        border_width: style.border_width,
+        corner_radius: style.corner_radius,
+    };
+    return WindowManager {
+        initialized: wm.initialized,
+        windows: wm.windows,
+        window_count: wm.window_count,
+        focused_surface_id: wm.focused_surface_id,
+        focus_timestamp: wm.focus_timestamp,
+        focus_history: wm.focus_history,
+        history_depth: wm.history_depth,
+        stacking_order: wm.stacking_order,
+        stack_depth: wm.stack_depth,
+        next_stacking_id: wm.next_stacking_id,
+        decoration_style: style,
+        decoration_enabled: wm.decoration_enabled,
+        pending_configures: wm.pending_configures,
+        configure_count: wm.configure_count,
+        configure_serial: wm.configure_serial,
+        allow_fullscreen: wm.allow_fullscreen,
+        allow_minimize: wm.allow_minimize,
+        allow_maximize: wm.allow_maximize,
+        allow_resize: wm.allow_resize,
+        allow_move: wm.allow_move,
+        focus_follows_mouse: wm.focus_follows_mouse,
+        click_to_focus: wm.click_to_focus,
+        raise_on_click: wm.raise_on_click,
+        default_width: wm.default_width,
+        default_height: wm.default_height,
+        min_width: wm.min_width,
+        min_height: wm.min_height,
+        max_width: wm.max_width,
+        max_height: wm.max_height,
+        created_count: wm.created_count,
+        destroyed_count: wm.destroyed_count,
+        configure_count_total: wm.configure_count_total,
+        focus_change_count: wm.focus_change_count,
+        stack_change_count: wm.stack_change_count,
+    };
+}
+
+fn wm_toggle_decoration(wm: WindowManager, enabled: bool) -> WindowManager
+    effect [compute, residual]
+{
+    residual emit {
+        op: "wm:decoration_toggle",
+        enabled: enabled,
+    };
+    return WindowManager {
+        initialized: wm.initialized,
+        windows: wm.windows,
+        window_count: wm.window_count,
+        focused_surface_id: wm.focused_surface_id,
+        focus_timestamp: wm.focus_timestamp,
+        focus_history: wm.focus_history,
+        history_depth: wm.history_depth,
+        stacking_order: wm.stacking_order,
+        stack_depth: wm.stack_depth,
+        next_stacking_id: wm.next_stacking_id,
+        decoration_style: wm.decoration_style,
+        decoration_enabled: enabled,
+        pending_configures: wm.pending_configures,
+        configure_count: wm.configure_count,
+        configure_serial: wm.configure_serial,
+        allow_fullscreen: wm.allow_fullscreen,
+        allow_minimize: wm.allow_minimize,
+        allow_maximize: wm.allow_maximize,
+        allow_resize: wm.allow_resize,
+        allow_move: wm.allow_move,
+        focus_follows_mouse: wm.focus_follows_mouse,
+        click_to_focus: wm.click_to_focus,
+        raise_on_click: wm.raise_on_click,
+        default_width: wm.default_width,
+        default_height: wm.default_height,
+        min_width: wm.min_width,
+        min_height: wm.min_height,
+        max_width: wm.max_width,
+        max_height: wm.max_height,
+        created_count: wm.created_count,
+        destroyed_count: wm.destroyed_count,
+        configure_count_total: wm.configure_count_total,
+        focus_change_count: wm.focus_change_count,
+        stack_change_count: wm.stack_change_count,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Enumeration
+// ──────────────────────────────────────────────
+
+struct WindowEnumerator {
+    ids: Array(u64, MAX_WINDOWS),
+    count: u64,
+}
+
+fn wm_enumerate_windows(wm: WindowManager) -> WindowEnumerator
+    effect [compute]
+    bound iterations MAX_WINDOWS
+{
+    let mut enumerator: WindowEnumerator = WindowEnumerator {
+        ids: Array::zeroed(),
+        count: 0,
+    };
+    for i in 0..MAX_WINDOWS {
+        let w_opt: Option(surface.WindowSurface) = wm.windows[i];
+        match w_opt {
+            Option::Some(ws) => {
+                enumerator.ids[enumerator.count] = ws.common.id;
+                enumerator.count = enumerator.count + 1;
+            }
+            Option::None => {}
+        }
+    }
+    return enumerator;
+}
+
+fn wm_surface_at_point(wm: WindowManager, px: i32, py: i32) -> u64
+    effect [compute]
+    bound iterations MAX_STACK_DEPTH
+{
+    // Check from top of stack to bottom
+    for i in 0..MAX_STACK_DEPTH {
+        let s_opt: Option(u64) = wm.stacking_order[MAX_STACK_DEPTH - 1 - i];
+        match s_opt {
+            Option::Some(sid) => {
+                if sid == 0 { break; }
+                match wm_find_window(wm, sid) {
+                    Option::Some(ws) => {
+                        if ws.common.visible {
+                            let r: protocol.Rectangle = protocol.make_rect(
+                                ws.common.position.x, ws.common.position.y,
+                                ws.common.size.width, ws.common.size.height);
+                            if protocol.rect_contains(r, px, py) {
+                                return sid;
+                            }
+                        }
+                    }
+                    Option::None => {}
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return 0;
+}
+
+// ──────────────────────────────────────────────
+// Policy
+// ──────────────────────────────────────────────
+
+fn wm_set_policy(wm: WindowManager, click_focus: bool, raise_click: bool, focus_mouse: bool) -> WindowManager
+    effect [compute, residual]
+{
+    residual emit {
+        op: "wm:policy",
+        click_to_focus: click_focus,
+        raise_on_click: raise_click,
+        focus_follows_mouse: focus_mouse,
+    };
+    return WindowManager {
+        initialized: wm.initialized,
+        windows: wm.windows,
+        window_count: wm.window_count,
+        focused_surface_id: wm.focused_surface_id,
+        focus_timestamp: wm.focus_timestamp,
+        focus_history: wm.focus_history,
+        history_depth: wm.history_depth,
+        stacking_order: wm.stacking_order,
+        stack_depth: wm.stack_depth,
+        next_stacking_id: wm.next_stacking_id,
+        decoration_style: wm.decoration_style,
+        decoration_enabled: wm.decoration_enabled,
+        pending_configures: wm.pending_configures,
+        configure_count: wm.configure_count,
+        configure_serial: wm.configure_serial,
+        allow_fullscreen: wm.allow_fullscreen,
+        allow_minimize: wm.allow_minimize,
+        allow_maximize: wm.allow_maximize,
+        allow_resize: wm.allow_resize,
+        allow_move: wm.allow_move,
+        focus_follows_mouse: focus_mouse,
+        click_to_focus: click_focus,
+        raise_on_click: raise_click,
+        default_width: wm.default_width,
+        default_height: wm.default_height,
+        min_width: wm.min_width,
+        min_height: wm.min_height,
+        max_width: wm.max_width,
+        max_height: wm.max_height,
+        created_count: wm.created_count,
+        destroyed_count: wm.destroyed_count,
+        configure_count_total: wm.configure_count_total,
+        focus_change_count: wm.focus_change_count,
+        stack_change_count: wm.stack_change_count,
+    };
+}
+
+// ──────────────────────────────────────────────
+// WM Info
+// ──────────────────────────────────────────────
+
+struct WMInfo {
+    initialized: bool,
+    window_count: u64,
+    focused_surface_id: u64,
+    stack_depth: u64,
+    decoration_enabled: bool,
+    pending_configures: u64,
+    created_count: u64,
+    destroyed_count: u64,
+    focus_change_count: u64,
+    click_to_focus: bool,
+    focus_follows_mouse: bool,
+    default_width: u32,
+    default_height: u32,
+}
+
+fn wm_get_info(wm: WindowManager) -> WMInfo
+    effect [compute]
+{
+    return WMInfo {
+        initialized: wm.initialized,
+        window_count: wm.window_count,
+        focused_surface_id: wm.focused_surface_id,
+        stack_depth: wm.stack_depth,
+        decoration_enabled: wm.decoration_enabled,
+        pending_configures: wm.configure_count,
+        created_count: wm.created_count,
+        destroyed_count: wm.destroyed_count,
+        focus_change_count: wm.focus_change_count,
+        click_to_focus: wm.click_to_focus,
+        focus_follows_mouse: wm.focus_follows_mouse,
+        default_width: wm.default_width,
+        default_height: wm.default_height,
+    };
+}

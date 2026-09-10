@@ -1,0 +1,1507 @@
+// network_stack.phor — Network stack orchestration: driver registration, packet dispatch, protocol demux, buffer management, interface management
+// Coordinates all network protocols (Ethernet, ARP, IPv4, IPv6, ICMP, UDP, TCP, DNS, DHCP, TLS) into a unified stack.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/network_stack.phor
+// Court: network_stack:v1
+
+package network.stack;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ethernet.*;
+import network.arp.*;
+import network.ipv4.*;
+import network.ipv6.*;
+import network.icmp.*;
+import network.udp.*;
+import network.tcp.*;
+import network.socket.*;
+import network.dns.*;
+import network.dhcp.*;
+import network.tls.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// Network Stack sub-range: 0xEB00 - 0xEBFF
+
+type NetworkStackError = enum {
+    NetStackNotInitialized     = 0xEB00,  // NEB00: Network stack not initialized
+    NetStackAlreadyInitialized = 0xEB01,  // NEB01: Network stack already initialized
+    NetStackDriverNotFound     = 0xEB02,  // NEB02: Network driver not found
+    NetStackInterfaceDown      = 0xEB03,  // NEB03: Network interface is down
+    NetStackNoMemory           = 0xEB04,  // NEB04: Network buffer allocation failed
+    NetStackDemuxFailed        = 0xEB05,  // NEB05: Protocol demultiplexing failed
+    NetStackUnsupportedProto   = 0xEB06,  // NEB06: Unsupported protocol
+    NetStackCapabilityError    = 0xEB07,  // NEB07: Insufficient capability for network operation
+    NetStackBufferFull         = 0xEB08,  // NEB08: Network buffer full
+    NetStackBufferEmpty        = 0xEB09,  // NEB09: Network buffer empty
+    NetStackTimeout            = 0xEB0A,  // NEB0A: Network operation timed out
+    NetStackMtuExceeded        = 0xEB0B,  // NEB0B: Packet exceeds MTU
+    NetStackArpFailed          = 0xEB0C,  // NEB0C: ARP resolution failed
+    NetStackRoutingFailed      = 0xEB0D,  // NEB0D: Routing failed
+    NetStackChecksumError      = 0xEB0E,  // NEB0E: Protocol checksum error
+    NetStackConfigError        = 0xEB0F,  // NEB0F: Configuration error
+    NetStackDrvRegistration    = 0xEB10,  // NEB10: Driver registration limit reached
+    NetStackInterfaceNotFound  = 0xEB11,  // NEB11: Network interface not found
+    NetStackIpConflict         = 0xEB12,  // NEB12: IP address conflict detected
+    NetStackLoopDetected       = 0xEB13,  // NEB13: Packet loop detected
+    NetStackFragError          = 0xEB14,  // NEB14: Fragmentation/reassembly error
+    NetStackRateLimitExceeded  = 0xEB15,  // NEB15: Rate limit exceeded
+    NetStackPortBlocked        = 0xEB16,  // NEB16: Port blocked by capability filter
+    NetStackProtoNotReady      = 0xEB17,  // NEB17: Protocol layer not ready
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const NET_STACK_MAX_INTERFACES : u64 = 16;
+const NET_STACK_MAX_DRIVERS    : u64 = 32;
+const NET_STACK_RX_BUF_SIZE    : u64 = 256;
+const NET_STACK_TX_BUF_SIZE    : u64 = 256;
+const NET_STACK_MTU_DEFAULT    : u64 = 1500;
+const NET_STACK_TIMER_INTERVAL_MS : u64 = 100;
+const NET_STACK_MAX_PACKET_CHAIN : u64 = 16;
+
+// ─────────────────────────────────────────────────────────────
+// Packet Buffer
+// ─────────────────────────────────────────────────────────────
+
+struct PacketBuffer {
+    data: Array(u8, 1518),
+    length: u64,
+    interface_index: u64,
+    timestamp: u64,
+    protocol: u16,
+    next_buf: u64,
+    in_use: bool,
+}
+
+impl PacketBuffer {
+    fn empty() -> PacketBuffer
+        effect [deterministic]
+    {
+        return PacketBuffer {
+            data: Array::zeroed(),
+            length: 0,
+            interface_index: 0,
+            timestamp: 0,
+            protocol: 0,
+            next_buf: 0,
+            in_use: false,
+        };
+    }
+
+    fn allocate() -> PacketBuffer
+        effect [deterministic]
+    {
+        return PacketBuffer {
+            data: Array::zeroed(),
+            length: 0,
+            interface_index: 0,
+            timestamp: 0,
+            protocol: 0,
+            next_buf: 0,
+            in_use: true,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Packet Buffer Pool (Fixed-Capacity)
+// ─────────────────────────────────────────────────────────────
+
+struct PacketBufferPool {
+    buffers: Array(PacketBuffer, NET_STACK_RX_BUF_SIZE),
+    free_list: Array(u64, NET_STACK_RX_BUF_SIZE),
+    free_count: u64,
+}
+
+impl PacketBufferPool {
+    fn new() -> PacketBufferPool
+        effect [deterministic]
+    {
+        let mut free_list: Array(u64, NET_STACK_RX_BUF_SIZE) = Array::zeroed();
+        loop bound NET_STACK_RX_BUF_SIZE {
+            free_list[i] = i;
+        };
+        return PacketBufferPool {
+            buffers: Array::zeroed(),
+            free_list: free_list,
+            free_count: NET_STACK_RX_BUF_SIZE,
+        };
+    }
+
+    fn alloc(self: ref mut) -> Result(u64, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.free_count == 0 {
+            return Result::Err(NetworkStackError::NetStackBufferFull);
+        };
+        self.free_count = self.free_count - 1;
+        let idx: u64 = self.free_list[self.free_count];
+        self.buffers[idx] = PacketBuffer::allocate();
+        return Result::Ok(idx);
+    }
+
+    fn free(self: ref mut, idx: u64)
+        effect [deterministic]
+    {
+        if idx < NET_STACK_RX_BUF_SIZE {
+            self.buffers[idx].in_use = false;
+            self.free_list[self.free_count] = idx;
+            self.free_count = self.free_count + 1;
+        };
+    }
+
+    fn get(self: ref mut, idx: u64) -> Result(ref mut PacketBuffer, NetworkStackError)
+        effect [deterministic]
+    {
+        if idx >= NET_STACK_RX_BUF_SIZE || !self.buffers[idx].in_use {
+            return Result::Err(NetworkStackError::NetStackBufferEmpty);
+        };
+        return Result::Ok(self.buffers[idx]);
+    }
+
+    fn available(self) -> u64
+        effect [deterministic]
+    {
+        return self.free_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Interface Configuration
+// ─────────────────────────────────────────────────────────────
+
+struct NetInterfaceConfig {
+    name: Array(u8, 32),
+    name_len: u64,
+    mac_address: Array(u8, ETH_ADDR_LEN),
+    ipv4_address: Ipv4Address,
+    ipv4_netmask: Ipv4Address,
+    ipv4_gateway: Ipv4Address,
+    ipv6_address: Ipv6Address,
+    ipv6_gateway: Ipv6Address,
+    dns_server: Ipv4Address,
+    dhcp_enabled: bool,
+    mtu: u64,
+    speed_mb: u64,
+    promiscuous: bool,
+    multicast_enabled: bool,
+    checksum_offload: bool,
+    tso_enabled: bool,
+    rss_enabled: bool,
+    flow_control: bool,
+    up: bool,
+    generation: u64,
+}
+
+impl NetInterfaceConfig {
+    fn new(name: Array(u8, 32), name_len: u64, mac: Array(u8, ETH_ADDR_LEN)) -> NetInterfaceConfig
+        effect [deterministic]
+    {
+        return NetInterfaceConfig {
+            name: name,
+            name_len: name_len,
+            mac_address: mac,
+            ipv4_address: Ipv4Address::any(),
+            ipv4_netmask: Ipv4Address::any(),
+            ipv4_gateway: Ipv4Address::any(),
+            ipv6_address: Ipv6Address::any(),
+            ipv6_gateway: Ipv6Address::any(),
+            dns_server: Ipv4Address::any(),
+            dhcp_enabled: false,
+            mtu: NET_STACK_MTU_DEFAULT,
+            speed_mb: 1000,
+            promiscuous: false,
+            multicast_enabled: false,
+            checksum_offload: true,
+            tso_enabled: false,
+            rss_enabled: false,
+            flow_control: true,
+            up: false,
+            generation: 1,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Interface
+// ─────────────────────────────────────────────────────────────
+
+struct NetworkInterface {
+    config: NetInterfaceConfig,
+    nic_handle: u64,
+    eth_registry: Handle(NicRegistry),
+    arp_state: ArpState,
+    slaac_state: SlaacState,
+    ipv4_routes: Ipv4RoutingTable,
+    ipv6_routes: Ipv6RoutingTable,
+    reassembly: ReassemblyBuffer,
+    rx_chain: Array(u64, NET_STACK_MAX_PACKET_CHAIN),
+    rx_chain_count: u64,
+    tx_chain: Array(u64, NET_STACK_MAX_PACKET_CHAIN),
+    tx_chain_count: u64,
+    packets_in: u64,
+    packets_out: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    errors_in: u64,
+    errors_out: u64,
+    last_activity: u64,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Protocol Dispatcher
+// ─────────────────────────────────────────────────────────────
+
+struct ProtocolDispatchEntry {
+    ether_type: u16,
+    handler: fn(u64, ref mut PacketBuffer, ref mut NetworkStack) -> Result(void, NetworkStackError)
+               effect [deterministic, memory:mmio, machine:ioport],
+    registered: bool,
+}
+
+const MAX_DISPATCH_ENTRIES: u64 = 16;
+
+struct ProtocolDispatcher {
+    entries: Array(ProtocolDispatchEntry, MAX_DISPATCH_ENTRIES),
+    entry_count: u64,
+}
+
+impl ProtocolDispatcher {
+    fn new() -> ProtocolDispatcher
+        effect [deterministic]
+    {
+        return ProtocolDispatcher {
+            entries: Array::zeroed(),
+            entry_count: 0,
+        };
+    }
+
+    fn register(self: ref mut, ether_type: u16,
+                 handler: fn(u64, ref mut PacketBuffer, ref mut NetworkStack) -> Result(void, NetworkStackError)
+                           effect [deterministic, memory:mmio, machine:ioport])
+        -> Result(void, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.entry_count >= MAX_DISPATCH_ENTRIES {
+            return Result::Err(NetworkStackError::NetStackDrvRegistration);
+        };
+        self.entries[self.entry_count] = ProtocolDispatchEntry {
+            ether_type: ether_type,
+            handler: handler,
+            registered: true,
+        };
+        self.entry_count = self.entry_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn dispatch(self: ref mut, iface_idx: u64, pkt_buf: ref mut PacketBuffer,
+                 stack: ref mut NetworkStack) -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let ether_type: u16 = pkt_buf.protocol;
+        loop bound MAX_DISPATCH_ENTRIES {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].registered && self.entries[i].ether_type == ether_type {
+                return self.entries[i].handler(iface_idx, pkt_buf, stack);
+            };
+        };
+        return Result::Err(NetworkStackError::NetStackDemuxFailed);
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Manager
+// ─────────────────────────────────────────────────────────────
+
+struct TimerEntry {
+    interval_ms: u64,
+    last_fire: u64,
+    callback: fn(u64) -> void effect [deterministic],
+    user_data: u64,
+    active: bool,
+}
+
+const MAX_TIMERS: u64 = 32;
+
+struct TimerManager {
+    timers: Array(TimerEntry, MAX_TIMERS),
+    timer_count: u64,
+}
+
+impl TimerManager {
+    fn new() -> TimerManager
+        effect [deterministic]
+    {
+        return TimerManager {
+            timers: Array::zeroed(),
+            timer_count: 0,
+        };
+    }
+
+    fn add_timer(self: ref mut, interval_ms: u64, callback: fn(u64) -> void effect [deterministic],
+                  user_data: u64) -> Result(void, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.timer_count >= MAX_TIMERS {
+            return Result::Err(NetworkStackError::NetStackBufferFull);
+        };
+        self.timers[self.timer_count] = TimerEntry {
+            interval_ms: interval_ms,
+            last_fire: 0,
+            callback: callback,
+            user_data: user_data,
+            active: true,
+        };
+        self.timer_count = self.timer_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn tick(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        loop bound MAX_TIMERS {
+            if i >= self.timer_count {
+                break;
+            };
+            if !self.timers[i].active {
+                continue;
+            };
+            if (now - self.timers[i].last_fire) >= self.timers[i].interval_ms {
+                self.timers[i].last_fire = now;
+                self.timers[i].callback(self.timers[i].user_data);
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Statistics
+// ─────────────────────────────────────────────────────────────
+
+struct NetworkStackStatistics {
+    total_packets_received: u64,
+    total_packets_sent: u64,
+    total_bytes_received: u64,
+    total_bytes_sent: u64,
+    total_errors_received: u64,
+    total_errors_sent: u64,
+    arp_requests_sent: u64,
+    arp_replies_sent: u64,
+    ipv4_packets_received: u64,
+    ipv6_packets_received: u64,
+    icmp_echo_sent: u64,
+    icmp_echo_received: u64,
+    udp_datagrams_sent: u64,
+    udp_datagrams_received: u64,
+    tcp_segments_sent: u64,
+    tcp_segments_received: u64,
+    dns_queries_sent: u64,
+    dhcp_transactions: u64,
+    tls_handshakes: u64,
+    reassembly_completions: u64,
+    reassembly_failures: u64,
+    buffer_allocs: u64,
+    buffer_frees: u64,
+    driver_irqs: u64,
+    stack_uptime_ms: u64,
+}
+
+impl NetworkStackStatistics {
+    fn new() -> NetworkStackStatistics
+        effect [deterministic]
+    {
+        return NetworkStackStatistics {
+            total_packets_received: 0,
+            total_packets_sent: 0,
+            total_bytes_received: 0,
+            total_bytes_sent: 0,
+            total_errors_received: 0,
+            total_errors_sent: 0,
+            arp_requests_sent: 0,
+            arp_replies_sent: 0,
+            ipv4_packets_received: 0,
+            ipv6_packets_received: 0,
+            icmp_echo_sent: 0,
+            icmp_echo_received: 0,
+            udp_datagrams_sent: 0,
+            udp_datagrams_received: 0,
+            tcp_segments_sent: 0,
+            tcp_segments_received: 0,
+            dns_queries_sent: 0,
+            dhcp_transactions: 0,
+            tls_handshakes: 0,
+            reassembly_completions: 0,
+            reassembly_failures: 0,
+            buffer_allocs: 0,
+            buffer_frees: 0,
+            driver_irqs: 0,
+            stack_uptime_ms: 0,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Main Network Stack
+// ─────────────────────────────────────────────────────────────
+
+struct NetworkStack {
+    initialized: bool,
+    interfaces: Array(NetworkInterface, NET_STACK_MAX_INTERFACES),
+    interface_count: u64,
+    nic_registry: Handle(NicRegistry),
+    buffer_pool: Handle(PacketBufferPool),
+    dispatcher: ProtocolDispatcher,
+    timer_mgr: TimerManager,
+    udp_state: UdpState,
+    tcp_state: TcpStateMachine,
+    icmp_state: IcmpState,
+    dns_resolver: DnsResolver,
+    dhcp_client: Option(DhcpClient),
+    socket_mgr: Option(SocketManager),
+    local_ip: Ipv4Address,
+    stats: NetworkStackStatistics,
+    generation: u64,
+    started_at: u64,
+}
+
+impl NetworkStack {
+    fn new(
+        nic_reg: Handle(NicRegistry),
+        local_ip: Ipv4Address,
+        mac: Array(u8, ETH_ADDR_LEN),
+    ) -> NetworkStack
+        effect [deterministic]
+    {
+        return NetworkStack {
+            initialized: false,
+            interfaces: Array::zeroed(),
+            interface_count: 0,
+            nic_registry: nic_reg,
+            buffer_pool: PacketBufferPool::new(),
+            dispatcher: ProtocolDispatcher::new(),
+            timer_mgr: TimerManager::new(),
+            udp_state: UdpState::new(),
+            tcp_state: TcpStateMachine::new(),
+            icmp_state: IcmpState::new(),
+            dns_resolver: DnsResolver::new(),
+            dhcp_client: Option::None,
+            socket_mgr: Option::None,
+            local_ip: local_ip,
+            stats: NetworkStackStatistics::new(),
+            generation: 1,
+            started_at: 0,
+        };
+    }
+
+    fn init(self: ref mut, timestamp: u64) -> Result(void, NetworkStackError)
+        effect [deterministic]
+        court "netstack_init:v1"
+    {
+        if self.initialized {
+            return Result::Err(NetworkStackError::NetStackAlreadyInitialized);
+        };
+        self.started_at = timestamp;
+        self.initialized = true;
+        self.generation = self.generation + 1;
+        // Register protocol dispatch handlers (thin wrappers adapt protocol types)
+        // IPv4
+        self.dispatcher.register(0x0800, fn(iface_idx: u64, pkt: ref mut PacketBuffer,
+                                              stack: ref mut NetworkStack) -> Result(void, NetworkStackError)
+                                              effect [deterministic, memory:mmio, machine:ioport] {
+            return stack.handle_ipv4_packet(iface_idx, pkt);
+        })?;
+        // ARP
+        self.dispatcher.register(0x0806, fn(iface_idx: u64, pkt: ref mut PacketBuffer,
+                                              stack: ref mut NetworkStack) -> Result(void, NetworkStackError)
+                                              effect [deterministic, memory:mmio, machine:ioport] {
+            return stack.handle_arp_packet(iface_idx, pkt);
+        })?;
+        // IPv6
+        self.dispatcher.register(0x86DD, fn(iface_idx: u64, pkt: ref mut PacketBuffer,
+                                              stack: ref mut NetworkStack) -> Result(void, NetworkStackError)
+                                              effect [deterministic, memory:mmio, machine:ioport] {
+            return stack.handle_ipv6_packet(iface_idx, pkt);
+        })?;
+
+        residual emit {
+            op: "netstack.init",
+            timestamp: timestamp,
+            generation: self.generation,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn register_interface(
+        self: ref mut,
+        name: Array(u8, 32),
+        name_len: u64,
+        mac: Array(u8, ETH_ADDR_LEN),
+        nic_idx: u64,
+    ) -> Result(u64, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.interface_count >= NET_STACK_MAX_INTERFACES {
+            return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+        };
+        let idx: u64 = self.interface_count;
+        self.interfaces[idx] = NetworkInterface {
+            config: NetInterfaceConfig::new(name, name_len, mac),
+            nic_handle: nic_idx,
+            eth_registry: self.nic_registry,
+            arp_state: ArpState::new(mac, Array::zeroed()),
+            slaac_state: SlaacState::new(mac),
+            ipv4_routes: Ipv4RoutingTable::new(),
+            ipv6_routes: Ipv6RoutingTable::new(),
+            reassembly: ReassemblyBuffer::new(),
+            rx_chain: Array::zeroed(),
+            rx_chain_count: 0,
+            tx_chain: Array::zeroed(),
+            tx_chain_count: 0,
+            packets_in: 0,
+            packets_out: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            errors_in: 0,
+            errors_out: 0,
+            last_activity: 0,
+            generation: 1,
+        };
+        self.interface_count = self.interface_count + 1;
+
+        residual emit {
+            op: "netstack.register_interface",
+            index: idx,
+            name: name,
+            mac: mac,
+        };
+
+        return Result::Ok(idx);
+    }
+
+    fn set_interface_ip(self: ref mut, iface_idx: u64, ip: Ipv4Address, netmask: Ipv4Address, gateway: Ipv4Address)
+        effect [deterministic]
+    {
+        if iface_idx < self.interface_count {
+            self.interfaces[iface_idx].config.ipv4_address = ip;
+            self.interfaces[iface_idx].config.ipv4_netmask = netmask;
+            self.interfaces[iface_idx].config.ipv4_gateway = gateway;
+            self.interfaces[iface_idx].arp_state.update_local_ip(ip.to_array(), 0);
+            self.local_ip = ip;
+
+            residual emit {
+                op: "netstack.set_ip",
+                interface: iface_idx,
+                ip: ip.to_array(),
+            };
+        };
+    }
+
+    fn bring_up(self: ref mut, iface_idx: u64, now: u64) -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        if iface_idx >= self.interface_count {
+            return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+        };
+        self.interfaces[iface_idx].config.up = true;
+        self.interfaces[iface_idx].last_activity = now;
+
+        residual emit {
+            op: "netstack.interface_up",
+            index: iface_idx,
+            timestamp: now,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn bring_down(self: ref mut, iface_idx: u64, now: u64) -> Result(void, NetworkStackError)
+        effect [deterministic]
+    {
+        if iface_idx >= self.interface_count {
+            return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+        };
+        self.interfaces[iface_idx].config.up = false;
+
+        residual emit {
+            op: "netstack.interface_down",
+            index: iface_idx,
+            timestamp: now,
+        };
+
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Receive Path
+    // ─────────────────────────────────────────────────────
+    fn receive_packet(self: ref mut, iface_idx: u64, raw_data: Array(u8, 1518), raw_len: u64, timestamp: u64)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+        court "netstack_receive:v1"
+    {
+        if !self.initialized {
+            return Result::Err(NetworkStackError::NetStackNotInitialized);
+        };
+        if iface_idx >= self.interface_count {
+            return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+        };
+        // Allocate buffer
+        let buf_idx_res: Result(u64, NetworkStackError) = self.buffer_pool.alloc();
+        if buf_idx_res.is_err() {
+            self.stats.total_errors_received = self.stats.total_errors_received + 1;
+            return Result::Err(buf_idx_res.unwrap_err());
+        };
+        let buf_idx: u64 = buf_idx_res.unwrap();
+        let buf_res: Result(ref mut PacketBuffer, NetworkStackError) = self.buffer_pool.get(buf_idx);
+        if buf_res.is_err() {
+            return Result::Err(buf_res.unwrap_err());
+        };
+        let buf: ref mut PacketBuffer = buf_res.unwrap();
+        // Copy raw data into buffer
+        let copy_len: u64 = if raw_len > 1518 { 1518 } else { raw_len };
+        loop bound 1518 {
+            if i >= copy_len {
+                break;
+            };
+            buf.data[i] = raw_data[i];
+        };
+        buf.length = copy_len;
+        buf.interface_index = iface_idx;
+        buf.timestamp = timestamp;
+        self.stats.buffer_allocs = self.stats.buffer_allocs + 1;
+        // Parse Ethernet header to determine protocol
+        if copy_len < 14 {
+            self.buffer_pool.free(buf_idx);
+            return Result::Err(NetworkStackError::NetStackDemuxFailed);
+        };
+        let ether_type: u16 = ((buf.data[12] as u16) << 8) | (buf.data[13] as u16);
+        buf.protocol = ether_type;
+        // Dispatch to protocol handler
+        let dispatch_res: Result(void, NetworkStackError) = self.dispatcher.dispatch(iface_idx, buf, self);
+        if dispatch_res.is_err() {
+            self.interfaces[iface_idx].errors_in = self.interfaces[iface_idx].errors_in + 1;
+            self.buffer_pool.free(buf_idx);
+            return Result::Err(dispatch_res.unwrap_err());
+        };
+        self.interfaces[iface_idx].packets_in = self.interfaces[iface_idx].packets_in + 1;
+        self.interfaces[iface_idx].bytes_in = self.interfaces[iface_idx].bytes_in + copy_len;
+        self.stats.total_packets_received = self.stats.total_packets_received + 1;
+        self.stats.total_bytes_received = self.stats.total_bytes_received + copy_len;
+        self.buffer_pool.free(buf_idx);
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // ARP Handler
+    // ─────────────────────────────────────────────────────
+    fn handle_arp_packet(self: ref mut, iface_idx: u64, buf: ref mut PacketBuffer)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        if buf.length < 28 {
+            return Result::Err(NetworkStackError::NetStackDemuxFailed);
+        };
+        let arp_data: Array(u8, 1518) = buf.data;
+        // Skip Ethernet header (14 bytes) to get to ARP payload
+        let arp_payload_offset: u64 = 14;
+        let arp_len: u64 = buf.length - arp_payload_offset;
+        let mut arp_raw: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= arp_len {
+                break;
+            };
+            arp_raw[j] = arp_data[arp_payload_offset + j];
+        };
+        let arp_pkt_res: Result(ArpPacket, ArpError) = ArpPacket::parse(arp_raw, arp_len);
+        if arp_pkt_res.is_err() {
+            return Result::Err(NetworkStackError::NetStackDemuxFailed);
+        };
+        let arp_pkt: ArpPacket = arp_pkt_res.unwrap();
+        let (result, response): (Result(void, ArpError), Option(ArpPacket)) =
+            self.interfaces[iface_idx].arp_state.handle_packet(arp_pkt, buf.timestamp);
+        if result.is_err() {
+            return Result::Err(NetworkStackError::NetStackArpFailed);
+        };
+        if response.is_some() {
+            // Need to send ARP reply
+            let reply: ArpPacket = response.unwrap();
+            let reply_bytes_res: Result(Array(u8, 1518), ArpError) = reply.serialize();
+            if reply_bytes_res.is_ok() {
+                let reply_bytes: Array(u8, 1518) = reply_bytes_res.unwrap();
+                let _ = self.send_ethernet_frame(iface_idx, reply_bytes, 28, 0x0806, buf.timestamp);
+            };
+        };
+        self.stats.arp_requests_sent = self.stats.arp_requests_sent + 1;
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // IPv4 Handler
+    // ─────────────────────────────────────────────────────
+    fn handle_ipv4_packet(self: ref mut, iface_idx: u64, buf: ref mut PacketBuffer)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let ipv4_payload_offset: u64 = 14;
+        let ip_len: u64 = buf.length - ipv4_payload_offset;
+        let mut ip_raw: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= ip_len {
+                break;
+            };
+            ip_raw[j] = buf.data[ipv4_payload_offset + j];
+        };
+        let ip_res: Result(Ipv4Packet, Ipv4Error) = Ipv4Packet::parse(ip_raw, ip_len);
+        if ip_res.is_err() {
+            self.stats.total_errors_received = self.stats.total_errors_received + 1;
+            return Result::Err(NetworkStackError::NetStackChecksumError);
+        };
+        let ip_pkt: Ipv4Packet = ip_res.unwrap();
+        self.stats.ipv4_packets_received = self.stats.ipv4_packets_received + 1;
+        // TTL check
+        let ttl_ok: bool = ip_pkt.header.ttl > 0;
+        if !ttl_ok {
+            // Send ICMP time exceeded
+            return Result::Err(NetworkStackError::NetStackChecksumError);
+        };
+        // Reassembly
+        let reass_res: Result(Option(Ipv4Packet), Ipv4Error) = ipv4_reassemble(
+            self.interfaces[iface_idx].reassembly,
+            ip_pkt.header,
+            ip_raw,
+            ip_len,
+            buf.timestamp,
+        );
+        if reass_res.is_err() {
+            self.stats.reassembly_failures = self.stats.reassembly_failures + 1;
+            return Result::Err(NetworkStackError::NetStackFragError);
+        };
+        let maybe_pkt: Option(Ipv4Packet) = reass_res.unwrap();
+        if maybe_pkt.is_none() {
+            return Result::Ok(void); // Waiting for more fragments
+        };
+        let reassembled: Ipv4Packet = maybe_pkt.unwrap();
+        self.stats.reassembly_completions = self.stats.reassembly_completions + 1;
+        // Demux by protocol
+        let proto: u8 = reassembled.header.protocol;
+        if proto == 1 {
+            // ICMPv4
+            return self.handle_icmpv4_packet(iface_idx, reassembled, buf.timestamp);
+        } else if proto == 17 {
+            // UDP
+            return self.handle_udp_packet(iface_idx, reassembled, buf.timestamp);
+        } else if proto == 6 {
+            // TCP
+            return self.handle_tcp_packet(iface_idx, reassembled, buf.timestamp);
+        };
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // IPv6 Handler
+    // ─────────────────────────────────────────────────────
+    fn handle_ipv6_packet(self: ref mut, iface_idx: u64, buf: ref mut PacketBuffer)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let ipv6_offset: u64 = 14;
+        let ipv6_len: u64 = buf.length - ipv6_offset;
+        let mut ipv6_raw: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= ipv6_len {
+                break;
+            };
+            ipv6_raw[j] = buf.data[ipv6_offset + j];
+        };
+        let ipv6_res: Result(Ipv6Packet, Ipv6Error) = Ipv6Packet::parse(ipv6_raw, ipv6_len);
+        if ipv6_res.is_err() {
+            return Result::Err(NetworkStackError::NetStackDemuxFailed);
+        };
+        let ipv6_pkt: Ipv6Packet = ipv6_res.unwrap();
+        self.stats.ipv6_packets_received = self.stats.ipv6_packets_received + 1;
+        // Check hop limit
+        if ipv6_pkt.header.hop_limit <= 1 {
+            return Result::Err(NetworkStackError::NetStackLoopDetected);
+        };
+        // Demux by next header
+        if ipv6_pkt.upper_protocol == 58 {
+            // ICMPv6 (includes NDP)
+            return self.handle_icmpv6_packet(iface_idx, ipv6_pkt, buf.timestamp);
+        } else if ipv6_pkt.upper_protocol == 17 {
+            // UDP over IPv6
+            return Result::Ok(void);
+        } else if ipv6_pkt.upper_protocol == 6 {
+            // TCP over IPv6
+            return Result::Ok(void);
+        };
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // ICMPv4 Handler
+    // ─────────────────────────────────────────────────────
+    fn handle_icmpv4_packet(self: ref mut, iface_idx: u64, ip_pkt: Ipv4Packet, timestamp: u64)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let icmp_raw: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= ip_pkt.payload_length { break; };
+            icmp_raw[j] = ip_pkt.payload[j];
+        };
+        let icmp_res: Result(Icmpv4Packet, IcmpError) = Icmpv4Packet::parse(icmp_raw, ip_pkt.payload_length);
+        if icmp_res.is_err() {
+            return Result::Err(NetworkStackError::NetStackChecksumError);
+        };
+        let icmp_pkt: Icmpv4Packet = icmp_res.unwrap();
+        if icmp_pkt.is_echo_request() {
+            let reply_res: Result(Option(Icmpv4Packet), IcmpError) =
+                self.icmp_state.handle_v4_echo(icmp_pkt, timestamp);
+            if reply_res.is_ok() {
+                self.stats.icmp_echo_received = self.stats.icmp_echo_received + 1;
+            };
+        } else if icmp_pkt.is_dest_unreachable() || icmp_pkt.is_time_exceeded() {
+            self.stats.total_errors_received = self.stats.total_errors_received + 1;
+        };
+        return Result::Ok(void);
+    }
+
+    fn handle_icmpv6_packet(self: ref mut, iface_idx: u64, ipv6_pkt: Ipv6Packet, timestamp: u64)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let _ = iface_idx;
+        let _ = ipv6_pkt;
+        let _ = timestamp;
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // UDP Handler
+    // ─────────────────────────────────────────────────────
+    fn handle_udp_packet(self: ref mut, iface_idx: u64, ip_pkt: Ipv4Packet, timestamp: u64)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let _ = iface_idx;
+        let udp_raw: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= ip_pkt.payload_length { break; };
+            udp_raw[j] = ip_pkt.payload[j];
+        };
+        let udp_res: Result(UdpDatagram, UdpError) = UdpDatagram::parse(udp_raw, ip_pkt.payload_length);
+        if udp_res.is_err() {
+            return Result::Err(NetworkStackError::NetStackChecksumError);
+        };
+        let datagram: UdpDatagram = udp_res.unwrap();
+        // Verify checksum
+        if !datagram.verify_checksum(ip_pkt.header.source_addr.to_array(), ip_pkt.header.dest_addr.to_array()) {
+            return Result::Err(NetworkStackError::NetStackChecksumError);
+        };
+        // Deliver to UDP port table
+        let deliver_res: Result(void, UdpError) = self.udp_state.receive(datagram, ip_pkt.header.source_addr, timestamp);
+        if deliver_res.is_err() {
+            // Port not open
+            self.stats.total_errors_received = self.stats.total_errors_received + 1;
+        };
+        self.stats.udp_datagrams_received = self.stats.udp_datagrams_received + 1;
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // TCP Handler
+    // ─────────────────────────────────────────────────────
+    fn handle_tcp_packet(self: ref mut, iface_idx: u64, ip_pkt: Ipv4Packet, timestamp: u64)
+        -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let _ = iface_idx;
+        let tcp_raw: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= ip_pkt.payload_length { break; };
+            tcp_raw[j] = ip_pkt.payload[j];
+        };
+        let tcp_res: Result(TcpSegment, TcpError) = TcpSegment::parse(tcp_raw, ip_pkt.payload_length);
+        if tcp_res.is_err() {
+            return Result::Err(NetworkStackError::NetStackChecksumError);
+        };
+        let _segment: TcpSegment = tcp_res.unwrap();
+        self.stats.tcp_segments_received = self.stats.tcp_segments_received + 1;
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Send Path
+    // ─────────────────────────────────────────────────────
+    fn send_ethernet_frame(
+        self: ref mut,
+        iface_idx: u64,
+        payload: Array(u8, 1518),
+        payload_len: u64,
+        ether_type: u16,
+        timestamp: u64,
+    ) -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        if iface_idx >= self.interface_count {
+            return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+        };
+        // Build Ethernet frame
+        let iface: NetworkInterface = self.interfaces[iface_idx];
+        let mac: Array(u8, ETH_ADDR_LEN) = iface.config.mac_address;
+        // Use broadcast as default destination if none specified
+        let broadcast: Array(u8, ETH_ADDR_LEN) = Array::from_literal([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut eth_data: Array(u8, 1518) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            eth_data[i] = broadcast[i]; // dst
+            eth_data[6 + i] = mac[i];  // src
+        };
+        eth_data[12] = ((ether_type >> 8) & 0xFF) as u8;
+        eth_data[13] = (ether_type & 0xFF) as u8;
+        loop bound 1518 {
+            if j >= payload_len {
+                break;
+            };
+            eth_data[14 + j] = payload[j];
+        };
+        let total_frame_len: u64 = 14 + payload_len;
+        // Pad to minimum frame size
+        let final_len: u64 = if total_frame_len < 60 { 64 } else { total_frame_len + 4 };
+        // Record statistics
+        self.interfaces[iface_idx].packets_out = self.interfaces[iface_idx].packets_out + 1;
+        self.interfaces[iface_idx].bytes_out = self.interfaces[iface_idx].bytes_out + final_len;
+        self.stats.total_packets_sent = self.stats.total_packets_sent + 1;
+        self.stats.total_bytes_sent = self.stats.total_bytes_sent + final_len;
+
+        residual emit {
+            op: "netstack.send_frame",
+            interface: iface_idx,
+            ether_type: ether_type,
+            length: final_len,
+            timestamp: timestamp,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn send_ipv4_packet(
+        self: ref mut,
+        iface_idx: u64,
+        dst_ip: Ipv4Address,
+        protocol: u8,
+        payload: Array(u8, 1518),
+        payload_len: u64,
+        timestamp: u64,
+    ) -> Result(void, NetworkStackError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let iface: NetworkInterface = self.interfaces[iface_idx];
+        let src_ip: Ipv4Address = iface.config.ipv4_address;
+        let mut header: Ipv4Header = Ipv4Header::new(src_ip, dst_ip, protocol, payload_len);
+        header.set_identification((timestamp & 0xFFFF) as u16);
+        header.compute_and_set_checksum();
+        let hdr_buf_res: Result(Array(u8, 1518), Ipv4Error) = header.serialize();
+        if hdr_buf_res.is_err() {
+            return Result::Err(NetworkStackError::NetStackBufOverflow);
+        };
+        let hdr_buf: Array(u8, 1518) = hdr_buf_res.unwrap();
+        let hdr_len: u64 = header.header_length();
+        let mut ip_buf: Array(u8, 1518) = Array::zeroed();
+        loop bound 1518 {
+            if j >= hdr_len { break; };
+            ip_buf[j] = hdr_buf[j];
+        };
+        loop bound 1518 {
+            if j >= payload_len { break; };
+            ip_buf[hdr_len + j] = payload[j];
+        };
+        let total_ip_len: u64 = hdr_len + payload_len;
+        // ARP resolution for destination MAC
+        let arp_res: Result(Array(u8, ETH_ADDR_LEN), ArpError) = iface.arp_state.resolve(dst_ip.to_array(), timestamp);
+        // Send over Ethernet
+        let send_res: Result(void, NetworkStackError) = self.send_ethernet_frame(
+            iface_idx, ip_buf, total_ip_len, 0x0800, timestamp,
+        );
+        return send_res;
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Socket API Wrappers
+    // ─────────────────────────────────────────────────────
+    fn enable_sockets(self: ref mut, cap: Cap(NicCapability)) -> Result(void, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.socket_mgr.is_none() {
+            let tcp_handle: Handle(TcpStateMachine) = Handle::new(self.tcp_state);
+            let udp_handle: Handle(UdpState) = Handle::new(self.udp_state);
+            let sock_mgr: SocketManager = SocketManager::new(
+                tcp_handle, udp_handle, self.local_ip, 0,
+            );
+            self.socket_mgr = Option::Some(sock_mgr);
+        };
+        return Result::Ok(void);
+    }
+
+    fn enable_dhcp(self: ref mut, mac: Array(u8, ETH_ADDR_LEN), hostname: Array(u8, 64), hlen: u64)
+        -> Result(void, NetworkStackError)
+        effect [deterministic]
+    {
+        let dhcp_res: Result(DhcpClient, DhcpError) = dhcp_init(mac, hostname, hlen);
+        if dhcp_res.is_ok() {
+            self.dhcp_client = Option::Some(dhcp_res.unwrap());
+        };
+        return Result::Ok(void);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Timer / Periodic Processing
+    // ─────────────────────────────────────────────────────
+    fn periodic_tick(self: ref mut, now: u64)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        // Update uptime
+        if self.started_at > 0 {
+            self.stats.stack_uptime_ms = now - self.started_at;
+        };
+        // Process periodic maintenance for each interface
+        loop bound NET_STACK_MAX_INTERFACES {
+            if i >= self.interface_count {
+                break;
+            };
+            if self.interfaces[i].config.up {
+                // ARP maintenance
+                self.interfaces[i].arp_state.periodic_maintenance(now);
+                // IPv4 reassembly timeout
+                self.interfaces[i].reassembly.purge_expired(now);
+            };
+        };
+        // Fire timers
+        self.timer_mgr.tick(now);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // Statistics
+    // ─────────────────────────────────────────────────────
+    fn get_statistics(self) -> NetworkStackStatistics
+        effect [deterministic]
+    {
+        return self.stats;
+    }
+
+    fn get_interface_stats(self, iface_idx: u64) -> Result((u64, u64, u64, u64, u64, u64), NetworkStackError)
+        effect [deterministic]
+    {
+        if iface_idx >= self.interface_count {
+            return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+        };
+        let iface: NetworkInterface = self.interfaces[iface_idx];
+        return Result::Ok((
+            iface.packets_in,
+            iface.packets_out,
+            iface.bytes_in,
+            iface.bytes_out,
+            iface.errors_in,
+            iface.errors_out,
+        ));
+    }
+
+    fn is_running(self) -> bool
+        effect [deterministic]
+    {
+        return self.initialized;
+    }
+
+    fn uptime_ms(self) -> u64
+        effect [deterministic]
+    {
+        return self.stats.stack_uptime_ms;
+    }
+
+    fn interface_count(self) -> u64
+        effect [deterministic]
+    {
+        return self.interface_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization Function
+// ─────────────────────────────────────────────────────────────
+
+fn netstack_create(
+    nic_reg: Handle(NicRegistry),
+    local_ip: Ipv4Address,
+    mac: Array(u8, ETH_ADDR_LEN),
+    timestamp: u64,
+) -> Result(NetworkStack, NetworkStackError)
+    effect [deterministic]
+    court "netstack_create:v1"
+{
+    let mut stack: NetworkStack = NetworkStack::new(nic_reg, local_ip, mac);
+    let init_res: Result(void, NetworkStackError) = stack.init(timestamp);
+    if init_res.is_err() {
+        return Result::Err(init_res.unwrap_err());
+    };
+
+    residual emit {
+        op: "netstack.created",
+        timestamp: timestamp,
+        local_ip: local_ip.to_array(),
+        status: "operational",
+    };
+
+    return Result::Ok(stack);
+}
+
+fn netstack_system_init(timestamp: u64) -> Result(Handle(NetworkStack), NetworkStackError)
+    effect [deterministic]
+    court "netstack_system_init:v1"
+{
+    residual emit {
+        op: "netstack.system_init",
+        timestamp: timestamp,
+        status: "booting",
+    };
+    return Result::Err(NetworkStackError::NetStackNotInitialized);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Diagnostic Functions
+// ─────────────────────────────────────────────────────────────
+
+fn netstack_diag_print_interfaces(stack: ref NetworkStack) -> Result(u64, NetworkStackError)
+    effect [deterministic]
+{
+    if !stack.initialized {
+        return Result::Err(NetworkStackError::NetStackNotInitialized);
+    };
+    let mut up_count: u64 = 0;
+    loop bound NET_STACK_MAX_INTERFACES {
+        if i >= stack.interface_count {
+            break;
+        };
+        if stack.interfaces[i].config.up {
+            up_count = up_count + 1;
+        };
+    };
+    return Result::Ok(up_count);
+}
+
+fn netstack_diag_print_stats(stack: ref NetworkStack) -> NetworkStackStatistics
+    effect [deterministic]
+{
+    return stack.stats;
+}
+
+fn netstack_diag_check_integrity(stack: ref NetworkStack) -> bool
+    effect [deterministic]
+{
+    if !stack.initialized {
+        return false;
+    };
+    if stack.interface_count > NET_STACK_MAX_INTERFACES {
+        return false;
+    };
+    loop bound NET_STACK_MAX_INTERFACES {
+        if i >= stack.interface_count {
+            break;
+        };
+        let iface: NetworkInterface = stack.interfaces[i];
+        if iface.packets_in < iface.packets_out {
+            // This can happen during counter wrap
+        };
+    };
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Buffer Management Utilities
+// ─────────────────────────────────────────────────────────────
+
+fn netstack_buffer_chain_alloc(pool: ref mut PacketBufferPool, count: u64)
+    -> Result(Array(u64, NET_STACK_MAX_PACKET_CHAIN), NetworkStackError)
+    effect [deterministic]
+{
+    if count > NET_STACK_MAX_PACKET_CHAIN {
+        return Result::Err(NetworkStackError::NetStackNoMemory);
+    };
+    let mut chain: Array(u64, NET_STACK_MAX_PACKET_CHAIN) = Array::zeroed();
+    loop bound NET_STACK_MAX_PACKET_CHAIN {
+        if i >= count {
+            break;
+        };
+        let buf_res: Result(u64, NetworkStackError) = pool.alloc();
+        if buf_res.is_err() {
+            // Free already allocated
+            loop bound NET_STACK_MAX_PACKET_CHAIN {
+                if j >= i {
+                    break;
+                };
+                pool.free(chain[j]);
+            };
+            return Result::Err(buf_res.unwrap_err());
+        };
+        chain[i] = buf_res.unwrap();
+    };
+    return Result::Ok(chain);
+}
+
+fn netstack_buffer_chain_free(pool: ref mut PacketBufferPool, chain: Array(u64, NET_STACK_MAX_PACKET_CHAIN), count: u64)
+    effect [deterministic]
+{
+    loop bound NET_STACK_MAX_PACKET_CHAIN {
+        if i >= count {
+            break;
+        };
+        pool.free(chain[i]);
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Configuration Validation
+// ─────────────────────────────────────────────────────────────
+
+fn netstack_validate_config(config: NetInterfaceConfig) -> Result(void, NetworkStackError)
+    effect [deterministic]
+{
+    if config.name_len == 0 || config.name_len > 32 {
+        return Result::Err(NetworkStackError::NetStackConfigError);
+    };
+    if config.mtu < 576 || config.mtu > 9000 {
+        return Result::Err(NetworkStackError::NetStackConfigError);
+    };
+    loop bound ETH_ADDR_LEN {
+        if config.mac_address[i] == 0 && i == 0 {
+            return Result::Err(NetworkStackError::NetStackConfigError);
+        };
+    };
+    return Result::Ok(void);
+}
+
+fn netstack_validate_ip_config(ip: Ipv4Address, netmask: Ipv4Address, gateway: Ipv4Address) -> Result(void, NetworkStackError)
+    effect [deterministic]
+{
+    if ip.is_unspecified() {
+        return Result::Err(NetworkStackError::NetStackConfigError);
+    };
+    if ip.is_loopback() && !gateway.is_unspecified() {
+        return Result::Err(NetworkStackError::NetStackConfigError);
+    };
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Event Notification
+// ─────────────────────────────────────────────────────────────
+
+type NetStackEvent = enum {
+    EventLinkUp         = 0,
+    EventLinkDown       = 1,
+    EventIpAssigned     = 2,
+    EventIpConflict     = 3,
+    EventDhcpBound      = 4,
+    EventDhcpRenewed    = 5,
+    EventDhcpExpired    = 6,
+    EventArpConflict    = 7,
+    EventDnsResolved    = 8,
+    EventDnsFailed      = 9,
+    EventMtuChanged     = 10,
+    EventRxOverflow     = 11,
+    EventTxTimeout      = 12,
+    EventDriverError    = 13,
+    EventPowerState     = 14,
+}
+
+struct NetStackEventRecord {
+    event_type: NetStackEvent,
+    interface_idx: u64,
+    data: Array(u8, 32),
+    data_len: u64,
+    timestamp: u64,
+}
+
+impl NetStackEventRecord {
+    fn new(event: NetStackEvent, iface: u64, ev_data: Array(u8, 32),
+            dlen: u64, ts: u64) -> NetStackEventRecord
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 32) = Array::zeroed();
+        loop bound 32 {
+            if i >= dlen { break; };
+            data[i] = ev_data[i];
+        };
+        return NetStackEventRecord {
+            event_type: event,
+            interface_idx: iface,
+            data: data,
+            data_len: dlen,
+            timestamp: ts,
+        };
+    }
+}
+
+const NETSTACK_EVENT_QUEUE_SIZE: u64 = 64;
+
+struct NetStackEventQueue {
+    events: Array(NetStackEventRecord, NETSTACK_EVENT_QUEUE_SIZE),
+    head: u64,
+    tail: u64,
+    count: u64,
+}
+
+impl NetStackEventQueue {
+    fn new() -> NetStackEventQueue
+        effect [deterministic]
+    {
+        return NetStackEventQueue {
+            events: Array::zeroed(),
+            head: 0,
+            tail: 0,
+            count: 0,
+        };
+    }
+
+    fn push(self: ref mut, event: NetStackEventRecord) -> Result(void, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.count >= NETSTACK_EVENT_QUEUE_SIZE {
+            return Result::Err(NetworkStackError::NetStackBufferFull);
+        };
+        self.events[self.head] = event;
+        self.head = (self.head + 1) % NETSTACK_EVENT_QUEUE_SIZE;
+        self.count = self.count + 1;
+        return Result::Ok(void);
+    }
+
+    fn pop(self: ref mut) -> Result(NetStackEventRecord, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(NetworkStackError::NetStackBufferEmpty);
+        };
+        let evt: NetStackEventRecord = self.events[self.tail];
+        self.tail = (self.tail + 1) % NETSTACK_EVENT_QUEUE_SIZE;
+        self.count = self.count - 1;
+        return Result::Ok(evt);
+    }
+
+    fn peek(self) -> Result(NetStackEventRecord, NetworkStackError)
+        effect [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(NetworkStackError::NetStackBufferEmpty);
+        };
+        return Result::Ok(self.events[self.tail]);
+    }
+
+    fn pending(self) -> u64
+        effect [deterministic]
+    {
+        return self.count;
+    }
+
+    fn clear(self: ref mut)
+        effect [deterministic]
+    {
+        self.head = 0;
+        self.tail = 0;
+        self.count = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Power Management
+// ─────────────────────────────────────────────────────────────
+
+type NetStackPowerState = enum {
+    PowerFull       = 0,
+    PowerLow        = 1,
+    PowerSuspend    = 2,
+    PowerOff        = 3,
+}
+
+fn netstack_set_power_state(stack: ref mut NetworkStack, state: NetStackPowerState, timestamp: u64)
+    effect [deterministic, memory:mmio, machine:ioport]
+{
+    loop bound NET_STACK_MAX_INTERFACES {
+        if i >= stack.interface_count {
+            break;
+        };
+        if state == NetStackPowerState::PowerOff {
+            stack.interfaces[i].config.up = false;
+        };
+    };
+
+    residual emit {
+        op: "netstack.power_state",
+        state: state as u64,
+        timestamp: timestamp,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Network Stack Route Management
+// ─────────────────────────────────────────────────────────────
+
+fn netstack_add_ipv4_route(stack: ref mut NetworkStack, iface_idx: u64,
+                             dest: Ipv4Address, prefix: u8, gateway: Ipv4Address,
+                             metric: u32) -> Result(void, NetworkStackError)
+    effect [deterministic]
+{
+    if iface_idx >= stack.interface_count {
+        return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+    };
+    let route: Ipv4RouteEntry = Ipv4RouteEntry::new(dest, prefix, gateway, iface_idx, metric, false);
+    let add_res: Result(void, Ipv4Error) = stack.interfaces[iface_idx].ipv4_routes.add_route(route);
+    if add_res.is_err() {
+        return Result::Err(NetworkStackError::NetStackRoutingFailed);
+    };
+    return Result::Ok(void);
+}
+
+fn netstack_add_ipv6_route(stack: ref mut NetworkStack, iface_idx: u64,
+                             dest: Ipv6Address, prefix: u8, gateway: Ipv6Address,
+                             metric: u32) -> Result(void, NetworkStackError)
+    effect [deterministic]
+{
+    if iface_idx >= stack.interface_count {
+        return Result::Err(NetworkStackError::NetStackInterfaceNotFound);
+    };
+    let route: Ipv6RouteEntry = Ipv6RouteEntry {
+        destination: dest,
+        prefix_length: prefix,
+        gateway: gateway,
+        interface_index: iface_idx,
+        metric: metric,
+    };
+    let add_res: Result(void, Ipv6Error) = stack.interfaces[iface_idx].ipv6_routes.add_route(route);
+    if add_res.is_err() {
+        return Result::Err(NetworkStackError::NetStackRoutingFailed);
+    };
+    return Result::Ok(void);
+}

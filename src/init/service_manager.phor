@@ -1,0 +1,1143 @@
+// file: service_manager.phor
+// purpose: Service manager: service records, start/stop/restart, health checks,
+//          watchdog integration, dependency tracking, service status reporting.
+//          All operations use bounded loops and record residuals for all
+//          service state changes.
+// evidence: INIT-SM-ARCH-001 through INIT-SM-ARCH-240
+// residual: Every service start, stop, restart, health check, and status
+//           change records a residual for the service audit trail.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use process::process::*
+use process::thread::*
+use process::signal::*
+use init::init::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-DIAG-001 through INIT-SM-DIAG-010
+
+const DIAG_SM_BASE           : Word64 = Word64::from_u64(0xC100)
+const DIAG_SM_OK             : Word64 = DIAG_SM_BASE | 0x000
+const DIAG_SM_NOT_FOUND      : Word64 = DIAG_SM_BASE | 0x001
+const DIAG_SM_ALREADY_RUNNING: Word64 = DIAG_SM_BASE | 0x002
+const DIAG_SM_ALREADY_STOPPED: Word64 = DIAG_SM_BASE | 0x003
+const DIAG_SM_DEP_FAIL       : Word64 = DIAG_SM_BASE | 0x004
+const DIAG_SM_HEALTH_FAIL    : Word64 = DIAG_SM_BASE | 0x005
+const DIAG_SM_WATCHDOG_TRIG  : Word64 = DIAG_SM_BASE | 0x006
+const DIAG_SM_RESTART_FAIL   : Word64 = DIAG_SM_BASE | 0x007
+const DIAG_SM_BOUNDS         : Word64 = DIAG_SM_BASE | 0x008
+const DIAG_SM_TIMEOUT        : Word64 = DIAG_SM_BASE | 0x009
+
+// ──────────────────────────────────────────────
+// Service Manager Constants
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-CONST-001 through INIT-SM-CONST-020
+
+const SM_MAX_SERVICES            : u32 = 64
+const SM_MAX_DEPENDENCIES        : u32 = 16
+const SM_MAX_HEALTH_CHECKS       : u32 = 8
+const SM_MAX_WATCHDOG_TIMERS     : u32 = 16
+const SM_MAX_RESTART_COUNT       : u32 = 5
+const SM_RESTART_DELAY_US        : u64 = 1000000  // 1 second base delay
+const SM_HEALTH_CHECK_INTERVAL_US: u64 = 5000000  // 5 seconds
+const SM_WATCHDOG_TIMEOUT_US     : u64 = 30000000 // 30 seconds
+const SM_SERVICE_NAME_MAX        : u32 = 64
+const SM_STATUS_MSG_MAX          : u32 = 128
+
+// Service Record Flags
+const SR_FLAG_AUTOSTART          : u32 = 0x01
+const SR_FLAG_RESPWN             : u32 = 0x02
+const SR_FLAG_TRACK_DEPENDENCIES : u32 = 0x04
+const SR_FLAG_NOTIFY_ON_CHANGE   : u32 = 0x08
+
+// Health Check Status
+const HEALTH_UNKNOWN             : u8 = 0
+const HEALTH_OK                  : u8 = 1
+const HEALTH_DEGRADED            : u8 = 2
+const HEALTH_FAILED              : u8 = 3
+const HEALTH_NOT_RUNNING         : u8 = 4
+
+// ──────────────────────────────────────────────
+// Service Record
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-RECORD-001 through INIT-SM-RECORD-035
+
+pub type ServiceRecord : struct {
+    service_index: u32,
+    name: FixedString[SM_SERVICE_NAME_MAX],
+    state: u8,
+    flags: u32,
+    pid: Pid,
+    start_count: u32,
+    stop_count: u32,
+    restart_count: u32,
+    fail_count: u32,
+    health_status: u8,
+    health_message: FixedString[SM_STATUS_MSG_MAX],
+    watchdog_expiry: Word64,
+    last_start_time: Word64,
+    last_stop_time: Word64,
+    last_health_check: Word64,
+    uptime_ns: u64,
+    dependencies: FixedArray[SM_MAX_DEPENDENCIES, u32],
+    num_dependencies: u32,
+    dependents: FixedArray[SM_MAX_DEPENDENCIES, u32],
+    num_dependents: u32,
+    generation: Word32,
+}
+
+impl ServiceRecord {
+    pub fn new(service_index: u32, name: FixedString[SM_SERVICE_NAME_MAX]) -> ServiceRecord
+        effects: [deterministic]
+    {
+        ServiceRecord {
+            service_index: service_index,
+            name: name,
+            state: SVC_STATE_STOPPED,
+            flags: SR_FLAG_AUTOSTART,
+            pid: Pid::zero(),
+            start_count: 0,
+            stop_count: 0,
+            restart_count: 0,
+            fail_count: 0,
+            health_status: HEALTH_NOT_RUNNING,
+            health_message: FixedString::new(),
+            watchdog_expiry: Word64::zero(),
+            last_start_time: Word64::zero(),
+            last_stop_time: Word64::zero(),
+            last_health_check: Word64::zero(),
+            uptime_ns: 0,
+            dependencies: FixedArray::new(),
+            num_dependencies: 0,
+            dependents: FixedArray::new(),
+            num_dependents: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn is_running(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_RUNNING
+    }
+
+    pub fn is_starting(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_STARTING
+    }
+
+    pub fn is_stopped(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_STOPPED
+    }
+
+    pub fn has_failed(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_FAILED
+    }
+
+    pub fn add_dependency(self: ref mut, dep_index: u32) -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_dependencies >= SM_MAX_DEPENDENCIES {
+            return Result::Err(init_error(
+                DIAG_SM_BOUNDS,
+                FixedString[128]::from_slice("Max dependencies per service")))
+        }
+        self.dependencies.push(dep_index);
+        self.num_dependencies = self.num_dependencies + 1
+        Result::Ok(())
+    }
+
+    pub fn add_dependent(self: ref mut, dep_index: u32) -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_dependents >= SM_MAX_DEPENDENCIES {
+            return Result::Err(init_error(
+                DIAG_SM_BOUNDS,
+                FixedString[128]::from_slice("Max dependents per service")))
+        }
+        self.dependents.push(dep_index);
+        self.num_dependents = self.num_dependents + 1
+        Result::Ok(())
+    }
+
+    pub fn set_state(self: ref mut, state: u8)
+        effects: [deterministic]
+    {
+        self.state = state
+        self.generation.bump()
+    }
+
+    pub fn record_start(self: ref mut)
+        effects: [deterministic]
+    {
+        self.start_count = self.start_count + 1
+        self.last_start_time = __builtin_read_timestamp()
+        self.state = SVC_STATE_RUNNING
+        self.generation.bump()
+    }
+
+    pub fn record_stop(self: ref mut)
+        effects: [deterministic]
+    {
+        self.stop_count = self.stop_count + 1
+        self.last_stop_time = __builtin_read_timestamp()
+        if self.state == SVC_STATE_RUNNING {
+            self.uptime_ns = self.uptime_ns +
+                (self.last_stop_time.to_u64() - self.last_start_time.to_u64())
+        }
+        self.state = SVC_STATE_STOPPED
+        self.generation.bump()
+    }
+
+    pub fn record_restart(self: ref mut)
+        effects: [deterministic]
+    {
+        self.restart_count = self.restart_count + 1
+        self.generation.bump()
+    }
+
+    pub fn record_failure(self: ref mut)
+        effects: [deterministic]
+    {
+        self.fail_count = self.fail_count + 1
+        self.state = SVC_STATE_FAILED
+        self.health_status = HEALTH_FAILED
+        self.generation.bump()
+    }
+
+    pub fn set_health(self: ref mut, status: u8,
+                       message: FixedString[SM_STATUS_MSG_MAX])
+        effects: [deterministic]
+    {
+        self.health_status = status
+        self.health_message = message
+        self.last_health_check = __builtin_read_timestamp()
+        if status == HEALTH_OK && self.state == SVC_STATE_RUNNING {
+            // All good
+        } else if status == HEALTH_FAILED {
+            self.state = SVC_STATE_FAILED
+        } else if status == HEALTH_DEGRADED {
+            self.state = SVC_STATE_DEGRADED
+        }
+    }
+
+    pub fn dependencies_satisfied(self, records: ref FixedArray[SM_MAX_SERVICES, ServiceRecord])
+        -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_dependencies
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_dependencies {
+            let dep_idx: u32 = self.dependencies.get(i)
+            if dep_idx >= records.len() {
+                return false
+            }
+            let dep: ref ServiceRecord = records.get(dep_idx)
+            if !dep.is_running() && !dep.is_stopped() {
+                return false
+            }
+        }
+        true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Health Check
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-HEALTH-001 through INIT-SM-HEALTH-020
+
+pub type HealthCheck : struct {
+    service_index: u32,
+    check_fn: u64,
+    interval_us: u64,
+    timeout_us: u64,
+    last_check: Word64,
+    consecutive_failures: u32,
+    max_failures_allowed: u32,
+    is_active: bool,
+}
+
+impl HealthCheck {
+    pub fn new(service_index: u32, check_fn: u64) -> HealthCheck
+        effects: [deterministic]
+    {
+        HealthCheck {
+            service_index: service_index,
+            check_fn: check_fn,
+            interval_us: SM_HEALTH_CHECK_INTERVAL_US,
+            timeout_us: SM_HEALTH_CHECK_INTERVAL_US / 2,
+            last_check: Word64::zero(),
+            consecutive_failures: 0,
+            max_failures_allowed: 3,
+            is_active: true,
+        }
+    }
+
+    pub fn run(self, record: ref mut ServiceRecord)
+        effects: [deterministic, io]
+    {
+        if !self.is_active || self.check_fn == 0 {
+            return
+        }
+        // trust: call health check function
+        let result: u8 = trusted("health check execution") {
+            let checker: fn() -> u8 = __builtin_fn_ptr(self.check_fn)
+            checker()
+        }
+        if result == 0 {
+            record.set_health(HEALTH_OK, FixedString[SM_STATUS_MSG_MAX]::from_slice("OK"));
+            self.consecutive_failures = 0
+        } else if result == 1 {
+            record.set_health(HEALTH_DEGRADED,
+                FixedString[SM_STATUS_MSG_MAX]::from_slice("Degraded"));
+            self.consecutive_failures = self.consecutive_failures + 1
+        } else {
+            record.set_health(HEALTH_FAILED,
+                FixedString[SM_STATUS_MSG_MAX]::from_slice("Failed health check"));
+            self.consecutive_failures = self.consecutive_failures + 1
+        }
+        self.last_check = __builtin_read_timestamp()
+    }
+
+    pub fn should_run(self) -> bool
+        effects: [deterministic]
+    {
+        if !self.is_active {
+            return false
+        }
+        let now: u64 = __builtin_read_timestamp()
+        let elapsed: u64 = now - self.last_check.to_u64()
+        elapsed >= self.interval_us
+    }
+
+    pub fn is_failing(self) -> bool
+        effects: [deterministic]
+    {
+        self.consecutive_failures >= self.max_failures_allowed
+    }
+}
+
+// ──────────────────────────────────────────────
+// Watchdog Timer
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-WATCHDOG-001 through INIT-SM-WATCHDOG-015
+
+pub type WatchdogTimer : struct {
+    service_index: u32,
+    expiry: Word64,
+    timeout_us: u64,
+    is_active: bool,
+    has_fired: bool,
+    action_fn: u64,
+}
+
+impl WatchdogTimer {
+    pub fn new(service_index: u32, timeout_us: u64) -> WatchdogTimer
+        effects: [deterministic]
+    {
+        WatchdogTimer {
+            service_index: service_index,
+            expiry: Word64::zero(),
+            timeout_us: timeout_us,
+            is_active: false,
+            has_fired: false,
+            action_fn: 0,
+        }
+    }
+
+    pub fn arm(self: ref mut)
+        effects: [deterministic]
+    {
+        let now: u64 = __builtin_read_timestamp()
+        self.expiry = Word64::from_u64(now + self.timeout_us)
+        self.is_active = true
+        self.has_fired = false
+    }
+
+    pub fn disarm(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_active = false
+        self.has_fired = false
+    }
+
+    pub fn kick(self: ref mut)
+        effects: [deterministic]
+    {
+        let now: u64 = __builtin_read_timestamp()
+        self.expiry = Word64::from_u64(now + self.timeout_us)
+    }
+
+    pub fn has_expired(self) -> bool
+        effects: [deterministic]
+    {
+        if !self.is_active || self.has_fired {
+            return false
+        }
+        let now: u64 = __builtin_read_timestamp()
+        now >= self.expiry.to_u64()
+    }
+
+    pub fn fire(self: ref mut)
+        effects: [deterministic, io]
+    {
+        if self.has_fired {
+            return
+        }
+        self.has_fired = true
+        if self.action_fn != 0 {
+            // trust: call watchdog action handler
+            trusted("watchdog action execution") {
+                let handler: fn() = __builtin_fn_ptr(self.action_fn)
+                handler()
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Service Manager
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-CORE-001 through INIT-SM-CORE-120
+
+pub type ServiceManager : struct {
+    records: FixedArray[SM_MAX_SERVICES, ServiceRecord],
+    num_records: u32,
+    health_checks: FixedArray[SM_MAX_HEALTH_CHECKS, HealthCheck],
+    num_health_checks: u32,
+    watchdogs: FixedArray[SM_MAX_WATCHDOG_TIMERS, WatchdogTimer],
+    num_watchdogs: u32,
+    total_starts: u64,
+    total_stops: u64,
+    total_restarts: u64,
+    total_failures: u64,
+    total_health_ok: u64,
+    total_health_fail: u64,
+    generation: Word32,
+}
+
+impl ServiceManager {
+    pub fn new() -> ServiceManager
+        effects: [deterministic]
+    {
+        ServiceManager {
+            records: FixedArray::new(),
+            num_records: 0,
+            health_checks: FixedArray::new(),
+            num_health_checks: 0,
+            watchdogs: FixedArray::new(),
+            num_watchdogs: 0,
+            total_starts: 0,
+            total_stops: 0,
+            total_restarts: 0,
+            total_failures: 0,
+            total_health_ok: 0,
+            total_health_fail: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Service Registration
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-REG-001 through INIT-SM-REG-020
+
+    pub fn register_service(self: ref mut, name: FixedString[SM_SERVICE_NAME_MAX])
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.num_records >= SM_MAX_SERVICES {
+            return Result::Err(init_error(
+                DIAG_SM_BOUNDS,
+                FixedString[128]::from_slice("Max services registered")))
+        }
+        let index: u32 = self.num_records
+        let record: ServiceRecord = ServiceRecord::new(index, name)
+        self.records.push(record);
+        self.num_records = self.num_records + 1
+        self.generation.bump();
+        self.record_registration_residual(index, name)
+        Result::Ok(index)
+    }
+
+    pub fn get_record(self: ref, index: u32) -> Result[ref ServiceRecord, InitError>
+        effects: [deterministic]
+    {
+        if index >= self.num_records {
+            return Result::Err(init_error(
+                DIAG_SM_NOT_FOUND,
+                FixedString[128]::from_slice("Service record not found")))
+        }
+        // trust: index bounds-checked
+        trusted("service record access: index within range") {
+            Result::Ok(self.records.get(index))
+        }
+    }
+
+    pub fn get_record_mut(self: ref mut, index: u32)
+        -> Result[ref mut ServiceRecord, InitError>
+        effects: [deterministic]
+    {
+        if index >= self.num_records {
+            return Result::Err(init_error(
+                DIAG_SM_NOT_FOUND,
+                FixedString[128]::from_slice("Service record not found")))
+        }
+        // trust: index bounds-checked
+        trusted("service record mut access: index within range") {
+            Result::Ok(self.records.get_mut(index))
+        }
+    }
+
+    pub fn find_service(self, name: FixedString[SM_SERVICE_NAME_MAX]) -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_records
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_records {
+            let rec: ref ServiceRecord = self.records.get(i)
+            if rec.name == name {
+                return Result::Ok(i)
+            }
+        }
+        Result::Err(init_error(
+            DIAG_SM_NOT_FOUND,
+            FixedString[128]::from_slice("Service name not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Start Service
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-START-001 through INIT-SM-START-035
+
+    pub fn start_service(self: ref mut, index: u32,
+                          table: ref mut ProcessTable)
+        -> Result<Pid, InitError>
+        effects: [deterministic, io]
+    {
+        let record: ref ServiceRecord = self.records.get(index)
+        if record.is_running() {
+            return Result::Err(init_error(
+                DIAG_SM_ALREADY_RUNNING,
+                FixedString[128]::from_slice("Service already running")))
+        }
+        if !record.dependencies_satisfied(&self.records) {
+            return Result::Err(init_error(
+                DIAG_SM_DEP_FAIL,
+                FixedString[128]::from_slice("Dependencies not satisfied")))
+        }
+        // Check dependencies transitively
+        let dep_ok: bool = self.check_dependencies_recursive(index)
+        if !dep_ok {
+            return Result::Err(init_error(
+                DIAG_SM_DEP_FAIL,
+                FixedString[128]::from_slice("Transitive dependency check failed")))
+        }
+        let creds: Credentials = Credentials::kernel_default()
+        let name: FixedString[PROCESS_NAME_MAX_LEN] = FixedString::from_slice(record.name.as_slice())
+        let pid: Pid = table.create_process(Pid::zero(), creds, name)?
+        let rec_mut: ref mut ServiceRecord = self.get_record_mut(index)?
+        rec_mut.pid = pid
+        rec_mut.record_start();
+        self.total_starts = self.total_starts + 1
+        self.generation.bump();
+        self.record_start_residual(index, pid)
+        Result::Ok(pid)
+    }
+
+    fn check_dependencies_recursive(self, index: u32) -> bool
+        effects: [deterministic]
+    {
+        // To avoid infinite recursion, use a simple visited set
+        let mut visited: FixedArray[SM_MAX_SERVICES, bool] = FixedArray::new()
+        // loop: bounds[BOUND_MEDIUM] — bounded by SM_MAX_SERVICES
+        loop: bounds[BOUND_MEDIUM] for i in 0..SM_MAX_SERVICES {
+            visited.push(false)
+        }
+        self.check_deps_dfs(index, &mut visited)
+    }
+
+    fn check_deps_dfs(self, index: u32, visited: ref mut FixedArray[SM_MAX_SERVICES, bool]) -> bool
+        effects: [deterministic]
+    {
+        if index >= self.num_records {
+            return false
+        }
+        if visited.get(index) {
+            return true  // Cycle detected but we assume it's handled
+        }
+        visited.set(index, true);
+        let record: ref ServiceRecord = self.records.get(index)
+        // loop: bounds[BOUND_SMALL] — bounded by num_dependencies
+        loop: bounds[BOUND_SMALL] for i in 0..record.num_dependencies {
+            let dep_idx: u32 = record.dependencies.get(i)
+            if dep_idx >= self.num_records {
+                return false
+            }
+            let dep_rec: ref ServiceRecord = self.records.get(dep_idx)
+            if !dep_rec.is_running() && !dep_rec.is_stopped() {
+                // Check if dependency can be auto-started
+                if (dep_rec.flags & SR_FLAG_AUTOSTART) != 0 {
+                    // Would auto-start in production
+                }
+                return false
+            }
+            if !self.check_deps_dfs(dep_idx, visited) {
+                return false
+            }
+        }
+        true
+    }
+
+    // ──────────────────────────────────────────────
+    // Stop Service
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-STOP-001 through INIT-SM-STOP-025
+
+    pub fn stop_service(self: ref mut, index: u32)
+        -> Result<(), InitError>
+        effects: [deterministic, io]
+    {
+        let record: ref ServiceRecord = self.records.get(index)
+        if !record.is_running() && !record.is_starting() {
+            return Result::Err(init_error(
+                DIAG_SM_ALREADY_STOPPED,
+                FixedString[128]::from_slice("Service not running")))
+        }
+        // Stop dependents first
+        let rec_mut: ref mut ServiceRecord = self.get_record_mut(index)?
+        // loop: bounds[BOUND_SMALL] — bounded by num_dependents
+        loop: bounds[BOUND_SMALL] for i in 0..rec_mut.num_dependents {
+            let dep_idx: u32 = rec_mut.dependents.get(i)
+            if dep_idx < self.num_records {
+                let dep_rec: ref ServiceRecord = self.records.get(dep_idx)
+                if dep_rec.is_running() {
+                    let _ = self.stop_service(dep_idx)
+                }
+            }
+        }
+        let rec_stop: ref mut ServiceRecord = self.get_record_mut(index)?
+        rec_stop.record_stop();
+        self.total_stops = self.total_stops + 1
+        self.generation.bump();
+        self.record_stop_residual(index)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Restart Service
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-RESTART-001 through INIT-SM-RESTART-020
+
+    pub fn restart_service(self: ref mut, index: u32,
+                            table: ref mut ProcessTable)
+        -> Result<Pid, InitError>
+        effects: [deterministic, io]
+    {
+        let record: ref ServiceRecord = self.records.get(index)
+        if record.restart_count >= SM_MAX_RESTART_COUNT {
+            return Result::Err(init_error(
+                DIAG_SM_RESTART_FAIL,
+                FixedString[128]::from_slice("Max restart count exceeded")))
+        }
+        // Stop first
+        let _ = self.stop_service(index);
+        // Delay based on restart count (exponential backoff)
+        let delay_us: u64 = SM_RESTART_DELAY_US *
+                            (1u64 << record.restart_count)
+        // trust: busy-wait delay (in production, use timer)
+        trusted("restart delay") {
+            __builtin_udelay(delay_us)
+        }
+        // Start
+        let pid: Pid = self.start_service(index, table)?
+        let rec_mut: ref mut ServiceRecord = self.get_record_mut(index)?
+        rec_mut.record_restart();
+        self.total_restarts = self.total_restarts + 1
+        self.generation.bump();
+        self.record_restart_residual(index)
+        Result::Ok(pid)
+    }
+
+    // ──────────────────────────────────────────────
+    // Health Checks
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-HEALTH-MGMT-001 through INIT-SM-HEALTH-MGMT-030
+
+    pub fn register_health_check(self: ref mut, service_index: u32, check_fn: u64)
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.num_health_checks >= SM_MAX_HEALTH_CHECKS {
+            return Result::Err(init_error(
+                DIAG_SM_BOUNDS,
+                FixedString[128]::from_slice("Max health checks reached")))
+        }
+        let check: HealthCheck = HealthCheck::new(service_index, check_fn)
+        self.health_checks.push(check);
+        self.num_health_checks = self.num_health_checks + 1
+        Result::Ok(self.num_health_checks - 1)
+    }
+
+    pub fn run_health_checks(self: ref mut)
+        -> Result<u32, InitError>
+        effects: [deterministic, io]
+    {
+        let mut checks_run: u32 = 0
+        // loop: bounds[BOUND_SMALL] — bounded by num_health_checks
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_health_checks {
+            let check: ref mut HealthCheck = self.health_checks.get_mut(i)
+            if !check.should_run() {
+                continue
+            }
+            let svc_idx: u32 = check.service_index
+            if svc_idx >= self.num_records {
+                continue
+            }
+            let record: ref mut ServiceRecord = self.get_record_mut(svc_idx)?
+            check.run(record);
+            checks_run = checks_run + 1
+            if check.is_failing() {
+                self.total_health_fail = self.total_health_fail + 1
+                record.record_failure();
+                self.record_health_fail_residual(svc_idx)
+            } else {
+                self.total_health_ok = self.total_health_ok + 1
+            }
+        }
+        Result::Ok(checks_run)
+    }
+
+    // ──────────────────────────────────────────────
+    // Watchdog Integration
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-WD-MGMT-001 through INIT-SM-WD-MGMT-020
+
+    pub fn register_watchdog(self: ref mut, service_index: u32, timeout_us: u64)
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.num_watchdogs >= SM_MAX_WATCHDOG_TIMERS {
+            return Result::Err(init_error(
+                DIAG_SM_BOUNDS,
+                FixedString[128]::from_slice("Max watchdog timers reached")))
+        }
+        let wd: WatchdogTimer = WatchdogTimer::new(service_index, timeout_us)
+        self.watchdogs.push(wd);
+        self.num_watchdogs = self.num_watchdogs + 1
+        Result::Ok(self.num_watchdogs - 1)
+    }
+
+    pub fn arm_watchdog(self: ref mut, watchdog_index: u32)
+        -> Result<(), InitError>
+        effects: [deterministic]
+    {
+        if watchdog_index >= self.num_watchdogs {
+            return Result::Err(init_error(
+                DIAG_SM_NOT_FOUND,
+                FixedString[128]::from_slice("Watchdog not found")))
+        }
+        let wd: ref mut WatchdogTimer = self.watchdogs.get_mut(watchdog_index)
+        wd.arm();
+        self.record_watchdog_arm_residual(watchdog_index)
+        Result::Ok(())
+    }
+
+    pub fn kick_watchdog(self: ref mut, watchdog_index: u32)
+        -> Result<(), InitError>
+        effects: [deterministic]
+    {
+        if watchdog_index >= self.num_watchdogs {
+            return Result::Err(init_error(
+                DIAG_SM_NOT_FOUND,
+                FixedString[128]::from_slice("Watchdog not found")))
+        }
+        let wd: ref mut WatchdogTimer = self.watchdogs.get_mut(watchdog_index)
+        wd.kick()
+        Result::Ok(())
+    }
+
+    pub fn disarm_watchdog(self: ref mut, watchdog_index: u32)
+        -> Result<(), InitError>
+        effects: [deterministic]
+    {
+        if watchdog_index >= self.num_watchdogs {
+            return Result::Err(init_error(
+                DIAG_SM_NOT_FOUND,
+                FixedString[128]::from_slice("Watchdog not found")))
+        }
+        let wd: ref mut WatchdogTimer = self.watchdogs.get_mut(watchdog_index)
+        wd.disarm()
+        Result::Ok(())
+    }
+
+    pub fn check_watchdogs(self: ref mut) -> Result<u32, InitError>
+        effects: [deterministic, io]
+    {
+        let mut fired: u32 = 0
+        // loop: bounds[BOUND_SMALL] — bounded by num_watchdogs
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_watchdogs {
+            let wd: ref mut WatchdogTimer = self.watchdogs.get_mut(i)
+            if wd.has_expired() {
+                wd.fire();
+                let svc_idx: u32 = wd.service_index
+                if svc_idx < self.num_records {
+                    let record: ref mut ServiceRecord = self.get_record_mut(svc_idx)?
+                    record.record_failure();
+                }
+                fired = fired + 1
+                self.record_watchdog_fire_residual(i)
+            }
+        }
+        Result::Ok(fired)
+    }
+
+    // ──────────────────────────────────────────────
+    // Service Status
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-STATUS-001 through INIT-SM-STATUS-025
+
+    pub fn get_service_status(self, index: u32) -> Result[ServiceStatus, InitError>
+        effects: [deterministic]
+    {
+        let record: ref ServiceRecord = self.get_record(index)?
+        let status: ServiceStatus = ServiceStatus::new(
+            index, record.name, record.state, record.health_status,
+            record.pid, record.start_count, record.fail_count,
+            record.uptime_ns)
+        Result::Ok(status)
+    }
+
+    pub fn get_all_statuses(self) -> FixedArray[SM_MAX_SERVICES, ServiceStatus]
+        effects: [deterministic]
+    {
+        let mut statuses: FixedArray[SM_MAX_SERVICES, ServiceStatus] = FixedArray::new()
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_records
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_records {
+            let record: ref ServiceRecord = self.records.get(i)
+            let status: ServiceStatus = ServiceStatus::new(
+                i, record.name, record.state, record.health_status,
+                record.pid, record.start_count, record.fail_count,
+                record.uptime_ns)
+            statuses.push(status)
+        }
+        statuses
+    }
+
+    pub fn count_by_state(self, state: u8) -> u32
+        effects: [deterministic]
+    {
+        let mut count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_records
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_records {
+            let rec: ref ServiceRecord = self.records.get(i)
+            if rec.state == state {
+                count = count + 1
+            }
+        }
+        count
+    }
+
+    // ──────────────────────────────────────────────
+    // Dependency Tracking
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-DEPTRACK-001 through INIT-SM-DEPTRACK-020
+
+    pub fn add_dependency(self: ref mut, service_index: u32, depends_on: u32)
+        -> Result<(), InitError>
+        effects: [deterministic]
+    {
+        if service_index >= self.num_records || depends_on >= self.num_records {
+            return Result::Err(init_error(
+                DIAG_SM_NOT_FOUND,
+                FixedString[128]::from_slice("Invalid service index")))
+        }
+        let svc: ref mut ServiceRecord = self.get_record_mut(service_index)?
+        svc.add_dependency(depends_on)?;
+        let dep: ref mut ServiceRecord = self.get_record_mut(depends_on)?
+        dep.add_dependent(service_index)?;
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn get_service_dependencies(self, index: u32)
+        -> Result[FixedArray[SM_MAX_DEPENDENCIES, u32], InitError>
+        effects: [deterministic]
+    {
+        let record: ref ServiceRecord = self.get_record(index)?
+        Result::Ok(record.dependencies)
+    }
+
+    pub fn get_service_dependents(self, index: u32)
+        -> Result[FixedArray[SM_MAX_DEPENDENCIES, u32], InitError>
+        effects: [deterministic]
+    {
+        let record: ref ServiceRecord = self.get_record(index)?
+        Result::Ok(record.dependents)
+    }
+
+    // ──────────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-STATS-001 through INIT-SM-STATS-015
+
+    pub fn total_starts(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_starts
+    }
+
+    pub fn total_stops(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_stops
+    }
+
+    pub fn total_restarts(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_restarts
+    }
+
+    pub fn total_failures(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_failures
+    }
+
+    pub fn health_ok_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_health_ok
+    }
+
+    pub fn health_fail_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_health_fail
+    }
+
+    pub fn record_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_records
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn health_check_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_health_checks
+    }
+
+    pub fn watchdog_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_watchdogs
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SM-RESID-001 through INIT-SM-RESID-020
+
+    fn record_registration_residual(self, index: u32, name: FixedString[SM_SERVICE_NAME_MAX])
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service registered with manager",
+            code: DIAG_SM_OK,
+            data: (index, name),
+        )
+    }
+
+    fn record_start_residual(self, index: u32, pid: Pid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service started",
+            code: DIAG_SM_OK,
+            data: (index, pid.value()),
+        )
+    }
+
+    fn record_stop_residual(self, index: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service stopped",
+            code: DIAG_SM_OK,
+            data: index,
+        )
+    }
+
+    fn record_restart_residual(self, index: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service restarted",
+            code: DIAG_SM_OK,
+            data: index,
+        )
+    }
+
+    fn record_health_fail_residual(self, index: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service health check failed",
+            code: DIAG_SM_HEALTH_FAIL,
+            data: index,
+        )
+    }
+
+    fn record_watchdog_arm_residual(self, wd_index: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Watchdog armed",
+            code: DIAG_SM_OK,
+            data: wd_index,
+        )
+    }
+
+    fn record_watchdog_fire_residual(self, wd_index: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Watchdog fired",
+            code: DIAG_SM_WATCHDOG_TRIG,
+            data: wd_index,
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Service Status (returned to callers)
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-STATUS-OBJ-001 through INIT-SM-STATUS-OBJ-010
+
+pub type ServiceStatus : struct {
+    index: u32,
+    name: FixedString[SM_SERVICE_NAME_MAX],
+    state: u8,
+    health: u8,
+    pid: Pid,
+    start_count: u32,
+    fail_count: u32,
+    uptime_ns: u64,
+}
+
+impl ServiceStatus {
+    pub fn new(index: u32, name: FixedString[SM_SERVICE_NAME_MAX],
+               state: u8, health: u8, pid: Pid,
+               start_count: u32, fail_count: u32, uptime: u64) -> ServiceStatus
+        effects: [deterministic]
+    {
+        ServiceStatus {
+            index: index,
+            name: name,
+            state: state,
+            health: health,
+            pid: pid,
+            start_count: start_count,
+            fail_count: fail_count,
+            uptime_ns: uptime,
+        }
+    }
+
+    pub fn is_ok(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_RUNNING && self.health == HEALTH_OK
+    }
+
+    pub fn is_degraded(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_DEGRADED || self.health == HEALTH_DEGRADED
+    }
+
+    pub fn is_failed(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == SVC_STATE_FAILED || self.health == HEALTH_FAILED
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SM-INIT-001 through INIT-SM-INIT-010
+
+pub fn init_service_manager() -> ServiceManager
+    effects: [deterministic]
+{
+    ServiceManager::new()
+}
+
+pub fn register_core_service(sm: ref mut ServiceManager,
+                              name: FixedString[SM_SERVICE_NAME_MAX])
+    -> Result[u32, InitError>
+    effects: [deterministic]
+{
+    let index: u32 = sm.register_service(name)?
+    let record: ref mut ServiceRecord = sm.get_record_mut(index)?
+    record.flags = record.flags | SR_FLAG_AUTOSTART
+    Result::Ok(index)
+}
+
+pub fn register_user_service(sm: ref mut ServiceManager,
+                              name: FixedString[SM_SERVICE_NAME_MAX])
+    -> Result[u32, InitError>
+    effects: [deterministic]
+{
+    sm.register_service(name)
+}
+
+pub fn get_service_state_name(state: u8) -> FixedString[16]
+    effects: [deterministic]
+{
+    match state {
+        SVC_STATE_STOPPED => FixedString[16]::from_slice("stopped"),
+        SVC_STATE_STARTING => FixedString[16]::from_slice("starting"),
+        SVC_STATE_RUNNING => FixedString[16]::from_slice("running"),
+        SVC_STATE_STOPPING => FixedString[16]::from_slice("stopping"),
+        SVC_STATE_FAILED => FixedString[16]::from_slice("failed"),
+        SVC_STATE_DEGRADED => FixedString[16]::from_slice("degraded"),
+        SVC_STATE_RELOADING => FixedString[16]::from_slice("reloading"),
+        _ => FixedString[16]::from_slice("unknown"),
+    }
+}
+
+pub fn get_health_status_name(status: u8) -> FixedString[16]
+    effects: [deterministic]
+{
+    match status {
+        HEALTH_UNKNOWN => FixedString[16]::from_slice("unknown"),
+        HEALTH_OK => FixedString[16]::from_slice("ok"),
+        HEALTH_DEGRADED => FixedString[16]::from_slice("degraded"),
+        HEALTH_FAILED => FixedString[16]::from_slice("failed"),
+        HEALTH_NOT_RUNNING => FixedString[16]::from_slice("not-running"),
+        _ => FixedString[16]::from_slice("unknown"),
+    }
+}

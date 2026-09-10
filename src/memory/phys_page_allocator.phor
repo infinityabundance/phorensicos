@@ -1,0 +1,1645 @@
+// file: phys_page_allocator.phor
+// purpose: Physical page allocator implementing a buddy system, page frame database,
+//          contiguous page reservation, DMA zone management, NUMA-aware allocation,
+//          and page migration support. All operations use bounded loops and all
+//          allocator state changes record residuals.
+// evidence: MEM-PPA-ARCH-001 through MEM-PPA-ARCH-240
+// residual: Every page allocation, free, migration, and reservation records
+//           a residual in the page frame database.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-DIAG-001 through MEM-PPA-DIAG-010
+
+const DIAG_PPA_BASE        : Word64 = Word64::from_u64(0xA000)
+const DIAG_PPA_OK          : Word64 = DIAG_PPA_BASE | 0x000
+const DIAG_PPA_OOM         : Word64 = DIAG_PPA_BASE | 0x001
+const DIAG_PPA_INVALID_PAGE: Word64 = DIAG_PPA_BASE | 0x002
+const DIAG_PPA_FRAGMENTED  : Word64 = DIAG_PPA_BASE | 0x003
+const DIAG_PPA_NO_DMA      : Word64 = DIAG_PPA_BASE | 0x004
+const DIAG_PPA_NO_NUMA     : Word64 = DIAG_PPA_BASE | 0x005
+const DIAG_PPA_MIGRATE_FAIL: Word64 = DIAG_PPA_BASE | 0x006
+const DIAG_PPA_RESERVED    : Word64 = DIAG_PPA_BASE | 0x007
+const DIAG_PPA_BOUNDS      : Word64 = DIAG_PPA_BASE | 0x008
+
+// ──────────────────────────────────────────────
+// Constants for the Buddy Allocator
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-CONST-001 through MEM-PPA-CONST-020
+
+const PAGE_SIZE_BYTES        : u64 = 4096
+const PAGE_SHIFT             : u64 = 12
+const MAX_ORDER              : u32 = 10   // Max buddy order (4MB max block)
+const MIN_ORDER              : u32 = 0    // Minimum order (single page)
+const BUDDY_LEVELS           : u32 = 11  // MAX_ORDER - MIN_ORDER + 1
+const MAX_PAGE_FRAMES        : u32 = 1048576 // 1M frames for 4GB RAM
+const MAX_NUMA_NODES         : u32 = 8
+const DMA_ZONE_LIMIT         : u64 = 0x0100_0000 // 16MB DMA zone
+const DMA32_ZONE_LIMIT       : u64 = 0x1_0000_0000 // 4GB DMA32 zone
+const PAGE_BUDDY_FREE        : u8 = 0
+const PAGE_BUDDY_ALLOC       : u8 = 1
+const PAGE_BUDDY_RESERVED    : u8 = 2
+const PAGE_BUDDY_MIGRATING   : u8 = 3
+const PAGE_BUDDY_MIGRATE_SRC : u8 = 4
+const PAGE_BUDDY_MIGRATE_DST : u8 = 5
+const MAX_PAGE_MIGRATIONS    : u32 = 64
+const CONTIG_RESERVATION_MAX : u32 = 32
+const MAX_RESERVED_REGIONS   : u32 = 64
+
+// ──────────────────────────────────────────────
+// NUMA Node Identifier
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-NUMA-001 through MEM-PPA-NUMA-010
+
+pub type NumaNodeId : u32 = struct {
+    value: u32,
+}
+
+impl NumaNodeId {
+    pub fn new(value: u32) -> NumaNodeId
+        effects: [deterministic]
+    {
+        NumaNodeId { value: value % MAX_NUMA_NODES }
+    }
+
+    pub fn zero() -> NumaNodeId
+        effects: [deterministic]
+    {
+        NumaNodeId { value: 0 }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        self.value < MAX_NUMA_NODES
+    }
+
+    pub fn eq(self, other: NumaNodeId) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// Zone Type
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-ZONE-001 through MEM-PPA-ZONE-010
+
+pub type ZoneType : u8 = enum {
+    Zone_DMA    = 0,  // <16MB, suitable for ISA DMA
+    Zone_DMA32  = 1,  // <4GB, suitable for 32-bit DMA
+    Zone_Normal = 2,  // Normal zone (any address)
+    Zone_Movable = 3, // Migratable pages
+    Zone_Device = 4,  // Device memory
+}
+
+// ──────────────────────────────────────────────
+// Page Frame Flags
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-FLAGS-001 through MEM-PPA-FLAGS-010
+
+pub type PageFlags : Word64 = struct {
+    flags: Word64,
+}
+
+impl PageFlags {
+    pub fn new() -> PageFlags
+        effects: [deterministic]
+    {
+        PageFlags { flags: Word64::zero() }
+    }
+
+    pub fn set(self: ref mut, bit: u8)
+        effects: [deterministic]
+    {
+        let mask: Word64 = Word64::from_u64(1u64 << bit)
+        self.flags = self.flags.bitor(mask)
+    }
+
+    pub fn clear(self: ref mut, bit: u8)
+        effects: [deterministic]
+    {
+        let mask: Word64 = Word64::from_u64(!(1u64 << bit))
+        self.flags = self.flags.bitand(mask)
+    }
+
+    pub fn is_set(self, bit: u8) -> bool
+        effects: [deterministic]
+    {
+        let mask: Word64 = Word64::from_u64(1u64 << bit)
+        let result: Word64 = self.flags.bitand(mask)
+        !result.is_zero()
+    }
+
+    pub fn raw(self) -> Word64
+        effects: [deterministic]
+    {
+        self.flags
+    }
+}
+
+// Bit positions for PageFlags
+const PAGE_FLAG_PRESENT    : u8 = 0
+const PAGE_FLAG_ALLOCATED  : u8 = 1
+const PAGE_FLAG_RESERVED   : u8 = 2
+const PAGE_FLAG_MIGRATING  : u8 = 3
+const PAGE_FLAG_DMA        : u8 = 4
+const PAGE_FLAG_DMA32      : u8 = 5
+const PAGE_FLAG_MOVABLE    : u8 = 6
+const PAGE_FLAG_DEVICE     : u8 = 7
+const PAGE_FLAG_WRITEBACK  : u8 = 8
+const PAGE_FLAG_COMPOUND   : u8 = 9
+const PAGE_FLAG_HUGEPAGE   : u8 = 10
+const PAGE_FLAG_LOCKED     : u8 = 11
+const PAGE_FLAG_ERROR      : u8 = 12
+
+// ──────────────────────────────────────────────
+// Physical Page Number
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-PFN-001 through MEM-PPA-PFN-015
+
+pub type PhysicalPageNumber : u64 = struct {
+    value: u64,
+}
+
+impl PhysicalPageNumber {
+    pub fn new(value: u64) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        PhysicalPageNumber { value: value }
+    }
+
+    pub fn from_address(addr: u64) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        PhysicalPageNumber { value: addr >> PAGE_SHIFT }
+    }
+
+    pub fn to_address(self) -> u64
+        effects: [deterministic]
+    {
+        self.value << PAGE_SHIFT
+    }
+
+    pub fn value(self) -> u64
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn add(self, delta: u64) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        PhysicalPageNumber { value: self.value + delta }
+    }
+
+    pub fn sub(self, delta: u64) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        PhysicalPageNumber { value: self.value - delta }
+    }
+
+    pub fn distance(self, other: PhysicalPageNumber) -> u64
+        effects: [deterministic]
+    {
+        if self.value > other.value {
+            self.value - other.value
+        } else {
+            other.value - self.value
+        }
+    }
+
+    pub fn eq(self, other: PhysicalPageNumber) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+
+    pub fn is_valid(self, max_frames: u64) -> bool
+        effects: [deterministic]
+    {
+        self.value < max_frames
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Frame Entry
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-PFE-001 through MEM-PPA-PFE-025
+
+pub type PageFrameEntry : struct {
+    pfn: PhysicalPageNumber,
+    flags: PageFlags,
+    order: u32,
+    zone: ZoneType,
+    numa_node: NumaNodeId,
+    migration_generation: Word32,
+    refcount: Word32,
+    buddy_prev: u32,
+    buddy_next: u32,
+}
+
+impl PageFrameEntry {
+    pub fn new(pfn: PhysicalPageNumber) -> PageFrameEntry
+        effects: [deterministic]
+    {
+        PageFrameEntry {
+            pfn: pfn,
+            flags: PageFlags::new(),
+            order: 0,
+            zone: ZoneType::Zone_Normal,
+            numa_node: NumaNodeId::zero(),
+            migration_generation: Word32::zero(),
+            refcount: Word32::zero(),
+            buddy_prev: 0xFFFF_FFFF,
+            buddy_next: 0xFFFF_FFFF,
+        }
+    }
+
+    pub fn is_free(self) -> bool
+        effects: [deterministic]
+    {
+        !self.flags.is_set(PAGE_FLAG_ALLOCATED) &&
+        !self.flags.is_set(PAGE_FLAG_RESERVED)
+    }
+
+    pub fn is_allocated(self) -> bool
+        effects: [deterministic]
+    {
+        self.flags.is_set(PAGE_FLAG_ALLOCATED)
+    }
+
+    pub fn mark_allocated(self: ref mut)
+        effects: [deterministic]
+    {
+        self.flags.set(PAGE_FLAG_ALLOCATED);
+        self.flags.set(PAGE_FLAG_PRESENT);
+    }
+
+    pub fn mark_free(self: ref mut)
+        effects: [deterministic]
+    {
+        self.flags.clear(PAGE_FLAG_ALLOCATED);
+        self.flags.clear(PAGE_FLAG_PRESENT);
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Frame Database
+// ──────────────────────────────────────────────
+// Fixed-capacity database of all physical page frames.
+// Evidence path: MEM-PPA-PFD-001 through MEM-PPA-PFD-045
+
+pub type PageFrameDatabase : struct {
+    entries: FixedArray[MAX_PAGE_FRAMES, PageFrameEntry],
+    num_frames: u32,
+    total_memory: u64,
+    free_memory: u64,
+    generation: Word32,
+}
+
+impl PageFrameDatabase {
+    pub fn new(num_frames: u32, total_memory: u64) -> PageFrameDatabase
+        effects: [deterministic]
+    {
+        let mut db: PageFrameDatabase = PageFrameDatabase {
+            entries: FixedArray::new(),
+            num_frames: num_frames,
+            total_memory: total_memory,
+            free_memory: 0,
+            generation: Word32::initial(),
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_frames
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_frames {
+            let pfn: PhysicalPageNumber = PhysicalPageNumber::new(i as u64)
+            let entry: PageFrameEntry = PageFrameEntry::new(pfn)
+            db.entries.push(entry)
+        }
+        db.free_memory = (num_frames as u64) * PAGE_SIZE_BYTES
+        db
+    }
+
+    pub fn get(self: ref, pfn: PhysicalPageNumber) -> Result[ref PageFrameEntry, MemoryError]
+        effects: [deterministic]
+    {
+        let index: u32 = pfn.value() as u32
+        if index >= self.num_frames {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_INVALID_PAGE,
+                FixedString[128]::from_slice("PFN out of range")))
+        }
+        // trust: index bounds-checked above
+        trusted("page frame entry access: index verified within range") {
+            Result::Ok(self.entries.get(index))
+        }
+    }
+
+    pub fn get_mut(self: ref mut, pfn: PhysicalPageNumber) -> Result[ref mut PageFrameEntry, MemoryError]
+        effects: [deterministic]
+    {
+        let index: u32 = pfn.value() as u32
+        if index >= self.num_frames {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_INVALID_PAGE,
+                FixedString[128]::from_slice("PFN out of range")))
+        }
+        // trust: index bounds-checked above
+        trusted("page frame entry mutable access: index verified within range") {
+            Result::Ok(self.entries.get_mut(index))
+        }
+    }
+
+    pub fn mark_frame_allocated(self: ref mut, pfn: PhysicalPageNumber)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if self.free_memory < PAGE_SIZE_BYTES {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_OOM,
+                FixedString[128]::from_slice("No free memory")))
+        }
+        let entry: ref mut PageFrameEntry = self.get_mut(pfn)?
+        entry.mark_allocated();
+        self.free_memory = self.free_memory - PAGE_SIZE_BYTES
+        Result::Ok(())
+    }
+
+    pub fn mark_frame_free(self: ref mut, pfn: PhysicalPageNumber)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let entry: ref mut PageFrameEntry = self.get_mut(pfn)?
+        entry.mark_free();
+        self.free_memory = self.free_memory + PAGE_SIZE_BYTES
+        Result::Ok(())
+    }
+
+    pub fn free_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.free_memory
+    }
+
+    pub fn total_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_memory
+    }
+
+    pub fn used_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_memory - self.free_memory
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.total_memory == 0 {
+            return 0
+        }
+        let used: u64 = self.used_memory()
+        let pct: u64 = (used * 100) / self.total_memory
+        pct as u8
+    }
+
+    pub fn num_frames(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_frames
+    }
+
+    pub fn bump_generation(self: ref mut) -> Word32
+        effects: [deterministic]
+    {
+        self.generation.bump();
+        self.generation
+    }
+}
+
+// ──────────────────────────────────────────────
+// Buddy Free List (one per order)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-BFL-001 through MEM-PPA-BFL-030
+
+pub type BuddyFreeList : struct {
+    heads: FixedArray[BUDDY_LEVELS, FixedArray[CAPACITY_SMALL, u32]],
+    counts: FixedArray[BUDDY_LEVELS, u32],
+}
+
+impl BuddyFreeList {
+    pub fn new() -> BuddyFreeList
+        effects: [deterministic]
+    {
+        BuddyFreeList {
+            heads: FixedArray::new(),
+            counts: FixedArray::new(),
+        }
+    }
+
+    pub fn add_page(self: ref mut, order: u32, page_index: u32)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if order >= BUDDY_LEVELS {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Buddy order out of range")))
+        }
+        if self.counts.get(order) >= CAPACITY_SMALL {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_FRAGMENTED,
+                FixedString[128]::from_slice("Free list full at order")))
+        }
+        let list: ref mut FixedArray[CAPACITY_SMALL, u32] = self.heads.get_mut(order)
+        list.push(page_index);
+        let count: u32 = self.counts.get(order)
+        self.counts.set(order, count + 1)
+        Result::Ok(())
+    }
+
+    pub fn remove_page(self: ref mut, order: u32) -> Result[u32, MemoryError]
+        effects: [deterministic]
+    {
+        if order >= BUDDY_LEVELS {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Buddy order out of range")))
+        }
+        let count: u32 = self.counts.get(order)
+        if count == 0 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_OOM,
+                FixedString[128]::from_slice("No free pages at order")))
+        }
+        let list: ref mut FixedArray[CAPACITY_SMALL, u32] = self.heads.get_mut(order)
+        let page_index: u32 = list.pop()
+        self.counts.set(order, count - 1)
+        Result::Ok(page_index)
+    }
+
+    pub fn is_empty(self, order: u32) -> bool
+        effects: [deterministic]
+    {
+        if order >= BUDDY_LEVELS {
+            return true
+        }
+        self.counts.get(order) == 0
+    }
+
+    pub fn count(self, order: u32) -> u32
+        effects: [deterministic]
+    {
+        if order >= BUDDY_LEVELS {
+            return 0
+        }
+        self.counts.get(order)
+    }
+
+    pub fn has_pages(self, order: u32) -> bool
+        effects: [deterministic]
+    {
+        !self.is_empty(order)
+    }
+}
+
+// ──────────────────────────────────────────────
+// DMA Zone Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-DMA-001 through MEM-PPA-DMA-020
+
+pub type DmaZoneDescriptor : struct {
+    zone_type: ZoneType,
+    base_pfn: PhysicalPageNumber,
+    page_count: u32,
+    free_pages: u32,
+    min_free_pages: u32,
+    low_watermark_pages: u32,
+    allocation_count: u32,
+    max_allocation_size: u32,
+}
+
+impl DmaZoneDescriptor {
+    pub fn new(
+        zone_type: ZoneType,
+        base_pfn: PhysicalPageNumber,
+        page_count: u32,
+    ) -> DmaZoneDescriptor
+        effects: [deterministic]
+    {
+        let min_free: u32 = page_count / 10
+        DmaZoneDescriptor {
+            zone_type: zone_type,
+            base_pfn: base_pfn,
+            page_count: page_count,
+            free_pages: page_count,
+            min_free_pages: min_free,
+            low_watermark_pages: min_free * 2,
+            allocation_count: 0,
+            max_allocation_size: page_count,
+        }
+    }
+
+    pub fn allocate(self: ref mut, count: u32) -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        if count > self.free_pages {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_NO_DMA,
+                FixedString[128]::from_slice("Insufficient DMA zone pages")))
+        }
+        if count > self.max_allocation_size {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_NO_DMA,
+                FixedString[128]::from_slice("Exceeds DMA zone max allocation")))
+        }
+        let allocated_pfn: PhysicalPageNumber = self.base_pfn.add(
+            (self.page_count - self.free_pages) as u64)
+        self.free_pages = self.free_pages - count
+        self.allocation_count = self.allocation_count + 1
+        Result::Ok(allocated_pfn)
+    }
+
+    pub fn free(self: ref mut, count: u32)
+        effects: [deterministic]
+    {
+        let new_free: u32 = self.free_pages + count
+        if new_free <= self.page_count {
+            self.free_pages = new_free
+        }
+    }
+
+    pub fn is_low(self) -> bool
+        effects: [deterministic]
+    {
+        self.free_pages < self.low_watermark_pages
+    }
+
+    pub fn is_critical(self) -> bool
+        effects: [deterministic]
+    {
+        self.free_pages < self.min_free_pages
+    }
+}
+
+// ──────────────────────────────────────────────
+// NUMA Node Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-NUMA-NODE-001 through MEM-PPA-NUMA-NODE-020
+
+pub type NumaNodeDescriptor : struct {
+    node_id: NumaNodeId,
+    base_pfn: PhysicalPageNumber,
+    page_count: u32,
+    free_pages: u32,
+    distance_to: FixedArray[MAX_NUMA_NODES, u8],
+    memory_bandwidth: u32,
+    latency_penalty: u32,
+    processor_count: u32,
+    has_local_memory: bool,
+}
+
+impl NumaNodeDescriptor {
+    pub fn new(
+        node_id: NumaNodeId,
+        base_pfn: PhysicalPageNumber,
+        page_count: u32,
+    ) -> NumaNodeDescriptor
+        effects: [deterministic]
+    {
+        NumaNodeDescriptor {
+            node_id: node_id,
+            base_pfn: base_pfn,
+            page_count: page_count,
+            free_pages: page_count,
+            distance_to: FixedArray::new(),
+            memory_bandwidth: 100,
+            latency_penalty: 0,
+            processor_count: 1,
+            has_local_memory: true,
+        }
+    }
+
+    pub fn set_distance(self: ref mut, other_id: NumaNodeId, distance: u8)
+        effects: [deterministic]
+    {
+        let index: u32 = other_id.value()
+        if index < MAX_NUMA_NODES {
+            self.distance_to.set(index, distance)
+        }
+    }
+
+    pub fn distance_to(self, other_id: NumaNodeId) -> u8
+        effects: [deterministic]
+    {
+        let index: u32 = other_id.value()
+        if index < MAX_NUMA_NODES {
+            return self.distance_to.get(index)
+        }
+        0xFF
+    }
+
+    pub fn allocate_pages(self: ref mut, count: u32) -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        if count > self.free_pages {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_NO_NUMA,
+                FixedString[128]::from_slice("Insufficient NUMA node memory")))
+        }
+        let allocated_pfn: PhysicalPageNumber = self.base_pfn.add(
+            (self.page_count - self.free_pages) as u64)
+        self.free_pages = self.free_pages - count
+        Result::Ok(allocated_pfn)
+    }
+
+    pub fn free_pages(self: ref mut, count: u32)
+        effects: [deterministic]
+    {
+        let new_free: u32 = self.free_pages + count
+        if new_free <= self.page_count {
+            self.free_pages = new_free
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Contiguous Page Reservation
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-CONTIG-001 through MEM-PPA-CONTIG-025
+
+pub type ContiguousReservation : struct {
+    base_pfn: PhysicalPageNumber,
+    page_count: u32,
+    order: u32,
+    is_active: bool,
+    owning_capability: Capability,
+    reservation_id: Word32,
+}
+
+impl ContiguousReservation {
+    pub fn new(
+        base_pfn: PhysicalPageNumber,
+        page_count: u32,
+        order: u32,
+        capability: Capability,
+        reservation_id: Word32,
+    ) -> ContiguousReservation
+        effects: [deterministic]
+    {
+        ContiguousReservation {
+            base_pfn: base_pfn,
+            page_count: page_count,
+            order: order,
+            is_active: true,
+            owning_capability: capability,
+            reservation_id: reservation_id,
+        }
+    }
+
+    pub fn base(self) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        self.base_pfn
+    }
+
+    pub fn count(self) -> u32
+        effects: [deterministic]
+    {
+        self.page_count
+    }
+
+    pub fn end_pfn(self) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        self.base_pfn.add(self.page_count as u64)
+    }
+
+    pub fn release(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_active = false
+    }
+
+    pub fn is_active(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_active
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Migration State
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-MIGRATE-001 through MEM-PPA-MIGRATE-020
+
+pub type PageMigrationState : struct {
+    source_pfn: PhysicalPageNumber,
+    dest_pfn: PhysicalPageNumber,
+    status: u8,
+    generation: Word32,
+    numa_node_from: NumaNodeId,
+    numa_node_to: NumaNodeId,
+}
+
+impl PageMigrationState {
+    pub fn new(
+        source: PhysicalPageNumber,
+        dest: PhysicalPageNumber,
+        from_node: NumaNodeId,
+        to_node: NumaNodeId,
+    ) -> PageMigrationState
+        effects: [deterministic]
+    {
+        PageMigrationState {
+            source_pfn: source,
+            dest_pfn: dest,
+            status: PAGE_BUDDY_MIGRATING,
+            generation: Word32::initial(),
+            numa_node_from: from_node,
+            numa_node_to: to_node,
+        }
+    }
+
+    pub fn complete(self: ref mut)
+        effects: [deterministic]
+    {
+        self.status = PAGE_BUDDY_FREE
+    }
+
+    pub fn fail(self: ref mut)
+        effects: [deterministic]
+    {
+        self.status = PAGE_BUDDY_MIGRATE_SRC
+    }
+
+    pub fn is_complete(self) -> bool
+        effects: [deterministic]
+    {
+        self.status == PAGE_BUDDY_FREE
+    }
+
+    pub fn is_failed(self) -> bool
+        effects: [deterministic]
+    {
+        self.status == PAGE_BUDDY_MIGRATE_SRC
+    }
+}
+
+// ──────────────────────────────────────────────
+// Buddy Allocator Error
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-ERR-001 through MEM-PPA-ERR-010
+
+pub type MemoryError : struct {
+    code: Word64,
+    message: FixedString[128],
+}
+
+impl MemoryError {
+    pub fn new(code: Word64, message: FixedString[128]) -> MemoryError
+        effects: [deterministic]
+    {
+        MemoryError { code: code, message: message }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.message
+    }
+}
+
+pub fn mem_ppa_error(code: Word64, message: FixedString[128]) -> MemoryError
+    effects: [deterministic]
+{
+    MemoryError::new(code, message)
+}
+
+// ──────────────────────────────────────────────
+// Buddy Allocator Core
+// ──────────────────────────────────────────────
+// The main buddy allocator with page frame database and free lists.
+// Evidence path: MEM-PPA-CORE-001 through MEM-PPA-CORE-120
+
+pub type BuddyAllocator : struct {
+    page_db: PageFrameDatabase,
+    free_lists: BuddyFreeList,
+    dma_zone: DmaZoneDescriptor,
+    dma32_zone: DmaZoneDescriptor,
+    normal_zone: DmaZoneDescriptor,
+    numa_nodes: FixedArray[MAX_NUMA_NODES, NumaNodeDescriptor],
+    num_numa_nodes: u32,
+    reservations: FixedArray[MAX_RESERVED_REGIONS, ContiguousReservation],
+    num_reservations: u32,
+    migrations: FixedArray[MAX_PAGE_MIGRATIONS, PageMigrationState],
+    num_migrations: u32,
+    allocation_count: u64,
+    free_count: u64,
+    fail_count: u64,
+    migration_count: u64,
+    generation: Word32,
+}
+
+impl BuddyAllocator {
+    pub fn new(
+        num_frames: u32,
+        total_memory: u64,
+        dma_base: PhysicalPageNumber,
+        dma_count: u32,
+        dma32_base: PhysicalPageNumber,
+        dma32_count: u32,
+    ) -> BuddyAllocator
+        effects: [deterministic]
+    {
+        let page_db: PageFrameDatabase = PageFrameDatabase::new(num_frames, total_memory)
+        let dma_zone: DmaZoneDescriptor = DmaZoneDescriptor::new(
+            ZoneType::Zone_DMA, dma_base, dma_count)
+        let dma32_zone: DmaZoneDescriptor = DmaZoneDescriptor::new(
+            ZoneType::Zone_DMA32, dma32_base, dma32_count)
+        let normal_base: PhysicalPageNumber = dma32_base.add(dma32_count as u64)
+        let normal_count: u32 = num_frames - dma_count - dma32_count
+        let normal_zone: DmaZoneDescriptor = DmaZoneDescriptor::new(
+            ZoneType::Zone_Normal, normal_base, normal_count)
+        BuddyAllocator {
+            page_db: page_db,
+            free_lists: BuddyFreeList::new(),
+            dma_zone: dma_zone,
+            dma32_zone: dma32_zone,
+            normal_zone: normal_zone,
+            numa_nodes: FixedArray::new(),
+            num_numa_nodes: 0,
+            reservations: FixedArray::new(),
+            num_reservations: 0,
+            migrations: FixedArray::new(),
+            num_migrations: 0,
+            allocation_count: 0,
+            free_count: 0,
+            fail_count: 0,
+            migration_count: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Buddy Helper: Compute buddy PFN
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-BUDDY-001 through MEM-PPA-BUDDY-010
+
+    fn buddy_pfn(pfn: PhysicalPageNumber, order: u32) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        let mask: u64 = (1u64 << (order + 1)) - 1
+        let buddy_value: u64 = pfn.value() ^ (1u64 << order)
+        PhysicalPageNumber::new(buddy_value)
+    }
+
+    // ──────────────────────────────────────────────
+    // Find Buddy Order: Compute the order for a given page count
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-ORDER-001 through MEM-PPA-ORDER-010
+
+    pub fn order_for_pages(count: u32) -> u32
+        effects: [deterministic]
+    {
+        let mut order: u32 = 0
+        let mut size: u32 = 1
+        // loop: bounds[BOUND_TINY] — at most 11 iterations (BUDDY_LEVELS)
+        loop: bounds[BOUND_TINY] for i in 0..BUDDY_LEVELS {
+            if size >= count {
+                order = i
+                break
+            }
+            size = size * 2
+        }
+        order
+    }
+
+    // ──────────────────────────────────────────────
+    // Allocate Pages from the Buddy System
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-ALLOC-001 through MEM-PPA-ALLOC-040
+
+    pub fn allocate_pages(self: ref mut, count: u32, zone: ZoneType)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        if count == 0 || count > 1024 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Invalid page count")))
+        }
+        let order: u32 = BuddyAllocator::order_for_pages(count)
+        let allocated_pfn: PhysicalPageNumber = self.allocate_buddy(order, zone)?
+        let db: ref mut PageFrameDatabase = &mut self.page_db
+        // loop: bounds[BOUND_SMALL] — bounded by count (<=1024)
+        loop: bounds[BOUND_SMALL] for i in 0..count {
+            let pfn: PhysicalPageNumber = allocated_pfn.add(i as u64)
+            db.mark_frame_allocated(pfn)?
+        }
+        self.allocation_count = self.allocation_count + 1
+        self.generation.bump();
+        // Record residual for allocation
+        self.record_allocation_residual(allocated_pfn, count, zone)
+        Result::Ok(allocated_pfn)
+    }
+
+    // Internal buddy allocation
+    fn allocate_buddy(self: ref mut, order: u32, zone: ZoneType)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        let mut current_order: u32 = order
+        // loop: bounds[BOUND_TINY] — bounded by BUDDY_LEVELS
+        loop: bounds[BOUND_TINY] for i in order..BUDDY_LEVELS {
+            if self.free_lists.has_pages(current_order) {
+                let page_index: u32 = self.free_lists.remove_page(current_order)?
+                let pfn: PhysicalPageNumber = PhysicalPageNumber::new(page_index as u64)
+                // Split if allocated from a higher order
+                if current_order > order {
+                    let split_result: Result[(), MemoryError] = self.split_buddy(
+                        pfn, order, current_order)
+                    // trust: split is internal and bounded
+                    trusted("buddy split: internal operation with bounded recursion") {
+                        match split_result {
+                            Result::Ok(_) => {},
+                            Result::Err(e) => {
+                                self.fail_count = self.fail_count + 1
+                                return Result::Err(e)
+                            },
+                        }
+                    }
+                }
+                self.free_lists.remove_page(order)?; // Remove the now-lower-order entry
+                return Result::Ok(pfn)
+            }
+            current_order = current_order + 1
+            if current_order >= BUDDY_LEVELS {
+                self.fail_count = self.fail_count + 1
+                return Result::Err(mem_ppa_error(
+                    DIAG_PPA_OOM,
+                    FixedString[128]::from_slice("Out of memory in buddy allocator")))
+            }
+        }
+        self.fail_count = self.fail_count + 1
+        Result::Err(mem_ppa_error(
+            DIAG_PPA_OOM,
+            FixedString[128]::from_slice("Out of memory in buddy allocator")))
+    }
+
+    // Split a larger block into two buddies
+    fn split_buddy(self: ref mut, pfn: PhysicalPageNumber,
+                   target_order: u32, current_order: u32)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let mut split_order: u32 = current_order
+        // loop: bounds[BOUND_TINY] — bounded by BUDDY_LEVELS
+        loop: bounds[BOUND_TINY] for i in 0..BUDDY_LEVELS {
+            if split_order <= target_order {
+                break
+            }
+            split_order = split_order - 1
+            let buddy_pfn_calc: PhysicalPageNumber = BuddyAllocator::buddy_pfn(pfn, split_order)
+            let buddy_index: u32 = buddy_pfn_calc.value() as u32
+            self.free_lists.add_page(split_order, buddy_index)?
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Free Pages
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-FREE-001 through MEM-PPA-FREE-030
+
+    pub fn free_pages(self: ref mut, pfn: PhysicalPageNumber, count: u32)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if count == 0 || count > 1024 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Invalid free count")))
+        }
+        let order: u32 = BuddyAllocator::order_for_pages(count)
+        self.free_buddy(pfn, order)?;
+        let db: ref mut PageFrameDatabase = &mut self.page_db
+        // loop: bounds[BOUND_SMALL] — bounded by count (<=1024)
+        loop: bounds[BOUND_SMALL] for i in 0..count {
+            let frame_pfn: PhysicalPageNumber = pfn.add(i as u64)
+            db.mark_frame_free(frame_pfn)?
+        }
+        self.free_count = self.free_count + 1
+        self.generation.bump();
+        self.record_free_residual(pfn, count)
+        Result::Ok(())
+    }
+
+    // Internal buddy free with coalescing
+    fn free_buddy(self: ref mut, pfn: PhysicalPageNumber, order: u32)
+        -> Result<(), MemoryError>
+        effects: [deterministic]
+    {
+        let mut current_pfn: PhysicalPageNumber = pfn
+        let mut current_order: u32 = order
+        // loop: bounds[BOUND_TINY] — bounded by BUDDY_LEVELS
+        loop: bounds[BOUND_TINY] for i in 0..BUDDY_LEVELS {
+            if current_order >= MAX_ORDER {
+                break
+            }
+            let buddy: PhysicalPageNumber = BuddyAllocator::buddy_pfn(current_pfn, current_order)
+            let buddy_index: u32 = buddy.value() as u32
+            // Check if buddy is free (coalesce)
+            if self.free_lists.has_pages(current_order) {
+                // TODO: verify buddy is actually the one in free list
+                self.free_lists.remove_page(current_order)?;
+                // Merge: go to next order with the lower of the two addresses
+                if buddy.value() < current_pfn.value() {
+                    current_pfn = buddy
+                }
+                current_order = current_order + 1
+            } else {
+                self.free_lists.add_page(current_order, current_pfn.value() as u32)?
+                break
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // DMA Zone Allocation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-DMA-ALLOC-001 through MEM-PPA-DMA-ALLOC-020
+
+    pub fn allocate_dma_pages(self: ref mut, count: u32)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        if count == 0 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Invalid DMA page count")))
+        }
+        let allocated_pfn: PhysicalPageNumber = self.dma_zone.allocate(count)?
+        let db: ref mut PageFrameDatabase = &mut self.page_db
+        // loop: bounds[BOUND_SMALL] — bounded by count
+        loop: bounds[BOUND_SMALL] for i in 0..count {
+            let pfn: PhysicalPageNumber = allocated_pfn.add(i as u64)
+            db.mark_frame_allocated(pfn)?
+        }
+        self.allocation_count = self.allocation_count + 1
+        self.generation.bump();
+        self.record_dma_allocation_residual(allocated_pfn, count, ZoneType::Zone_DMA)
+        Result::Ok(allocated_pfn)
+    }
+
+    pub fn free_dma_pages(self: ref mut, pfn: PhysicalPageNumber, count: u32)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if count == 0 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Invalid DMA free count")))
+        }
+        self.dma_zone.free(count);
+        let db: ref mut PageFrameDatabase = &mut self.page_db
+        // loop: bounds[BOUND_SMALL] — bounded by count
+        loop: bounds[BOUND_SMALL] for i in 0..count {
+            let pfn_free: PhysicalPageNumber = pfn.add(i as u64)
+            db.mark_frame_free(pfn_free)?
+        }
+        self.free_count = self.free_count + 1
+        self.generation.bump();
+        self.record_free_residual(pfn, count)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Contiguous Page Reservation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-CONTIG-RES-001 through MEM-PPA-CONTIG-RES-025
+
+    pub fn reserve_contiguous(self: ref mut, page_count: u32, capability: Capability)
+        -> Result[ContiguousReservation, MemoryError]
+        effects: [deterministic]
+    {
+        if page_count == 0 || page_count > 256 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Invalid contiguous reservation size")))
+        }
+        if self.num_reservations >= MAX_RESERVED_REGIONS {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_RESERVED,
+                FixedString[128]::from_slice("Max reservations reached")))
+        }
+        let order: u32 = BuddyAllocator::order_for_pages(page_count)
+        let base_pfn: PhysicalPageNumber = self.allocate_buddy(order, ZoneType::Zone_Normal)?
+        let reservation_id: Word32 = self.generation
+        let reservation: ContiguousReservation = ContiguousReservation::new(
+            base_pfn, page_count, order, capability, reservation_id)
+        // loop: bounds[BOUND_SMALL] — bounded by page_count
+        loop: bounds[BOUND_SMALL] for i in 0..page_count {
+            let pfn: PhysicalPageNumber = base_pfn.add(i as u64)
+            let entry: ref mut PageFrameEntry = self.page_db.get_mut(pfn)?
+            entry.flags.set(PAGE_FLAG_RESERVED)
+        }
+        self.reservations.push(reservation);
+        self.num_reservations = self.num_reservations + 1
+        self.generation.bump();
+        self.record_reservation_residual(base_pfn, page_count)
+        Result::Ok(reservation)
+    }
+
+    pub fn release_reservation(self: ref mut, reservation_id: Word32)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by MAX_RESERVED_REGIONS
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_reservations {
+            let res: ref mut ContiguousReservation = self.reservations.get_mut(i)
+            if res.is_active() && res.reservation_id.value() == reservation_id.value() {
+                let base: PhysicalPageNumber = res.base()
+                let count: u32 = res.count()
+                // loop: bounds[BOUND_SMALL] — bounded by count
+                loop: bounds[BOUND_SMALL] for j in 0..count {
+                    let pfn: PhysicalPageNumber = base.add(j as u64)
+                    let entry: ref mut PageFrameEntry = self.page_db.get_mut(pfn)?
+                    entry.flags.clear(PAGE_FLAG_RESERVED)
+                    entry.mark_free()
+                }
+                res.release();
+                self.free_count = self.free_count + 1
+                self.generation.bump();
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_PPA_INVALID_PAGE,
+            FixedString[128]::from_slice("Reservation not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // NUMA Node Management
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-NUMA-MGMT-001 through MEM-PPA-NUMA-MGMT-025
+
+    pub fn add_numa_node(self: ref mut, descriptor: NumaNodeDescriptor)
+        -> Result<(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_numa_nodes >= MAX_NUMA_NODES {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_NO_NUMA,
+                FixedString[128]::from_slice("Max NUMA nodes reached")))
+        }
+        self.numa_nodes.push(descriptor);
+        self.num_numa_nodes = self.num_numa_nodes + 1
+        Result::Ok(())
+    }
+
+    pub fn allocate_on_node(self: ref mut, node_id: NumaNodeId, count: u32)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        let node_index: u32 = node_id.value()
+        if node_index >= self.num_numa_nodes {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_NO_NUMA,
+                FixedString[128]::from_slice("Invalid NUMA node ID")))
+        }
+        let node: ref mut NumaNodeDescriptor = self.numa_nodes.get_mut(node_index)
+        let pfn: PhysicalPageNumber = node.allocate_pages(count)?
+        let db: ref mut PageFrameDatabase = &mut self.page_db
+        // loop: bounds[BOUND_SMALL] — bounded by count
+        loop: bounds[BOUND_SMALL] for i in 0..count {
+            let frame_pfn: PhysicalPageNumber = pfn.add(i as u64)
+            db.mark_frame_allocated(frame_pfn)?
+        }
+        self.allocation_count = self.allocation_count + 1
+        self.generation.bump();
+        self.record_numa_allocation_residual(pfn, count, node_id)
+        Result::Ok(pfn)
+    }
+
+    pub fn closest_node(self, pfn: PhysicalPageNumber) -> NumaNodeId
+        effects: [deterministic]
+    {
+        let mut closest: NumaNodeId = NumaNodeId::zero()
+        let mut min_distance: u64 = 0xFFFF_FFFF_FFFF_FFFF
+        // loop: bounds[BOUND_TINY] — bounded by MAX_NUMA_NODES
+        loop: bounds[BOUND_TINY] for i in 0..self.num_numa_nodes {
+            let node: ref NumaNodeDescriptor = self.numa_nodes.get(i)
+            let node_base: u64 = node.base_pfn.value()
+            let node_end: u64 = node_base + (node.page_count as u64)
+            let pfn_val: u64 = pfn.value()
+            if pfn_val >= node_base && pfn_val < node_end {
+                return node.node_id
+            }
+            let dist: u64 = if pfn_val > node_end {
+                pfn_val - node_end
+            } else {
+                node_base - pfn_val
+            }
+            if dist < min_distance {
+                min_distance = dist
+                closest = node.node_id
+            }
+        }
+        closest
+    }
+
+    // ──────────────────────────────────────────────
+    // Page Migration
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-MIGRATE-CORE-001 through MEM-PPA-MIGRATE-CORE-030
+
+    pub fn migrate_pages(self: ref mut, source_pfn: PhysicalPageNumber,
+                          count: u32, target_node: NumaNodeId)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        if self.num_migrations >= MAX_PAGE_MIGRATIONS {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_MIGRATE_FAIL,
+                FixedString[128]::from_slice("Max migrations in flight")))
+        }
+        if count == 0 || count > 64 {
+            return Result::Err(mem_ppa_error(
+                DIAG_PPA_BOUNDS,
+                FixedString[128]::from_slice("Invalid migration count")))
+        }
+        let dest_pfn: PhysicalPageNumber = self.allocate_on_node(target_node, count)?
+        let from_node: NumaNodeId = self.closest_node(source_pfn)
+        let migration: PageMigrationState = PageMigrationState::new(
+            source_pfn, dest_pfn, from_node, target_node)
+        // loop: bounds[BOUND_SMALL] — bounded by count
+        loop: bounds[BOUND_SMALL] for i in 0..count {
+            let src: PhysicalPageNumber = source_pfn.add(i as u64)
+            let dst: PhysicalPageNumber = dest_pfn.add(i as u64)
+            let src_entry: ref mut PageFrameEntry = self.page_db.get_mut(src)?
+            let dst_entry: ref mut PageFrameEntry = self.page_db.get_mut(dst)?
+            src_entry.flags.set(PAGE_FLAG_MIGRATING);
+            src_entry.flags.set(PAGE_FLAG_WRITEBACK);
+            dst_entry.flags.set(PAGE_FLAG_MIGRATING);
+        }
+        self.migrations.push(migration);
+        self.num_migrations = self.num_migrations + 1
+        self.migration_count = self.migration_count + 1
+        self.generation.bump();
+        self.record_migration_residual(source_pfn, dest_pfn, count, target_node)
+        Result::Ok(dest_pfn)
+    }
+
+    pub fn complete_migration(self: ref mut, dest_pfn: PhysicalPageNumber)
+        -> Result<(), MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by MAX_PAGE_MIGRATIONS
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_migrations {
+            let mig: ref mut PageMigrationState = self.migrations.get_mut(i)
+            if mig.status == PAGE_BUDDY_MIGRATING &&
+               mig.dest_pfn.value() == dest_pfn.value() {
+                let src: PhysicalPageNumber = mig.source_pfn
+                let dst: PhysicalPageNumber = mig.dest_pfn
+                // Clear migration flags on source
+                let src_entry: ref mut PageFrameEntry = self.page_db.get_mut(src)?
+                src_entry.flags.clear(PAGE_FLAG_MIGRATING);
+                src_entry.flags.clear(PAGE_FLAG_WRITEBACK);
+                src_entry.mark_free();
+                // Mark destination as allocated
+                let dst_entry: ref mut PageFrameEntry = self.page_db.get_mut(dst)?
+                dst_entry.flags.clear(PAGE_FLAG_MIGRATING);
+                dst_entry.mark_allocated();
+                mig.complete();
+                self.generation.bump();
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_PPA_MIGRATE_FAIL,
+            FixedString[128]::from_slice("Migration not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Statistics and Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PPA-STATS-001 through MEM-PPA-STATS-025
+
+    pub fn total_free_pages(self) -> u64
+        effects: [deterministic]
+    {
+        self.page_db.free_memory()
+    }
+
+    pub fn total_used_pages(self) -> u64
+        effects: [deterministic]
+    {
+        self.page_db.used_memory()
+    }
+
+    pub fn allocation_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.allocation_count
+    }
+
+    pub fn free_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.free_count
+    }
+
+    pub fn fail_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.fail_count
+    }
+
+    pub fn migration_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.migration_count
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        self.page_db.utilization()
+    }
+
+    pub fn is_dma_zone_low(self) -> bool
+        effects: [deterministic]
+    {
+        self.dma_zone.is_low()
+    }
+
+    pub fn is_dma32_zone_low(self) -> bool
+        effects: [deterministic]
+    {
+        self.dma32_zone.is_low()
+    }
+
+    pub fn is_normal_zone_low(self) -> bool
+        effects: [deterministic]
+    {
+        self.normal_zone.is_low()
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn dma_zone_free_pages(self) -> u32
+        effects: [deterministic]
+    {
+        self.dma_zone.free_pages
+    }
+
+    pub fn normal_zone_free_pages(self) -> u32
+        effects: [deterministic]
+    {
+        self.normal_zone.free_pages
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // All state changes record residuals for auditability.
+    // Evidence path: MEM-PPA-RESID-001 through MEM-PPA-RESID-025
+
+    fn record_allocation_residual(self, pfn: PhysicalPageNumber,
+                                   count: u32, zone: ZoneType)
+        effects: [deterministic]
+    {
+        // residual: Record physical page allocation with zone and count
+        // The compiler emits this as a residual diagnostic for the audit trail.
+        @emit_residual(
+            message: "Physical page allocation",
+            code: DIAG_PPA_OK,
+            data: (pfn.value(), count, zone as u8),
+        )
+    }
+
+    fn record_free_residual(self, pfn: PhysicalPageNumber, count: u32)
+        effects: [deterministic]
+    {
+        // residual: Record physical page deallocation
+        @emit_residual(
+            message: "Physical page deallocation",
+            code: DIAG_PPA_OK,
+            data: (pfn.value(), count),
+        )
+    }
+
+    fn record_dma_allocation_residual(self, pfn: PhysicalPageNumber,
+                                       count: u32, zone: ZoneType)
+        effects: [deterministic]
+    {
+        // residual: Record DMA zone allocation
+        @emit_residual(
+            message: "DMA zone page allocation",
+            code: DIAG_PPA_OK,
+            data: (pfn.value(), count, zone as u8),
+        )
+    }
+
+    fn record_reservation_residual(self, pfn: PhysicalPageNumber, count: u32)
+        effects: [deterministic]
+    {
+        // residual: Record contiguous page reservation
+        @emit_residual(
+            message: "Contiguous page reservation",
+            code: DIAG_PPA_OK,
+            data: (pfn.value(), count),
+        )
+    }
+
+    fn record_numa_allocation_residual(self, pfn: PhysicalPageNumber,
+                                        count: u32, node_id: NumaNodeId)
+        effects: [deterministic]
+    {
+        // residual: Record NUMA-aware allocation
+        @emit_residual(
+            message: "NUMA node page allocation",
+            code: DIAG_PPA_OK,
+            data: (pfn.value(), count, node_id.value()),
+        )
+    }
+
+    fn record_migration_residual(self, src: PhysicalPageNumber,
+                                  dst: PhysicalPageNumber, count: u32,
+                                  target_node: NumaNodeId)
+        effects: [deterministic]
+    {
+        // residual: Record page migration
+        @emit_residual(
+            message: "Page migration",
+            code: DIAG_PPA_OK,
+            data: (src.value(), dst.value(), count, target_node.value()),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization Functions
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-INIT-001 through MEM-PPA-INIT-015
+
+pub fn init_buddy_allocator(
+    mem_size: u64,
+    dma_size: u32,
+    dma32_size: u32,
+) -> BuddyAllocator
+    effects: [deterministic]
+{
+    let total_pages: u32 = (mem_size / PAGE_SIZE_BYTES) as u32
+    let dma_pages: u32 = dma_size
+    let dma32_pages: u32 = dma32_size
+    let dma_base: PhysicalPageNumber = PhysicalPageNumber::new(0)
+    let dma32_base: PhysicalPageNumber = PhysicalPageNumber::new(dma_pages as u64)
+    let allocator: BuddyAllocator = BuddyAllocator::new(
+        total_pages, mem_size,
+        dma_base, dma_pages,
+        dma32_base, dma32_pages)
+    allocator
+}
+
+pub fn init_numa_topology(allocator: ref mut BuddyAllocator,
+                           node_configs: FixedArray[8, (u64, u64, u32)])
+    -> Result[(), MemoryError]
+    effects: [deterministic]
+{
+    // loop: bounds[BOUND_TINY] — bounded by MAX_NUMA_NODES
+    loop: bounds[BOUND_TINY] for i in 0..node_configs.len() {
+        let (base, size, processors): (u64, u64, u32) = node_configs.get(i)
+        if size == 0 {
+            break
+        }
+        let base_pfn: PhysicalPageNumber = PhysicalPageNumber::from_address(base)
+        let page_count: u32 = (size / PAGE_SIZE_BYTES) as u32
+        let node_id: NumaNodeId = NumaNodeId::new(i)
+        let descriptor: NumaNodeDescriptor = NumaNodeDescriptor::new(
+            node_id, base_pfn, page_count)
+        // Set distance to self as 0
+        descriptor.set_distance(node_id, 0)
+        allocator.add_numa_node(descriptor)?
+    }
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// Emergency Allocation (for OOM recovery)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-EMERG-001 through MEM-PPA-EMERG-010
+
+pub fn emergency_allocate_page(allocator: ref mut BuddyAllocator)
+    -> Result[PhysicalPageNumber, MemoryError]
+    effects: [deterministic]
+{
+    // Reserve pages at the highest order to guarantee at least one page
+    let order: u32 = BuddyAllocator::order_for_pages(1)
+    allocator.allocate_buddy(order, ZoneType::Zone_Normal)
+}
+
+// ──────────────────────────────────────────────
+// Page State Query
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-QUERY-001 through MEM-PPA-QUERY-015
+
+pub fn get_page_state(allocator: ref BuddyAllocator, pfn: PhysicalPageNumber)
+    -> Result[u8, MemoryError]
+    effects: [deterministic]
+{
+    let entry: ref PageFrameEntry = allocator.page_db.get(pfn)?
+    if entry.is_free() {
+        Result::Ok(PAGE_BUDDY_FREE)
+    } else if entry.flags.is_set(PAGE_FLAG_RESERVED) {
+        Result::Ok(PAGE_BUDDY_RESERVED)
+    } else if entry.flags.is_set(PAGE_FLAG_MIGRATING) {
+        Result::Ok(PAGE_BUDDY_MIGRATING)
+    } else {
+        Result::Ok(PAGE_BUDDY_ALLOC)
+    }
+}
+
+pub fn get_page_refcount(allocator: ref BuddyAllocator, pfn: PhysicalPageNumber)
+    -> Result[Word32, MemoryError]
+    effects: [deterministic]
+{
+    let entry: ref PageFrameEntry = allocator.page_db.get(pfn)?
+    Result::Ok(entry.refcount)
+}
+
+pub fn increment_page_refcount(allocator: ref mut BuddyAllocator, pfn: PhysicalPageNumber)
+    -> Result[Word32, MemoryError]
+    effects: [deterministic]
+{
+    let entry: ref mut PageFrameEntry = allocator.page_db.get_mut(pfn)?
+    entry.refcount.bump();
+    Result::Ok(entry.refcount)
+}
+
+pub fn decrement_page_refcount(allocator: ref mut BuddyAllocator, pfn: PhysicalPageNumber)
+    -> Result[Word32, MemoryError]
+    effects: [deterministic]
+{
+    let entry: ref mut PageFrameEntry = allocator.page_db.get_mut(pfn)?
+    if entry.refcount.value() > 0 {
+        entry.refcount = Word32::new(entry.refcount.value() - 1)
+    }
+    Result::Ok(entry.refcount)
+}
+
+// ──────────────────────────────────────────────
+// Memory Pressure Prediction
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PPA-PRESSURE-001 through MEM-PPA-PRESSURE-010
+
+pub fn memory_pressure_level(allocator: ref BuddyAllocator) -> u8
+    effects: [deterministic]
+{
+    let util: u8 = allocator.utilization()
+    if util >= 95 {
+        3  // Critical pressure
+    } else if util >= 80 {
+        2  // High pressure
+    } else if util >= 60 {
+        1  // Moderate pressure
+    } else {
+        0  // Normal
+    }
+}
+
+pub fn has_sufficient_memory(allocator: ref BuddyAllocator, required: u64) -> bool
+    effects: [deterministic]
+{
+    allocator.total_free_pages() * PAGE_SIZE_BYTES >= required
+}

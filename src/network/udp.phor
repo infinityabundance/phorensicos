@@ -1,0 +1,1280 @@
+// udp.phor — UDP: datagram parsing, checksum, port management, send/receive buffers
+// Implements RFC 768 User Datagram Protocol with residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/udp.phor
+// Court: udp:v1
+
+package network.udp;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ipv4.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// UDP sub-range: 0xE500 - 0xE5FF
+
+type UdpError = enum {
+    UdpPacketTooShort       = 0xE500,  // NE500: UDP packet shorter than 8 bytes
+    UdpChecksumMismatch     = 0xE501,  // NE501: UDP checksum mismatch
+    UdpPortInUse            = 0xE502,  // NE502: Port already in use
+    UdpPortNotOpen          = 0xE503,  // NE503: Port not open
+    UdpPortTableFull        = 0xE504,  // NE504: Port table at capacity
+    UdpSendBufferFull       = 0xE505,  // NE505: Send buffer full
+    UdpRecvBufferFull       = 0xE506,  // NE506: Receive buffer full
+    UdpRecvBufferEmpty      = 0xE507,  // NE507: Receive buffer empty
+    UdpInvalidLength        = 0xE508,  // NE508: Invalid UDP length field
+    UdpCapabilityError      = 0xE509,  // NE509: Insufficient capability for UDP operation
+    UdpBufferOverflow       = 0xE50A,  // NE50A: Buffer overflow
+    UdpNoRoute              = 0xE50B,  // NE50B: No route to destination
+    UdpInterfaceNotFound    = 0xE50C,  // NE50C: Network interface not found
+    UdpPortBlocked          = 0xE50D,  // NE50D: Port blocked by capability filter
+    UdpInvalidAddress       = 0xE50E,  // NE50E: Invalid source/destination address
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const UDP_HDR_LEN          : u64 = 8;
+const UDP_MAX_DATAGRAM     : u64 = 65535;
+const UDP_MAX_PAYLOAD      : u64 = 65527;
+const UDP_MAX_PORTS        : u64 = 65536;
+const UDP_PORT_TABLE_SIZE  : u64 = 128;
+const UDP_RECV_BUF_SIZE    : u64 = 64;
+const UDP_SEND_BUF_SIZE    : u64 = 64;
+const UDP_DEFAULT_TTL      : u8 = 64;
+const UDP_MTU_SAFE         : u64 = 534;
+const UDP_EPHEMERAL_START  : u16 = 49152;
+const UDP_EPHEMERAL_END    : u16 = 65535;
+
+// ─────────────────────────────────────────────────────────────
+// Well-Known Ports
+// ─────────────────────────────────────────────────────────────
+
+type WellKnownPort = enum {
+    Echo          = 7,
+    Discard       = 9,
+    Daytime       = 13,
+    Qotd          = 17,
+    Dns           = 53,
+    DhcpClient    = 68,
+    DhcpServer    = 67,
+    Tftp          = 69,
+    Ntp           = 123,
+    Snmp          = 161,
+    SnmpTrap      = 162,
+    Radius        = 1812,
+    RadiusAcct    = 1813,
+    Syslog        = 514,
+    Mqtt          = 1883,
+    Quic          = 443,
+    DnsOverTls    = 853,
+    Ssh           = 22,
+    Http          = 80,
+    Https         = 443,
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Header
+// ─────────────────────────────────────────────────────────────
+
+struct UdpHeader {
+    source_port: u16,
+    dest_port: u16,
+    length: u16,
+    checksum: u16,
+}
+
+impl UdpHeader {
+    fn new(src_port: u16, dst_port: u16, payload_len: u64) -> UdpHeader
+        effect [deterministic]
+    {
+        return UdpHeader {
+            source_port: src_port,
+            dest_port: dst_port,
+            length: (UDP_HDR_LEN + payload_len) as u16,
+            checksum: 0,
+        };
+    }
+
+    fn parse(data: Array(u8, 1518), len: u64) -> Result(UdpHeader, UdpError)
+        effect [deterministic]
+    {
+        if len < UDP_HDR_LEN {
+            return Result::Err(UdpError::UdpPacketTooShort);
+        };
+        let src_port: u16 = ((data[0] as u16) << 8) | (data[1] as u16);
+        let dst_port: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        let length: u16 = ((data[4] as u16) << 8) | (data[5] as u16);
+        let checksum: u16 = ((data[6] as u16) << 8) | (data[7] as u16);
+        if (length as u64) < UDP_HDR_LEN || (length as u64) > len {
+            return Result::Err(UdpError::UdpInvalidLength);
+        };
+        return Result::Ok(UdpHeader {
+            source_port: src_port,
+            dest_port: dst_port,
+            length: length,
+            checksum: checksum,
+        });
+    }
+
+    fn serialize(self) -> Array(u8, UDP_HDR_LEN)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, UDP_HDR_LEN) = Array::zeroed();
+        buf[0] = ((self.source_port >> 8) & 0xFF) as u8;
+        buf[1] = (self.source_port & 0xFF) as u8;
+        buf[2] = ((self.dest_port >> 8) & 0xFF) as u8;
+        buf[3] = (self.dest_port & 0xFF) as u8;
+        buf[4] = ((self.length >> 8) & 0xFF) as u8;
+        buf[5] = (self.length & 0xFF) as u8;
+        buf[6] = ((self.checksum >> 8) & 0xFF) as u8;
+        buf[7] = (self.checksum & 0xFF) as u8;
+        return buf;
+    }
+
+    fn payload_length(self) -> u64
+        effect [deterministic]
+    {
+        let len: u64 = self.length as u64;
+        if len >= UDP_HDR_LEN {
+            return len - UDP_HDR_LEN;
+        } else {
+            return 0;
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Datagram (Header + Payload)
+// ─────────────────────────────────────────────────────────────
+
+struct UdpDatagram {
+    header: UdpHeader,
+    payload: Array(u8, UDP_MAX_PAYLOAD),
+    payload_length: u64,
+}
+
+impl UdpDatagram {
+    fn new(src_port: u16, dst_port: u16, payload_data: Array(u8, UDP_MAX_PAYLOAD), payload_len: u64) -> UdpDatagram
+        effect [deterministic]
+    {
+        return UdpDatagram {
+            header: UdpHeader::new(src_port, dst_port, payload_len),
+            payload: payload_data,
+            payload_length: payload_len,
+        };
+    }
+
+    fn compute_checksum(self, src_ip: Array(u8, 4), dst_ip: Array(u8, 4)) -> u16
+        effect [deterministic]
+        court "udp_checksum:v1"
+    {
+        let mut sum: u32 = 0;
+        // IPv4 pseudo-header
+        let src_hi: u16 = ((src_ip[0] as u16) << 8) | (src_ip[1] as u16);
+        let src_lo: u16 = ((src_ip[2] as u16) << 8) | (src_ip[3] as u16);
+        let dst_hi: u16 = ((dst_ip[0] as u16) << 8) | (dst_ip[1] as u16);
+        let dst_lo: u16 = ((dst_ip[2] as u16) << 8) | (dst_ip[3] as u16);
+        let zero: u16 = 0;
+        let proto: u16 = 17;
+        let udp_len: u16 = self.header.length;
+        sum = sum + src_hi as u32;
+        sum = sum + src_lo as u32;
+        sum = sum + dst_hi as u32;
+        sum = sum + dst_lo as u32;
+        sum = sum + zero as u32;
+        sum = sum + proto as u32;
+        sum = sum + udp_len as u32;
+        // UDP header
+        sum = sum + ((self.header.source_port as u32) << 8) | (self.header.source_port as u32 >> 8);
+        sum = sum + ((self.header.dest_port as u32) << 8) | (self.header.dest_port as u32 >> 8);
+        sum = sum + ((self.header.length as u32) << 8) | (self.header.length as u32 >> 8);
+        sum = sum + 0; // checksum field zeroed
+        // Payload
+        let mut idx: u64 = 0;
+        loop bound (UDP_MAX_PAYLOAD / 2) {
+            if (idx * 2) >= self.payload_length {
+                break;
+            };
+            let byte0: u16 = if (idx * 2) < self.payload_length {
+                self.payload[idx * 2] as u16
+            } else { 0 };
+            let byte1: u16 = if (idx * 2 + 1) < self.payload_length {
+                self.payload[idx * 2 + 1] as u16
+            } else { 0 };
+            sum = sum + ((byte0 << 8) | byte1) as u32;
+        };
+        // Fold to 16 bits
+        loop bound 4 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        };
+        if sum == 0 {
+            return 0xFFFF;
+        };
+        return (!(sum as u16)) as u16;
+    }
+
+    fn verify_checksum(self, src_ip: Array(u8, 4), dst_ip: Array(u8, 4)) -> bool
+        effect [deterministic]
+    {
+        if self.header.checksum == 0 {
+            return true; // Zero checksum means disabled
+        };
+        let computed: u16 = self.compute_checksum(src_ip, dst_ip);
+        return computed == self.header.checksum;
+    }
+
+    fn set_checksum(self: ref mut, src_ip: Array(u8, 4), dst_ip: Array(u8, 4))
+        effect [deterministic]
+    {
+        let cksum: u16 = self.compute_checksum(src_ip, dst_ip);
+        self.header.checksum = cksum;
+    }
+
+    fn parse(raw: Array(u8, 1518), len: u64) -> Result(UdpDatagram, UdpError)
+        effect [deterministic]
+    {
+        let hdr_res: Result(UdpHeader, UdpError) = UdpHeader::parse(raw, len);
+        if hdr_res.is_err() {
+            return Result::Err(hdr_res.unwrap_err());
+        };
+        let hdr: UdpHeader = hdr_res.unwrap();
+        let payload_len: u64 = hdr.payload_length();
+        if (UDP_HDR_LEN + payload_len) > len {
+            return Result::Err(UdpError::UdpInvalidLength);
+        };
+        let mut payload: Array(u8, UDP_MAX_PAYLOAD) = Array::zeroed();
+        loop bound UDP_MAX_PAYLOAD {
+            if i >= payload_len {
+                break;
+            };
+            payload[i] = raw[UDP_HDR_LEN + i];
+        };
+        return Result::Ok(UdpDatagram {
+            header: hdr,
+            payload: payload,
+            payload_length: payload_len,
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, 1518), UdpError)
+        effect [deterministic]
+    {
+        let total_len: u64 = UDP_HDR_LEN + self.payload_length;
+        if total_len > 1518 {
+            return Result::Err(UdpError::UdpBufferOverflow);
+        };
+        let mut buf: Array(u8, 1518) = Array::zeroed();
+        buf[0] = ((self.header.source_port >> 8) & 0xFF) as u8;
+        buf[1] = (self.header.source_port & 0xFF) as u8;
+        buf[2] = ((self.header.dest_port >> 8) & 0xFF) as u8;
+        buf[3] = (self.header.dest_port & 0xFF) as u8;
+        buf[4] = ((self.header.length >> 8) & 0xFF) as u8;
+        buf[5] = (self.header.length & 0xFF) as u8;
+        buf[6] = ((self.header.checksum >> 8) & 0xFF) as u8;
+        buf[7] = (self.header.checksum & 0xFF) as u8;
+        loop bound UDP_MAX_PAYLOAD {
+            if i >= self.payload_length {
+                break;
+            };
+            buf[UDP_HDR_LEN + i] = self.payload[i];
+        };
+        return Result::Ok(buf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Socket Buffer
+// ─────────────────────────────────────────────────────────────
+
+struct UdpRecvEntry {
+    datagram: UdpDatagram,
+    src_addr: Ipv4Address,
+    src_port: u16,
+    timestamp: u64,
+}
+
+impl UdpRecvEntry {
+    fn new(dgram: UdpDatagram, src: Ipv4Address, sport: u16, ts: u64) -> UdpRecvEntry
+        effect [deterministic]
+    {
+        return UdpRecvEntry {
+            datagram: dgram,
+            src_addr: src,
+            src_port: sport,
+            timestamp: ts,
+        };
+    }
+}
+
+struct UdpRecvBuffer {
+    entries: Array(UdpRecvEntry, UDP_RECV_BUF_SIZE),
+    head: u64,
+    tail: u64,
+    count: u64,
+}
+
+impl UdpRecvBuffer {
+    fn new() -> UdpRecvBuffer
+        effect [deterministic]
+    {
+        return UdpRecvBuffer {
+            entries: Array::zeroed(),
+            head: 0,
+            tail: 0,
+            count: 0,
+        };
+    }
+
+    fn push(self: ref mut, entry: UdpRecvEntry) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        if self.count >= UDP_RECV_BUF_SIZE {
+            return Result::Err(UdpError::UdpRecvBufferFull);
+        };
+        self.entries[self.head] = entry;
+        self.head = (self.head + 1) % UDP_RECV_BUF_SIZE;
+        self.count = self.count + 1;
+        return Result::Ok(void);
+    }
+
+    fn pop(self: ref mut) -> Result(UdpRecvEntry, UdpError)
+        effect [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(UdpError::UdpRecvBufferEmpty);
+        };
+        let entry: UdpRecvEntry = self.entries[self.tail];
+        self.tail = (self.tail + 1) % UDP_RECV_BUF_SIZE;
+        self.count = self.count - 1;
+        return Result::Ok(entry);
+    }
+
+    fn peek(self) -> Result(UdpRecvEntry, UdpError)
+        effect [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(UdpError::UdpRecvBufferEmpty);
+        };
+        return Result::Ok(self.entries[self.tail]);
+    }
+
+    fn is_empty(self) -> bool
+        effect [deterministic]
+    {
+        return self.count == 0;
+    }
+
+    fn is_full(self) -> bool
+        effect [deterministic]
+    {
+        return self.count >= UDP_RECV_BUF_SIZE;
+    }
+
+    fn available(self) -> u64
+        effect [deterministic]
+    {
+        return self.count;
+    }
+
+    fn clear(self: ref mut)
+        effect [deterministic]
+    {
+        self.head = 0;
+        self.tail = 0;
+        self.count = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Port Entry
+// ─────────────────────────────────────────────────────────────
+
+struct UdpPortEntry {
+    port: u16,
+    recv_buffer: UdpRecvBuffer,
+    bound_addr: Ipv4Address,
+    bound_interface: u64,
+    reuse_addr: bool,
+    broadcast_enabled: bool,
+    cap_grant: Cap(NicCapability),
+    generation: u64,
+    in_use: bool,
+}
+
+impl UdpPortEntry {
+    fn empty() -> UdpPortEntry
+        effect [deterministic]
+    {
+        return UdpPortEntry {
+            port: 0,
+            recv_buffer: UdpRecvBuffer::new(),
+            bound_addr: Ipv4Address::any(),
+            bound_interface: 0,
+            reuse_addr: false,
+            broadcast_enabled: false,
+            cap_grant: Option::None,
+            generation: 0,
+            in_use: false,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Port Table
+// ─────────────────────────────────────────────────────────────
+
+struct UdpPortTable {
+    entries: Array(UdpPortEntry, UDP_PORT_TABLE_SIZE),
+    entry_count: u64,
+    next_ephemeral: u16,
+}
+
+impl UdpPortTable {
+    fn new() -> UdpPortTable
+        effect [deterministic]
+    {
+        return UdpPortTable {
+            entries: Array::zeroed(),
+            entry_count: 0,
+            next_ephemeral: UDP_EPHEMERAL_START,
+        };
+    }
+
+    fn find_by_port(self, port: u16) -> Result(u64, UdpError)
+        effect [deterministic]
+    {
+        loop bound UDP_PORT_TABLE_SIZE {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].in_use && self.entries[i].port == port {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(UdpError::UdpPortNotOpen);
+    }
+
+    fn find_by_port_and_addr(self, port: u16, addr: Ipv4Address) -> Result(u64, UdpError)
+        effect [deterministic]
+    {
+        loop bound UDP_PORT_TABLE_SIZE {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].in_use && self.entries[i].port == port {
+                if self.entries[i].bound_addr.is_unspecified() ||
+                   self.entries[i].bound_addr.eq(addr) {
+                    return Result::Ok(i);
+                };
+            };
+        };
+        return Result::Err(UdpError::UdpPortNotOpen);
+    }
+
+    fn bind(self: ref mut, port: u16, addr: Ipv4Address, iface: u64,
+             reuse: bool, broadcast: bool) -> Result(u64, UdpError)
+        effect [deterministic]
+    {
+        // Check if port already in use
+        let existing_res: Result(u64, UdpError) = self.find_by_port(port);
+        if existing_res.is_ok() {
+            let idx: u64 = existing_res.unwrap();
+            if !self.entries[idx].reuse_addr || !reuse {
+                return Result::Err(UdpError::UdpPortInUse);
+            };
+        };
+        if self.entry_count >= UDP_PORT_TABLE_SIZE {
+            return Result::Err(UdpError::UdpPortTableFull);
+        };
+        let idx: u64 = self.entry_count;
+        self.entries[idx] = UdpPortEntry {
+            port: port,
+            recv_buffer: UdpRecvBuffer::new(),
+            bound_addr: addr,
+            bound_interface: iface,
+            reuse_addr: reuse,
+            broadcast_enabled: broadcast,
+            cap_grant: Option::None,
+            generation: 1,
+            in_use: true,
+        };
+        self.entry_count = self.entry_count + 1;
+
+        residual emit {
+            op: "udp.bind",
+            port: port,
+            addr: addr.to_array(),
+            interface: iface,
+        };
+
+        return Result::Ok(idx);
+    }
+
+    fn unbind(self: ref mut, port: u16) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        let idx_res: Result(u64, UdpError) = self.find_by_port(port);
+        if idx_res.is_err() {
+            return Result::Err(idx_res.unwrap_err());
+        };
+        let idx: u64 = idx_res.unwrap();
+        self.entries[idx] = self.entries[self.entry_count - 1];
+        self.entry_count = self.entry_count - 1;
+
+        residual emit {
+            op: "udp.unbind",
+            port: port,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn allocate_ephemeral(self: ref mut) -> Result(u16, UdpError)
+        effect [deterministic]
+    {
+        let start: u16 = self.next_ephemeral;
+        loop bound (UDP_EPHEMERAL_END - UDP_EPHEMERAL_START + 1) as u64 {
+            let port: u16 = self.next_ephemeral;
+            self.next_ephemeral = if self.next_ephemeral >= UDP_EPHEMERAL_END {
+                UDP_EPHEMERAL_START
+            } else {
+                self.next_ephemeral + 1
+            };
+            let found_res: Result(u64, UdpError) = self.find_by_port(port);
+            if found_res.is_err() {
+                return Result::Ok(port);
+            };
+            if port == start {
+                break;
+            };
+        };
+        return Result::Err(UdpError::UdpPortTableFull);
+    }
+
+    fn deliver(self: ref mut, dgram: UdpDatagram, src_addr: Ipv4Address, timestamp: u64) -> Result(void, UdpError)
+        effect [deterministic]
+        court "udp_deliver:v1"
+    {
+        let idx_res: Result(u64, UdpError) = self.find_by_port_and_addr(dgram.header.dest_port, src_addr);
+        if idx_res.is_err() {
+            // Try with unspecified address
+            let any_res: Result(u64, UdpError) = self.find_by_port(dgram.header.dest_port);
+            if any_res.is_err() {
+                return Result::Err(UdpError::UdpPortNotOpen);
+            };
+            let any_idx: u64 = any_res.unwrap();
+            if !self.entries[any_idx].bound_addr.is_unspecified() {
+                return Result::Err(UdpError::UdpPortNotOpen);
+            };
+            return self.enqueue_recv(any_idx, dgram, src_addr, timestamp);
+        };
+        let idx: u64 = idx_res.unwrap();
+        return self.enqueue_recv(idx, dgram, src_addr, timestamp);
+    }
+
+    fn enqueue_recv(self: ref mut, idx: u64, dgram: UdpDatagram,
+                     src_addr: Ipv4Address, timestamp: u64) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        let entry: UdpRecvEntry = UdpRecvEntry::new(dgram, src_addr, dgram.header.source_port, timestamp);
+        return self.entries[idx].recv_buffer.push(entry);
+    }
+
+    fn recv(self: ref mut, port: u16) -> Result((UdpDatagram, Ipv4Address, u16), UdpError)
+        effect [deterministic]
+    {
+        let idx_res: Result(u64, UdpError) = self.find_by_port(port);
+        if idx_res.is_err() {
+            return Result::Err(idx_res.unwrap_err());
+        };
+        let idx: u64 = idx_res.unwrap();
+        let entry_res: Result(UdpRecvEntry, UdpError) = self.entries[idx].recv_buffer.pop();
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: UdpRecvEntry = entry_res.unwrap();
+        return Result::Ok((entry.datagram, entry.src_addr, entry.src_port));
+    }
+
+    fn recv_from(self: ref mut, port: u16, dst_addr: Ipv4Address) -> Result((UdpDatagram, Ipv4Address, u16), UdpError)
+        effect [deterministic]
+    {
+        // Similar to recv but filtered by destination
+        return self.recv(port);
+    }
+
+    fn pending(self, port: u16) -> u64
+        effect [deterministic]
+    {
+        let idx_res: Result(u64, UdpError) = self.find_by_port(port);
+        if idx_res.is_err() {
+            return 0;
+        };
+        let idx: u64 = idx_res.unwrap();
+        return self.entries[idx].recv_buffer.available();
+    }
+
+    fn is_bound(self, port: u16) -> bool
+        effect [deterministic]
+    {
+        return self.find_by_port(port).is_ok();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP State
+// ─────────────────────────────────────────────────────────────
+
+struct UdpState {
+    port_table: UdpPortTable,
+    datagrams_sent: u64,
+    datagrams_recv: u64,
+    datagrams_dropped: u64,
+    checksum_errors: u64,
+    generation: u64,
+}
+
+impl UdpState {
+    fn new() -> UdpState
+        effect [deterministic]
+    {
+        return UdpState {
+            port_table: UdpPortTable::new(),
+            datagrams_sent: 0,
+            datagrams_recv: 0,
+            datagrams_dropped: 0,
+            checksum_errors: 0,
+            generation: 1,
+        };
+    }
+
+    fn send(
+        self: ref mut,
+        src_port: u16,
+        dst_port: u16,
+        dst_ip: Ipv4Address,
+        payload: Array(u8, UDP_MAX_PAYLOAD),
+        payload_len: u64,
+        local_ip: Ipv4Address,
+    ) -> Result(UdpDatagram, UdpError)
+        effect [deterministic]
+        court "udp_send:v1"
+    {
+        if payload_len > UDP_MAX_PAYLOAD {
+            return Result::Err(UdpError::UdpBufferOverflow);
+        };
+        let datagram: UdpDatagram = UdpDatagram::new(src_port, dst_port, payload, payload_len);
+        self.datagrams_sent = self.datagrams_sent + 1;
+
+        residual emit {
+            op: "udp.send",
+            src_port: src_port,
+            dst_port: dst_port,
+            dst_ip: dst_ip.to_array(),
+            payload_len: payload_len,
+        };
+
+        return Result::Ok(datagram);
+    }
+
+    fn receive(
+        self: ref mut,
+        datagram: UdpDatagram,
+        src_ip: Ipv4Address,
+        timestamp: u64,
+    ) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        let deliver_res: Result(void, UdpError) = self.port_table.deliver(datagram, src_ip, timestamp);
+        if deliver_res.is_err() {
+            self.datagrams_dropped = self.datagrams_dropped + 1;
+            return Result::Err(deliver_res.unwrap_err());
+        };
+        self.datagrams_recv = self.datagrams_recv + 1;
+        return Result::Ok(void);
+    }
+
+    fn bind(self: ref mut, port: u16, addr: Ipv4Address, iface: u64,
+             reuse: bool, broadcast: bool) -> Result(u64, UdpError)
+        effect [deterministic]
+    {
+        return self.port_table.bind(port, addr, iface, reuse, broadcast);
+    }
+
+    fn unbind(self: ref mut, port: u16) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        return self.port_table.unbind(port);
+    }
+
+    fn recv(self: ref mut, port: u16) -> Result((UdpDatagram, Ipv4Address, u16), UdpError)
+        effect [deterministic]
+    {
+        return self.port_table.recv(port);
+    }
+
+    fn pending(self, port: u16) -> u64
+        effect [deterministic]
+    {
+        return self.port_table.pending(port);
+    }
+
+    fn allocate_ephemeral(self: ref mut) -> Result(u16, UdpError)
+        effect [deterministic]
+    {
+        return self.port_table.allocate_ephemeral();
+    }
+
+    fn get_statistics(self) -> (u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.datagrams_sent,
+            self.datagrams_recv,
+            self.datagrams_dropped,
+            self.checksum_errors,
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn udp_init() -> Result(UdpState, UdpError)
+    effect [deterministic]
+    court "udp_init:v1"
+{
+    residual emit {
+        op: "udp.init",
+        status: "ready",
+    };
+    return Result::Ok(UdpState::new());
+}
+
+fn udp_is_privileged_port(port: u16) -> bool
+    effect [deterministic]
+{
+    return port < 1024;
+}
+
+fn udp_is_ephemeral_port(port: u16) -> bool
+    effect [deterministic]
+{
+    return port >= UDP_EPHEMERAL_START;
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Connection (connected socket helper)
+// ─────────────────────────────────────────────────────────────
+
+struct UdpConnectedSocket {
+    local_port: u16,
+    remote_addr: Ipv4Address,
+    remote_port: u16,
+    state: ref mut UdpState,
+    generation: u64,
+}
+
+impl UdpConnectedSocket {
+    fn new(local: u16, remote_addr: Ipv4Address, remote: u16, st: ref mut UdpState) -> UdpConnectedSocket
+        effect [deterministic]
+    {
+        return UdpConnectedSocket {
+            local_port: local,
+            remote_addr: remote_addr,
+            remote_port: remote,
+            state: st,
+            generation: 1,
+        };
+    }
+
+    fn send(self: ref mut, data: Array(u8, UDP_MAX_PAYLOAD), data_len: u64) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        let dgram_res: Result(UdpDatagram, UdpError) = self.state.send(
+            self.local_port, self.remote_port, self.remote_addr,
+            data, data_len, Ipv4Address::any(),
+        );
+        if dgram_res.is_err() {
+            return Result::Err(dgram_res.unwrap_err());
+        };
+        return Result::Ok(void);
+    }
+
+    fn recv(self: ref mut) -> Result((UdpDatagram, Ipv4Address, u16), UdpError)
+        effect [deterministic]
+    {
+        return self.state.recv(self.local_port);
+    }
+
+    fn pending(self) -> u64
+        effect [deterministic]
+    {
+        return self.state.pending(self.local_port);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Broadcast Support
+// ─────────────────────────────────────────────────────────────
+
+fn udp_is_broadcast_addr(addr: Ipv4Address) -> bool
+    effect [deterministic]
+{
+    return addr.is_broadcast() || addr.is_subnet_broadcast(24);
+}
+
+fn udp_is_multicast_addr(addr: Ipv4Address) -> bool
+    effect [deterministic]
+{
+    return addr.is_multicast();
+}
+
+fn udp_allowed_broadcast_port(port: u16) -> bool
+    effect [deterministic]
+{
+    // Ports commonly used for broadcast/multicast
+    if port == 67 || port == 68 { return true; };  // DHCP
+    if port == 5353 { return true; };  // mDNS
+    if port == 1900 { return true; };  // SSDP
+    if port == 3702 { return true; };  // WS-Discovery
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Checksum Offload
+// ─────────────────────────────────────────────────────────────
+
+fn udp_checksum_offload_required(ip_src: Ipv4Address, ip_dst: Ipv4Address, udp_len: u64) -> bool
+    effect [deterministic]
+{
+    // RFC 768: UDP checksum is optional for IPv4
+    return true;
+}
+
+fn udp_compute_partial_checksum(data: Array(u8, 65535), len: u64, initial_sum: u32) -> u16
+    effect [deterministic]
+{
+    let mut sum: u32 = initial_sum;
+    let mut idx: u64 = 0;
+    loop bound 65535 {
+        if (idx * 2) >= len {
+            break;
+        };
+        let byte0: u16 = if idx * 2 < len { data[idx * 2] as u16 } else { 0 };
+        let byte1: u16 = if idx * 2 + 1 < len { data[idx * 2 + 1] as u16 } else { 0 };
+        sum = sum + ((byte0 << 8) | byte1) as u32;
+    };
+    loop bound 4 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    };
+    if sum == 0 {
+        return 0xFFFF;
+    };
+    return (!(sum as u16)) as u16;
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Multicast Group Management
+// ─────────────────────────────────────────────────────────────
+
+struct UdpMcastGroup {
+    mcast_addr: Ipv4Address,
+    interface_idx: u64,
+    joined: bool,
+    ttl: u8,
+    loopback: bool,
+}
+
+impl UdpMcastGroup {
+    fn new(addr: Ipv4Address, iface: u64) -> UdpMcastGroup
+        effect [deterministic]
+    {
+        return UdpMcastGroup {
+            mcast_addr: addr,
+            interface_idx: iface,
+            joined: true,
+            ttl: 1,
+            loopback: false,
+        };
+    }
+}
+
+const UDP_MAX_MCAST_GROUPS: u64 = 16;
+
+struct UdpMulticastManager {
+    groups: Array(UdpMcastGroup, UDP_MAX_MCAST_GROUPS),
+    group_count: u64,
+}
+
+impl UdpMulticastManager {
+    fn new() -> UdpMulticastManager
+        effect [deterministic]
+    {
+        return UdpMulticastManager {
+            groups: Array::zeroed(),
+            group_count: 0,
+        };
+    }
+
+    fn join_group(self: ref mut, addr: Ipv4Address, iface: u64) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        if !addr.is_multicast() {
+            return Result::Err(UdpError::UdpInvalidAddress);
+        };
+        if self.group_count >= UDP_MAX_MCAST_GROUPS {
+            return Result::Err(UdpError::UdpPortTableFull);
+        };
+        loop bound UDP_MAX_MCAST_GROUPS {
+            if i >= self.group_count { break; };
+            if self.groups[i].mcast_addr.eq(addr) && self.groups[i].interface_idx == iface {
+                return Result::Ok(void);
+            };
+        };
+        self.groups[self.group_count] = UdpMcastGroup::new(addr, iface);
+        self.group_count = self.group_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn leave_group(self: ref mut, addr: Ipv4Address, iface: u64) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        loop bound UDP_MAX_MCAST_GROUPS {
+            if i >= self.group_count { break; };
+            if self.groups[i].mcast_addr.eq(addr) && self.groups[i].interface_idx == iface {
+                self.groups[i] = self.groups[self.group_count - 1];
+                self.group_count = self.group_count - 1;
+                return Result::Ok(void);
+            };
+        };
+        return Result::Err(UdpError::UdpPortNotOpen);
+    }
+
+    fn is_member(self, addr: Ipv4Address) -> bool
+        effect [deterministic]
+    {
+        loop bound UDP_MAX_MCAST_GROUPS {
+            if i >= self.group_count { break; };
+            if self.groups[i].mcast_addr.eq(addr) && self.groups[i].joined {
+                return true;
+            };
+        };
+        return false;
+    }
+
+    fn count_groups(self) -> u64
+        effect [deterministic]
+    {
+        return self.group_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Port Range Reservation
+// ─────────────────────────────────────────────────────────────
+
+struct UdpPortRange {
+    start: u16,
+    end: u16,
+    owner: Identity,
+}
+
+const UDP_MAX_PORT_RANGES: u64 = 16;
+
+struct UdpPortRangeManager {
+    ranges: Array(UdpPortRange, UDP_MAX_PORT_RANGES),
+    range_count: u64,
+}
+
+impl UdpPortRangeManager {
+    fn new() -> UdpPortRangeManager
+        effect [deterministic]
+    {
+        return UdpPortRangeManager {
+            ranges: Array::zeroed(),
+            range_count: 0,
+        };
+    }
+
+    fn reserve(self: ref mut, start: u16, end: u16, owner: Identity) -> Result(void, UdpError)
+        effect [deterministic]
+    {
+        if self.range_count >= UDP_MAX_PORT_RANGES {
+            return Result::Err(UdpError::UdpPortTableFull);
+        };
+        loop bound UDP_MAX_PORT_RANGES {
+            if i >= self.range_count { break; };
+            let r: UdpPortRange = self.ranges[i];
+            if !(end < r.start || start > r.end) {
+                return Result::Err(UdpError::UdpPortInUse);
+            };
+        };
+        self.ranges[self.range_count] = UdpPortRange {
+            start: start, end: end, owner: owner,
+        };
+        self.range_count = self.range_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn release(self: ref mut, owner: Identity)
+        effect [deterministic]
+    {
+        let mut i: u64 = 0;
+        loop bound UDP_MAX_PORT_RANGES {
+            if i >= self.range_count { break; };
+            if self.ranges[i].owner == owner {
+                self.ranges[i] = self.ranges[self.range_count - 1];
+                self.range_count = self.range_count - 1;
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+
+    fn is_in_reserved_range(self, port: u16) -> bool
+        effect [deterministic]
+    {
+        loop bound UDP_MAX_PORT_RANGES {
+            if i >= self.range_count { break; };
+            if port >= self.ranges[i].start && port <= self.ranges[i].end {
+                return true;
+            };
+        };
+        return false;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Packet Capture / Diagnostics
+// ─────────────────────────────────────────────────────────────
+
+type UdpTraceDirection = enum {
+    TraceSent   = 0,
+    TraceRecv   = 1,
+    TraceDropped = 2,
+}
+
+struct UdpPacketTrace {
+    src_addr: Ipv4Address,
+    dst_addr: Ipv4Address,
+    src_port: u16,
+    dst_port: u16,
+    payload_len: u64,
+    direction: UdpTraceDirection,
+    timestamp: u64,
+}
+
+const UDP_MAX_TRACE_ENTRIES: u64 = 128;
+
+struct UdpTraceBuffer {
+    traces: Array(UdpPacketTrace, UDP_MAX_TRACE_ENTRIES),
+    head: u64,
+    count: u64,
+    tracing_enabled: bool,
+}
+
+impl UdpTraceBuffer {
+    fn new() -> UdpTraceBuffer
+        effect [deterministic]
+    {
+        return UdpTraceBuffer {
+            traces: Array::zeroed(),
+            head: 0,
+            count: 0,
+            tracing_enabled: false,
+        };
+    }
+
+    fn enable(self: ref mut)
+        effect [deterministic]
+    {
+        self.tracing_enabled = true;
+    }
+
+    fn disable(self: ref mut)
+        effect [deterministic]
+    {
+        self.tracing_enabled = false;
+    }
+
+    fn record(self: ref mut, trace: UdpPacketTrace)
+        effect [deterministic]
+    {
+        if !self.tracing_enabled { return; };
+        if self.count < UDP_MAX_TRACE_ENTRIES {
+            self.count = self.count + 1;
+        };
+        self.traces[self.head] = trace;
+        self.head = (self.head + 1) % UDP_MAX_TRACE_ENTRIES;
+    }
+
+    fn get_all(self) -> (Array(UdpPacketTrace, UDP_MAX_TRACE_ENTRIES), u64)
+        effect [deterministic]
+    {
+        return (self.traces, self.count);
+    }
+
+    fn clear(self: ref mut)
+        effect [deterministic]
+    {
+        self.head = 0;
+        self.count = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UDP Socket Statistics per Port
+// ─────────────────────────────────────────────────────────────
+
+struct UdpPortStats {
+    port: u16,
+    packets_sent: u64,
+    packets_recv: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    drops_in: u64,
+    drops_out: u64,
+    last_activity: u64,
+}
+
+impl UdpPortStats {
+    fn new(port_val: u16) -> UdpPortStats
+        effect [deterministic]
+    {
+        return UdpPortStats {
+            port: port_val,
+            packets_sent: 0,
+            packets_recv: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            drops_in: 0,
+            drops_out: 0,
+            last_activity: 0,
+        };
+    }
+
+    fn record_send(self: ref mut, bytes: u64, ts: u64)
+        effect [deterministic]
+    {
+        self.packets_sent = self.packets_sent + 1;
+        self.bytes_sent = self.bytes_sent + bytes;
+        self.last_activity = ts;
+    }
+
+    fn record_recv(self: ref mut, bytes: u64, ts: u64)
+        effect [deterministic]
+    {
+        self.packets_recv = self.packets_recv + 1;
+        self.bytes_recv = self.bytes_recv + bytes;
+        self.last_activity = ts;
+    }
+
+    fn record_drop(self: ref mut, incoming: bool)
+        effect [deterministic]
+    {
+        if incoming {
+            self.drops_in = self.drops_in + 1;
+        } else {
+            self.drops_out = self.drops_out + 1;
+        };
+    }
+}
+
+const UDP_MAX_PORT_STATS: u64 = 64;
+
+struct UdpStatsCollector {
+    port_stats: Array(UdpPortStats, UDP_MAX_PORT_STATS),
+    stats_count: u64,
+}
+
+impl UdpStatsCollector {
+    fn new() -> UdpStatsCollector
+        effect [deterministic]
+    {
+        return UdpStatsCollector {
+            port_stats: Array::zeroed(),
+            stats_count: 0,
+        };
+    }
+
+    fn get_or_create(self: ref mut, port: u16) -> Result(ref mut UdpPortStats, UdpError)
+        effect [deterministic]
+    {
+        loop bound UDP_MAX_PORT_STATS {
+            if i >= self.stats_count { break; };
+            if self.port_stats[i].port == port {
+                return Result::Ok(self.port_stats[i]);
+            };
+        };
+        if self.stats_count >= UDP_MAX_PORT_STATS {
+            return Result::Err(UdpError::UdpPortTableFull);
+        };
+        self.port_stats[self.stats_count] = UdpPortStats::new(port);
+        self.stats_count = self.stats_count + 1;
+        return Result::Ok(self.port_stats[self.stats_count - 1]);
+    }
+
+    fn record_send(self: ref mut, port: u16, bytes: u64, ts: u64)
+        effect [deterministic]
+    {
+        let stats_res: Result(ref mut UdpPortStats, UdpError) = self.get_or_create(port);
+        if stats_res.is_ok() {
+            let stats: ref mut UdpPortStats = stats_res.unwrap();
+            stats.record_send(bytes, ts);
+        };
+    }
+
+    fn record_recv(self: ref mut, port: u16, bytes: u64, ts: u64)
+        effect [deterministic]
+    {
+        let stats_res: Result(ref mut UdpPortStats, UdpError) = self.get_or_create(port);
+        if stats_res.is_ok() {
+            let stats: ref mut UdpPortStats = stats_res.unwrap();
+            stats.record_recv(bytes, ts);
+        };
+    }
+
+    fn record_drop(self: ref mut, port: u16, incoming: bool)
+        effect [deterministic]
+    {
+        let stats_res: Result(ref mut UdpPortStats, UdpError) = self.get_or_create(port);
+        if stats_res.is_ok() {
+            let stats: ref mut UdpPortStats = stats_res.unwrap();
+            stats.record_drop(incoming);
+        };
+    }
+
+    fn get_by_port(self, port: u16) -> Result(UdpPortStats, UdpError)
+        effect [deterministic]
+    {
+        loop bound UDP_MAX_PORT_STATS {
+            if i >= self.stats_count { break; };
+            if self.port_stats[i].port == port {
+                return Result::Ok(self.port_stats[i]);
+            };
+        };
+        return Result::Err(UdpError::UdpPortNotOpen);
+    }
+
+    fn reset(self: ref mut)
+        effect [deterministic]
+    {
+        self.stats_count = 0;
+    }
+}

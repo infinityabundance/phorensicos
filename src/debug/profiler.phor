@@ -1,0 +1,1127 @@
+// profiler.phor — Statistical Profiler: Timer-Based Sampling, Call-Graph Profiling,
+//                  Frame Pointer Unwinding, Profile Data Collection, Profile Buffer
+//                  Management, Symbolization, Profiling Output Formats (Flamegraph, Callgrind)
+// Phorensic OS — Debug Subsystem
+//
+// This module implements a statistical profiler for the Phorensic OS kernel.
+// It uses timer-based sampling to collect execution profiles, supporting both
+// flat profiles and call-graph profiles via frame pointer unwinding. Profile
+// data is collected into fixed-capacity buffers and can be exported in multiple
+// formats (flamegraph, callgrind) for external analysis.
+//
+// Operations:
+// 1. Timer-based sampling — periodic timer interrupt for stack capture
+// 2. Call-graph profiling — frame pointer unwinding for caller-callee relationships
+// 3. Profile data collection — sample accumulation in fixed buffers
+// 4. Profile buffer management — ring buffer for samples, aggregation
+// 5. Symbolization — address-to-symbol resolution for profile data
+// 6. Output formats — flamegraph (folded), callgrind (cachegrind-compatible)
+//
+// Boundedness: Sample buffer 4096 samples. Symbol cache 256 entries. Call graph
+// nodes 512 max. All loops bounded by their respective capacities.
+//
+// Effect declarations:
+//   [pure]    — data formatting, aggregation computations
+//   [io]      — output generation
+//   [timer]   — timer configuration, interrupt handling
+//   [memory]  — stack frame reads
+//   [diag]    — residual recording
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+use debug::kernel_debugger::SymbolEntry;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes for Profiler
+// ──────────────────────────────────────────────
+
+const PROF_SAMPLE_CAPTURED : u64 = 0x12000u64;
+const PROF_BUFFER_FLUSH    : u64 = 0x12001u64;
+const PROF_OUTPUT_GENERATED: u64 = 0x12002u64;
+const PROF_TIMER_CONFIG    : u64 = 0x12003u64;
+const PROF_CALLGRAPH_NODE  : u64 = 0x12004u64;
+const PROF_ERROR           : u64 = 0x1200Fu64;
+
+// ──────────────────────────────────────────────
+// Profiler Configuration
+// ──────────────────────────────────────────────
+
+/// Profiler sampling mode.
+pub sealdatatype SamplingMode : u8 {
+    /// Timer-based periodic sampling.
+    Timer = 0u8,
+    /// Event-based sampling (PMU counter overflow).
+    EventBased = 1u8,
+    /// Manual sampling (triggered by code).
+    Manual = 2u8,
+}
+
+/// Profiler output format.
+pub sealdatatype OutputFormat : u8 {
+    /// Folded stack trace format (for flamegraph.pl).
+    Flamegraph = 0u8,
+    /// Callgrind format (for KCachegrind).
+    Callgrind = 1u8,
+    /// Raw binary format (.phorprof).
+    RawBinary = 2u8,
+}
+
+/// A single profiler sample (stack frame).
+pub struct ProfilerSample {
+    /// Program counter at time of sample.
+    pub pc : u64,
+    /// Frame pointer at time of sample.
+    pub frame_pointer : u64,
+    /// Stack pointer at time of sample.
+    pub stack_pointer : u64,
+    /// CPU ID on which sample was taken.
+    pub cpu_id : u32,
+    /// Process/thread ID.
+    pub thread_id : u32,
+    /// Timestamp of sample.
+    pub timestamp : u64,
+    /// Depth of unwound call stack.
+    pub stack_depth : u32,
+}
+
+/// A call graph node representing a function.
+pub struct CallGraphNode {
+    /// Function address.
+    pub address : u64,
+    /// Function name (symbol).
+    pub name : FixedString256,
+    /// Number of samples where this function was on the top of stack.
+    pub self_samples : u32,
+    /// Total samples including children.
+    pub total_samples : u32,
+    /// Indices of caller nodes.
+    pub caller_indices : Array64<u32>,
+    /// Indices of callee nodes.
+    pub callee_indices : Array64<u32>,
+    /// Self sample count per caller.
+    pub call_counts : Array64<u32>,
+}
+
+/// Profiler residual for forensic analysis.
+pub struct ProfilerResidual {
+    /// Residual code.
+    pub code : u64,
+    /// Message description.
+    pub message : FixedString256,
+    /// Action that triggered the residual.
+    pub action : FixedString64,
+    /// Number of samples recorded.
+    pub sample_count : u32,
+    /// Timestamp.
+    pub timestamp : u64,
+}
+
+/// Main profiler state.
+pub struct Profiler {
+    /// Sampling mode.
+    pub mode : SamplingMode,
+    /// Sampling frequency in Hz.
+    pub frequency_hz : u32,
+    /// Sample ring buffer (max 4096 samples).
+    pub samples : Array512<ProfilerSample>,
+    /// Current write index in ring buffer.
+    pub write_index : u32,
+    /// Total samples collected.
+    pub total_samples_collected : u32,
+    /// Whether the profiler is active.
+    pub active : bool,
+    /// Symbol table (256 entries).
+    pub symbol_table : Array256<SymbolEntry>,
+    /// Call graph nodes.
+    pub call_graph : Array256<CallGraphNode>,
+    /// Next call graph node index.
+    pub call_graph_count : u32,
+    /// Maximum stack depth to unwind.
+    pub max_stack_depth : u32,
+    /// CPU ID for this profiler instance.
+    pub cpu_id : u32,
+    /// Timer interval in microseconds.
+    pub timer_interval_us : u32,
+    /// Rate of samples collected.
+    pub sample_rate_per_sec : u32,
+    /// Samples lost due to full buffer.
+    pub samples_lost : u32,
+    /// Residual log (128 entries).
+    pub residual_log : Array128<ProfilerResidual>,
+}
+
+impl Profiler {
+    /// Create a new profiler instance.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> Profiler [pure] {
+        Profiler {
+            mode: SamplingMode::Timer,
+            frequency_hz: 1000u32,
+            samples: Array512::new(),
+            write_index: 0u32,
+            total_samples_collected: 0u32,
+            active: false,
+            symbol_table: Array256::new(),
+            call_graph: Array256::new(),
+            call_graph_count: 0u32,
+            max_stack_depth: 32u32,
+            cpu_id: 0u32,
+            timer_interval_us: 1000u32,
+            sample_rate_per_sec: 1000u32,
+            samples_lost: 0u32,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a profiler residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, sample_count : u32) -> Profiler [diag] {
+        let residual : ProfilerResidual = ProfilerResidual {
+            code: code,
+            message: message,
+            action: action,
+            sample_count: sample_count,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Timer Configuration
+    // ──────────────────────────────────────────
+
+    /// Configure the sampling timer.
+    /// Effect: timer — programs hardware timer.
+    pub fn configure_timer(mut self, frequency_hz : u32) -> Result<Profiler, FixedString256>
+                           [timer, diag] {
+        if frequency_hz < 1u32 || frequency_hz > 1000000u32 {
+            return Result::Err(FixedString256::from("frequency out of range"));
+        }
+
+        self.frequency_hz = frequency_hz;
+        self.timer_interval_us = 1000000u32 / frequency_hz;
+        self.sample_rate_per_sec = frequency_hz;
+
+        // Configure hardware timer for periodic interrupt.
+        __builtin_configure_timer(self.timer_interval_us);
+
+        self = self.record_residual(PROF_TIMER_CONFIG,
+                                    FixedString256::from("timer configured"),
+                                    FixedString64::from("config_timer"),
+                                    frequency_hz);
+        Result::Ok(self)
+    }
+
+    /// Set the sampling mode.
+    /// Effect: pure — configuration change.
+    pub fn set_mode(mut self, mode : SamplingMode) -> Profiler [pure] {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the maximum stack depth for unwinding.
+    /// Effect: pure — configuration change.
+    pub fn set_max_stack_depth(mut self, depth : u32) -> Result<Profiler, FixedString256> [pure] {
+        if depth > 64u32 {
+            return Result::Err(FixedString256::from("max stack depth must be <= 64"));
+        }
+        self.max_stack_depth = depth;
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Profiler Lifecycle
+    // ──────────────────────────────────────────
+
+    /// Start the profiler.
+    /// Effect: timer — enables timer interrupt.
+    pub fn start(mut self) -> Result<Profiler, FixedString256> [timer, diag] {
+        if self.active {
+            return Result::Err(FixedString256::from("profiler already active"));
+        }
+
+        self.active = true;
+        self.samples.clear();
+        self.write_index = 0u32;
+        self.total_samples_collected = 0u32;
+        self.samples_lost = 0u32;
+
+        // Enable timer interrupt.
+        __builtin_enable_timer_interrupt(self.timer_interval_us);
+
+        self = self.record_residual(PROF_TIMER_CONFIG,
+                                    FixedString256::from("profiler started"),
+                                    FixedString64::from("start"),
+                                    0u32);
+        Result::Ok(self)
+    }
+
+    /// Stop the profiler.
+    /// Effect: timer — disables timer interrupt.
+    pub fn stop(mut self) -> Result<Profiler, FixedString256> [timer, diag] {
+        if !self.active {
+            return Result::Err(FixedString256::from("profiler not active"));
+        }
+
+        self.active = false;
+
+        // Disable timer interrupt.
+        __builtin_disable_timer_interrupt();
+
+        self = self.record_residual(PROF_TIMER_CONFIG,
+                                    FixedString256::from("profiler stopped"),
+                                    FixedString64::from("stop"),
+                                    self.total_samples_collected);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Sample Capture
+    // ──────────────────────────────────────────
+
+    /// Capture a sample (called from timer interrupt handler).
+    /// Effect: memory, timer — reads stack and registers.
+    pub fn capture_sample(mut self, pc : u64, fp : u64, sp : u64) -> Profiler [memory, timer, diag] {
+        if !self.active {
+            return self;
+        }
+
+        let sample : ProfilerSample = ProfilerSample {
+            pc: pc,
+            frame_pointer: fp,
+            stack_pointer: sp,
+            cpu_id: self.cpu_id,
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+            stack_depth: 0u32,
+        };
+
+        if self.samples.is_full() {
+            // Ring buffer behavior: overwrite oldest.
+            self.samples_lost += 1u32;
+        }
+
+        let _ = self.samples.push(sample);
+        self.total_samples_collected += 1u32;
+
+        self.record_residual(PROF_SAMPLE_CAPTURED,
+                             FixedString256::from("sample captured"),
+                             FixedString64::from("capture"),
+                             self.total_samples_collected)
+    }
+
+    /// Capture a sample with stack unwinding.
+    /// Effect: memory — reads stack frames for backtrace.
+    pub fn capture_sample_with_unwind(mut self, pc : u64, fp : u64,
+                                      sp : u64) -> Profiler [memory, diag] {
+        if !self.active {
+            return self;
+        }
+
+        let mut sample : ProfilerSample = ProfilerSample {
+            pc: pc,
+            frame_pointer: fp,
+            stack_pointer: sp,
+            cpu_id: self.cpu_id,
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+            stack_depth: 0u32,
+        };
+
+        // Unwind stack using frame pointers.
+        var current_fp : u64 = fp;
+        var depth : u32 = 0u32;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by max_stack_depth.
+        loop: bounds[BOUND_MEDIUM] while current_fp != 0u64 && depth < self.max_stack_depth {
+            // Read saved return address at [fp + 8].
+            let ra : u64 = __builtin_read_u64(current_fp + 8u64);
+            if ra == 0u64 {
+                break;
+            }
+            // Record frame address in sample (simplified: just increment depth).
+            current_fp = __builtin_read_u64(current_fp); // saved fp
+            depth += 1u32;
+        }
+
+        sample.stack_depth = depth;
+
+        if self.samples.is_full() {
+            self.samples_lost += 1u32;
+        }
+        let _ = self.samples.push(sample);
+        self.total_samples_collected += 1u32;
+
+        self.record_residual(PROF_SAMPLE_CAPTURED,
+                             FixedString256::from("sample with unwind captured"),
+                             FixedString64::from("capture_unwind"),
+                             self.total_samples_collected)
+    }
+
+    // ──────────────────────────────────────────
+    // Buffer Management
+    // ──────────────────────────────────────────
+
+    /// Flush (clear) the sample buffer.
+    /// Effect: pure — buffer reset.
+    pub fn flush_buffer(mut self) -> Profiler [diag] {
+        let count : u32 = self.samples.len();
+        self.samples.clear();
+        self.write_index = 0u32;
+        self.record_residual(PROF_BUFFER_FLUSH,
+                             FixedString256::from("sample buffer flushed"),
+                             FixedString64::from("flush"),
+                             count)
+    }
+
+    /// Get the current sample count.
+    /// Effect: pure — data query.
+    pub fn sample_count(&self) -> u32 [pure] {
+        self.samples.len()
+    }
+
+    /// Get the total number of samples collected since start.
+    /// Effect: pure — data query.
+    pub fn total_samples(&self) -> u32 [pure] {
+        self.total_samples_collected
+    }
+
+    /// Get the number of samples lost due to buffer overflow.
+    /// Effect: pure — data query.
+    pub fn samples_lost_count(&self) -> u32 [pure] {
+        self.samples_lost
+    }
+
+    // ──────────────────────────────────────────
+    // Symbolization
+    // ──────────────────────────────────────────
+
+    /// Load a symbol table for symbolization.
+    /// Effect: pure — loads symbols.
+    pub fn load_symbols(mut self, symbols : Array256<SymbolEntry>) -> Profiler [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by 256 entries.
+        for var i : u32 = 0u32; i < symbols.len(); i += 1u32 [symbols.len()] {
+            let _ = self.symbol_table.push(symbols.get(i));
+        }
+        self
+    }
+
+    /// Look up a symbol name for an address.
+    /// Effect: pure — table lookup.
+    pub fn lookup_symbol(&self, address : u64) -> FixedString256 [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by 256 entries.
+        for var i : u32 = 0u32; i < self.symbol_table.len(); i += 1u32 [self.symbol_table.len()] {
+            let sym : SymbolEntry = self.symbol_table.get(i);
+            if address >= sym.address && address < sym.address + sym.size {
+                return sym.name;
+            }
+        }
+        FixedString256::new()
+    }
+
+    /// Symbolize an address, returning a formatted string.
+    /// Effect: pure — symbol lookup and formatting.
+    pub fn symbolize_address(&self, address : u64) -> FixedString256 [pure] {
+        let name : FixedString256 = self.lookup_symbol(address);
+        if name.len() > 0u32 {
+            var result : FixedString256 = name;
+            result.push_str(FixedString256::from("+0x"));
+            // Compute offset within function.
+            var offset : u64 = 0u64;
+            // loop: bounds[BOUND_LARGE] — bounded by symbol table.
+            for var i : u32 = 0u32; i < self.symbol_table.len(); i += 1u32 [self.symbol_table.len()] {
+                let sym : SymbolEntry = self.symbol_table.get(i);
+                if sym.name == name {
+                    offset = address - sym.address;
+                    break;
+                }
+            }
+            result.push_u64_hex(offset);
+            result
+        } else {
+            var result : FixedString256 = FixedString256::from("0x");
+            result.push_u64_hex(address);
+            result
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Call Graph Construction
+    // ──────────────────────────────────────────
+
+    /// Build a call graph from collected samples.
+    /// Effect: pure — data aggregation.
+    pub fn build_call_graph(mut self) -> Result<Profiler, FixedString256> [pure] {
+        self.call_graph.clear();
+        self.call_graph_count = 0u32;
+
+        // loop: bounds[BOUND_LARGE] — bounded by sample count.
+        for var i : u32 = 0u32; i < self.samples.len(); i += 1u32 [self.samples.len()] {
+            let sample : ProfilerSample = self.samples.get(i);
+            let node_index : u32 = self.find_or_create_callgraph_node(sample.pc);
+
+            // Update self samples.
+            let mut node : CallGraphNode = self.call_graph.get(node_index);
+            node.self_samples += 1u32;
+            node.total_samples += 1u32;
+            let _ = self.call_graph.set(node_index, node);
+        }
+
+        self = self.record_residual(PROF_CALLGRAPH_NODE,
+                                    FixedString256::from("call graph built"),
+                                    FixedString64::from("build_callgraph"),
+                                    self.call_graph_count);
+        Result::Ok(self)
+    }
+
+    /// Find a call graph node by address, or create one.
+    /// Effect: pure — table lookup/creation.
+    fn find_or_create_callgraph_node(mut self, address : u64) -> u32 [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by call graph count.
+        for var i : u32 = 0u32; i < self.call_graph_count; i += 1u32 [self.call_graph_count] {
+            let node : CallGraphNode = self.call_graph.get(i);
+            if node.address == address {
+                return i;
+            }
+        }
+
+        // Create new node.
+        let name : FixedString256 = self.lookup_symbol(address);
+        let node : CallGraphNode = CallGraphNode {
+            address: address,
+            name: name,
+            self_samples: 0u32,
+            total_samples: 0u32,
+            caller_indices: Array64::new(),
+            callee_indices: Array64::new(),
+            call_counts: Array64::new(),
+        };
+        let index : u32 = self.call_graph_count;
+        let _ = self.call_graph.push(node);
+        self.call_graph_count += 1u32;
+        index
+    }
+
+    /// Add a caller-callee relationship to the call graph.
+    /// Effect: pure — graph edge insertion.
+    pub fn add_call_graph_edge(mut self, caller_addr : u64,
+                               callee_addr : u64) -> Result<Profiler, FixedString256> [pure] {
+        let caller_idx : u32 = self.find_or_create_callgraph_node(caller_addr);
+        let callee_idx : u32 = self.find_or_create_callgraph_node(callee_addr);
+
+        // Add callee to caller's callee list.
+        let mut caller_node : CallGraphNode = self.call_graph.get(caller_idx);
+
+        // Check if edge already exists.
+        var edge_exists : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by callee list.
+        for var i : u32 = 0u32; i < caller_node.callee_indices.len(); i += 1u32 [caller_node.callee_indices.len()] {
+            if caller_node.callee_indices.get(i) == callee_idx {
+                edge_exists = true;
+                // Increment call count.
+                if i < caller_node.call_counts.len() {
+                    let count : u32 = caller_node.call_counts.get(i);
+                    let _ = caller_node.call_counts.set(i, count + 1u32);
+                }
+                break;
+            }
+        }
+
+        if !edge_exists {
+            let _ = caller_node.callee_indices.push(callee_idx);
+            let _ = caller_node.call_counts.push(1u32);
+        }
+        let _ = self.call_graph.set(caller_idx, caller_node);
+
+        // Add caller to callee's caller list.
+        let mut callee_node : CallGraphNode = self.call_graph.get(callee_idx);
+        var caller_exists : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by caller list.
+        for var i : u32 = 0u32; i < callee_node.caller_indices.len(); i += 1u32 [callee_node.caller_indices.len()] {
+            if callee_node.caller_indices.get(i) == caller_idx {
+                caller_exists = true;
+                break;
+            }
+        }
+
+        if !caller_exists {
+            let _ = callee_node.caller_indices.push(caller_idx);
+        }
+        let _ = self.call_graph.set(callee_idx, callee_node);
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Flamegraph Output
+    // ──────────────────────────────────────────
+
+    /// Generate a folded stack trace format for flamegraph.pl.
+    /// Effect: io — output generation.
+    pub fn generate_flamegraph(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        // loop: bounds[BOUND_LARGE] — bounded by sample count.
+        for var i : u32 = 0u32; i < self.samples.len(); i += 1u32 [self.samples.len()] {
+            let sample : ProfilerSample = self.samples.get(i);
+            let sym : FixedString256 = self.symbolize_address(sample.pc);
+
+            if sym.len() > 0u32 {
+                output.push_str(sym);
+            } else {
+                output.push_str(FixedString256::from("unknown"));
+            }
+            output.push_str(FixedString256::from(" 1\n"));
+        }
+
+        output
+    }
+
+    /// Generate a folded stack trace with full backtrace.
+    /// Effect: memory, io — reads stack and formats.
+    pub fn generate_flamegraph_with_backtrace(&self) -> FixedString1024 [memory, io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        // loop: bounds[BOUND_LARGE] — bounded by sample count.
+        for var i : u32 = 0u32; i < self.samples.len(); i += 1u32 [self.samples.len()] {
+            let sample : ProfilerSample = self.samples.get(i);
+
+            // Unwind stack for this sample (simplified: use pre-recorded frames).
+            var fp : u64 = sample.frame_pointer;
+            var frames : Array64<FixedString256> = Array64::new();
+            var depth : u32 = 0u32;
+
+            // loop: bounds[BOUND_MEDIUM] — bounded by max stack depth.
+            loop: bounds[BOUND_MEDIUM] while fp != 0u64 && depth < 32u32 && frames.len() < 64u32 {
+                let ra : u64 = __builtin_read_u64(fp + 8u64);
+                if ra == 0u64 {
+                    break;
+                }
+                let sym : FixedString256 = self.symbolize_address(ra);
+                let _ = frames.push(sym);
+                fp = __builtin_read_u64(fp);
+                depth += 1u32;
+            }
+
+            // Output folded stack (bottom to top, semicolon-separated).
+            // loop: bounds[BOUND_MEDIUM] — bounded by frame count.
+            for var j : u32 = 0u32; j < frames.len(); j += 1u32 [frames.len()] {
+                let idx : u32 = frames.len() - 1u32 - j;
+                if j > 0u32 {
+                    output.push_str(FixedString256::from(";"));
+                }
+                output.push_str(frames.get(idx));
+            }
+            output.push_str(FixedString256::from(" 1\n"));
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Callgrind Output
+    // ──────────────────────────────────────────
+
+    /// Generate callgrind format output.
+    /// Effect: io — output generation.
+    pub fn generate_callgrind(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        // Header.
+        output.push_str(FixedString256::from("version: 1\n"));
+        output.push_str(FixedString256::from("creator: PhorensicOS Profiler\n"));
+        output.push_str(FixedString256::from("pid: "));
+        output.push_u32(__builtin_current_thread_id());
+        output.push_str(FixedString256::from("\ncmd: kernel\n"));
+        output.push_str(FixedString256::from("part: 1\n\n"));
+
+        // Events.
+        output.push_str(FixedString256::from("events: Samples\n\n"));
+
+        // Summary.
+        output.push_str(FixedString256::from("summary: "));
+        output.push_u32(self.total_samples_collected);
+        output.push_str(FixedString256::from("\n\n"));
+
+        // Per-function data.
+        // loop: bounds[BOUND_LARGE] — bounded by call graph count.
+        for var i : u32 = 0u32; i < self.call_graph_count; i += 1u32 [self.call_graph_count] {
+            let node : CallGraphNode = self.call_graph.get(i);
+            output.push_str(FixedString256::from("ob="));
+            if node.name.len() > 0u32 {
+                output.push_str(node.name);
+            } else {
+                output.push_str(FixedString256::from("0x"));
+                output.push_u64_hex(node.address);
+            }
+            output.push_str(FixedString256::from("\n"));
+            output.push_str(FixedString256::from("fn="));
+            output.push_str(node.name);
+            output.push_str(FixedString256::from("\n"));
+            output.push_str(FixedString256::from("0x"));
+            output.push_u64_hex(node.address);
+            output.push_str(FixedString256::from(" "));
+            output.push_u32(node.self_samples);
+            output.push_str(FixedString256::from("\n"));
+
+            // Caller edges (caller -> this function).
+            // loop: bounds[BOUND_SMALL] — bounded by caller list.
+            for var j : u32 = 0u32; j < node.caller_indices.len(); j += 1u32 [node.caller_indices.len()] {
+                let caller_idx : u32 = node.caller_indices.get(j);
+                let caller_node : CallGraphNode = self.call_graph.get(caller_idx);
+                let call_count : u32 = if j < node.call_counts.len() {
+                    node.call_counts.get(j)
+                } else {
+                    1u32
+                };
+                output.push_str(FixedString256::from("cob="));
+                output.push_str(caller_node.name);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("cfn="));
+                output.push_str(caller_node.name);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("calls="));
+                output.push_u32(call_count);
+                output.push_str(FixedString256::from(" "));
+                output.push_str(FixedString256::from("0x"));
+                output.push_u64_hex(caller_node.address);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("0x"));
+                output.push_u64_hex(node.address);
+                output.push_str(FixedString256::from(" "));
+                output.push_u32(call_count);
+                output.push_str(FixedString256::from("\n"));
+            }
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Aggregate Profile Data
+    // ──────────────────────────────────────────
+
+    /// Aggregate samples by symbol, producing a sorted profile.
+    /// Effect: pure — data aggregation.
+    pub fn aggregate_by_symbol(&self) -> Array256<(FixedString256, u32)> [pure] {
+        var result : Array256<(FixedString256, u32)> = Array256::new();
+        var symbol_counts : Array256<u32> = Array256::new();
+
+        // Count samples per unique symbol.
+        // loop: bounds[BOUND_LARGE] — bounded by sample count.
+        for var i : u32 = 0u32; i < self.samples.len(); i += 1u32 [self.samples.len()] {
+            let sample : ProfilerSample = self.samples.get(i);
+            let sym : FixedString256 = self.lookup_symbol(sample.pc);
+
+            // Find existing entry.
+            var found : bool = false;
+            // loop: bounds[BOUND_LARGE] — bounded by result count.
+            for var j : u32 = 0u32; j < result.len(); j += 1u32 [result.len()] {
+                let entry : (FixedString256, u32) = result.get(j);
+                if entry.0 == sym {
+                    symbol_counts.set(j, symbol_counts.get(j) + 1u32);
+                    // Update entry.
+                    let new_entry : (FixedString256, u32) = (sym, symbol_counts.get(j));
+                    let _ = result.set(j, new_entry);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                let _ = symbol_counts.push(1u32);
+                let _ = result.push((sym, 1u32));
+            }
+        }
+
+        result
+    }
+
+    /// Get the call graph node with the most samples (hotspot).
+    /// Effect: pure — search.
+    pub fn find_hotspot(&self) -> Result<CallGraphNode, FixedString256> [pure] {
+        if self.call_graph_count == 0u32 {
+            return Result::Err(FixedString256::from("call graph is empty"));
+        }
+
+        var hottest : CallGraphNode = self.call_graph.get(0u32);
+        // loop: bounds[BOUND_LARGE] — bounded by call graph count.
+        for var i : u32 = 1u32; i < self.call_graph_count; i += 1u32 [self.call_graph_count] {
+            let node : CallGraphNode = self.call_graph.get(i);
+            if node.self_samples > hottest.self_samples {
+                hottest = node;
+            }
+        }
+
+        Result::Ok(hottest)
+    }
+
+    /// Compute the flat profile as a percentage of total samples.
+    /// Effect: pure — percentage computation.
+    pub fn flat_profile_percentages(&self) -> Array128<(FixedString256, f64)> [pure] {
+        var result : Array128<(FixedString256, f64)> = Array128::new();
+        let total : f64 = self.total_samples_collected as f64;
+
+        if total < 0.0001f64 {
+            return result;
+        }
+
+        let aggregated : Array256<(FixedString256, u32)> = self.aggregate_by_symbol();
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by aggregated count.
+        for var i : u32 = 0u32; i < aggregated.len(); i += 1u32 [aggregated.len()] {
+            let entry : (FixedString256, u32) = aggregated.get(i);
+            let pct : f64 = (entry.1 as f64 / total) * 100.0f64;
+            let _ = result.push((entry.0, pct));
+        }
+
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Profile Report
+    // ──────────────────────────────────────────
+
+    /// Generate a human-readable profile report.
+    /// Effect: io — output generation.
+    pub fn generate_report(&self) -> FixedString1024 [io] {
+        var report : FixedString1024 = FixedString1024::new();
+
+        report.push_str(FixedString256::from("=== PhorensicOS Profile Report ===\n\n"));
+        report.push_str(FixedString256::from("Sampling Mode: "));
+        report.push_str(match self.mode {
+            SamplingMode::Timer => FixedString256::from("Timer"),
+            SamplingMode::EventBased => FixedString256::from("Event-Based"),
+            SamplingMode::Manual => FixedString256::from("Manual"),
+        });
+        report.push_str(FixedString256::from("\n"));
+        report.push_str(FixedString256::from("Frequency: "));
+        report.push_u32(self.frequency_hz);
+        report.push_str(FixedString256::from(" Hz\n"));
+        report.push_str(FixedString256::from("Total Samples: "));
+        report.push_u32(self.total_samples_collected);
+        report.push_str(FixedString256::from("\n"));
+        report.push_str(FixedString256::from("Samples Lost: "));
+        report.push_u32(self.samples_lost);
+        report.push_str(FixedString256::from("\n\n"));
+
+        report.push_str(FixedString256::from("--- Flat Profile ---\n"));
+        report.push_str(FixedString256::from("Symbol                          Samples   %\n"));
+        report.push_str(FixedString256::from("----                            ------  -----\n"));
+
+        let aggregated : Array256<(FixedString256, u32)> = self.aggregate_by_symbol();
+        let total : f64 = self.total_samples_collected as f64;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by aggregated count.
+        for var i : u32 = 0u32; i < aggregated.len(); i += 1u32 [aggregated.len()] {
+            let entry : (FixedString256, u32) = aggregated.get(i);
+            let pct : f64 = if total > 0.0f64 {
+                (entry.1 as f64 / total) * 100.0f64
+            } else {
+                0.0f64
+            };
+
+            report.push_str(entry.0);
+            var padding : u32 = 32u32;
+            if entry.0.len() < padding {
+                padding = entry.0.len();
+            }
+            var pad_count : u32 = 0u32;
+            // loop: bounds[BOUND_SMALL] — bounded by padding.
+            loop: bounds[BOUND_SMALL] while pad_count < (35u32 - entry.0.len()) {
+                report.push_str(FixedString256::from(" "));
+                pad_count += 1u32;
+            }
+            report.push_u32(entry.1);
+            report.push_str(FixedString256::from("  "));
+            report.push_f64(pct, 2u32);
+            report.push_str(FixedString256::from("%\n"));
+        }
+
+        report.push_str(FixedString256::from("\n--- Hotspot ---\n"));
+        let hotspot_result : Result<CallGraphNode, FixedString256> = self.find_hotspot();
+        match hotspot_result {
+            Result::Ok(node) => {
+                report.push_str(FixedString256::from("Hottest function: "));
+                report.push_str(node.name);
+                report.push_str(FixedString256::from("\n"));
+                report.push_str(FixedString256::from("Self samples: "));
+                report.push_u32(node.self_samples);
+                report.push_str(FixedString256::from("\n"));
+                report.push_str(FixedString256::from("Total samples: "));
+                report.push_u32(node.total_samples);
+                report.push_str(FixedString256::from("\n"));
+            },
+            Result::Err(msg) => {
+                report.push_str(FixedString256::from("(call graph empty)\n"));
+            },
+        }
+
+        report.push_str(FixedString256::from("\n=== End of Report ===\n"));
+        report
+    }
+
+    // ──────────────────────────────────────────
+    // Raw Binary Export
+    // ──────────────────────────────────────────
+
+    /// Export profile data as raw binary.
+    /// Effect: pure — serializes samples to byte buffer.
+    pub fn export_raw(&self, buffer : ref mut Array256<u8>) -> Result<u32, FixedString256> [pure] {
+        let header_size : u32 = 16u32; // magic(8) + count(4) + flags(4)
+        let sample_size : u32 = 40u32; // pc(8) + fp(8) + sp(8) + cpu(4) + tid(4) + ts(8)
+
+        let total_size : u32 = header_size + self.samples.len() * sample_size;
+        if buffer.capacity() < total_size {
+            return Result::Err(FixedString256::from("buffer too small for export"));
+        }
+
+        // Write header.
+        let magic : Array16<u8> = Array16::from_fixed([
+            'p' as u8, 'h' as u8, 'o' as u8, 'r' as u8,
+            'p' as u8, 'r' as u8, 'o' as u8, 'f' as u8,
+        ]);
+        var offset : u32 = 0u32;
+        // loop: bounds[BOUND_SMALL] — bounded by 8 bytes.
+        for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+            let _ = buffer.set(offset, magic.get(i));
+            offset += 1u32;
+        }
+
+        // Write sample count.
+        let count : u32 = self.samples.len();
+        let _ = buffer.set(offset, (count & 0xFFu32) as u8); offset += 1u32;
+        let _ = buffer.set(offset, ((count >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+        let _ = buffer.set(offset, ((count >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+        let _ = buffer.set(offset, ((count >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+        // Write flags.
+        let _ = buffer.set(offset, self.mode as u8); offset += 1u32;
+        let _ = buffer.set(offset, 0u8); offset += 1u32;
+        let _ = buffer.set(offset, 0u8); offset += 1u32;
+        let _ = buffer.set(offset, 0u8); offset += 1u32;
+
+        // Write samples.
+        // loop: bounds[BOUND_LARGE] — bounded by sample count.
+        for var i : u32 = 0u32; i < self.samples.len(); i += 1u32 [self.samples.len()] {
+            let sample : ProfilerSample = self.samples.get(i);
+
+            // Write PC (8 bytes).
+            var val : u64 = sample.pc;
+            // loop: bounds[BOUND_SMALL] — 8 bytes per value.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64;
+                offset += 1u32;
+            }
+
+            // Write FP (8 bytes).
+            val = sample.frame_pointer;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64;
+                offset += 1u32;
+            }
+
+            // Write SP (8 bytes).
+            val = sample.stack_pointer;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64;
+                offset += 1u32;
+            }
+
+            // Write CPU ID (4 bytes).
+            let cpu : u32 = sample.cpu_id;
+            let _ = buffer.set(offset, (cpu & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((cpu >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((cpu >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((cpu >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+            // Write Thread ID (4 bytes).
+            let tid : u32 = sample.thread_id;
+            let _ = buffer.set(offset, (tid & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((tid >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((tid >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((tid >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+            // Write Timestamp (8 bytes).
+            val = sample.timestamp;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64;
+                offset += 1u32;
+            }
+        }
+
+        Result::Ok(total_size)
+    }
+}
+
+/// Implementation of SamplingMode name.
+impl SamplingMode {
+    /// Get the name of this sampling mode.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            SamplingMode::Timer => FixedString64::from("timer"),
+            SamplingMode::EventBased => FixedString64::from("event"),
+            SamplingMode::Manual => FixedString64::from("manual"),
+        }
+    }
+}
+
+/// Implementation of OutputFormat name.
+impl OutputFormat {
+    /// Get the name of this output format.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            OutputFormat::Flamegraph => FixedString64::from("flamegraph"),
+            OutputFormat::Callgrind => FixedString64::from("callgrind"),
+            OutputFormat::RawBinary => FixedString64::from("raw"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Profiler Sample Processing Utilities
+// ──────────────────────────────────────────────
+
+/// Compute the average stack depth across all samples.
+/// Effect: pure — statistics.
+pub fn average_stack_depth(profiler : Profiler) -> f64 [pure] {
+    let total_depth : u64 = 0u64;
+    // loop: bounds[BOUND_LARGE] — bounded by sample count.
+    for var i : u32 = 0u32; i < profiler.samples.len(); i += 1u32 [profiler.samples.len()] {
+        let sample : ProfilerSample = profiler.samples.get(i);
+        total_depth += sample.stack_depth as u64;
+    }
+    if profiler.samples.len() == 0u32 {
+        return 0.0f64;
+    }
+    total_depth as f64 / profiler.samples.len() as f64
+}
+
+/// Find the sample with the maximum stack depth.
+/// Effect: pure — search.
+pub fn max_stack_depth(profiler : Profiler) -> u32 [pure] {
+    var max_depth : u32 = 0u32;
+    // loop: bounds[BOUND_LARGE] — bounded by sample count.
+    for var i : u32 = 0u32; i < profiler.samples.len(); i += 1u32 [profiler.samples.len()] {
+        let sample : ProfilerSample = profiler.samples.get(i);
+        if sample.stack_depth > max_depth {
+            max_depth = sample.stack_depth;
+        }
+    }
+    max_depth
+}
+
+/// Filter samples to only those within a given CPU ID.
+/// Effect: pure — filter.
+pub fn filter_samples_by_cpu(profiler : Profiler, cpu_id : u32) -> Array512<ProfilerSample> [pure] {
+    var filtered : Array512<ProfilerSample> = Array512::new();
+    // loop: bounds[BOUND_LARGE] — bounded by sample count.
+    for var i : u32 = 0u32; i < profiler.samples.len(); i += 1u32 [profiler.samples.len()] {
+        let sample : ProfilerSample = profiler.samples.get(i);
+        if sample.cpu_id == cpu_id {
+            let _ = filtered.push(sample);
+        }
+    }
+    filtered
+}
+
+/// Compute the sample rate (samples per second) from timestamps.
+/// Effect: pure — rate computation.
+pub fn compute_sample_rate(profiler : Profiler) -> f64 [pure] {
+    if profiler.samples.len() < 2u32 {
+        return 0.0f64;
+    }
+    let first : ProfilerSample = profiler.samples.get(0u32);
+    let last : ProfilerSample = profiler.samples.get(profiler.samples.len() - 1u32);
+    let elapsed_ns : u64 = last.timestamp - first.timestamp;
+    if elapsed_ns == 0u64 {
+        return 0.0f64;
+    }
+    profiler.samples.len() as f64 / (elapsed_ns as f64 / 1_000_000_000.0f64)
+}
+
+/// Generate a simple text-based flamegraph (ASCII).
+/// Effect: io — text output.
+pub fn generate_ascii_flamegraph(profiler : Profiler) -> FixedString1024 [io] {
+    var output : FixedString1024 = FixedString1024::new();
+    output.push_str(FixedString256::from("ASCII Flamegraph\n"));
+    output.push_str(FixedString256::from("================\n\n"));
+
+    let aggregated : Array256<(FixedString256, u32)> = profiler.aggregate_by_symbol();
+    // loop: bounds[BOUND_MEDIUM] — bounded by aggregated entries.
+    for var i : u32 = 0u32; i < aggregated.len(); i += 1u32 [aggregated.len()] {
+        let (name, count) : (FixedString256, u32) = aggregated.get(i);
+        // Print bar with proportional width.
+        output.push_str(FixedString256::from("  "));
+        var bar_len : u32 = count / 5u32 + 1u32;
+        if bar_len > 60u32 { bar_len = 60u32; }
+        // loop: bounds[BOUND_SMALL] — bounded by bar length.
+        for var j : u32 = 0u32; j < bar_len; j += 1u32 [bar_len] {
+            output.push_str(FixedString256::from("#"));
+        }
+        output.push_str(FixedString256::from(" "));
+        output.push_str(name);
+        output.push_str(FixedString256::from(" ("));
+        output.push_u32(count);
+        output.push_str(FixedString256::from(")\n"));
+    }
+
+    output
+}
+
+/// Check if profiler data indicates a hot loop.
+pub fn detect_hot_loop(profiler : Profiler, threshold_pct : f64) -> bool [pure] {
+    let aggregated : Array256<(FixedString256, u32)> = profiler.aggregate_by_symbol();
+    let total : u32 = profiler.total_samples_collected;
+    if total == 0u32 { return false; }
+    for var i : u32 = 0u32; i < aggregated.len(); i += 1u32 [aggregated.len()] {
+        let (_, count) : (FixedString256, u32) = aggregated.get(i);
+        let pct : f64 = count as f64 / total as f64 * 100.0f64;
+        if pct >= threshold_pct { return true; }
+    }
+    false
+}
+
+/// Export profile data as a JSON summary.
+pub fn profile_json_summary(profiler : Profiler) -> FixedString1024 [io] {
+    let agg : Array256<(FixedString256, u32)> = profiler.aggregate_by_symbol();
+    var out : FixedString1024 = FixedString1024::new();
+    out.push_str(FixedString256::from("{\"samples\":"));
+    out.push_u32(profiler.total_samples_collected);
+    out.push_str(FixedString256::from(",\"functions\":["));
+    for var i : u32 = 0u32; i < agg.len(); i += 1u32 [agg.len()] {
+        if i > 0u32 { out.push_str(FixedString256::from(",")); }
+        let (name, count) : (FixedString256, u32) = agg.get(i);
+        out.push_str(FixedString256::from("{\"n\":\""));
+        out.push_str(name);
+        out.push_str(FixedString256::from("\",\"c\":"));
+        out.push_u32(count);
+        out.push_str(FixedString256::from("}"));
+    }
+    out.push_str(FixedString256::from("]}"));
+    out
+}

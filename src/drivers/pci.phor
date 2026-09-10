@@ -1,0 +1,1394 @@
+// pci.phor — PCI bus driver
+// Configuration space access, device enumeration, BAR parsing, capability list
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/pci.phor
+// Court: pci_driver:v2
+
+package drivers.pci;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type PciError = enum {
+    PciNotInitialized         = 0x200,  // E0200: PCI driver not initialized
+    PciDeviceNotFound         = 0x201,  // E0201: PCI device not found at BDF
+    PciInvalidBus             = 0x202,  // E0202: invalid bus number
+    PciInvalidDevice          = 0x203,  // E0203: invalid device number
+    PciInvalidFunction        = 0x204,  // E0204: invalid function number
+    PciConfigAccessError      = 0x205,  // E0205: PCI configuration access failed
+    PciBarInvalid             = 0x206,  // E0206: invalid BAR
+    PciBarTypeUnknown         = 0x207,  // E0207: unknown BAR type
+    PciCapabilityNotFound     = 0x208,  // E0208: capability not found
+    PciCapabilityListInvalid  = 0x209,  // E0209: capability list corrupted
+    PciMsiConfigError         = 0x20A,  // E020A: MSI/MSI-X configuration error
+    PciBridgeConfigError      = 0x20B,  // E020B: PCI bridge configuration error
+    PciCapabilityError        = 0x20C,  // E020C: insufficient capability
+    PciEnumerationIncomplete  = 0x20D,  // E020D: device enumeration incomplete
+    PciResourceConflict       = 0x20E,  // E020E: resource BAR conflict detected
+    PciMaxDevicesExceeded     = 0x20F,  // E020F: maximum tracked devices exceeded
+    PciInvalidVendor          = 0x210,  // E0210: invalid vendor ID (0xFFFF)
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Configuration Space Address Format
+// ─────────────────────────────────────────────────────────────
+
+struct PciConfigAddress {
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+}
+
+impl PciConfigAddress {
+    fn to_u32(self) -> u32
+        effect [deterministic]
+    {
+        // Bit 31: Enable bit, Bits 24-30: Reserved, Bits 23-16: Bus, Bits 15-11: Device, Bits 10-8: Func, Bits 7-0: Offset
+        let enable: u32 = 0x80000000;
+        let bus_part: u32 = (self.bus as u32) << 16;
+        let dev_part: u32 = (self.device as u32) << 11;
+        let func_part: u32 = (self.func as u32) << 8;
+        let off_part: u32 = (self.offset as u32) & 0xFC;  // DWORD-aligned
+        return enable | bus_part | dev_part | func_part | off_part;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Configuration Access Mechanism
+// ─────────────────────────────────────────────────────────────
+
+struct PciConfigAccess {
+    config_port_addr: u16,
+    config_port_data: u16,
+    use_mmio: bool,
+    mmio_base: u64,
+    mmio_size: u64,
+}
+
+impl PciConfigAccess {
+    fn port_addr() -> u16 { return 0xCF8; }
+    fn port_data() -> u16 { return 0xCFC; }
+
+    fn read32(self, addr: PciConfigAddress) -> u32
+        effect [machine:ioport, memory:mmio, deterministic]
+        court "pci_config_read:v2"
+    {
+        return trusted reason "PCI configuration read via CF8/CFC or MMIO, PCI Local Bus Spec §3.2" {
+            if self.use_mmio {
+                let mmio_offset: u64 = (addr.bus as u64) * 256 * 32 * 4096
+                                     + (addr.device as u64) * 32 * 4096
+                                     + (addr.func as u64) * 4096
+                                     + (addr.offset as u64);
+                let ptr: *(u32) = (self.mmio_base + mmio_offset) as *(u32);
+                return *ptr;
+            } else {
+                // outl(config_port_addr, addr.to_u32())
+                // return inl(config_port_data)
+                return 0;
+            };
+        };
+    }
+
+    fn write32(self, addr: PciConfigAddress, value: u32) -> void
+        effect [machine:ioport, memory:mmio, deterministic]
+        court "pci_config_write:v2"
+    {
+        trusted reason "PCI configuration write via CF8/CFC or MMIO, PCI Local Bus Spec §3.2" {
+            if self.use_mmio {
+                let mmio_offset: u64 = (addr.bus as u64) * 256 * 32 * 4096
+                                     + (addr.device as u64) * 32 * 4096
+                                     + (addr.func as u64) * 4096
+                                     + (addr.offset as u64);
+                let ptr: *(u32) = (self.mmio_base + mmio_offset) as *(u32);
+                *ptr = value;
+            } else {
+                // outl(config_port_addr, addr.to_u32())
+                // outl(config_port_data, value)
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Device Identifier
+// ─────────────────────────────────────────────────────────────
+
+struct PciDeviceId {
+    vendor_id: u16,
+    device_id: u16,
+    revision_id: u8,
+    prog_if: u8,
+    subclass: u8,
+    class_code: u8,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Header Type 0x00 (General Device)
+// ─────────────────────────────────────────────────────────────
+
+struct PciHeader0 {
+    vendor_id: u16,
+    device_id: u16,
+    command: u16,
+    status: u16,
+    revision_id: u8,
+    prog_if: u8,
+    subclass: u8,
+    class_code: u8,
+    cache_line_size: u8,
+    latency_timer: u8,
+    header_type: u8,
+    bist: u8,
+    bars: Array(u32, 6),
+    cardbus_cis_ptr: u32,
+    subsystem_vendor_id: u16,
+    subsystem_id: u16,
+    expansion_rom_base: u32,
+    capabilities_ptr: u8,
+    interrupt_line: u8,
+    interrupt_pin: u8,
+    min_grant: u8,
+    max_latency: u8,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Header Type 0x01 (PCI-PCI Bridge)
+// ─────────────────────────────────────────────────────────────
+
+struct PciHeader1 {
+    vendor_id: u16,
+    device_id: u16,
+    command: u16,
+    status: u16,
+    revision_id: u8,
+    prog_if: u8,
+    subclass: u8,
+    class_code: u8,
+    cache_line_size: u8,
+    latency_timer: u8,
+    header_type: u8,
+    bist: u8,
+    bars: Array(u32, 2),
+    primary_bus: u8,
+    secondary_bus: u8,
+    subordinate_bus: u8,
+    secondary_latency_timer: u8,
+    io_base: u8,
+    io_limit: u8,
+    secondary_status: u16,
+    memory_base: u16,
+    memory_limit: u16,
+    prefetch_memory_base: u16,
+    prefetch_memory_limit: u16,
+    prefetch_base_upper: u32,
+    prefetch_limit_upper: u32,
+    io_base_upper: u16,
+    io_limit_upper: u16,
+    capabilities_ptr: u8,
+    expansion_rom_base: u32,
+    interrupt_line: u8,
+    interrupt_pin: u8,
+    bridge_control: u16,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI BAR Descriptor
+// ─────────────────────────────────────────────────────────────
+
+type PciBarType = enum {
+    BarMemory32   = 0,  // 32-bit memory BAR
+    BarMemory64   = 1,  // 64-bit memory BAR
+    BarIo         = 2,  // I/O BAR
+    BarInvalid    = 3,  // Invalid/unimplemented BAR
+    BarUnused     = 4,  // BAR is not implemented (read-zero)
+}
+
+struct PciBar {
+    bar_index: u8,
+    bar_type: PciBarType,
+    is_prefetchable: bool,
+    address: u64,
+    size: u64,
+    flags: u32,
+    is_64bit: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Capability Descriptor
+// ─────────────────────────────────────────────────────────────
+
+type PciCapabilityId = enum {
+    CapNull             = 0x00,
+    CapPowerManagement  = 0x01,
+    CapAgp              = 0x02,
+    CapVitalProductData = 0x03,
+    CapSlotIdentification = 0x04,
+    CapMsi              = 0x05,
+    CapHotSwap          = 0x06,
+    CapPciExpress       = 0x10,
+    CapMsiX             = 0x11,
+    CapSata             = 0x12,
+    CapPciBridgeSubsystem = 0x13,
+    CapAer              = 0x14,
+    CapPowerBudgeting   = 0x18,
+    CapAts              = 0x20,
+    CapPris             = 0x21,
+    CapPasid            = 0x24,
+    CapLnr              = 0x25,
+    CapMcast            = 0x28,
+    CapResizableBar     = 0x29,
+    CapVendorSpecific   = 0xFF,  // Non-standard vendor cap
+}
+
+struct PciCapability {
+    cap_id: PciCapabilityId,
+    cap_ptr: u8,
+    cap_version: u8,
+    next_cap_ptr: u8,
+    cap_data: Array(u32, 16),
+    cap_data_dwords: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Device Details
+// ─────────────────────────────────────────────────────────────
+
+struct PciDevice {
+    device_identity: Identity,
+    bdf: u32,                    // Encoded bus/device/function
+    bus: u8,
+    device: u8,
+    func: u8,
+    vendor_id: u16,
+    device_id: u16,
+    revision_id: u8,
+    class_code: u8,
+    subclass: u8,
+    prog_if: u8,
+    header_type: u8,
+    is_multi_function: bool,
+    is_bridge: bool,
+    bars: Array(PciBar, 6),
+    bar_count: u64,
+    capabilities: Array(PciCapability, 24),
+    capability_count: u64,
+    interrupt_line: u8,
+    interrupt_pin: u8,
+    subsystem_vendor: u16,
+    subsystem_device: u16,
+    expansion_rom_base: u64,
+    secondary_bus: u8,
+    subordinate_bus: u8,
+    initialized: bool,
+    enumerated: bool,
+    residual_log: RingBuf(ResidualRecord, 32),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct PciDriverState {
+    driver_identity: Identity,
+    config_access: PciConfigAccess,
+    devices: Array(PciDevice, 64),
+    device_count: u64,
+    bus_count: u8,
+    initialized: bool,
+    initialization_timestamp: u64,
+    enumeration_complete: bool,
+    bridge_count: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+struct PciCapability {
+    object_id: Identity,
+    generation: u64,
+    can_enum: bool,
+    can_read_config: bool,
+    can_write_config: bool,
+    can_configure_bars: bool,
+    can_manage_msi: bool,
+    max_bus_count: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Helper: Encode BDF
+// ─────────────────────────────────────────────────────────────
+
+fn pci_encode_bdf(bus: u8, device: u8, func: u8) -> u32
+    effect [deterministic]
+{
+    return ((bus as u32) << 16) | ((device as u32) << 11) | ((func as u32) << 8);
+}
+
+fn pci_bus_from_bdf(bdf: u32) -> u8
+    effect [deterministic]
+{
+    return ((bdf >> 16) & 0xFF) as u8;
+}
+
+fn pci_device_from_bdf(bdf: u32) -> u8
+    effect [deterministic]
+{
+    return ((bdf >> 11) & 0x1F) as u8;
+}
+
+fn pci_func_from_bdf(bdf: u32) -> u8
+    effect [deterministic]
+{
+    return ((bdf >> 8) & 0x07) as u8;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read Configuration Register (generic, 8/16/32-bit)
+// ─────────────────────────────────────────────────────────────
+
+fn pci_read_config_u32(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+) -> u32
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_read_u32:v1"
+{
+    let addr: PciConfigAddress = PciConfigAddress {
+        bus: bus, device: device, func: func, offset: offset,
+    };
+    return access.read32(addr);
+}
+
+fn pci_read_config_u16(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+) -> u16
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_read_u16:v1"
+{
+    let aligned_offset: u8 = offset & 0xFC;
+    let dword: u32 = pci_read_config_u32(access, bus, device, func, aligned_offset);
+    let shift: u8 = (offset & 0x02) as u8;
+    return ((dword >> (shift * 8)) & 0xFFFF) as u16;
+}
+
+fn pci_read_config_u8(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+) -> u8
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_read_u8:v1"
+{
+    let aligned_offset: u8 = offset & 0xFC;
+    let dword: u32 = pci_read_config_u32(access, bus, device, func, aligned_offset);
+    let shift: u8 = (offset & 0x03) as u8;
+    return ((dword >> (shift * 8)) & 0xFF) as u8;
+}
+
+fn pci_write_config_u32(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+    value: u32,
+) -> void
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_write_u32:v1"
+{
+    let addr: PciConfigAddress = PciConfigAddress {
+        bus: bus, device: device, func: func, offset: offset,
+    };
+    access.write32(addr, value);
+}
+
+fn pci_write_config_u16(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+    value: u16,
+) -> void
+    effect [machine:ioport, memory:mmio, deterministic]
+{
+    let aligned_offset: u8 = offset & 0xFC;
+    let dword: u32 = pci_read_config_u32(access, bus, device, func, aligned_offset);
+    let shift: u8 = (offset & 0x02) as u8;
+    let mask: u32 = !(0xFFFF << (shift * 8));
+    let new_val: u32 = dword & mask | ((value as u32) << (shift * 8));
+    pci_write_config_u32(access, bus, device, func, aligned_offset, new_val);
+}
+
+fn pci_write_config_u8(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+    offset: u8,
+    value: u8,
+) -> void
+    effect [machine:ioport, memory:mmio, deterministic]
+{
+    let aligned_offset: u8 = offset & 0xFC;
+    let dword: u32 = pci_read_config_u32(access, bus, device, func, aligned_offset);
+    let shift: u8 = (offset & 0x03) as u8;
+    let mask: u32 = !(0xFF << (shift * 8));
+    let new_val: u32 = dword & mask | ((value as u32) << (shift * 8));
+    pci_write_config_u32(access, bus, device, func, aligned_offset, new_val);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Check if a device exists at given BDF
+// ─────────────────────────────────────────────────────────────
+
+fn pci_device_exists(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    device: u8,
+    func: u8,
+) -> bool
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_device_exists:v1"
+{
+    let vendor: u16 = pci_read_config_u16(access, bus, device, func, 0x00);
+    if vendor == 0xFFFF {
+        return false;
+    };
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse a single BAR (32-bit indexed)
+// ─────────────────────────────────────────────────────────────
+
+fn pci_parse_bar(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    dev: u8,
+    func: u8,
+    bar_index: u8,
+) -> PciBar
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_parse_bar:v1"
+{
+    let bar_offset: u8 = 0x10 + bar_index * 4;
+    let bar_raw: u32 = pci_read_config_u32(access, bus, dev, func, bar_offset);
+    let zero_bar: PciBar = PciBar {
+        bar_index: bar_index, bar_type: PciBarType::BarInvalid,
+        is_prefetchable: false, address: 0, size: 0, flags: bar_raw,
+        is_64bit: false,
+    };
+
+    if bar_raw == 0 {
+        return PciBar { bar_index: bar_index, bar_type: PciBarType::BarUnused,
+            is_prefetchable: false, address: 0, size: 0, flags: 0, is_64bit: false };
+    };
+
+    let io_flag: u32 = bar_raw & 0x01;
+    if io_flag != 0 {
+        let io_addr: u32 = bar_raw & 0xFFFFFFFC;
+        // Determine size by writing all 1s and reading back
+        pci_write_config_u32(access, bus, dev, func, bar_offset, 0xFFFFFFFF);
+        let io_mask: u32 = pci_read_config_u32(access, bus, dev, func, bar_offset);
+        pci_write_config_u32(access, bus, dev, func, bar_offset, bar_raw);
+        let io_size: u32 = !(io_mask & 0xFFFFFFFC) + 1;
+
+        return PciBar {
+            bar_index: bar_index, bar_type: PciBarType::BarIo,
+            is_prefetchable: false, address: io_addr as u64, size: io_size as u64,
+            flags: bar_raw, is_64bit: false,
+        };
+    };
+
+    let mem_type: u32 = (bar_raw >> 1) & 0x03;
+    let prefetchable: bool = ((bar_raw >> 3) & 0x01) != 0;
+    let is_64: bool = mem_type == 0x02;
+
+    if is_64 && bar_index >= 5 {
+        return PciBar {
+            bar_index: bar_index, bar_type: PciBarType::BarMemory32,
+            is_prefetchable: prefetchable, address: (bar_raw & 0xFFFFFFF0) as u64,
+            size: 0, flags: bar_raw, is_64bit: false,
+        };
+    };
+
+    let mem_addr: u64 = if is_64 {
+        let bar_high_offset: u8 = bar_offset + 4;
+        let low_part: u64 = (bar_raw & 0xFFFFFFF0) as u64;
+        let high_part: u64 = pci_read_config_u32(access, bus, dev, func, bar_high_offset) as u64;
+        (high_part << 32) | low_part
+    } else {
+        (bar_raw & 0xFFFFFFF0) as u64
+    };
+
+    // Determine size
+    let saved_high: u32 = if is_64 {
+        pci_read_config_u32(access, bus, dev, func, bar_offset + 4)
+    } else { 0 };
+
+    pci_write_config_u32(access, bus, dev, func, bar_offset, 0xFFFFFFFF);
+    let size_low: u32 = pci_read_config_u32(access, bus, dev, func, bar_offset);
+    pci_write_config_u32(access, bus, dev, func, bar_offset, bar_raw);
+
+    if is_64 {
+        pci_write_config_u32(access, bus, dev, func, bar_offset + 4, saved_high);
+    };
+
+    let mem_size: u64 = if is_64 {
+        let size_low64: u64 = (size_low & 0xFFFFFFF0) as u64;
+        let size_high64: u64 = (saved_high as u64) << 32;
+        let raw_mask: u64 = size_low64 | size_high64;
+        !raw_mask + 1
+    } else {
+        let raw_mask: u64 = (size_low & 0xFFFFFFF0) as u64;
+        !raw_mask + 1
+    };
+
+    return PciBar {
+        bar_index: bar_index,
+        bar_type: if is_64 { PciBarType::BarMemory64 } else { PciBarType::BarMemory32 },
+        is_prefetchable: prefetchable,
+        address: mem_addr,
+        size: mem_size,
+        flags: bar_raw,
+        is_64bit: is_64,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse Capability List
+// ─────────────────────────────────────────────────────────────
+
+fn pci_find_capabilities(
+    access: Handle(PciConfigAccess),
+    bus: u8,
+    dev: u8,
+    func: u8,
+    device_out: Handle(PciDevice),
+) -> void
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_find_caps:v1"
+{
+    // Check if the device supports capabilities (status register bit 4)
+    let status_reg: u16 = pci_read_config_u16(access, bus, dev, func, 0x06);
+    if (status_reg & 0x0010) == 0 {
+        return;  // Capabilities list not supported
+    };
+
+    let header_type: u8 = pci_read_config_u8(access, bus, dev, func, 0x0E);
+    let caps_ptr_offset: u8 = if (header_type & 0x7F) == 0x00 {
+        0x34  // Type 0: capabilities pointer at 0x34
+    } else if (header_type & 0x7F) == 0x01 {
+        0x34  // Type 1: also at 0x34
+    } else {
+        return;  // Unknown header type
+    };
+
+    let mut cap_ptr: u8 = pci_read_config_u8(access, bus, dev, func, caps_ptr_offset);
+    if cap_ptr == 0 {
+        return;
+    };
+
+    // Capabilities are at DWORD-aligned byte offsets (bits 1-0 are reserved)
+    loop bound 48 {
+        if cap_ptr < 0x40 || cap_ptr > 0xFC {
+            break;
+        };
+
+        if device_out.capability_count >= 24 {
+            break;
+        };
+
+        let cap_id_byte: u8 = pci_read_config_u8(access, bus, dev, func, cap_ptr);
+        let cap_id: PciCapabilityId;
+        match cap_id_byte {
+            0x00 => cap_id = PciCapabilityId::CapNull,
+            0x01 => cap_id = PciCapabilityId::CapPowerManagement,
+            0x02 => cap_id = PciCapabilityId::CapAgp,
+            0x03 => cap_id = PciCapabilityId::CapVitalProductData,
+            0x04 => cap_id = PciCapabilityId::CapSlotIdentification,
+            0x05 => cap_id = PciCapabilityId::CapMsi,
+            0x06 => cap_id = PciCapabilityId::CapHotSwap,
+            0x10 => cap_id = PciCapabilityId::CapPciExpress,
+            0x11 => cap_id = PciCapabilityId::CapMsiX,
+            0x12 => cap_id = PciCapabilityId::CapSata,
+            0x13 => cap_id = PciCapabilityId::CapPciBridgeSubsystem,
+            0x14 => cap_id = PciCapabilityId::CapAer,
+            0x18 => cap_id = PciCapabilityId::CapPowerBudgeting,
+            _ => cap_id = PciCapabilityId::CapVendorSpecific,
+        };
+
+        let next_ptr: u8 = pci_read_config_u8(access, bus, dev, func, cap_ptr + 1);
+
+        // Read up to 16 dwords of capability data
+        let mut cap_dwords: u64 = 0;
+        let mut cap_data_arr: Array(u32, 16) = Array::zeroed();
+        loop bound 16 {
+            let data_offset: u8 = cap_ptr + 2 + (cap_dwords as u8) * 4;
+            if data_offset > 0xFC || data_offset < cap_ptr + 2 {
+                break;
+            };
+            cap_data_arr[cap_dwords] = pci_read_config_u32(access, bus, dev, func, data_offset);
+            cap_dwords = cap_dwords + 1;
+            if data_offset + 4 > 0xFF {
+                break;
+            };
+        };
+
+        let cap: PciCapability = PciCapability {
+            cap_id: cap_id, cap_ptr: cap_ptr, cap_version: 0,
+            next_cap_ptr: next_ptr, cap_data: cap_data_arr,
+            cap_data_dwords: cap_dwords,
+        };
+
+        device_out.capabilities[device_out.capability_count] = cap;
+        device_out.capability_count = device_out.capability_count + 1;
+
+        if next_ptr == 0 || next_ptr <= cap_ptr {
+            break;
+        };
+        cap_ptr = next_ptr;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enumerate a Single Function
+// ─────────────────────────────────────────────────────────────
+
+fn pci_enumerate_function(
+    state: Handle(PciDriverState),
+    bus: u8,
+    device: u8,
+    func: u8,
+    enum_cap: Cap(PciCapability),
+    timestamp: u64,
+) -> Result(u64, PciError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "pci_enum_func:v1"
+{
+    if state.device_count >= 64 {
+        return Result::Err(PciError::PciMaxDevicesExceeded);
+    };
+
+    if !pci_device_exists(Handle(PciConfigAccess)::from_ptr(&state.config_access), bus, device, func) {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    let access: Handle(PciConfigAccess) = Handle(PciConfigAccess)::from_ptr(&state.config_access);
+
+    let vendor: u16 = pci_read_config_u16(access, bus, device, func, 0x00);
+    let dev_id: u16 = pci_read_config_u16(access, bus, device, func, 0x02);
+    let rev: u8 = pci_read_config_u8(access, bus, device, func, 0x08);
+    let prog_if: u8 = pci_read_config_u8(access, bus, device, func, 0x09);
+    let subclass: u8 = pci_read_config_u8(access, bus, device, func, 0x0A);
+    let class_code: u8 = pci_read_config_u8(access, bus, device, func, 0x0B);
+    let header_type: u8 = pci_read_config_u8(access, bus, device, func, 0x0E);
+    let is_multi: bool = (header_type & 0x80) != 0;
+    let header_type_base: u8 = header_type & 0x7F;
+    let is_bridge: bool = header_type_base == 0x01;
+
+    let int_line: u8 = pci_read_config_u8(access, bus, device, func, 0x3C);
+    let int_pin: u8 = pci_read_config_u8(access, bus, device, func, 0x3D);
+
+    let subsys_vendor: u16 = pci_read_config_u16(access, bus, device, func, 0x2C);
+    let subsys_dev: u16 = pci_read_config_u16(access, bus, device, func, 0x2E);
+
+    let device_identity: Identity = identity_new(
+        0x5043_49, timestamp, state.device_count as u64, vendor as u64,
+    );
+
+    // Parse BARs
+    let mut bar_arr: Array(PciBar, 6) = Array::zeroed();
+    let mut bar_cnt: u64 = 0;
+    let max_bars: u64 = if is_bridge { 2 } else { 6 };
+    let bar_start: u8 = 0x10;
+
+    loop bound 6 {
+        if bar_cnt >= max_bars {
+            break;
+        };
+        let bar_local: PciBar = pci_parse_bar(access, bus, device, func, bar_cnt as u8);
+        bar_arr[bar_cnt] = bar_local;
+        if bar_local.bar_type != PciBarType::BarUnused {
+            bar_cnt = bar_cnt + 1;
+            if bar_local.is_64bit {
+                if bar_cnt >= max_bars {
+                    break;
+                };
+                // Skip the next BAR index (consumed by 64-bit pair)
+                let skip_bar: PciBar = PciBar {
+                    bar_index: bar_cnt as u8, bar_type: PciBarType::BarUnused,
+                    is_prefetchable: false, address: 0, size: 0, flags: 0, is_64bit: false,
+                };
+                bar_arr[bar_cnt] = skip_bar;
+                bar_cnt = bar_cnt + 1;
+            };
+        } else {
+            bar_cnt = bar_cnt + 1;
+        };
+    };
+
+    let sec_bus: u8 = if is_bridge {
+        pci_read_config_u8(access, bus, device, func, 0x19)
+    } else { 0 };
+    let sub_bus: u8 = if is_bridge {
+        pci_read_config_u8(access, bus, device, func, 0x1A)
+    } else { 0 };
+
+    let mut device_out: PciDevice = PciDevice {
+        device_identity: device_identity,
+        bdf: pci_encode_bdf(bus, device, func),
+        bus: bus, device: device, func: func,
+        vendor_id: vendor, device_id: dev_id,
+        revision_id: rev, class_code: class_code,
+        subclass: subclass, prog_if: prog_if,
+        header_type: header_type, is_multi_function: is_multi,
+        is_bridge: is_bridge,
+        bars: bar_arr, bar_count: bar_cnt,
+        capabilities: Array::zeroed(), capability_count: 0,
+        interrupt_line: int_line, interrupt_pin: int_pin,
+        subsystem_vendor: subsys_vendor, subsystem_device: subsys_dev,
+        expansion_rom_base: 0,
+        secondary_bus: sec_bus, subordinate_bus: sub_bus,
+        initialized: true, enumerated: true,
+        residual_log: RingBuf::new(),
+        trust_state: TrustState::Unknown, generation: 1,
+    };
+
+    // Parse capability list
+    pci_find_capabilities(access, bus, device, func, Handle(PciDevice)::from_ptr(&device_out));
+
+    // If bridge, record bus range
+    if is_bridge {
+        state.bridge_count = state.bridge_count + 1;
+    };
+
+    let dev_idx: u64 = state.device_count;
+    state.devices[dev_idx] = device_out;
+    state.device_count = state.device_count + 1;
+
+    residual emit {
+        op: "pci.enumerate_function",
+        bus: bus as u64, device: device as u64, func: func as u64,
+        vendor: vendor as u64, device_id: dev_id as u64,
+        class: class_code as u64, subclass: subclass as u64,
+        bars_found: bar_cnt,
+        caps_found: device_out.capability_count,
+        is_bridge: if is_bridge { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(dev_idx);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scan a Single Device (all functions)
+// ─────────────────────────────────────────────────────────────
+
+fn pci_scan_device(
+    state: Handle(PciDriverState),
+    bus: u8,
+    device: u8,
+    enum_cap: Cap(PciCapability),
+    timestamp: u64,
+) -> u64
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "pci_scan_device:v1"
+{
+    let mut found: u64 = 0;
+
+    // Function 0 must exist for the device to exist
+    if !pci_device_exists(Handle(PciConfigAccess)::from_ptr(&state.config_access), bus, device, 0) {
+        return 0;
+    };
+
+    // Check if device is multi-function (header type bit 7)
+    let header: u8 = pci_read_config_u8(
+        Handle(PciConfigAccess)::from_ptr(&state.config_access), bus, device, 0, 0x0E);
+    let multi_fn: bool = (header & 0x80) != 0;
+
+    let max_funcs: u64 = if multi_fn { 8 } else { 1 };
+
+    loop bound 8 {
+        if found >= 8 {
+            break;
+        };
+        let func: u8 = found as u8;
+        if func >= (max_funcs as u8) {
+            break;
+        };
+        if pci_device_exists(Handle(PciConfigAccess)::from_ptr(&state.config_access), bus, device, func) {
+            let result: Result(u64, PciError) = pci_enumerate_function(state, bus, device, func, enum_cap, timestamp);
+            match result {
+                Result::Ok(_) => { found = found + 1; },
+                Result::Err(_) => {},
+            };
+        };
+    };
+
+    return found;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Recursive Bus Scan
+// ─────────────────────────────────────────────────────────────
+
+fn pci_scan_bus(
+    state: Handle(PciDriverState),
+    bus: u8,
+    max_depth: u8,
+    current_depth: u8,
+    enum_cap: Cap(PciCapability),
+    timestamp: u64,
+) -> u64
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "pci_scan_bus:v1"
+{
+    let mut total_found: u64 = 0;
+
+    if current_depth > max_depth {
+        return total_found;
+    };
+
+    loop bound 32 {
+        let dev: u8 = total_found as u8;
+        if dev >= 32 {
+            break;
+        };
+        let count: u64 = pci_scan_device(state, bus, dev, enum_cap, timestamp);
+        if count > 0 {
+            total_found = total_found + count;
+
+            // Scan secondary buses behind bridges found on this device
+            let access: Handle(PciConfigAccess) = Handle(PciConfigAccess)::from_ptr(&state.config_access);
+            if pci_device_exists(access, bus, dev, 0) {
+                let hdr: u8 = pci_read_config_u8(access, bus, dev, 0, 0x0E);
+                if (hdr & 0x7F) == 0x01 {
+                    let sec_bus: u8 = pci_read_config_u8(access, bus, dev, 0, 0x19);
+                    let sub_bus: u8 = pci_read_config_u8(access, bus, dev, 0, 0x1A);
+                    if sec_bus != 0 && sec_bus <= sub_bus && sec_bus != bus {
+                        let sub_count: u64 = pci_scan_bus(state, sec_bus, max_depth, current_depth + 1, enum_cap, timestamp);
+                        total_found = total_found + sub_count;
+                    };
+                };
+            };
+        };
+        if (dev as u64) >= 31 {
+            break;
+        };
+    };
+
+    return total_found;
+}
+
+// ─────────────────────────────────────────────────────────────
+// PCI Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn pci_driver_init(
+    driver_identity: Identity,
+    use_mmio: bool,
+    mmio_base: u64,
+    mmio_size: u64,
+    cap: Cap(PciCapability),
+    timestamp: u64,
+) -> PciDriverState
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "pci_driver_init:v2"
+{
+    let access: PciConfigAccess = PciConfigAccess {
+        config_port_addr: PciConfigAccess::port_addr(),
+        config_port_data: PciConfigAccess::port_data(),
+        use_mmio: use_mmio,
+        mmio_base: mmio_base,
+        mmio_size: mmio_size,
+    };
+
+    let state: PciDriverState = PciDriverState {
+        driver_identity: driver_identity,
+        config_access: access,
+        devices: Array::zeroed(),
+        device_count: 0,
+        bus_count: 0,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        enumeration_complete: false,
+        bridge_count: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "pci_driver.init",
+        driver_identity: driver_identity.id_hash,
+        use_mmio: if use_mmio { 1 } else { 0 },
+        mmio_base: mmio_base,
+        mmio_size: mmio_size,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Full PCI Enumeration
+// ─────────────────────────────────────────────────────────────
+
+fn pci_enumerate_all(
+    state: Handle(PciDriverState),
+    max_bus: u8,
+    max_depth: u8,
+    enum_cap: Cap(PciCapability),
+    timestamp: u64,
+) -> Result(u64, PciError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "pci_enumerate_all:v2"
+{
+    if !state.initialized {
+        return Result::Err(PciError::PciNotInitialized);
+    };
+
+    if !enum_cap.can_enum {
+        return Result::Err(PciError::PciCapabilityError);
+    };
+
+    let mut total_devices: u64 = 0;
+
+    loop bound 256 {
+        let bus: u8 = total_devices as u8;
+        if bus >= max_bus {
+            break;
+        };
+        let bus_max: u8 = if bus == 0 { 255 } else { bus };
+        if total_devices >= 256 {
+            break;
+        };
+        let count: u64 = pci_scan_bus(state, bus, max_depth, 0, enum_cap, timestamp);
+        total_devices = total_devices + count;
+        if (bus as u64) >= (max_bus as u64 - 1) {
+            break;
+        };
+    };
+
+    state.enumeration_complete = true;
+
+    residual emit {
+        op: "pci_driver.enumerate_all",
+        total_devices: total_devices,
+        max_bus_seen: max_bus as u64,
+        bridge_count: state.bridge_count,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(total_devices);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Find Device by Class/Subclass
+// ─────────────────────────────────────────────────────────────
+
+fn pci_find_by_class(
+    state: Handle(PciDriverState),
+    class_code: u8,
+    subclass: u8,
+    prog_if: u8,
+    result_indices: Array(u64, 16),
+) -> u64
+    effect [deterministic]
+    court "pci_find_class:v1"
+{
+    let mut found: u64 = 0;
+
+    loop bound 64 {
+        if found >= state.device_count {
+            break;
+        };
+        let i: u64 = found;
+        let dev: PciDevice = state.devices[i];
+        if dev.class_code == class_code
+            && dev.subclass == subclass
+            && dev.prog_if == prog_if
+        {
+            if found < 16 {
+                result_indices[found] = i;
+            };
+            found = found + 1;
+        };
+        if found >= 64 || i >= 63 {
+            break;
+        };
+    };
+
+    return found;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Find Device by Vendor/Device ID
+// ─────────────────────────────────────────────────────────────
+
+fn pci_find_by_vendor_device(
+    state: Handle(PciDriverState),
+    vendor_id: u16,
+    device_id: u16,
+) -> Result(u64, PciError)
+    effect [deterministic]
+{
+    loop bound 64 {
+        let i: u64 = 0;
+        loop while i < state.device_count {
+            let dev: PciDevice = state.devices[i];
+            if dev.vendor_id == vendor_id && dev.device_id == device_id {
+                return Result::Ok(i);
+            };
+            if i >= 63 {
+                break;
+            };
+        };
+        break;
+    };
+    return Result::Err(PciError::PciDeviceNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read MSI Capability
+// ─────────────────────────────────────────────────────────────
+
+fn pci_read_msi_cap(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    msi_info_out: Handle(MsiInfo),
+) -> Result(void, PciError)
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_read_msi:v1"
+{
+    if device_idx >= state.device_count {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    let dev: PciDevice = state.devices[device_idx];
+    let cap_idx: u64 = 0;
+    loop bound 24 {
+        if cap_idx >= dev.capability_count {
+            break;
+        };
+        let cap: PciCapability = dev.capabilities[cap_idx];
+        match cap.cap_id {
+            PciCapabilityId::CapMsi => {
+                let msg_addr: u32 = cap.cap_data[0];
+                let msg_data: u32 = if cap.cap_data_dwords >= 2 {
+                    cap.cap_data[1]
+                } else { 0 };
+                msi_info_out.message_address = msg_addr as u64;
+                msi_info_out.message_data = msg_data;
+                msi_info_out.capability_ptr = cap.cap_ptr;
+                msi_info_out.found = true;
+                return Result::Ok(void);
+            },
+            _ => {},
+        };
+        cap_idx = cap_idx + 1;
+    };
+
+    return Result::Err(PciError::PciCapabilityNotFound);
+}
+
+struct MsiInfo {
+    message_address: u64,
+    message_data: u32,
+    capability_ptr: u8,
+    found: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read MSI-X Capability
+// ─────────────────────────────────────────────────────────────
+
+fn pci_read_msix_cap(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    msix_info_out: Handle(MsixInfo),
+) -> Result(void, PciError)
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "pci_read_msix:v1"
+{
+    if device_idx >= state.device_count {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    let dev: PciDevice = state.devices[device_idx];
+    let cap_idx: u64 = 0;
+    loop bound 24 {
+        if cap_idx >= dev.capability_count {
+            break;
+        };
+        let cap: PciCapability = dev.capabilities[cap_idx];
+        match cap.cap_id {
+            PciCapabilityId::CapMsiX => {
+                let table_offset: u32 = cap.cap_data[0];
+                let bir: u32 = table_offset & 0x07;
+                let offset_val: u32 = table_offset & 0xFFFFFFF8;
+                let pba_offset: u32 = cap.cap_data[1];
+                let pba_bir: u32 = pba_offset & 0x07;
+                let pba_offset_val: u32 = pba_offset & 0xFFFFFFF8;
+                msix_info_out.table_bir = bir as u8;
+                msix_info_out.table_offset = offset_val as u64;
+                msix_info_out.pba_bir = pba_bir as u8;
+                msix_info_out.pba_offset = pba_offset_val as u64;
+                msix_info_out.capability_ptr = cap.cap_ptr;
+                msix_info_out.found = true;
+                return Result::Ok(void);
+            },
+            _ => {},
+        };
+        cap_idx = cap_idx + 1;
+    };
+
+    return Result::Err(PciError::PciCapabilityNotFound);
+}
+
+struct MsixInfo {
+    table_bir: u8,
+    table_offset: u64,
+    pba_bir: u8,
+    pba_offset: u64,
+    capability_ptr: u8,
+    found: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get BAR Address for a Device
+// ─────────────────────────────────────────────────────────────
+
+fn pci_get_bar_address(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    bar_index: u8,
+) -> Result(u64, PciError)
+    effect [deterministic]
+{
+    if device_idx >= state.device_count {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    let dev: PciDevice = state.devices[device_idx];
+    if (bar_index as u64) >= dev.bar_count {
+        return Result::Err(PciError::PciBarInvalid);
+    };
+
+    let bar: PciBar = dev.bars[bar_index as u64];
+    if bar.bar_type == PciBarType::BarUnused || bar.bar_type == PciBarType::BarInvalid {
+        return Result::Err(PciError::PciBarInvalid);
+    };
+
+    return Result::Ok(bar.address);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get BAR Size for a Device
+// ─────────────────────────────────────────────────────────────
+
+fn pci_get_bar_size(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    bar_index: u8,
+) -> Result(u64, PciError)
+    effect [deterministic]
+{
+    if device_idx >= state.device_count {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    let dev: PciDevice = state.devices[device_idx];
+    if (bar_index as u64) >= dev.bar_count {
+        return Result::Err(PciError::PciBarInvalid);
+    };
+
+    let bar: PciBar = dev.bars[bar_index as u64];
+    return Result::Ok(bar.size);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Configure PCI Command Register
+// ─────────────────────────────────────────────────────────────
+
+fn pci_set_command_flags(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    set_mask: u16,
+    clear_mask: u16,
+    cfg_cap: Cap(PciCapability),
+) -> Result(void, PciError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "pci_set_command:v1"
+{
+    if device_idx >= state.device_count {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    if !cfg_cap.can_write_config {
+        return Result::Err(PciError::PciCapabilityError);
+    };
+
+    let dev: PciDevice = state.devices[device_idx];
+    let access: Handle(PciConfigAccess) = Handle(PciConfigAccess)::from_ptr(&state.config_access);
+
+    let cur_cmd: u16 = pci_read_config_u16(access, dev.bus, dev.device, dev.func, 0x04);
+    let new_cmd: u16 = (cur_cmd | set_mask) & !clear_mask;
+    pci_write_config_u16(access, dev.bus, dev.device, dev.func, 0x04, new_cmd);
+
+    residual emit {
+        op: "pci.set_command",
+        device_idx: device_idx,
+        bdf: dev.bdf as u64,
+        old_cmd: cur_cmd as u64,
+        new_cmd: new_cmd as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable Bus Mastering for Device
+// ─────────────────────────────────────────────────────────────
+
+fn pci_enable_bus_master(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    cfg_cap: Cap(PciCapability),
+) -> Result(void, PciError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    return pci_set_command_flags(state, device_idx, 0x0004, 0x0000, cfg_cap);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable MMIO Space for Device
+// ─────────────────────────────────────────────────────────────
+
+fn pci_enable_mmio(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    cfg_cap: Cap(PciCapability),
+) -> Result(void, PciError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    return pci_set_command_flags(state, device_idx, 0x0002, 0x0000, cfg_cap);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable I/O Space for Device
+// ─────────────────────────────────────────────────────────────
+
+fn pci_enable_io_space(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    cfg_cap: Cap(PciCapability),
+) -> Result(void, PciError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    return pci_set_command_flags(state, device_idx, 0x0001, 0x0000, cfg_cap);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Dump Device Info (residual recording)
+// ─────────────────────────────────────────────────────────────
+
+fn pci_record_device_residual(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+    timestamp: u64,
+) -> Result(void, PciError)
+    effect [residual]
+    court "pci_record_residual:v1"
+{
+    if device_idx >= state.device_count {
+        return Result::Err(PciError::PciDeviceNotFound);
+    };
+
+    let dev: PciDevice = state.devices[device_idx];
+
+    residual emit {
+        op: "pci_driver.device_info",
+        device_idx: device_idx,
+        bdf: dev.bdf as u64,
+        vendor: dev.vendor_id as u64,
+        device_id: dev.device_id as u64,
+        class: dev.class_code as u64,
+        subclass: dev.subclass as u64,
+        prog_if: dev.prog_if as u64,
+        bars_found: dev.bar_count,
+        caps_found: dev.capability_count,
+        int_line: dev.interrupt_line as u64,
+        int_pin: dev.interrupt_pin as u64,
+        is_bridge: if dev.is_bridge { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read and Record All Device Residuals
+// ─────────────────────────────────────────────────────────────
+
+fn pci_record_all_residuals(
+    state: Handle(PciDriverState),
+    timestamp: u64,
+) -> u64
+    effect [residual]
+    court "pci_record_all:v1"
+{
+    let mut recorded: u64 = 0;
+    loop bound 64 {
+        if recorded >= state.device_count {
+            break;
+        };
+        let _ = pci_record_device_residual(state, recorded, timestamp);
+        recorded = recorded + 1;
+    };
+    return recorded;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Validate Configuration Space Checksum (basic integrity)
+// ─────────────────────────────────────────────────────────────
+
+fn pci_validate_device(
+    state: Handle(PciDriverState),
+    device_idx: u64,
+) -> bool
+    effect [deterministic]
+    court "pci_validate:v1"
+{
+    if device_idx >= state.device_count {
+        return false;
+    };
+    let dev: PciDevice = state.devices[device_idx];
+    // A device is considered valid if vendor is non-0xFFFF and device has
+    // been successfully enumerated with at least minimal configuration
+    if dev.vendor_id == 0xFFFF || dev.vendor_id == 0x0000 {
+        return false;
+    };
+    if !dev.initialized || !dev.enumerated {
+        return false;
+    };
+    return true;
+}

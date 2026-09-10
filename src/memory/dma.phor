@@ -1,0 +1,1282 @@
+// file: dma.phor
+// purpose: DMA management: DMA buffer allocation, IOMMU interface, scatter-gather
+//          lists, DMA pool, cache coherence operations, DMA API for drivers.
+//          All operations use bounded loops and record residuals for all
+//          DMA state changes.
+// evidence: MEM-DMA-ARCH-001 through MEM-DMA-ARCH-240
+// residual: Every DMA buffer allocation, mapping, and transfer records a residual.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use memory::phys_page_allocator::*
+use memory::virtual_memory::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-DIAG-001 through MEM-DMA-DIAG-010
+
+const DIAG_DMA_BASE        : Word64 = Word64::from_u64(0xA500)
+const DIAG_DMA_OK          : Word64 = DIAG_DMA_BASE | 0x000
+const DIAG_DMA_NOMEM       : Word64 = DIAG_DMA_BASE | 0x001
+const DIAG_DMA_INVALID     : Word64 = DIAG_DMA_BASE | 0x002
+const DIAG_DMA_IOMMU_FAIL  : Word64 = DIAG_DMA_BASE | 0x003
+const DIAG_DMA_MAPPING     : Word64 = DIAG_DMA_BASE | 0x004
+const DIAG_DMA_COHERENCE   : Word64 = DIAG_DMA_BASE | 0x005
+const DIAG_DMA_ALIGNMENT   : Word64 = DIAG_DMA_BASE | 0x006
+const DIAG_DMA_BOUNDS      : Word64 = DIAG_DMA_BASE | 0x007
+const DIAG_DMA_TIMEOUT     : Word64 = DIAG_DMA_BASE | 0x008
+const DIAG_DMA_POOL_EXHAUSTED: Word64 = DIAG_DMA_BASE | 0x009
+
+// ──────────────────────────────────────────────
+// DMA Constants
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-CONST-001 through MEM-DMA-CONST-020
+
+const DMA_MAX_BUFFERS         : u32 = 256
+const DMA_MAX_SG_ENTRIES      : u32 = 128
+const DMA_MAX_POOLS           : u32 = 16
+const DMA_POOL_MIN_BUF_SIZE   : u32 = 32
+const DMA_POOL_MAX_BUF_SIZE   : u32 = 1048576  // 1MB
+const DMA_ALIGNMENT           : u32 = 32
+const DMA_IOMMU_PAGE_SIZE     : u64 = 4096
+const DMA_MAX_IOMMU_DOMAINS   : u32 = 16
+const DMA_CACHE_LINE_SIZE     : u32 = 64
+const DMA_MAX_SEGMENT_SIZE    : u64 = 0x1000000  // 16MB per segment
+const DMA_CONSISTENT_POOL_SIZE: u64 = 2 * 1024 * 1024  // 2MB consistent pool
+
+// DMA Direction
+const DMA_BIDIRECTIONAL       : u8 = 0
+const DMA_TO_DEVICE           : u8 = 1
+const DMA_FROM_DEVICE         : u8 = 2
+const DMA_NONE                : u8 = 3
+
+// IOMMU Page Table Entry Flags
+const IOMMU_READ              : u64 = 0x01
+const IOMMU_WRITE             : u64 = 0x02
+const IOMMU_EXEC              : u64 = 0x04
+const IOMMU_MMIO              : u64 = 0x08
+const IOMMU_CACHE_COHERENT    : u64 = 0x10
+
+// ──────────────────────────────────────────────
+// DMA Direction Type
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-DIR-001 through MEM-DMA-DIR-005
+
+pub type DmaDirection : u8 = struct {
+    value: u8,
+}
+
+impl DmaDirection {
+    pub fn bidir() -> DmaDirection
+        effects: [deterministic]
+    {
+        DmaDirection { value: DMA_BIDIRECTIONAL }
+    }
+
+    pub fn to_device() -> DmaDirection
+        effects: [deterministic]
+    {
+        DmaDirection { value: DMA_TO_DEVICE }
+    }
+
+    pub fn from_device() -> DmaDirection
+        effects: [deterministic]
+    {
+        DmaDirection { value: DMA_FROM_DEVICE }
+    }
+
+    pub fn none() -> DmaDirection
+        effects: [deterministic]
+    {
+        DmaDirection { value: DMA_NONE }
+    }
+
+    pub fn is_bidir(self) -> bool
+        effects: [deterministic]
+    {
+        self.value == DMA_BIDIRECTIONAL
+    }
+
+    pub fn is_to_device(self) -> bool
+        effects: [deterministic]
+    {
+        self.value == DMA_TO_DEVICE
+    }
+
+    pub fn is_from_device(self) -> bool
+        effects: [deterministic]
+    {
+        self.value == DMA_FROM_DEVICE
+    }
+
+    pub fn needs_sync(self) -> bool
+        effects: [deterministic]
+    {
+        self.value == DMA_BIDIRECTIONAL ||
+        self.value == DMA_TO_DEVICE ||
+        self.value == DMA_FROM_DEVICE
+    }
+}
+
+// ──────────────────────────────────────────────
+// DMA Buffer Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-BUF-001 through MEM-DMA-BUF-025
+
+pub type DmaBuffer : struct {
+    buffer_id: Word32,
+    virtual_addr: u64,
+    physical_addr: u64,
+    size: u64,
+    direction: DmaDirection,
+    is_consistent: bool,
+    is_mapped: bool,
+    iommu_handle: Handle,
+    owning_device: Word64,
+    generation: Word32,
+}
+
+impl DmaBuffer {
+    pub fn new(vaddr: u64, paddr: u64, size: u64, dir: DmaDirection) -> DmaBuffer
+        effects: [deterministic]
+    {
+        DmaBuffer {
+            buffer_id: Word32::initial(),
+            virtual_addr: vaddr,
+            physical_addr: paddr,
+            size: size,
+            direction: dir,
+            is_consistent: false,
+            is_mapped: false,
+            iommu_handle: Handle::null(),
+            owning_device: Word64::zero(),
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.physical_addr + self.size
+    }
+
+    pub fn contains(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        addr >= self.physical_addr && addr < self.physical_addr + self.size
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scatter-Gather Entry
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-SG-001 through MEM-DMA-SG-015
+
+pub type ScatterGatherEntry : struct {
+    physical_addr: u64,
+    size: u64,
+    dma_address: u64,
+    is_last: bool,
+}
+
+impl ScatterGatherEntry {
+    pub fn new(phys_addr: u64, size: u64) -> ScatterGatherEntry
+        effects: [deterministic]
+    {
+        ScatterGatherEntry {
+            physical_addr: phys_addr,
+            size: size,
+            dma_address: 0,
+            is_last: false,
+        }
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.physical_addr + self.size
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scatter-Gather List
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-SGLIST-001 through MEM-DMA-SGLIST-025
+
+pub type ScatterGatherList : struct {
+    entries: FixedArray[DMA_MAX_SG_ENTRIES, ScatterGatherEntry],
+    num_entries: u32,
+    total_size: u64,
+    direction: DmaDirection,
+    is_mapped: bool,
+    generation: Word32,
+}
+
+impl ScatterGatherList {
+    pub fn new(dir: DmaDirection) -> ScatterGatherList
+        effects: [deterministic]
+    {
+        ScatterGatherList {
+            entries: FixedArray::new(),
+            num_entries: 0,
+            total_size: 0,
+            direction: dir,
+            is_mapped: false,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn add_entry(self: ref mut, entry: ScatterGatherEntry)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_entries >= DMA_MAX_SG_ENTRIES {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_BOUNDS,
+                FixedString[128]::from_slice("Max SG entries reached")))
+        }
+        let new_size: u64 = self.total_size + entry.size
+        if entry.size > DMA_MAX_SEGMENT_SIZE {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_BOUNDS,
+                FixedString[128]::from_slice("SG entry exceeds max segment size")))
+        }
+        self.entries.push(entry);
+        self.num_entries = self.num_entries + 1
+        self.total_size = new_size
+        Result::Ok(())
+    }
+
+    pub fn get(self, index: u32) -> Result[ref ScatterGatherEntry, MemoryError>
+        effects: [deterministic]
+    {
+        if index >= self.num_entries {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_BOUNDS,
+                FixedString[128]::from_slice("SG entry index out of bounds")))
+        }
+        // trust: index bounds-checked
+        trusted("SG entry access: index within range") {
+            Result::Ok(self.entries.get(index))
+        }
+    }
+
+    pub fn get_mut(self: ref mut, index: u32)
+        -> Result[ref mut ScatterGatherEntry, MemoryError>
+        effects: [deterministic]
+    {
+        if index >= self.num_entries {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_BOUNDS,
+                FixedString[128]::from_slice("SG entry index out of bounds")))
+        }
+        // trust: index bounds-checked
+        trusted("SG entry mut access: index within range") {
+            Result::Ok(self.entries.get_mut(index))
+        }
+    }
+
+    pub fn entry_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_entries
+    }
+
+    pub fn total_size(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_size
+    }
+
+    pub fn set_last(self: ref mut)
+        effects: [deterministic]
+    {
+        if self.num_entries > 0 {
+            let last_idx: u32 = self.num_entries - 1
+            let entry: ref mut ScatterGatherEntry = self.entries.get_mut(last_idx)
+            entry.is_last = true
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// IOMMU Domain
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-IOMMU-001 through MEM-DMA-IOMMU-035
+
+pub type IommuDomain : struct {
+    domain_id: u32,
+    page_table_root: u64,
+    is_active: bool,
+    mappings: FixedArray[64, (u64, u64, u64)],  // (iova, phys, size)
+    num_mappings: u32,
+    generation: Word32,
+}
+
+impl IommuDomain {
+    pub fn new(domain_id: u32) -> IommuDomain
+        effects: [deterministic]
+    {
+        IommuDomain {
+            domain_id: domain_id,
+            page_table_root: 0,
+            is_active: false,
+            mappings: FixedArray::new(),
+            num_mappings: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn attach_device(self: ref mut, device_handle: Handle)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        // trust: IOMMU hardware attachment
+        trusted("IOMMU attach device: hardware register programming") {
+            __builtin_iommu_attach(device_handle, self.domain_id)
+        }
+        self.is_active = true
+        Result::Ok(())
+    }
+
+    pub fn detach_device(self: ref mut, device_handle: Handle)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        trusted("IOMMU detach device: hardware register programming") {
+            __builtin_iommu_detach(device_handle, self.domain_id)
+        }
+        self.is_active = false
+        Result::Ok(())
+    }
+
+    pub fn map_iova(self: ref mut, iova: u64, phys_addr: u64, size: u64,
+                     flags: u64)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        if self.num_mappings >= 64 {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_IOMMU_FAIL,
+                FixedString[128]::from_slice("Max IOMMU mappings per domain")))
+        }
+        // trust: IOMMU page table programming
+        trusted("IOMMU map IOVA: program IOMMU page table") {
+            __builtin_iommu_map(self.domain_id, iova, phys_addr, size, flags)
+        }
+        self.mappings.push((iova, phys_addr, size));
+        self.num_mappings = self.num_mappings + 1
+        self.generation.bump();
+        Result::Ok(())
+    }
+
+    pub fn unmap_iova(self: ref mut, iova: u64)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_mappings (<=64)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_mappings {
+            let (mapped_iova, phys, size): (u64, u64, u64) = self.mappings.get(i)
+            if mapped_iova == iova {
+                trusted("IOMMU unmap IOVA: clear IOMMU page table entry") {
+                    __builtin_iommu_unmap(self.domain_id, iova, size)
+                }
+                // Shift entries
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining entries
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_mappings - 1) {
+                    let next: (u64, u64, u64) = self.mappings.get(j + 1)
+                    self.mappings.set(j, next)
+                }
+                self.num_mappings = self.num_mappings - 1
+                self.generation.bump();
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_DMA_IOMMU_FAIL,
+            FixedString[128]::from_slice("IOVA not found in domain")))
+    }
+
+    pub fn clear_all(self: ref mut)
+        effects: [deterministic, io]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_mappings
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_mappings {
+            let (iova, phys, size): (u64, u64, u64) = self.mappings.get(i)
+            trusted("IOMMU clear all: batch unmap") {
+                __builtin_iommu_unmap(self.domain_id, iova, size)
+            }
+        }
+        self.num_mappings = 0
+        self.generation.bump()
+    }
+}
+
+// ──────────────────────────────────────────────
+// IOMMU Manager
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-IOMMUMGR-001 through MEM-DMA-IOMMUMGR-030
+
+pub type IommuManager : struct {
+    domains: FixedArray[DMA_MAX_IOMMU_DOMAINS, IommuDomain],
+    num_domains: u32,
+    default_domain_id: u32,
+    hardware_present: bool,
+    generation: Word32,
+}
+
+impl IommuManager {
+    pub fn new() -> IommuManager
+        effects: [deterministic]
+    {
+        IommuManager {
+            domains: FixedArray::new(),
+            num_domains: 0,
+            default_domain_id: 0,
+            hardware_present: false,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn init(self: ref mut, hardware_present: bool)
+        effects: [deterministic]
+    {
+        self.hardware_present = hardware_present
+        if hardware_present {
+            let domain: IommuDomain = IommuDomain::new(0)
+            self.domains.push(domain);
+            self.num_domains = 1
+            self.default_domain_id = 0
+        }
+    }
+
+    pub fn create_domain(self: ref mut) -> Result[u32, MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_domains >= DMA_MAX_IOMMU_DOMAINS {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_IOMMU_FAIL,
+                FixedString[128]::from_slice("Max IOMMU domains reached")))
+        }
+        let domain_id: u32 = self.num_domains
+        let domain: IommuDomain = IommuDomain::new(domain_id)
+        self.domains.push(domain);
+        self.num_domains = self.num_domains + 1
+        self.generation.bump();
+        Result::Ok(domain_id)
+    }
+
+    pub fn get_domain(self: ref, domain_id: u32)
+        -> Result[ref IommuDomain, MemoryError>
+        effects: [deterministic]
+    {
+        if domain_id >= self.num_domains {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_IOMMU_FAIL,
+                FixedString[128]::from_slice("Invalid IOMMU domain ID")))
+        }
+        // trust: index bounds-checked
+        trusted("IOMMU domain access: index within range") {
+            Result::Ok(self.domains.get(domain_id))
+        }
+    }
+
+    pub fn get_domain_mut(self: ref mut, domain_id: u32)
+        -> Result[ref mut IommuDomain, MemoryError>
+        effects: [deterministic]
+    {
+        if domain_id >= self.num_domains {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_IOMMU_FAIL,
+                FixedString[128]::from_slice("Invalid IOMMU domain ID")))
+        }
+        // trust: index bounds-checked
+        trusted("IOMMU domain mut access: index within range") {
+            Result::Ok(self.domains.get_mut(domain_id))
+        }
+    }
+
+    pub fn map_dma(self: ref mut, domain_id: u32,
+                    phys_addr: u64, size: u64, flags: u64)
+        -> Result[u64, MemoryError>
+        effects: [deterministic, io]
+    {
+        let domain: ref mut IommuDomain = self.get_domain_mut(domain_id)?
+        // Use physical address as IOVA (identity mapping for simplicity)
+        let iova: u64 = phys_addr
+        domain.map_iova(iova, phys_addr, size, flags)?;
+        self.generation.bump();
+        self.record_iommu_map_residual(domain_id, iova, phys_addr, size)
+        Result::Ok(iova)
+    }
+
+    pub fn unmap_dma(self: ref mut, domain_id: u32, iova: u64)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        let domain: ref mut IommuDomain = self.get_domain_mut(domain_id)?
+        domain.unmap_iova(iova)?;
+        self.generation.bump();
+        self.record_iommu_unmap_residual(domain_id, iova)
+        Result::Ok(())
+    }
+
+    fn record_iommu_map_residual(self, domain: u32, iova: u64,
+                                  phys: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "IOMMU mapping",
+            code: DIAG_DMA_OK,
+            data: (domain, iova, phys, size),
+        )
+    }
+
+    fn record_iommu_unmap_residual(self, domain: u32, iova: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "IOMMU unmapping",
+            code: DIAG_DMA_OK,
+            data: (domain, iova),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// DMA Pool (for consistent DMA allocations)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-POOL-001 through MEM-DMA-POOL-025
+
+pub type DmaPool : struct {
+    base_phys: u64,
+    base_virt: u64,
+    size: u64,
+    free_offset: u64,
+    is_initialized: bool,
+    allocation_count: u32,
+    generation: Word32,
+}
+
+impl DmaPool {
+    pub fn new() -> DmaPool
+        effects: [deterministic]
+    {
+        DmaPool {
+            base_phys: 0,
+            base_virt: 0,
+            size: 0,
+            free_offset: 0,
+            is_initialized: false,
+            allocation_count: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn init(self: ref mut, base_phys: u64, base_virt: u64, size: u64)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if size < DMA_POOL_MIN_BUF_SIZE as u64 {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_POOL_EXHAUSTED,
+                FixedString[128]::from_slice("DMA pool too small")))
+        }
+        self.base_phys = base_phys
+        self.base_virt = base_virt
+        self.size = size
+        self.free_offset = 0
+        self.is_initialized = true
+        Result::Ok(())
+    }
+
+    pub fn allocate(self: ref mut, size: u64, align: u32)
+        -> Result[(u64, u64), MemoryError>
+        effects: [deterministic]
+    {
+        if !self.is_initialized {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_POOL_EXHAUSTED,
+                FixedString[128]::from_slice("DMA pool not initialized")))
+        }
+        let aligned_size: u64 = (size + (align as u64) - 1) & !((align as u64) - 1)
+        let aligned_offset: u64 = (self.free_offset + (align as u64) - 1) &
+                                   !((align as u64) - 1)
+        if aligned_offset + aligned_size > self.size {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_POOL_EXHAUSTED,
+                FixedString[128]::from_slice("DMA pool exhausted")))
+        }
+        let vaddr: u64 = self.base_virt + aligned_offset
+        let paddr: u64 = self.base_phys + aligned_offset
+        self.free_offset = aligned_offset + aligned_size
+        self.allocation_count = self.allocation_count + 1
+        self.generation.bump();
+        // Zero the buffer for consistent DMA
+        trusted("DMA pool: zero allocated buffer for consistency") {
+            __builtin_memzero(vaddr, aligned_size)
+        }
+        self.record_pool_alloc_residual(vaddr, aligned_size)
+        Result::Ok((vaddr, paddr))
+    }
+
+    pub fn free_all(self: ref mut)
+        effects: [deterministic]
+    {
+        self.free_offset = 0
+        self.allocation_count = 0
+        self.generation.bump()
+    }
+
+    pub fn remaining(self) -> u64
+        effects: [deterministic]
+    {
+        self.size - self.free_offset
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.size == 0 {
+            return 0
+        }
+        ((self.free_offset * 100) / self.size) as u8
+    }
+
+    fn record_pool_alloc_residual(self, vaddr: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "DMA pool allocation",
+            code: DIAG_DMA_OK,
+            data: (vaddr, size),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Cache Operations
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-CACHE-001 through MEM-DMA-CACHE-020
+
+pub type CacheOperations : struct {
+}
+
+impl CacheOperations {
+    pub fn new() -> CacheOperations
+        effects: [deterministic]
+    {
+        CacheOperations {}
+    }
+
+    pub fn clean(self, addr: u64, size: u64)
+        effects: [deterministic]
+    {
+        // trust: cache maintenance instruction
+        trusted("cache clean: write back dirty cache lines") {
+            __builtin_cache_clean(addr, size)
+        }
+    }
+
+    pub fn invalidate(self, addr: u64, size: u64)
+        effects: [deterministic]
+    {
+        // trust: cache maintenance instruction
+        trusted("cache invalidate: discard cache lines") {
+            __builtin_cache_invalidate(addr, size)
+        }
+    }
+
+    pub fn clean_and_invalidate(self, addr: u64, size: u64)
+        effects: [deterministic]
+    {
+        // trust: cache maintenance instruction
+        trusted("cache clean and invalidate: write back then discard") {
+            __builtin_cache_clean_and_invalidate(addr, size)
+        }
+    }
+
+    pub fn clean_range(self, addr: u64, size: u64)
+        effects: [deterministic]
+    {
+        let aligned_addr: u64 = addr & !(DMA_CACHE_LINE_SIZE as u64 - 1)
+        let aligned_size: u64 = size + (addr - aligned_addr)
+        let num_lines: u32 = ((aligned_size + (DMA_CACHE_LINE_SIZE as u64) - 1) /
+                               (DMA_CACHE_LINE_SIZE as u64)) as u32
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_lines
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_lines {
+            let line_addr: u64 = aligned_addr + (i as u64) * (DMA_CACHE_LINE_SIZE as u64)
+            trusted("cache clean range: per-line clean") {
+                __builtin_cache_clean(line_addr, DMA_CACHE_LINE_SIZE as u64)
+            }
+        }
+    }
+
+    pub fn invalidate_range(self, addr: u64, size: u64)
+        effects: [deterministic]
+    {
+        let aligned_addr: u64 = addr & !(DMA_CACHE_LINE_SIZE as u64 - 1)
+        let aligned_size: u64 = size + (addr - aligned_addr)
+        let num_lines: u32 = ((aligned_size + (DMA_CACHE_LINE_SIZE as u64) - 1) /
+                               (DMA_CACHE_LINE_SIZE as u64)) as u32
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_lines
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_lines {
+            let line_addr: u64 = aligned_addr + (i as u64) * (DMA_CACHE_LINE_SIZE as u64)
+            trusted("cache invalidate range: per-line invalidate") {
+                __builtin_cache_invalidate(line_addr, DMA_CACHE_LINE_SIZE as u64)
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// DMA Synchronization
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-SYNC-001 through MEM-DMA-SYNC-020
+
+pub type DmaSync : struct {
+}
+
+impl DmaSync {
+    pub fn new() -> DmaSync
+        effects: [deterministic]
+    {
+        DmaSync {}
+    }
+
+    pub fn sync_for_device(self, buffer: ref DmaBuffer, cache_ops: ref CacheOperations)
+        effects: [deterministic]
+    {
+        if buffer.direction.is_bidir() || buffer.direction.is_to_device() {
+            // Clean cache before device reads
+            cache_ops.clean_range(buffer.virtual_addr, buffer.size)
+        }
+    }
+
+    pub fn sync_for_cpu(self, buffer: ref DmaBuffer, cache_ops: ref CacheOperations)
+        effects: [deterministic]
+    {
+        if buffer.direction.is_bidir() || buffer.direction.is_from_device() {
+            // Invalidate cache after device writes
+            cache_ops.invalidate_range(buffer.virtual_addr, buffer.size)
+        }
+    }
+
+    pub fn sync_sg_for_device(self, sg_list: ref ScatterGatherList,
+                               cache_ops: ref CacheOperations)
+        effects: [deterministic]
+    {
+        if !sg_list.direction.is_to_device() && !sg_list.direction.is_bidir() {
+            return
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by sg_list.num_entries
+        loop: bounds[BOUND_MEDIUM] for i in 0..sg_list.num_entries {
+            let entry: ref ScatterGatherEntry = sg_list.entries.get(i)
+            cache_ops.clean_range(entry.physical_addr, entry.size)
+        }
+    }
+
+    pub fn sync_sg_for_cpu(self, sg_list: ref ScatterGatherList,
+                            cache_ops: ref CacheOperations)
+        effects: [deterministic]
+    {
+        if !sg_list.direction.is_from_device() && !sg_list.direction.is_bidir() {
+            return
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by sg_list.num_entries
+        loop: bounds[BOUND_MEDIUM] for i in 0..sg_list.num_entries {
+            let entry: ref ScatterGatherEntry = sg_list.entries.get(i)
+            cache_ops.invalidate_range(entry.physical_addr, entry.size)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// DMA Manager (Main API for Drivers)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-MGR-001 through MEM-DMA-MGR-080
+
+pub type DmaManager : struct {
+    buffers: FixedArray[DMA_MAX_BUFFERS, DmaBuffer],
+    num_buffers: u32,
+    pool: DmaPool,
+    iommu: IommuManager,
+    cache_ops: CacheOperations,
+    sync: DmaSync,
+    allocation_count: u64,
+    free_count: u64,
+    map_count: u64,
+    unmap_count: u64,
+    generation: Word32,
+}
+
+impl DmaManager {
+    pub fn new() -> DmaManager
+        effects: [deterministic]
+    {
+        DmaManager {
+            buffers: FixedArray::new(),
+            num_buffers: 0,
+            pool: DmaPool::new(),
+            iommu: IommuManager::new(),
+            cache_ops: CacheOperations::new(),
+            sync: DmaSync::new(),
+            allocation_count: 0,
+            free_count: 0,
+            map_count: 0,
+            unmap_count: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn init(self: ref mut, pool_phys: u64, pool_virt: u64, pool_size: u64,
+                 iommu_present: bool)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        self.pool.init(pool_phys, pool_virt, pool_size)?;
+        self.iommu.init(iommu_present);
+        self.record_init_residual(pool_phys, pool_size)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // DMA Buffer Allocation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-DMA-ALLOC-001 through MEM-DMA-ALLOC-030
+
+    pub fn alloc_coherent(self: ref mut, size: u64, dir: DmaDirection,
+                           device_id: Word64)
+        -> Result[DmaBuffer, MemoryError>
+        effects: [deterministic, io]
+    {
+        if self.num_buffers >= DMA_MAX_BUFFERS {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_NOMEM,
+                FixedString[128]::from_slice("Max DMA buffers reached")))
+        }
+        let aligned_size: u64 = (size + DMA_ALIGNMENT as u64 - 1) &
+                                 !(DMA_ALIGNMENT as u64 - 1)
+        let (vaddr, paddr): (u64, u64) = self.pool.allocate(aligned_size, DMA_ALIGNMENT)?;
+        let mut buffer: DmaBuffer = DmaBuffer::new(vaddr, paddr, aligned_size, dir)
+        buffer.is_consistent = true
+        buffer.owning_device = device_id
+        buffer.buffer_id = Word32::new(self.num_buffers)
+        self.buffers.push(buffer);
+        self.num_buffers = self.num_buffers + 1
+        self.allocation_count = self.allocation_count + 1
+        self.generation.bump();
+        self.record_alloc_residual(buffer.buffer_id, aligned_size)
+        // Return the stored buffer (copy)
+        // trust: we just pushed it, index = num_buffers - 1
+        trusted("DMA alloc coherent: retrieve just-pushed buffer") {
+            let stored: ref DmaBuffer = self.buffers.get(self.num_buffers - 1)
+            Result::Ok(stored)
+        }
+    }
+
+    pub fn alloc_streaming(self: ref mut, size: u64, dir: DmaDirection,
+                            device_id: Word64,
+                            allocator: ref mut BuddyAllocator)
+        -> Result[DmaBuffer, MemoryError>
+        effects: [deterministic, io]
+    {
+        if self.num_buffers >= DMA_MAX_BUFFERS {
+            return Result::Err(mem_ppa_error(
+                DIAG_DMA_NOMEM,
+                FixedString[128]::from_slice("Max DMA buffers reached")))
+        }
+        let num_pages: u32 = ((size + PAGE_4K_SIZE - 1) / PAGE_4K_SIZE) as u32
+        let pfn: PhysicalPageNumber = allocator.allocate_dma_pages(num_pages)?;
+        let paddr: u64 = pfn.to_address()
+        let aligned_size: u64 = (num_pages as u64) * PAGE_4K_SIZE
+        let mut buffer: DmaBuffer = DmaBuffer::new(paddr, paddr, aligned_size, dir)
+        // Streaming buffers use physical address directly (no virtual mapping needed)
+        buffer.is_consistent = false
+        buffer.owning_device = device_id
+        buffer.buffer_id = Word32::new(self.num_buffers)
+        self.buffers.push(buffer);
+        self.num_buffers = self.num_buffers + 1
+        self.allocation_count = self.allocation_count + 1
+        self.generation.bump();
+        self.record_alloc_residual(buffer.buffer_id, aligned_size)
+        // trust: same as above
+        trusted("DMA alloc streaming: retrieve just-pushed buffer") {
+            let stored: ref DmaBuffer = self.buffers.get(self.num_buffers - 1)
+            Result::Ok(stored)
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // DMA Buffer Free
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-DMA-FREE-001 through MEM-DMA-FREE-015
+
+    pub fn free_buffer(self: ref mut, buffer_id: Word32,
+                        allocator: ref mut BuddyAllocator)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_buffers
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_buffers {
+            let buffer: ref DmaBuffer = self.buffers.get(i)
+            if buffer.buffer_id.value() == buffer_id.value() {
+                let pfn: PhysicalPageNumber = PhysicalPageNumber::from_address(
+                    buffer.physical_addr)
+                let num_pages: u32 = ((buffer.size + PAGE_4K_SIZE - 1) /
+                                       PAGE_4K_SIZE) as u32
+                if buffer.is_consistent {
+                    // Consistent pool: no need to free pages individually
+                    self.pool.free_all();
+                } else {
+                    allocator.free_dma_pages(pfn, num_pages)?;
+                }
+                // Remove from array
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_buffers - 1) {
+                    let next: DmaBuffer = self.buffers.get(j + 1)
+                    self.buffers.set(j, next)
+                }
+                self.num_buffers = self.num_buffers - 1
+                self.free_count = self.free_count + 1
+                self.generation.bump();
+                self.record_free_residual(buffer_id)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_DMA_INVALID,
+            FixedString[128]::from_slice("Buffer ID not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // DMA Mapping (via IOMMU)
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-DMA-MAP-001 through MEM-DMA-MAP-020
+
+    pub fn map_buffer(self: ref mut, buffer_id: Word32, domain_id: u32)
+        -> Result[u64, MemoryError>
+        effects: [deterministic, io]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_buffers
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_buffers {
+            let buffer: ref DmaBuffer = self.buffers.get(i)
+            if buffer.buffer_id.value() == buffer_id.value() {
+                let flags: u64 = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE_COHERENT
+                let dma_addr: u64 = self.iommu.map_dma(
+                    domain_id, buffer.physical_addr, buffer.size, flags)?;
+                let buf_mut: ref mut DmaBuffer = self.buffers.get_mut(i)
+                buf_mut.is_mapped = true
+                buf_mut.iommu_handle = Handle::new(domain_id)
+                self.map_count = self.map_count + 1
+                self.generation.bump();
+                self.record_map_residual(buffer_id, dma_addr)
+                return Result::Ok(dma_addr)
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_DMA_MAPPING,
+            FixedString[128]::from_slice("Buffer ID not found for mapping")))
+    }
+
+    pub fn unmap_buffer(self: ref mut, buffer_id: Word32, domain_id: u32)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_buffers
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_buffers {
+            let buffer: ref DmaBuffer = self.buffers.get(i)
+            if buffer.buffer_id.value() == buffer_id.value() {
+                let iova: u64 = buffer.physical_addr  // Identity mapping
+                self.iommu.unmap_dma(domain_id, iova)?;
+                let buf_mut: ref mut DmaBuffer = self.buffers.get_mut(i)
+                buf_mut.is_mapped = false
+                self.unmap_count = self.unmap_count + 1
+                self.generation.bump();
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_DMA_MAPPING,
+            FixedString[128]::from_slice("Buffer ID not found for unmapping")))
+    }
+
+    pub fn map_sg(self: ref mut, sg_list: ref mut ScatterGatherList,
+                   domain_id: u32)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        let flags: u64 = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE_COHERENT
+        // loop: bounds[BOUND_MEDIUM] — bounded by sg_list.num_entries
+        loop: bounds[BOUND_MEDIUM] for i in 0..sg_list.num_entries {
+            let entry: ref ScatterGatherEntry = sg_list.entries.get(i)
+            let dma_addr: u64 = self.iommu.map_dma(
+                domain_id, entry.physical_addr, entry.size, flags)?;
+            let entry_mut: ref mut ScatterGatherEntry = sg_list.entries.get_mut(i)
+            entry_mut.dma_address = dma_addr
+        }
+        sg_list.is_mapped = true
+        self.map_count = self.map_count + 1
+        self.generation.bump();
+        self.record_sg_map_residual(sg_list.total_size, sg_list.num_entries)
+        Result::Ok(())
+    }
+
+    pub fn unmap_sg(self: ref mut, sg_list: ref mut ScatterGatherList,
+                     domain_id: u32)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by sg_list.num_entries
+        loop: bounds[BOUND_MEDIUM] for i in 0..sg_list.num_entries {
+            let entry: ref ScatterGatherEntry = sg_list.entries.get(i)
+            if entry.dma_address != 0 {
+                self.iommu.unmap_dma(domain_id, entry.dma_address)?;
+            }
+        }
+        sg_list.is_mapped = false
+        self.unmap_count = self.unmap_count + 1
+        self.generation.bump();
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Synchronization Helpers
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-DMA-SYNC-API-001 through MEM-DMA-SYNC-API-015
+
+    pub fn sync_buffer_for_device(self, buffer_id: Word32)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_buffers
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_buffers {
+            let buffer: ref DmaBuffer = self.buffers.get(i)
+            if buffer.buffer_id.value() == buffer_id.value() {
+                self.sync.sync_for_device(buffer, &self.cache_ops)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_DMA_COHERENCE,
+            FixedString[128]::from_slice("Buffer ID not found for sync")))
+    }
+
+    pub fn sync_buffer_for_cpu(self, buffer_id: Word32)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_buffers
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_buffers {
+            let buffer: ref DmaBuffer = self.buffers.get(i)
+            if buffer.buffer_id.value() == buffer_id.value() {
+                self.sync.sync_for_cpu(buffer, &self.cache_ops)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_DMA_COHERENCE,
+            FixedString[128]::from_slice("Buffer ID not found for sync")))
+    }
+
+    pub fn sync_sg_for_device(self, sg_list: ref ScatterGatherList)
+        effects: [deterministic]
+    {
+        self.sync.sync_sg_for_device(sg_list, &self.cache_ops)
+    }
+
+    pub fn sync_sg_for_cpu(self, sg_list: ref ScatterGatherList)
+        effects: [deterministic]
+    {
+        self.sync.sync_sg_for_cpu(sg_list, &self.cache_ops)
+    }
+
+    // ──────────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-DMA-STATS-001 through MEM-DMA-STATS-015
+
+    pub fn buffer_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_buffers
+    }
+
+    pub fn allocation_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.allocation_count
+    }
+
+    pub fn free_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.free_count
+    }
+
+    pub fn map_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.map_count
+    }
+
+    pub fn unmap_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.unmap_count
+    }
+
+    pub fn iommu_present(self) -> bool
+        effects: [deterministic]
+    {
+        self.iommu.hardware_present
+    }
+
+    pub fn pool_remaining(self) -> u64
+        effects: [deterministic]
+    {
+        self.pool.remaining()
+    }
+
+    pub fn pool_utilization(self) -> u8
+        effects: [deterministic]
+    {
+        self.pool.utilization()
+    }
+
+    pub fn cache_ops(self) -> ref CacheOperations
+        effects: [deterministic]
+    {
+        &self.cache_ops
+    }
+
+    pub fn iommu_manager(self: ref mut) -> ref mut IommuManager
+        effects: [deterministic]
+    {
+        &mut self.iommu
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-DMA-RESID-001 through MEM-DMA-RESID-015
+
+    fn record_init_residual(self, pool_phys: u64, pool_size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "DMA manager initialized",
+            code: DIAG_DMA_OK,
+            data: (pool_phys, pool_size),
+        )
+    }
+
+    fn record_alloc_residual(self, buffer_id: Word32, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "DMA buffer allocated",
+            code: DIAG_DMA_OK,
+            data: (buffer_id.value(), size),
+        )
+    }
+
+    fn record_free_residual(self, buffer_id: Word32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "DMA buffer freed",
+            code: DIAG_DMA_OK,
+            data: buffer_id.value(),
+        )
+    }
+
+    fn record_map_residual(self, buffer_id: Word32, dma_addr: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "DMA buffer mapped",
+            code: DIAG_DMA_OK,
+            data: (buffer_id.value(), dma_addr),
+        )
+    }
+
+    fn record_sg_map_residual(self, total_size: u64, num_entries: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Scatter-gather list mapped",
+            code: DIAG_DMA_OK,
+            data: (total_size, num_entries),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Driver API Convenience Functions
+// ──────────────────────────────────────────────
+// Evidence path: MEM-DMA-DRIVER-001 through MEM-DMA-DRIVER-015
+
+pub fn dma_alloc_coherent(dma_mgr: ref mut DmaManager, size: u64,
+                           device_id: Word64)
+    -> Result[DmaBuffer, MemoryError>
+    effects: [deterministic, io]
+{
+    dma_mgr.alloc_coherent(size, DmaDirection::bidir(), device_id)
+}
+
+pub fn dma_alloc_streaming(dma_mgr: ref mut DmaManager, size: u64,
+                            device_id: Word64,
+                            allocator: ref mut BuddyAllocator)
+    -> Result[DmaBuffer, MemoryError>
+    effects: [deterministic, io]
+{
+    dma_mgr.alloc_streaming(size, DmaDirection::bidir(), device_id, allocator)
+}
+
+pub fn dma_free(dma_mgr: ref mut DmaManager, buffer_id: Word32,
+                 allocator: ref mut BuddyAllocator)
+    -> Result[(), MemoryError>
+    effects: [deterministic, io]
+{
+    dma_mgr.free_buffer(buffer_id, allocator)
+}
+
+pub fn dma_map_single(dma_mgr: ref mut DmaManager, buffer_id: Word32,
+                       domain_id: u32)
+    -> Result[u64, MemoryError>
+    effects: [deterministic, io]
+{
+    dma_mgr.map_buffer(buffer_id, domain_id)
+}
+
+pub fn dma_unmap_single(dma_mgr: ref mut DmaManager, buffer_id: Word32,
+                         domain_id: u32)
+    -> Result[(), MemoryError>
+    effects: [deterministic, io]
+{
+    dma_mgr.unmap_buffer(buffer_id, domain_id)
+}
+
+pub fn dma_sync_for_device(dma_mgr: ref mut DmaManager, buffer_id: Word32)
+    -> Result[(), MemoryError>
+    effects: [deterministic]
+{
+    dma_mgr.sync_buffer_for_device(buffer_id)
+}
+
+pub fn dma_sync_for_cpu(dma_mgr: ref mut DmaManager, buffer_id: Word32)
+    -> Result[(), MemoryError>
+    effects: [deterministic]
+{
+    dma_mgr.sync_buffer_for_cpu(buffer_id)
+}

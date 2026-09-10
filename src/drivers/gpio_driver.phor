@@ -1,0 +1,914 @@
+// gpio_driver.phor — GPIO driver
+// Pin control, interrupt support (edge/level, debounce), GPIO chip abstraction,
+// pin multiplexing, GPIO in I2C/SPI bitbanging, sysfs-style GPIO access for compatibility,
+// capability-gated pin access.
+//
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/gpio_driver.phor
+// Court: gpio_driver:v2
+
+package drivers.gpio_driver;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type GpioError = enum {
+    GpioNotInitialized          = 0x1100,
+    GpioChipNotFound            = 0x1101,
+    GpioPinInvalid              = 0x1102,
+    GpioPinAlreadyRequested     = 0x1103,
+    GpioPinNotRequested         = 0x1104,
+    GpioDirectionError          = 0x1105,
+    GpioInterruptError          = 0x1106,
+    GpioDebounceError           = 0x1107,
+    GpioCapabilityError         = 0x1108,
+    GpioPinmuxError             = 0x1109,
+    GpioIrqNotSupported         = 0x110A,
+    GpioEdgeLevelConflict       = 0x110B,
+    GpioSysfsError              = 0x110C,
+    GpioMaxPinsExceeded         = 0x110D,
+    GpioResidualStoreFull       = 0x110E,
+    GpioBitbangInUse            = 0x110F,
+    GpioPinNotAvailable         = 0x1110,
+    GpioInvalidPullConfig       = 0x1111,
+    GpioDriveStrengthError      = 0x1112,
+    GpioAltFunctionNotAvail     = 0x1113,
+}
+
+// ─────────────────────────────────────────────────────────────
+// GPIO Full Capability
+// ─────────────────────────────────────────────────────────────
+
+struct GpioCapability {
+    object_id: Identity,
+    generation: u64,
+    can_read: bool,
+    can_write: bool,
+    can_interrupt: bool,
+    can_debounce: bool,
+    can_pinmux: bool,
+    can_bitbang: bool,
+    can_sysfs: bool,
+    max_pins: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pin Direction
+// ─────────────────────────────────────────────────────────────
+
+type GpioDirection = enum {
+    Input       = 0,
+    Output      = 1,
+    InputPullUp = 2,
+    InputPullDown = 3,
+    OutputOpenDrain = 4,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Interrupt Trigger
+// ─────────────────────────────────────────────────────────────
+
+type GpioIrqTrigger = enum {
+    None            = 0,
+    RisingEdge      = 1,
+    FallingEdge     = 2,
+    BothEdges       = 3,
+    LevelLow        = 4,
+    LevelHigh       = 5,
+    Deasserted      = 6,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pin Multiplexing Function
+// ─────────────────────────────────────────────────────────────
+
+struct GpioPinmux {
+    alternative_function: u8,
+    function_name: String(32),
+    is_gpio: bool,
+    driver_strength_ma: u8,
+    pull_up: bool,
+    pull_down: bool,
+    input_enable: bool,
+    output_enable: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pin State
+// ─────────────────────────────────────────────────────────────
+
+struct GpioPin {
+    pin_number: u8,
+    direction: GpioDirection,
+    value: bool,
+    irq_trigger: GpioIrqTrigger,
+    irq_enabled: bool,
+    irq_fired: bool,
+    debounce_us: u32,
+    debounce_enabled: bool,
+    requested: bool,
+    in_use_by_bitbang: bool,
+    pinmux: GpioPinmux,
+    alt_function: u8,
+    label: String(32),
+}
+
+// ─────────────────────────────────────────────────────────────
+// Interrupt Handler State
+// ─────────────────────────────────────────────────────────────
+
+struct GpioIrqHandler {
+    handler_fn: u64,
+    context: u64,
+    pin_number: u8,
+    trigger: GpioIrqTrigger,
+    registered: bool,
+    fire_count: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// GPIO Chip
+// ─────────────────────────────────────────────────────────────
+
+struct GpioChip {
+    chip_identity: Identity,
+    chip_id: u8,
+    base: u64,
+    pins: Array(GpioPin, 64),
+    pin_count: u8,
+    irq_handlers: Array(GpioIrqHandler, 16),
+    irq_handler_count: u8,
+    mmio_base: u64,
+    reg_data_in: u64,
+    reg_data_out: u64,
+    reg_direction: u64,
+    reg_irq_en: u64,
+    reg_irq_status: u64,
+    reg_debounce: u64,
+    reg_pinmux: u64,
+    label: String(32),
+    initialized: bool,
+    residual_log: RingBuf(ResidualRecord, 32),
+}
+
+// ─────────────────────────────────────────────────────────────
+// Controller State
+// ─────────────────────────────────────────────────────────────
+
+struct GpioController {
+    controller_identity: Identity,
+    chips: Array(GpioChip, 4),
+    chip_count: u8,
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    mmio_base: u64,
+    mmio_size: u64,
+    irq_vector: u8,
+    initialized: bool,
+    residual_log: RingBuf(ResidualRecord, 64),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct GpioDriverState {
+    driver_identity: Identity,
+    controllers: Array(GpioController, 4),
+    controller_count: u64,
+    initialized: bool,
+    initialization_timestamp: u64,
+    total_ops: u64,
+    total_errors: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// GPIO MMIO Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_mmio_read32(base: u64, offset: u64) -> u32
+    effect [memory:mmio]
+{
+    return trusted reason "GPIO MMIO register read" {
+        let ptr: *(u32) = (base + offset) as *(u32);
+        return *ptr;
+    };
+}
+
+fn gpio_mmio_write32(base: u64, offset: u64, value: u32) -> void
+    effect [memory:mmio]
+{
+    trusted reason "GPIO MMIO register write" {
+        let ptr: *(u32) = (base + offset) as *(u32);
+        *ptr = value;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Request Pin
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_request_pin(
+    chip: Handle(GpioChip),
+    pin: u8,
+    label: String(32),
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [deterministic, residual]
+    court "gpio_request_pin:v1"
+{
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    if p.requested {
+        return Result::Err(GpioError::GpioPinAlreadyRequested);
+    };
+
+    p.requested = true;
+    p.label = label;
+
+    residual emit {
+        op: "gpio.request_pin",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Free Pin
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_free_pin(
+    chip: Handle(GpioChip),
+    pin: u8,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [deterministic, residual]
+    court "gpio_free_pin:v1"
+{
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    if !p.requested {
+        return Result::Err(GpioError::GpioPinNotRequested);
+    };
+
+    p.requested = false;
+    p.in_use_by_bitbang = false;
+
+    residual emit {
+        op: "gpio.free_pin",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Direction
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_set_direction(
+    chip: Handle(GpioChip),
+    pin: u8,
+    dir: GpioDirection,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_set_direction:v1"
+{
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    if !p.requested {
+        return Result::Err(GpioError::GpioPinNotRequested);
+    };
+
+    let dir_reg: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_direction);
+    let bit: u32 = 1 << pin;
+
+    if dir == GpioDirection::Input || dir == GpioDirection::InputPullUp || dir == GpioDirection::InputPullDown {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_direction, dir_reg & !bit);
+    } else {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_direction, dir_reg | bit);
+    };
+
+    p.direction = dir;
+
+    residual emit {
+        op: "gpio.set_direction",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        dir: dir as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read Pin Value
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_read_pin(
+    chip: Handle(GpioChip),
+    pin: u8,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(bool, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_read_pin:v1"
+{
+    if !cap.can_read {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    if !p.requested {
+        return Result::Err(GpioError::GpioPinNotRequested);
+    };
+
+    let in_reg: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_data_in);
+    let bit: u32 = 1 << pin;
+    let value: bool = (in_reg & bit) != 0;
+
+    p.value = value;
+
+    residual emit {
+        op: "gpio.read_pin",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        value: value,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(value);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Write Pin Value
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_write_pin(
+    chip: Handle(GpioChip),
+    pin: u8,
+    value: bool,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_write_pin:v1"
+{
+    if !cap.can_write {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    if !p.requested {
+        return Result::Err(GpioError::GpioPinNotRequested);
+    };
+
+    let out_reg: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_data_out);
+    let bit: u32 = 1 << pin;
+
+    if value {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_data_out, out_reg | bit);
+    } else {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_data_out, out_reg & !bit);
+    };
+
+    p.value = value;
+
+    residual emit {
+        op: "gpio.write_pin",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        value: value,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Configure Interrupt
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_configure_interrupt(
+    chip: Handle(GpioChip),
+    pin: u8,
+    trigger: GpioIrqTrigger,
+    handler_fn: u64,
+    context: u64,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_configure_interrupt:v1"
+{
+    if !cap.can_interrupt {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    if !p.requested {
+        return Result::Err(GpioError::GpioPinNotRequested);
+    };
+
+    p.irq_trigger = trigger;
+
+    let irq_en_reg: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_irq_en);
+    let bit: u32 = 1 << pin;
+
+    if trigger != GpioIrqTrigger::None {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_irq_en, irq_en_reg | bit);
+        p.irq_enabled = true;
+
+        if chip.irq_handler_count < 16 {
+            let h: Handle(GpioIrqHandler) = Handle(GpioIrqHandler)::from_ptr(&chip.irq_handlers[chip.irq_handler_count as u64]);
+            h.handler_fn = handler_fn;
+            h.context = context;
+            h.pin_number = pin;
+            h.trigger = trigger;
+            h.registered = true;
+            h.fire_count = 0;
+            chip.irq_handler_count = chip.irq_handler_count + 1;
+        };
+    } else {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_irq_en, irq_en_reg & !bit);
+        p.irq_enabled = false;
+    };
+
+    residual emit {
+        op: "gpio.configure_interrupt",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        trigger: trigger as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Handle Interrupt (acknowledge and dispatch)
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_handle_interrupt(
+    chip: Handle(GpioChip),
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_handle_interrupt:v1"
+{
+    let irq_sts: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_irq_status);
+    if irq_sts == 0 {
+        return Result::Ok(void);
+    };
+
+    gpio_mmio_write32(chip.mmio_base, chip.reg_irq_status, irq_sts);
+
+    loop bound 16 {
+        let mut i: u64 = 0;
+        if i >= (chip.irq_handler_count as u64) {
+            break;
+        };
+        let h: Handle(GpioIrqHandler) = Handle(GpioIrqHandler)::from_ptr(&chip.irq_handlers[i]);
+        let bit: u32 = 1 << h.pin_number;
+        if (irq_sts & bit) != 0 {
+            h.fire_count = h.fire_count + 1;
+            let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[h.pin_number as u64]);
+            p.irq_fired = true;
+        };
+        i = i + 1;
+    };
+
+    residual emit {
+        op: "gpio.handle_interrupt",
+        chip_id: chip.chip_id as u64,
+        status: irq_sts as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable Debounce
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_set_debounce(
+    chip: Handle(GpioChip),
+    pin: u8,
+    debounce_us: u32,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_set_debounce:v1"
+{
+    if !cap.can_debounce {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+    p.debounce_us = debounce_us;
+    p.debounce_enabled = debounce_us > 0;
+
+    let debounce_reg: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_debounce);
+    let bit: u32 = 1 << pin;
+    if p.debounce_enabled {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_debounce, debounce_reg | bit);
+    } else {
+        gpio_mmio_write32(chip.mmio_base, chip.reg_debounce, debounce_reg & !bit);
+    };
+
+    residual emit {
+        op: "gpio.set_debounce",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        debounce_us: debounce_us,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pin Multiplexing (Set Alternative Function)
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_set_pinmux(
+    chip: Handle(GpioChip),
+    pin: u8,
+    alt_func: u8,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_set_pinmux:v1"
+{
+    if !cap.can_pinmux {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    if (pin as u64) >= (chip.pin_count as u64) {
+        return Result::Err(GpioError::GpioPinInvalid);
+    };
+
+    let p: Handle(GpioPin) = Handle(GpioPin)::from_ptr(&chip.pins[pin as u64]);
+
+    let pmux_reg: u32 = gpio_mmio_read32(chip.mmio_base, chip.reg_pinmux);
+    let shift: u32 = (pin as u32) * 4;
+    let new_pmux: u32 = (pmux_reg & !(0x0F << shift)) | ((alt_func as u32) << shift);
+    gpio_mmio_write32(chip.mmio_base, chip.reg_pinmux, new_pmux);
+
+    p.alt_function = alt_func;
+    p.pinmux.alternative_function = alt_func;
+
+    residual emit {
+        op: "gpio.set_pinmux",
+        chip_id: chip.chip_id as u64,
+        pin: pin as u64,
+        alt_func: alt_func as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// GPIO Bitbang: Write SCL / SDA (for I2C bitbang fallback)
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_bitbang_write_scl(
+    chip: Handle(GpioChip),
+    scl_pin: u8,
+    value: bool,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_bitbang_write_scl:v1"
+{
+    if !cap.can_bitbang {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    let result: Result(void, GpioError) = gpio_write_pin(chip, scl_pin, value, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            residual emit {
+                op: "gpio.bitbang_write_scl",
+                pin: scl_pin as u64,
+                value: value,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+fn gpio_bitbang_write_sda(
+    chip: Handle(GpioChip),
+    sda_pin: u8,
+    value: bool,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_bitbang_write_sda:v1"
+{
+    return gpio_write_pin(chip, sda_pin, value, cap, timestamp);
+}
+
+fn gpio_bitbang_read_sda(
+    chip: Handle(GpioChip),
+    sda_pin: u8,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(bool, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_bitbang_read_sda:v1"
+{
+    return gpio_read_pin(chip, sda_pin, cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// GPIO Chip Init
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_chip_init(
+    chip: Handle(GpioChip),
+    chip_id: u8,
+    mmio_base: u64,
+    pin_count: u8,
+    label: String(32),
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_chip_init:v1"
+{
+    chip.chip_id = chip_id;
+    chip.mmio_base = mmio_base;
+    chip.pin_count = pin_count;
+    chip.label = label;
+
+    chip.reg_data_in = 0x00;
+    chip.reg_data_out = 0x04;
+    chip.reg_direction = 0x08;
+    chip.reg_irq_en = 0x10;
+    chip.reg_irq_status = 0x14;
+    chip.reg_debounce = 0x20;
+    chip.reg_pinmux = 0x30;
+
+    gpio_mmio_write32(mmio_base, chip.reg_data_out, 0x00);
+    gpio_mmio_write32(mmio_base, chip.reg_direction, 0x00);
+
+    chip.initialized = true;
+
+    residual emit {
+        op: "gpio.chip_init",
+        chip_id: chip_id as u64,
+        pin_count: pin_count as u64,
+        mmio_base: mmio_base,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_driver_init(
+    driver_identity: Identity,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> GpioDriverState
+    effect [deterministic, residual]
+    court "gpio_driver_init:v1"
+{
+    let state: GpioDriverState = GpioDriverState {
+        driver_identity: driver_identity,
+        controllers: Array::zeroed(),
+        controller_count: 0,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        total_ops: 0,
+        total_errors: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "gpio.driver_init",
+        driver_identity: driver_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add GPIO Chip to Controller
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_add_chip(
+    controller: Handle(GpioController),
+    chip_id: u8,
+    mmio_base: u64,
+    pin_count: u8,
+    label: String(32),
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(u8, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_add_chip:v1"
+{
+    if (controller.chip_count as u64) >= 4 {
+        return Result::Err(GpioError::GpioMaxPinsExceeded);
+    };
+
+    let idx: u64 = controller.chip_count as u64;
+    let chip: Handle(GpioChip) = Handle(GpioChip)::from_ptr(&controller.chips[idx]);
+
+    let init_result: Result(void, GpioError) = gpio_chip_init(chip, chip_id, mmio_base, pin_count, label, cap, timestamp);
+    match init_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    controller.chip_count = controller.chip_count + 1;
+
+    residual emit {
+        op: "gpio.add_chip",
+        chip_id: chip_id as u64,
+        pin_count: pin_count as u64,
+        mmio_base: mmio_base,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx as u8);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sysfs-Style GPIO Export/Unxport
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_export_pin(
+    chip: Handle(GpioChip),
+    pin: u8,
+    label: String(32),
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [deterministic, residual]
+    court "gpio_export_pin:v1"
+{
+    if !cap.can_sysfs {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    let result: Result(void, GpioError) = gpio_request_pin(chip, pin, label, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            residual emit {
+                op: "gpio.export_pin",
+                chip_id: chip.chip_id as u64,
+                pin: pin as u64,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+fn gpio_unexport_pin(
+    chip: Handle(GpioChip),
+    pin: u8,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(void, GpioError)
+    effect [deterministic, residual]
+    court "gpio_unexport_pin:v1"
+{
+    if !cap.can_sysfs {
+        return Result::Err(GpioError::GpioCapabilityError);
+    };
+
+    let result: Result(void, GpioError) = gpio_free_pin(chip, pin, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            residual emit {
+                op: "gpio.unexport_pin",
+                chip_id: chip.chip_id as u64,
+                pin: pin as u64,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add GPIO Controller from PCI Discovery
+// ─────────────────────────────────────────────────────────────
+
+fn gpio_add_controller(
+    state: Handle(GpioDriverState),
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    mmio_base: u64,
+    mmio_size: u64,
+    irq_vector: u8,
+    cap: GpioCapability,
+    timestamp: u64,
+) -> Result(u64, GpioError)
+    effect [memory:mmio, deterministic, residual]
+    court "gpio_add_controller:v1"
+{
+    if state.controller_count >= 4 {
+        return Result::Err(GpioError::GpioMaxPinsExceeded);
+    };
+
+    let idx: u64 = state.controller_count;
+    let ctrl_identity: Identity = identity_new(0x47494F, timestamp, idx, pci_bus as u64);
+
+    let ctrl: GpioController = GpioController {
+        controller_identity: ctrl_identity,
+        chips: Array::zeroed(),
+        chip_count: 0,
+        pci_bus: pci_bus,
+        pci_device: pci_device,
+        pci_func: pci_func,
+        mmio_base: mmio_base,
+        mmio_size: mmio_size,
+        irq_vector: irq_vector,
+        initialized: true,
+        residual_log: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    state.controllers[idx] = ctrl;
+    state.controller_count = state.controller_count + 1;
+
+    residual emit {
+        op: "gpio.add_controller",
+        controller_idx: idx,
+        mmio_base: mmio_base,
+        pci_bus: pci_bus as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx);
+}

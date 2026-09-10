@@ -1,0 +1,1097 @@
+// kdump.phor — Kernel Crash Dump: Dump Format, Memory Region Capture, Register State
+//               Dump, Panic Reason Capture, Dump Compression, Dump Storage (Reserved
+//               Region, Store, Serial), Dump Analysis Tools
+// Phorensic OS — Debug Subsystem
+//
+// This module implements kernel crash dump capture and management for Phorensic OS.
+// When a fatal fault occurs, the crash dump subsystem captures memory regions,
+// register state, and panic reason, then stores the dump via configured storage
+// backends (reserved memory region, forensic store, serial output). Dumps can be
+// compressed and include analysis tools for post-mortem investigation.
+//
+// Operations:
+// 1. Dump format — binary dump with header, regions, and footer
+// 2. Memory region capture — selective memory region snapshots
+// 3. Register state dump — full CPU register set capture
+// 4. Panic reason capture — panic message, fault vector, error code
+// 5. Dump compression — simple run-length encoding for dump data
+// 6. Dump storage — reserved region, forensic store, serial output
+// 7. Dump analysis tools — in-field dump parsing and report generation
+//
+// Boundedness: Memory regions 32 max. Dump buffer 4096 bytes. All loops bounded.
+//
+// Effect declarations:
+//   [pure]    — format parsing, analysis
+//   [io]      — serial output, store write
+//   [memory]  — memory region capture
+//   [panic]   — panic state management
+//   [compression] — dump data compression
+//   [diag]    — residual recording
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes for Kdump
+// ──────────────────────────────────────────────
+
+const KDUMP_CAPTURED       : u64 = 0x15000u64;
+const KDUMP_STORED         : u64 = 0x15001u64;
+const KDUMP_COMPRESSED     : u64 = 0x15002u64;
+const KDUMP_ANALYZED       : u64 = 0x15003u64;
+const KDUMP_ERROR          : u64 = 0x1500Fu64;
+
+// ──────────────────────────────────────────────
+// Dump Format Constants
+// ──────────────────────────────────────────────
+
+/// Dump magic identifier ("PHORCRSH").
+const KDUMP_MAGIC : u64 = 0x485352434f4850u64; // "PHORCRSH"
+const KDUMP_VERSION : u32 = 1u32;
+const KDUMP_HEADER_SIZE : u32 = 64u32;
+const KDUMP_REGION_HEADER_SIZE : u32 = 32u32;
+const KDUMP_FOOTER_SIZE : u32 = 32u32;
+
+// ──────────────────────────────────────────────
+// Dump Format Types
+// ──────────────────────────────────────────────
+
+/// Compression type for dump data.
+pub sealdatatype DumpCompression : u8 {
+    /// No compression.
+    None = 0u8,
+    /// Run-length encoding.
+    RLE = 1u8,
+    /// Simple LZ-like compression.
+    SimpleLZ = 2u8,
+}
+
+/// Storage backend for crash dumps.
+pub sealdatatype DumpStorage : u8 {
+    /// Reserved physical memory region.
+    ReservedMemory = 0u8,
+    /// Forensic store.
+    Store = 1u8,
+    /// Serial output (hex encoded).
+    Serial = 2u8,
+    /// All available backends.
+    All = 3u8,
+}
+
+/// Memory region descriptor for dump capture.
+pub struct MemoryRegion {
+    /// Region start address.
+    pub start_address : u64,
+    /// Region size in bytes.
+    pub size : u64,
+    /// Region name.
+    pub name : FixedString64,
+    /// Region flags (readable, writable, executable).
+    pub flags : u8,
+    /// Whether the region was captured.
+    pub captured : bool,
+    /// Captured data size (may be compressed).
+    pub captured_size : u64,
+}
+
+/// Register state block for dump.
+pub struct DumpRegisterState {
+    /// General-purpose registers.
+    pub rax : u64, pub rbx : u64, pub rcx : u64, pub rdx : u64,
+    pub rsi : u64, pub rdi : u64, pub rbp : u64, pub rsp : u64,
+    pub r8 : u64, pub r9 : u64, pub r10 : u64, pub r11 : u64,
+    pub r12 : u64, pub r13 : u64, pub r14 : u64, pub r15 : u64,
+    pub rip : u64, pub rflags : u64,
+    pub cs : u64, pub ss : u64, pub ds : u64, pub es : u64,
+    pub fs : u64, pub gs : u64,
+    pub cr0 : u64, pub cr2 : u64, pub cr3 : u64, pub cr4 : u64,
+    pub dr0 : u64, pub dr1 : u64, pub dr2 : u64, pub dr3 : u64,
+    pub dr6 : u64, pub dr7 : u64,
+}
+
+/// Panic reason information.
+pub struct PanicReason {
+    /// Panic message string.
+    pub message : FixedString256,
+    /// Fault vector number.
+    pub fault_vector : u32,
+    /// Error code.
+    pub error_code : u64,
+    /// Fault address.
+    pub fault_address : u64,
+    /// Instruction pointer at panic.
+    pub instruction_pointer : u64,
+    /// Stack pointer at panic.
+    pub stack_pointer : u64,
+    /// CPU ID.
+    pub cpu_id : u32,
+    /// Thread ID.
+    pub thread_id : u32,
+    /// Timestamp.
+    pub timestamp : u64,
+}
+
+/// Complete crash dump header.
+pub struct CrashDumpHeader {
+    /// Magic identifier.
+    pub magic : u64,
+    /// Dump format version.
+    pub version : u32,
+    /// Total dump size in bytes.
+    pub total_size : u64,
+    /// Number of memory regions.
+    pub region_count : u32,
+    /// Compression type used.
+    pub compression : DumpCompression,
+    /// Flags.
+    pub flags : u32,
+    /// Offset to register state.
+    pub register_offset : u64,
+    /// Offset to panic reason.
+    pub panic_offset : u64,
+    /// Offset to first memory region.
+    pub regions_offset : u64,
+    /// Architecture (0 = x86-64).
+    pub architecture : u8,
+    /// Padding.
+    pub reserved : Array32<u8>,
+}
+
+/// Kdump residual.
+pub struct KdumpResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub dump_size : u64,
+    pub region_count : u32,
+    pub timestamp : u64,
+}
+
+/// Main crash dump manager.
+pub struct KdumpManager {
+    /// Whether dumps are enabled.
+    pub enabled : bool,
+    /// Active storage backends.
+    pub storage_backends : Array32<DumpStorage>,
+    /// Memory regions to capture.
+    pub regions : Array32<MemoryRegion>,
+    /// Current dump header.
+    pub header : CrashDumpHeader,
+    /// Current register state.
+    pub register_state : DumpRegisterState,
+    /// Current panic reason.
+    pub panic_reason : PanicReason,
+    /// Dump data buffer (max 4 KB).
+    pub dump_buffer : Array512<u8>,
+    /// Current write offset in dump buffer.
+    pub dump_offset : u32,
+    /// Compression setting.
+    pub compression : DumpCompression,
+    /// Total dumps captured.
+    pub total_dumps : u32,
+    /// Total bytes stored.
+    pub total_bytes_stored : u64,
+    /// Residual log.
+    pub residual_log : Array128<KdumpResidual>,
+}
+
+impl KdumpManager {
+    /// Create a new kdump manager.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> KdumpManager [pure] {
+        KdumpManager {
+            enabled: true,
+            storage_backends: Array32::new(),
+            regions: Array32::new(),
+            header: CrashDumpHeader {
+                magic: KDUMP_MAGIC,
+                version: KDUMP_VERSION,
+                total_size: KDUMP_HEADER_SIZE as u64,
+                region_count: 0u32,
+                compression: DumpCompression::None,
+                flags: 0u32,
+                register_offset: 0u64,
+                panic_offset: 0u64,
+                regions_offset: 0u64,
+                architecture: 0u8,
+                reserved: Array32::new(),
+            },
+            register_state: DumpRegisterState {
+                rax: 0u64, rbx: 0u64, rcx: 0u64, rdx: 0u64,
+                rsi: 0u64, rdi: 0u64, rbp: 0u64, rsp: 0u64,
+                r8: 0u64, r9: 0u64, r10: 0u64, r11: 0u64,
+                r12: 0u64, r13: 0u64, r14: 0u64, r15: 0u64,
+                rip: 0u64, rflags: 0u64,
+                cs: 0u64, ss: 0u64, ds: 0u64, es: 0u64,
+                fs: 0u64, gs: 0u64,
+                cr0: 0u64, cr2: 0u64, cr3: 0u64, cr4: 0u64,
+                dr0: 0u64, dr1: 0u64, dr2: 0u64, dr3: 0u64,
+                dr6: 0u64, dr7: 0u64,
+            },
+            panic_reason: PanicReason {
+                message: FixedString256::new(),
+                fault_vector: 0u32,
+                error_code: 0u64,
+                fault_address: 0u64,
+                instruction_pointer: 0u64,
+                stack_pointer: 0u64,
+                cpu_id: 0u32,
+                thread_id: 0u32,
+                timestamp: 0u64,
+            },
+            dump_buffer: Array512::new(),
+            dump_offset: 0u32,
+            compression: DumpCompression::None,
+            total_dumps: 0u32,
+            total_bytes_stored: 0u64,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a kdump residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, dump_size : u64,
+                       region_count : u32) -> KdumpManager [diag] {
+        let residual : KdumpResidual = KdumpResidual {
+            code: code,
+            message: message,
+            action: action,
+            dump_size: dump_size,
+            region_count: region_count,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Memory Region Management
+    // ──────────────────────────────────────────
+
+    /// Register a memory region for dump capture.
+    /// Effect: pure — region registration.
+    pub fn register_region(mut self, start : u64, size : u64, name : FixedString64,
+                           flags : u8) -> Result<KdumpManager, FixedString256> [pure] {
+        if self.regions.is_full() {
+            return Result::Err(FixedString256::from("region table full"));
+        }
+
+        let region : MemoryRegion = MemoryRegion {
+            start_address: start,
+            size: size,
+            name: name,
+            flags: flags,
+            captured: false,
+            captured_size: 0u64,
+        };
+        let _ = self.regions.push(region);
+        Result::Ok(self)
+    }
+
+    /// Remove a registered region.
+    /// Effect: pure — region removal.
+    pub fn unregister_region(mut self, index : u32) -> Result<KdumpManager, FixedString256> [pure] {
+        if index >= self.regions.len() {
+            return Result::Err(FixedString256::from("region index out of range"));
+        }
+        let _ = self.regions.remove(index);
+        Result::Ok(self)
+    }
+
+    /// Configure storage backend.
+    /// Effect: pure — backend configuration.
+    pub fn add_storage_backend(mut self, backend : DumpStorage) -> Result<KdumpManager, FixedString256> [pure] {
+        if self.storage_backends.is_full() {
+            return Result::Err(FixedString256::from("storage backend list full"));
+        }
+        let _ = self.storage_backends.push(backend);
+        Result::Ok(self)
+    }
+
+    /// Set compression type.
+    /// Effect: pure — compression configuration.
+    pub fn set_compression(mut self, compression : DumpCompression) -> KdumpManager [pure] {
+        self.compression = compression;
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Register State Capture
+    // ──────────────────────────────────────────
+
+    /// Capture current CPU register state.
+    /// Effect: debug — reads CPU registers.
+    pub fn capture_registers(mut self) -> KdumpManager [debug] {
+        self.register_state = DumpRegisterState {
+            rax: __builtin_read_register(0u32),
+            rbx: __builtin_read_register(1u32),
+            rcx: __builtin_read_register(2u32),
+            rdx: __builtin_read_register(3u32),
+            rsi: __builtin_read_register(4u32),
+            rdi: __builtin_read_register(5u32),
+            rbp: __builtin_read_register(6u32),
+            rsp: __builtin_read_register(7u32),
+            r8: __builtin_read_register(8u32),
+            r9: __builtin_read_register(9u32),
+            r10: __builtin_read_register(10u32),
+            r11: __builtin_read_register(11u32),
+            r12: __builtin_read_register(12u32),
+            r13: __builtin_read_register(13u32),
+            r14: __builtin_read_register(14u32),
+            r15: __builtin_read_register(15u32),
+            rip: __builtin_read_register(16u32),
+            rflags: __builtin_read_rflags(),
+            cs: __builtin_read_cs(),
+            ss: __builtin_read_ss(),
+            ds: __builtin_read_ds(),
+            es: __builtin_read_es(),
+            fs: __builtin_read_fs(),
+            gs: __builtin_read_gs(),
+            cr0: __builtin_read_cr0(),
+            cr2: __builtin_read_cr2(),
+            cr3: __builtin_read_cr3(),
+            cr4: __builtin_read_cr4(),
+            dr0: 0u64, dr1: 0u64, dr2: 0u64, dr3: 0u64,
+            dr6: 0u64, dr7: 0u64,
+        };
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Memory Region Capture
+    // ──────────────────────────────────────────
+
+    /// Capture a memory region into the dump buffer.
+    /// Effect: memory — reads memory regions.
+    pub fn capture_memory_region(mut self, index : u32) -> Result<KdumpManager, FixedString256>
+                                 [memory] {
+        if index >= self.regions.len() {
+            return Result::Err(FixedString256::from("region index out of range"));
+        }
+
+        let mut region : MemoryRegion = self.regions.get(index);
+        if region.captured {
+            return Result::Ok(self);
+        }
+
+        let data_size : u64 = region.size;
+        if (self.dump_offset as u64 + KDUMP_REGION_HEADER_SIZE as u64 + data_size) > 4096u64 {
+            return Result::Err(FixedString256::from("dump buffer full"));
+        }
+
+        // Write region header at current offset.
+        // Format: start(8) + size(8) + flags(4) + name(12)
+        self.write_u64_to_buffer(self.dump_offset, region.start_address);
+        self.dump_offset += 8u32;
+        self.write_u64_to_buffer(self.dump_offset, region.size);
+        self.dump_offset += 8u32;
+        self.write_u32_to_buffer(self.dump_offset, region.flags as u32);
+        self.dump_offset += 4u32;
+        // Write name (12 bytes, null-padded).
+        var name_offset : u32 = 0u32;
+        // loop: bounds[BOUND_SMALL] — bounded by 12 bytes name.
+        loop: bounds[BOUND_SMALL] while name_offset < 12u32 {
+            let ch : u8 = if name_offset < region.name.len() {
+                region.name.get_byte(name_offset)
+            } else {
+                0u8
+            };
+            self.write_u8_to_buffer(self.dump_offset, ch);
+            self.dump_offset += 1u32;
+            name_offset += 1u32;
+        }
+
+        // Write region data.
+        // loop: bounds[BOUND_MEDIUM] — bounded by region size.
+        for var i : u64 = 0u64; i < data_size && (self.dump_offset as u64) < 4096u64; i += 1u64 [data_size] {
+            let byte : u8 = __builtin_read_byte(region.start_address + i);
+            self.write_u8_to_buffer(self.dump_offset, byte);
+            self.dump_offset += 1u32;
+        }
+
+        region.captured = true;
+        region.captured_size = data_size;
+        let _ = self.regions.set(index, region);
+
+        self.header.region_count += 1u32;
+        Result::Ok(self)
+    }
+
+    /// Capture all registered memory regions.
+    /// Effect: memory — captures all regions.
+    pub fn capture_all_regions(mut self) -> Result<KdumpManager, FixedString256> [memory] {
+        // loop: bounds[BOUND_SMALL] — bounded by region count (max 32).
+        for var i : u32 = 0u32; i < self.regions.len(); i += 1u32 [self.regions.len()] {
+            let result : Result<KdumpManager, FixedString256> = self.capture_memory_region(i);
+            match result {
+                Result::Ok(manager) => { self = manager; },
+                Result::Err(msg) => { return Result::Err(msg); },
+            }
+        }
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Dump Buffer Write Helpers
+    // ──────────────────────────────────────────
+
+    /// Write a u8 to the dump buffer.
+    /// Effect: pure — buffer write.
+    fn write_u8_to_buffer(mut self, offset : u32, value : u8) -> KdumpManager [pure] {
+        if offset < 512u32 {
+            let _ = self.dump_buffer.set(offset, value);
+        }
+        self
+    }
+
+    /// Write a u32 to the dump buffer (little-endian).
+    /// Effect: pure — buffer write.
+    fn write_u32_to_buffer(mut self, offset : u32, value : u32) -> KdumpManager [pure] {
+        if offset + 3u32 < 512u32 {
+            let _ = self.dump_buffer.set(offset, (value & 0xFFu32) as u8);
+            let _ = self.dump_buffer.set(offset + 1u32, ((value >> 8u32) & 0xFFu32) as u8);
+            let _ = self.dump_buffer.set(offset + 2u32, ((value >> 16u32) & 0xFFu32) as u8);
+            let _ = self.dump_buffer.set(offset + 3u32, ((value >> 24u32) & 0xFFu32) as u8);
+        }
+        self
+    }
+
+    /// Write a u64 to the dump buffer (little-endian).
+    /// Effect: pure — buffer write.
+    fn write_u64_to_buffer(mut self, offset : u32, value : u64) -> KdumpManager [pure] {
+        // loop: bounds[BOUND_SMALL] — 8 bytes.
+        for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+            if (offset + i) < 512u32 {
+                let byte : u8 = ((value >> (i * 8u32)) & 0xFFu64) as u8;
+                let _ = self.dump_buffer.set(offset + i, byte);
+            }
+        }
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Dump Compression
+    // ──────────────────────────────────────────
+
+    /// Compress dump data using run-length encoding.
+    /// Effect: compression — compresses data.
+    pub fn compress_dump(mut self) -> Result<KdumpManager, FixedString256> [compression] {
+        if self.compression == DumpCompression::None {
+            return Result::Ok(self);
+        }
+
+        var compressed : Array512<u8> = Array512::new();
+        var src_pos : u32 = 0u32;
+        var dst_pos : u32 = 0u32;
+
+        // RLE compression.
+        // loop: bounds[BOUND_LARGE] — bounded by dump buffer size.
+        loop: bounds[BOUND_LARGE] while src_pos < self.dump_offset && dst_pos < 508u32 {
+            let current_byte : u8 = self.dump_buffer.get(src_pos);
+            var run_length : u32 = 1u32;
+
+            // Count consecutive identical bytes.
+            // loop: bounds[BOUND_SMALL] — bounded by max run (127).
+            loop: bounds[BOUND_SMALL] while (src_pos + run_length) < self.dump_offset && run_length < 127u32 {
+                let next_byte : u8 = self.dump_buffer.get(src_pos + run_length);
+                if next_byte == current_byte {
+                    run_length += 1u32;
+                } else {
+                    break;
+                }
+            }
+
+            // Write RLE token: (length - 1) << 1 | marker_bit.
+            let token : u8 = ((run_length - 1u32) << 1u8) as u8 | 0x01u8;
+            let _ = compressed.set(dst_pos, token);
+            let _ = compressed.set(dst_pos + 1u32, current_byte);
+            dst_pos += 2u32;
+            src_pos += run_length;
+        }
+
+        // Copy remaining uncompressed bytes (if any).
+        // loop: bounds[BOUND_MEDIUM] — bounded by remaining data.
+        loop: bounds[BOUND_MEDIUM] while src_pos < self.dump_offset && dst_pos < 512u32 {
+            let byte : u8 = self.dump_buffer.get(src_pos);
+            if byte >= 0x02u8 { // literal bytes > 1 are stored directly
+                let _ = compressed.set(dst_pos, byte);
+                dst_pos += 1u32;
+            }
+            src_pos += 1u32;
+        }
+
+        self.dump_buffer = compressed;
+        self.dump_offset = dst_pos;
+        self.header.compression = self.compression;
+
+        self = self.record_residual(KDUMP_COMPRESSED,
+                                    FixedString256::from("dump compressed"),
+                                    FixedString64::from("compress"),
+                                    dst_pos as u64,
+                                    self.header.region_count);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Dump Storage
+    // ──────────────────────────────────────────
+
+    /// Store dump to reserved memory region.
+    /// Effect: memory — writes to reserved region.
+    pub fn store_to_reserved_region(&self, reserved_address : u64) -> Result<u64, FixedString256>
+                                    [memory] {
+        // Write dump data to reserved region.
+        // loop: bounds[BOUND_LARGE] — bounded by dump offset.
+        for var i : u32 = 0u32; i < self.dump_offset; i += 1u32 [self.dump_offset] {
+            let byte : u8 = self.dump_buffer.get(i);
+            __builtin_write_byte(reserved_address + i as u64, byte);
+        }
+
+        // Write dump size at the beginning.
+        __builtin_write_u64(reserved_address, self.dump_offset as u64);
+
+        Result::Ok(self.dump_offset as u64)
+    }
+
+    /// Store dump to serial output (hex-encoded).
+    /// Effect: io — serial output.
+    pub fn store_to_serial(&self) -> Result<u64, FixedString256> [io] {
+        __builtin_serial_write_string(FixedString256::from("=== KDUMP START ===\n"));
+
+        // loop: bounds[BOUND_LARGE] — bounded by dump offset.
+        for var i : u32 = 0u32; i < self.dump_offset; i += 1u32 [self.dump_offset] {
+            let byte : u8 = self.dump_buffer.get(i);
+            __builtin_serial_write_hex_byte(byte);
+            if (i + 1u32) % 32u32 == 0u32 {
+                __builtin_serial_write_string(FixedString256::from("\n"));
+            }
+        }
+
+        __builtin_serial_write_string(FixedString256::from("\n=== KDUMP END ===\n"));
+        Result::Ok(self.dump_offset as u64)
+    }
+
+    /// Store dump to forensic store.
+    /// Effect: io — store write.
+    pub fn store_to_store(&self, store_id : u64) -> Result<u64, FixedString256> [io] {
+        let written : u64 = __builtin_store_write(store_id, self.dump_buffer, self.dump_offset);
+        if written == 0u64 {
+            return Result::Err(FixedString256::from("store write failed"));
+        }
+        Result::Ok(written)
+    }
+
+    /// Store the dump to all configured backends.
+    /// Effect: memory, io — stores via all backends.
+    pub fn store_dump(mut self, reserved_address : u64,
+                      store_id : u64) -> Result<KdumpManager, FixedString256> [memory, io, diag] {
+        self = self.record_residual(KDUMP_STORED,
+                                    FixedString256::from("storing dump"),
+                                    FixedString64::from("store"),
+                                    self.dump_offset as u64,
+                                    self.header.region_count);
+
+        // loop: bounds[BOUND_SMALL] — bounded by backend count (max 32).
+        for var i : u32 = 0u32; i < self.storage_backends.len(); i += 1u32 [self.storage_backends.len()] {
+            let backend : DumpStorage = self.storage_backends.get(i);
+            match backend {
+                DumpStorage::ReservedMemory | DumpStorage::All => {
+                    let _ = self.store_to_reserved_region(reserved_address);
+                },
+                DumpStorage::Serial | DumpStorage::All => {
+                    let _ = self.store_to_serial();
+                },
+                DumpStorage::Store | DumpStorage::All => {
+                    let _ = self.store_to_store(store_id);
+                },
+            }
+        }
+
+        self.total_dumps += 1u32;
+        self.total_bytes_stored += self.dump_offset as u64;
+
+        self = self.record_residual(KDUMP_STORED,
+                                    FixedString256::from("dump stored"),
+                                    FixedString64::from("stored"),
+                                    self.dump_offset as u64,
+                                    self.header.region_count);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Panic Reason Capture
+    // ──────────────────────────────────────────
+
+    /// Set the panic reason for the dump.
+    /// Effect: pure — panic state capture.
+    pub fn set_panic_reason(mut self, message : FixedString256, fault_vector : u32,
+                            error_code : u64, fault_address : u64, ip : u64,
+                            sp : u64) -> KdumpManager [diag] {
+        self.panic_reason = PanicReason {
+            message: message,
+            fault_vector: fault_vector,
+            error_code: error_code,
+            fault_address: fault_address,
+            instruction_pointer: ip,
+            stack_pointer: sp,
+            cpu_id: __builtin_current_cpu_id(),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Full Dump Capture
+    // ──────────────────────────────────────────
+
+    /// Capture a full crash dump (registers + memory regions + panic reason).
+    /// Effect: debug, memory, compression, io — full dump capture.
+    pub fn capture_full_dump(mut self, panic_message : FixedString256,
+                             fault_vector : u32, error_code : u64,
+                             fault_address : u64, ip : u64,
+                             sp : u64) -> Result<KdumpManager, FixedString256>
+                             [debug, memory, compression, io, diag] {
+        if !self.enabled {
+            return Result::Err(FixedString256::from("kdump disabled"));
+        }
+
+        // Reset dump buffer.
+        self.dump_buffer.clear();
+        self.dump_offset = 0u32;
+
+        // Step 1: Write header.
+        self.header.magic = KDUMP_MAGIC;
+        self.header.version = KDUMP_VERSION;
+        self.header.compression = self.compression;
+        self.header.architecture = 0u8;
+        self.dump_offset = KDUMP_HEADER_SIZE;
+
+        // Step 2: Capture register state.
+        self = self.capture_registers();
+        self.header.register_offset = self.dump_offset as u64;
+        // Write registers to buffer.
+        let regs : DumpRegisterState = self.register_state;
+        self.write_u64_to_buffer(self.dump_offset, regs.rax); self.dump_offset += 8u32;
+        self.write_u64_to_buffer(self.dump_offset, regs.rbx); self.dump_offset += 8u32;
+        // ... (simplified: write all GPRs)
+        self.dump_offset += 8u32 * 18u32; // 18 more registers
+
+        // Step 3: Capture panic reason.
+        self = self.set_panic_reason(panic_message, fault_vector, error_code,
+                                     fault_address, ip, sp);
+        self.header.panic_offset = self.dump_offset as u64;
+        // Write panic reason to buffer.
+        self.write_u64_to_buffer(self.dump_offset, self.panic_reason.timestamp); self.dump_offset += 8u32;
+        self.write_u32_to_buffer(self.dump_offset, self.panic_reason.fault_vector); self.dump_offset += 4u32;
+        self.write_u64_to_buffer(self.dump_offset, self.panic_reason.error_code); self.dump_offset += 8u32;
+        self.write_u64_to_buffer(self.dump_offset, self.panic_reason.fault_address); self.dump_offset += 8u32;
+        self.write_u64_to_buffer(self.dump_offset, self.panic_reason.instruction_pointer); self.dump_offset += 8u32;
+
+        // Step 4: Capture memory regions.
+        self.header.regions_offset = self.dump_offset as u64;
+        let region_result : Result<KdumpManager, FixedString256> = self.capture_all_regions();
+        match region_result {
+            Result::Ok(manager) => { self = manager; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        // Step 5: Update header fields.
+        self.header.total_size = self.dump_offset as u64;
+        // Rewrite header at offset 0.
+        self.write_u64_to_buffer(0u32, KDUMP_MAGIC);
+        self.write_u32_to_buffer(8u32, KDUMP_VERSION);
+        self.write_u64_to_buffer(12u32, self.header.total_size);
+        self.write_u32_to_buffer(20u32, self.header.region_count);
+        self.write_u32_to_buffer(24u32, self.header.compression as u32);
+        self.write_u64_to_buffer(28u32, self.header.register_offset);
+        self.write_u64_to_buffer(36u32, self.header.panic_offset);
+        self.write_u64_to_buffer(44u32, self.header.regions_offset);
+
+        // Step 6: Compress if configured.
+        if self.compression != DumpCompression::None {
+            let compress_result : Result<KdumpManager, FixedString256> = self.compress_dump();
+            match compress_result {
+                Result::Ok(manager) => { self = manager; },
+                Result::Err(msg) => { return Result::Err(msg); },
+            }
+        }
+
+        self = self.record_residual(KDUMP_CAPTURED,
+                                    FixedString256::from("full dump captured"),
+                                    FixedString64::from("capture"),
+                                    self.dump_offset as u64,
+                                    self.header.region_count);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Dump Analysis
+    // ──────────────────────────────────────────
+
+    /// Analyze a dump buffer and generate a report.
+    /// Effect: pure — dump analysis.
+    pub fn analyze_dump(&self, dump_data : Array512<u8>,
+                        data_size : u32) -> Result<FixedString1024, FixedString256> [pure] {
+        if data_size < KDUMP_HEADER_SIZE {
+            return Result::Err(FixedString256::from("dump data too small for header"));
+        }
+
+        var report : FixedString1024 = FixedString1024::new();
+        var offset : u32 = 0u32;
+
+        // Parse header.
+        let magic : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+        let version : u32 = self.read_u32_from_buffer(dump_data, offset); offset += 4u32;
+        let total_size : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+        let region_count : u32 = self.read_u32_from_buffer(dump_data, offset); offset += 4u32;
+        let compression_val : u32 = self.read_u32_from_buffer(dump_data, offset); offset += 4u32;
+        let reg_offset : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+        let panic_offset : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+        let regions_offset : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+
+        if magic != KDUMP_MAGIC {
+            return Result::Err(FixedString256::from("invalid dump magic"));
+        }
+
+        report.push_str(FixedString256::from("=== Crash Dump Analysis ===\n"));
+        report.push_str(FixedString256::from("Version: "));
+        report.push_u32(version);
+        report.push_str(FixedString256::from("\nTotal size: "));
+        report.push_u64(total_size);
+        report.push_str(FixedString256::from(" bytes\nRegions: "));
+        report.push_u32(region_count);
+        report.push_str(FixedString256::from("\nCompression: "));
+        let comp_name : FixedString64 = if compression_val == 0u32 {
+            FixedString64::from("none")
+        } else if compression_val == 1u32 {
+            FixedString64::from("RLE")
+        } else {
+            FixedString64::from("LZ")
+        };
+        report.push_str(FixedString256::from_buffer(comp_name));
+        report.push_str(FixedString256::from("\n\n"));
+
+        // Parse panic reason.
+        if panic_offset > 0u64 && (panic_offset as u32 + 42u32) <= data_size {
+            offset = panic_offset as u32;
+            let panic_ts : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+            let panic_vec : u32 = self.read_u32_from_buffer(dump_data, offset); offset += 4u32;
+            let panic_err : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+            let panic_addr : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+            let panic_ip : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+
+            report.push_str(FixedString256::from("Panic Reason:\n"));
+            report.push_str(FixedString256::from("  Timestamp: "));
+            report.push_u64(panic_ts);
+            report.push_str(FixedString256::from("\n  Vector: "));
+            report.push_u32(panic_vec);
+            report.push_str(FixedString256::from("\n  Error: 0x"));
+            report.push_u64_hex(panic_err);
+            report.push_str(FixedString256::from("\n  Fault Addr: 0x"));
+            report.push_u64_hex(panic_addr);
+            report.push_str(FixedString256::from("\n  RIP: 0x"));
+            report.push_u64_hex(panic_ip);
+            report.push_str(FixedString256::from("\n\n"));
+        }
+
+        // Parse memory regions.
+        if regions_offset > 0u64 {
+            offset = regions_offset as u32;
+            report.push_str(FixedString256::from("Memory Regions:\n"));
+
+            // loop: bounds[BOUND_SMALL] — bounded by region count.
+            for var i : u32 = 0u32; i < region_count && (offset + 32u32) <= data_size; i += 1u32 [region_count] {
+                let region_start : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+                let region_size : u64 = self.read_u64_from_buffer(dump_data, offset); offset += 8u32;
+                let region_flags : u32 = self.read_u32_from_buffer(dump_data, offset); offset += 4u32;
+
+                // Read name (12 bytes).
+                var region_name : FixedString64 = FixedString64::new();
+                // loop: bounds[BOUND_SMALL] — 12 bytes name.
+                for var j : u32 = 0u32; j < 12u32; j += 1u32 [12u32] {
+                    let ch : u8 = dump_data.get(offset);
+                    if ch != 0u8 {
+                        let _ = region_name.push_byte(ch);
+                    }
+                    offset += 1u32;
+                }
+
+                report.push_str(FixedString256::from("  ["));
+                report.push_u32(i);
+                report.push_str(FixedString256::from("] "));
+                report.push_str(FixedString256::from_buffer(region_name));
+                report.push_str(FixedString256::from(": 0x"));
+                report.push_u64_hex(region_start);
+                report.push_str(FixedString256::from(" - 0x"));
+                report.push_u64_hex(region_start + region_size);
+                report.push_str(FixedString256::from(" ("));
+                report.push_u64(region_size);
+                report.push_str(FixedString256::from(" bytes, flags=0x"));
+                report.push_u32_hex(region_flags);
+                report.push_str(FixedString256::from(")\n"));
+
+                // Skip region data.
+                offset += region_size as u32;
+            }
+        }
+
+        report.push_str(FixedString256::from("\n=== End of Analysis ===\n"));
+        Result::Ok(report)
+    }
+
+    /// Read a u32 from a buffer (little-endian).
+    /// Effect: pure — buffer read.
+    fn read_u32_from_buffer(&self, buffer : Array512<u8>, offset : u32) -> u32 [pure] {
+        if offset + 3u32 >= buffer.len() {
+            return 0u32;
+        }
+        let b0 : u32 = buffer.get(offset) as u32;
+        let b1 : u32 = buffer.get(offset + 1u32) as u32;
+        let b2 : u32 = buffer.get(offset + 2u32) as u32;
+        let b3 : u32 = buffer.get(offset + 3u32) as u32;
+        b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32)
+    }
+
+    /// Read a u64 from a buffer (little-endian).
+    /// Effect: pure — buffer read.
+    fn read_u64_from_buffer(&self, buffer : Array512<u8>, offset : u32) -> u64 [pure] {
+        var result : u64 = 0u64;
+        // loop: bounds[BOUND_SMALL] — 8 bytes.
+        for var i : u32 = 0u32; i < 8u32 && (offset + i) < buffer.len(); i += 1u32 [8u32] {
+            result |= (buffer.get(offset + i) as u64) << (i * 8u32);
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Finalization
+    // ──────────────────────────────────────────
+
+    // ──────────────────────────────────────────
+    // Dump Verification
+    // ──────────────────────────────────────────
+
+    /// Verify the integrity of a crash dump.
+    /// Effect: pure — integrity check.
+    pub fn verify_dump_integrity(&self, dump_data : Array512<u8>,
+                                  data_size : u32) -> Result<bool, FixedString256> [pure] {
+        if data_size < KDUMP_HEADER_SIZE {
+            return Result::Err(FixedString256::from("dump too small for header"));
+        }
+
+        // Check magic.
+        let magic : u64 = self.read_u64_from_buffer(dump_data, 0u32);
+        if magic != KDUMP_MAGIC {
+            return Result::Err(FixedString256::from("invalid magic signature"));
+        }
+
+        // Check version.
+        let version : u32 = self.read_u32_from_buffer(dump_data, 8u32);
+        if version != KDUMP_VERSION {
+            return Result::Err(FixedString256::from("unsupported dump version"));
+        }
+
+        // Check total size.
+        let total_size : u64 = self.read_u64_from_buffer(dump_data, 12u32);
+        if total_size as u32 > data_size {
+            return Result::Err(FixedString256::from("dump size exceeds available data"));
+        }
+
+        // Check region offsets.
+        let regions_offset : u64 = self.read_u64_from_buffer(dump_data, 44u32);
+        if regions_offset as u32 >= data_size {
+            return Result::Err(FixedString256::from("region offset out of bounds"));
+        }
+
+        // Verify that all region data falls within bounds.
+        let region_count : u32 = self.read_u32_from_buffer(dump_data, 20u32);
+        var offset : u64 = regions_offset;
+
+        // loop: bounds[BOUND_SMALL] — bounded by region count.
+        for var i : u32 = 0u32; i < region_count; i += 1u32 [region_count] {
+            if offset as u32 + 32u32 > data_size {
+                return Result::Err(FixedString256::from("region header out of bounds"));
+            }
+            let region_size : u64 = self.read_u64_from_buffer(dump_data, (offset + 8u32) as u32);
+            if (offset + 32u64 + region_size) as u32 > data_size {
+                return Result::Err(FixedString256::from("region data out of bounds"));
+            }
+            offset += 32u64 + region_size;
+        }
+
+        Result::Ok(true)
+    }
+
+    /// Compute a hash of the dump data for integrity verification.
+    /// Effect: pure — hash computation.
+    pub fn compute_dump_hash(&self, dump_data : Array512<u8>,
+                              data_size : u32) -> u64 [pure] {
+        var hash : u64 = 14695981039346656037u64;
+        // loop: bounds[BOUND_LARGE] — bounded by data size.
+        for var i : u32 = 0u32; i < data_size && i < 512u32; i += 1u32 [data_size] {
+            hash ^= dump_data.get(i) as u64;
+            hash *= 1099511628211u64;
+        }
+        hash
+    }
+
+    /// Get a summary of dump statistics.
+    /// Effect: pure — statistics.
+    pub fn get_statistics(&self) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("Total dumps: "));
+        result.push_u32(self.total_dumps);
+        result.push_str(FixedString256::from("\nTotal bytes stored: "));
+        result.push_u64(self.total_bytes_stored);
+        result.push_str(FixedString256::from("\nRegions registered: "));
+        result.push_u32(self.regions.len());
+        result.push_str(FixedString256::from("\nActive backends: "));
+        result.push_u32(self.storage_backends.len());
+        result.push_str(FixedString256::from("\nCompression: "));
+        match self.compression {
+            DumpCompression::None => result.push_str(FixedString256::from("none")),
+            DumpCompression::RLE => result.push_str(FixedString256::from("RLE")),
+            DumpCompression::SimpleLZ => result.push_str(FixedString256::from("LZ")),
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Dump Region Query
+    // ──────────────────────────────────────────
+
+    /// Find a memory region by name.
+    /// Effect: pure — region lookup.
+    pub fn find_region_by_name(&self, name : FixedString64) -> Option<MemoryRegion> [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by region count.
+        for var i : u32 = 0u32; i < self.regions.len(); i += 1u32 [self.regions.len()] {
+            let region : MemoryRegion = self.regions.get(i);
+            if region.name == name {
+                return Option::Some(region);
+            }
+        }
+        Option::None
+    }
+
+    /// Check if a specific region has been captured.
+    /// Effect: pure — query.
+    pub fn is_region_captured(&self, index : u32) -> Result<bool, FixedString256> [pure] {
+        if index >= self.regions.len() {
+            return Result::Err(FixedString256::from("region index out of range"));
+        }
+        let region : MemoryRegion = self.regions.get(index);
+        Result::Ok(region.captured)
+    }
+
+    /// Get the total captured data size (sum of all region sizes).
+    /// Effect: pure — sum.
+    pub fn total_captured_size(&self) -> u64 [pure] {
+        var total : u64 = 0u64;
+        // loop: bounds[BOUND_SMALL] — bounded by region count.
+        for var i : u32 = 0u32; i < self.regions.len(); i += 1u32 [self.regions.len()] {
+            let region : MemoryRegion = self.regions.get(i);
+            if region.captured {
+                total += region.captured_size;
+            }
+        }
+        total
+    }
+
+    /// Clear all region capture flags for a fresh dump.
+    /// Effect: pure — reset.
+    pub fn reset_regions(mut self) -> KdumpManager [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by region count.
+        for var i : u32 = 0u32; i < self.regions.len(); i += 1u32 [self.regions.len()] {
+            let mut region : MemoryRegion = self.regions.get(i);
+            region.captured = false;
+            region.captured_size = 0u64;
+            let _ = self.regions.set(i, region);
+        }
+        self.header.region_count = 0u32;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// Dump Format Constants and Size Computation
+// ──────────────────────────────────────────────
+
+/// Get the expected size of a dump header.
+pub fn dump_header_size() -> u32 [pure] {
+    KDUMP_HEADER_SIZE
+}
+
+/// Get the size of a single dump region header.
+pub fn dump_region_header_size() -> u32 [pure] {
+    KDUMP_REGION_HEADER_SIZE
+}
+
+/// Compute the total estimated dump size for a set of regions.
+pub fn estimate_dump_size(region_sizes : Array64<u64>, num_regions : u32) -> u64 [pure] {
+    var total : u64 = KDUMP_HEADER_SIZE as u64;
+    // Registers: ~272 bytes. Panic reason: ~50 bytes.
+    total += 272u64 + 50u64;
+    // loop: bounds[BOUND_SMALL] — bounded by num_regions.
+    for var i : u32 = 0u32; i < num_regions && i < region_sizes.len(); i += 1u32 [num_regions] {
+        total += KDUMP_REGION_HEADER_SIZE as u64 + region_sizes.get(i);
+    }
+    total
+}
+
+/// Check if a dump buffer has enough space for a region.
+pub fn dump_has_space_for_region(dump_offset : u32, region_size : u64) -> bool [pure] {
+    (dump_offset as u64 + KDUMP_REGION_HEADER_SIZE as u64 + region_size) <= 4096u64
+}
+
+/// Get a human-readable dump status string.
+pub fn dump_status_string(manager : KdumpManager) -> FixedString256 [pure] {
+    var result : FixedString256 = FixedString256::new();
+    result.push_str(FixedString256::from("Dump enabled: "));
+    result.push_str(if manager.enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+    result.push_str(FixedString256::from(", Regions: "));
+    result.push_u32(manager.regions.len());
+    result.push_str(FixedString256::from(", Backends: "));
+    result.push_u32(manager.storage_backends.len());
+    result.push_str(FixedString256::from(", Total dumps: "));
+    result.push_u32(manager.total_dumps);
+    result
+}
+
+/// Check if the dump manager is ready to capture a dump.
+pub fn is_dump_ready(manager : KdumpManager) -> bool [pure] {
+    manager.enabled && manager.regions.len() > 0u32 && manager.storage_backends.len() > 0u32
+}
+
+/// Get the total reserved memory needed for dumps.
+pub fn total_reserved_memory_needed(manager : KdumpManager) -> u64 [pure] {
+    4096u64 + manager.regions.len() as u64 * 1024u64
+}
+
+/// Print dump configuration to serial.
+pub fn print_dump_config(manager : KdumpManager) [io] {
+    __builtin_serial_write_string(FixedString256::from("Kdump config:\n"));
+    __builtin_serial_write_string(FixedString256::from("  enabled="));
+    __builtin_serial_write_string(if manager.enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+    __builtin_serial_write_string(FixedString256::from("\n  regions="));
+    __builtin_serial_write_hex_u32(manager.regions.len());
+    __builtin_serial_write_string(FixedString256::from("\n  backends="));
+    __builtin_serial_write_hex_u32(manager.storage_backends.len());
+    __builtin_serial_write_string(FixedString256::from("\n  compression="));
+    __builtin_serial_write_hex_u32(manager.compression as u32);
+    __builtin_serial_write_string(FixedString256::from("\n"));
+}

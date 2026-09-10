@@ -1,0 +1,885 @@
+// ============================================================================
+// translation_map.phor — TranslationEntry, TranslationMap, Candidate Tracking
+// ============================================================================
+// The translation map is built by the dialect cage as it observes foreign code
+// execution. Each entry maps a foreign operation to its native counterpart.
+// Entries progress from candidate (observed once) through replay and court
+// verification to become promoted (stable, trusted).
+// ============================================================================
+
+package "phorensic:translation_map:v1.0";
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+type TranslationMapError = enum {
+    EntryNotFound = 0x01,
+    DuplicateEntry = 0x02,
+    MapFull = 0x03,
+    InvalidForeignOp = 0x04,
+    InvalidNativeOp = 0x05,
+    ObservationLimitExceeded = 0x06,
+    PromotionBlocked = 0x07,
+    DemotionBlocked = 0x08,
+    InvalidOperationSignature = 0x09,
+    VerificationRequired = 0x0A,
+    EntryLocked = 0x0B,
+    InternalError = 0xFF,
+}
+
+// ============================================================================
+// Trust State (mirrors cage.phor)
+// ============================================================================
+
+type TrustState = enum {
+    Unknown = 0,
+    Observed = 1,
+    Replayed = 2,
+    OracleCompared = 3,
+    ResidualStable = 4,
+    Sealed = 5,
+    Promoted = 6,
+}
+
+// ============================================================================
+// Operation Signature
+// ============================================================================
+
+type OperationSignature = struct {
+    operation_name: FixedString[128],
+    parameter_types: Array[FixedString[64], 16],
+    parameter_count: u64,
+    return_type: FixedString[64],
+    effects: Array[FixedString[64], 8],
+    effect_count: u64,
+    dialect_family: FixedString[64],
+    is_variadic: bool,
+}
+
+// ============================================================================
+// Residual Reference
+// ============================================================================
+
+type ResidualRef = struct {
+    residual_hash: Hash256,
+    cage_id: Hash256,
+    execution_id: u64,
+    operation_index: u64,
+    timestamp: u64,
+}
+
+// ============================================================================
+// Translation Entry
+// ============================================================================
+
+type TranslationEntry = struct {
+    entry_id: u64,
+    foreign_operation: OperationSignature,
+    native_operation: OperationSignature,
+    observation_count: u64,
+    replay_count: u64,
+    oracle_verified: bool,
+    court_verified: bool,
+    court_casefile_id: FixedString[128],
+    trust_state: TrustState,
+    confidence_score: u64,
+    residual_references: Array[ResidualRef, 64],
+    residual_count: u64,
+    is_locked: bool,
+    created_at: u64,
+    last_observed_at: u64,
+    promoted_at: u64,
+    generation: u64,
+}
+
+// ============================================================================
+// Translation Map
+// ============================================================================
+
+type TranslationMap = struct {
+    entries: Array[TranslationEntry, 1024],
+    entry_count: u64,
+    total_observations: u64,
+    successful_translations: u64,
+    failed_translations: u64,
+    pending_review_count: u64,
+    map_hash: Hash256,
+    generation: u64,
+}
+
+// ============================================================================
+// FixedString and Hash256 (forward declarations)
+// ============================================================================
+
+type FixedString[cap: u64] = struct {
+    len: u64,
+    data: Array[u8, cap],
+}
+
+type Hash256 = struct {
+    bytes: Array[u8, 32],
+}
+
+// ============================================================================
+// Create Translation Map
+// ============================================================================
+
+fn create_translation_map() -> TranslationMap
+    effects: [compute]
+{
+    let empty_entries: Array[TranslationEntry, 1024] = Array[TranslationEntry, 1024]::zeroed();
+    let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+
+    return TranslationMap {
+        entries: empty_entries,
+        entry_count: 0,
+        total_observations: 0,
+        successful_translations: 0,
+        failed_translations: 0,
+        pending_review_count: 0,
+        map_hash: zero_hash,
+        generation: 1,
+    };
+}
+
+// ============================================================================
+// Create Empty Foreign Operation Signature
+// ============================================================================
+
+fn create_operation_signature(name: &FixedString[128]) -> OperationSignature
+    effects: [compute]
+{
+    let empty_params: Array[FixedString[64], 16] = Array[FixedString[64], 16]::zeroed();
+    let empty_effects: Array[FixedString[64], 8] = Array[FixedString[64], 8]::zeroed();
+
+    return OperationSignature {
+        operation_name: *name,
+        parameter_types: empty_params,
+        parameter_count: 0,
+        return_type: FixedString[64]::zeroed(),
+        effects: empty_effects,
+        effect_count: 0,
+        dialect_family: FixedString[64]::zeroed(),
+        is_variadic: false,
+    };
+}
+
+// ============================================================================
+// Add Candidate Entry
+// ============================================================================
+// A candidate entry represents a foreign→native mapping that has been
+// observed at least once but not yet verified.
+
+fn add_candidate_entry(map: &mut TranslationMap, foreign: &OperationSignature, native: &OperationSignature, cage_id: Hash256, execution_id: u64) -> Result[u64, TranslationMapError]
+    effects: [compute, residual]
+{
+    if map.entry_count >= 1024 {
+        return Err(TranslationMapError::MapFull);
+    }
+
+    // Validate operation names
+    if foreign.operation_name.len == 0 {
+        return Err(TranslationMapError::InvalidForeignOp);
+    }
+    if native.operation_name.len == 0 {
+        return Err(TranslationMapError::InvalidNativeOp);
+    }
+
+    // Check for duplicate foreign→native mapping
+    for i in 0..map.entry_count {
+        if map.entries[i].foreign_operation.operation_name == foreign.operation_name {
+            // Entry already exists — increment observation count
+            map.entries[i].observation_count = map.entries[i].observation_count + 1;
+            map.entries[i].last_observed_at = kernel.tick_count();
+            map.total_observations = map.total_observations + 1;
+
+            // Add residual reference
+            if map.entries[i].residual_count < 64 {
+                let ref_entry: ResidualRef = ResidualRef {
+                    residual_hash: Hash256 { bytes: Array[u8, 32]::zeroed() },
+                    cage_id: cage_id,
+                    execution_id: execution_id,
+                    operation_index: map.entries[i].observation_count,
+                    timestamp: kernel.tick_count(),
+                };
+                map.entries[i].residual_references[map.entries[i].residual_count] = ref_entry;
+                map.entries[i].residual_count = map.entries[i].residual_count + 1;
+            }
+
+            @emit_residual("translation_map.observed", "candidate_observed", foreign.operation_name.hash());
+            return Ok(map.entries[i].entry_id);
+        }
+    }
+
+    // Create new entry
+    let entry_id: u64 = map.entry_count as u64;
+    let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    let empty_refs: Array[ResidualRef, 64] = Array[ResidualRef, 64]::zeroed();
+
+    // Create initial residual reference
+    let mut refs: Array[ResidualRef, 64] = empty_refs;
+    let initial_ref: ResidualRef = ResidualRef {
+        residual_hash: zero_hash,
+        cage_id: cage_id,
+        execution_id: execution_id,
+        operation_index: 0,
+        timestamp: kernel.tick_count(),
+    };
+    refs[0] = initial_ref;
+
+    let entry: TranslationEntry = TranslationEntry {
+        entry_id: entry_id,
+        foreign_operation: *foreign,
+        native_operation: *native,
+        observation_count: 1,
+        replay_count: 0,
+        oracle_verified: false,
+        court_verified: false,
+        court_casefile_id: FixedString[128]::zeroed(),
+        trust_state: TrustState::Observed,
+        confidence_score: 10,
+        residual_references: refs,
+        residual_count: 1,
+        is_locked: false,
+        created_at: kernel.tick_count(),
+        last_observed_at: kernel.tick_count(),
+        promoted_at: 0,
+        generation: map.generation,
+    };
+
+    map.entries[map.entry_count] = entry;
+    map.entry_count = map.entry_count + 1;
+    map.total_observations = map.total_observations + 1;
+    map.pending_review_count = map.pending_review_count + 1;
+
+    // Update map hash
+    map.map_hash = recompute_map_hash(map);
+
+    @emit_residual("translation_map.add_candidate", "candidate_added", entry_id);
+
+    return Ok(entry_id);
+}
+
+// ============================================================================
+// Get Entry By ID
+// ============================================================================
+
+fn get_entry_by_id(map: &TranslationMap, entry_id: u64) -> Result[&TranslationEntry, TranslationMapError]
+    effects: [compute]
+{
+    for i in 0..map.entry_count {
+        if map.entries[i].entry_id == entry_id {
+            return Ok(map.entries[i]);
+        }
+    }
+    return Err(TranslationMapError::EntryNotFound);
+}
+
+fn get_entry_by_id_mut(map: &mut TranslationMap, entry_id: u64) -> Result[&mut TranslationEntry, TranslationMapError]
+    effects: [compute]
+{
+    for i in 0..map.entry_count {
+        if map.entries[i].entry_id == entry_id {
+            return Ok(map.entries[i]);
+        }
+    }
+    return Err(TranslationMapError::EntryNotFound);
+}
+
+// ============================================================================
+// Find Entry By Foreign Operation Name
+// ============================================================================
+
+fn find_entry_by_foreign_op(map: &TranslationMap, op_name: &FixedString[128]) -> Result[&TranslationEntry, TranslationMapError]
+    effects: [compute]
+{
+    for i in 0..map.entry_count {
+        if map.entries[i].foreign_operation.operation_name == *op_name {
+            return Ok(map.entries[i]);
+        }
+    }
+    return Err(TranslationMapError::EntryNotFound);
+}
+
+// ============================================================================
+// Record Observation
+// ============================================================================
+// Records an additional observation of an existing translation entry.
+
+fn record_observation(map: &mut TranslationMap, entry_id: u64, cage_id: Hash256, execution_id: u64) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    entry.observation_count = entry.observation_count + 1;
+    entry.last_observed_at = kernel.tick_count();
+    map.total_observations = map.total_observations + 1;
+
+    // Add residual reference
+    if entry.residual_count < 64 {
+        let ref_entry: ResidualRef = ResidualRef {
+            residual_hash: Hash256 { bytes: Array[u8, 32]::zeroed() },
+            cage_id: cage_id,
+            execution_id: execution_id,
+            operation_index: entry.observation_count,
+            timestamp: kernel.tick_count(),
+        };
+        entry.residual_references[entry.residual_count] = ref_entry;
+        entry.residual_count = entry.residual_count + 1;
+    }
+
+    // Update confidence score based on observation count
+    if entry.observation_count > 1 {
+        entry.confidence_score = entry.confidence_score + 5;
+        if entry.confidence_score > 100 {
+            entry.confidence_score = 100;
+        }
+    }
+
+    @emit_residual("translation_map.record_observation", "observation_recorded", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Record Replay
+// ============================================================================
+// Records a successful replay of a translation entry.
+
+fn record_replay(map: &mut TranslationMap, entry_id: u64, success: bool) -> Result<(), TranslationMapError>
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    if success {
+        entry.replay_count = entry.replay_count + 1;
+        entry.confidence_score = entry.confidence_score + 10;
+        if entry.confidence_score > 100 {
+            entry.confidence_score = 100;
+        }
+
+        // Promote to Replayed if enough successful replays
+        if entry.replay_count >= 3 && entry.trust_state < TrustState::Replayed {
+            entry.trust_state = TrustState::Replayed;
+            map.pending_review_count = if map.pending_review_count > 0 { map.pending_review_count - 1 } else { 0 };
+        }
+    } else {
+        entry.confidence_score = if entry.confidence_score > 10 { entry.confidence_score - 10 } else { entry.confidence_score };
+    }
+
+    @emit_residual("translation_map.record_replay", "replay_recorded", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Mark Oracle Verified
+// ============================================================================
+
+fn mark_oracle_verified(map: &mut TranslationMap, entry_id: u64) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    entry.oracle_verified = true;
+
+    // Promote to OracleCompared
+    if entry.trust_state < TrustState::OracleCompared {
+        entry.trust_state = TrustState::OracleCompared;
+        entry.confidence_score = if entry.confidence_score + 15 > 100 { 100 } else { entry.confidence_score + 15 };
+    }
+
+    @emit_residual("translation_map.oracle_verified", "oracle_verification_complete", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Mark Court Verified
+// ============================================================================
+
+fn mark_court_verified(map: &mut TranslationMap, entry_id: u64, casefile_id: &FixedString[128]) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    entry.court_verified = true;
+    entry.court_casefile_id = *casefile_id;
+
+    // Promote to Sealed after court verification
+    if entry.trust_state < TrustState::Sealed {
+        entry.trust_state = TrustState::Sealed;
+        entry.confidence_score = if entry.confidence_score + 20 > 100 { 100 } else { entry.confidence_score + 20 };
+    }
+
+    @emit_residual("translation_map.court_verified", "court_verification_complete", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Promote Entry
+// ============================================================================
+// Promotes a translation entry to the final Promoted trust state.
+
+fn promote_entry(map: &mut TranslationMap, entry_id: u64) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    // Must have court verification to be promoted
+    if !entry.court_verified {
+        return Err(TranslationMapError::VerificationRequired);
+    }
+
+    // Must have oracle verification (if oracle available)
+    // Soft requirement — oracle_verified can be false if no oracle available
+
+    // Must be at Sealed or higher
+    if entry.trust_state < TrustState::Sealed {
+        return Err(TranslationMapError::PromotionBlocked);
+    }
+
+    entry.trust_state = TrustState::Promoted;
+    entry.promoted_at = kernel.tick_count();
+    entry.is_locked = true;
+    entry.confidence_score = 100;
+
+    map.successful_translations = map.successful_translations + 1;
+
+    @emit_residual("translation_map.promote", "entry_promoted", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Lock Entry
+// ============================================================================
+// Prevents further modification to a translation entry.
+
+fn lock_entry(map: &mut TranslationMap, entry_id: u64) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+    entry.is_locked = true;
+
+    @emit_residual("translation_map.lock", "entry_locked", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Demote Entry
+// ============================================================================
+// Demotes a translation entry to a lower trust state (e.g., after a
+// replay failure or divergence discovery).
+
+fn demote_entry(map: &mut TranslationMap, entry_id: u64, target: TrustState) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    if entry.is_locked && target < entry.trust_state {
+        return Err(TranslationMapError::EntryLocked);
+    }
+
+    let target_val: u64 = target as u64;
+    let current_val: u64 = entry.trust_state as u64;
+
+    if target_val >= current_val {
+        return Err(TranslationMapError::DemotionBlocked);
+    }
+
+    entry.trust_state = target;
+
+    // Reduce confidence on demotion
+    entry.confidence_score = if entry.confidence_score > 20 { entry.confidence_score - 20 } else { entry.confidence_score };
+
+    // If demoted below Verified, add to pending review
+    if target <= TrustState::Observed {
+        map.pending_review_count = map.pending_review_count + 1;
+    }
+
+    @emit_residual("translation_map.demote", "entry_demoted", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Get Entries By Trust State
+// ============================================================================
+
+fn get_entries_by_trust_state(map: &TranslationMap, state: TrustState) -> Result[Array[TranslationEntry, 1024], TranslationMapError]
+    effects: [compute]
+{
+    let mut results: Array[TranslationEntry, 1024] = Array[TranslationEntry, 1024]::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..map.entry_count {
+        if map.entries[i].trust_state == state {
+            if count < 1024 {
+                results[count] = map.entries[i];
+                count = count + 1;
+            }
+        }
+    }
+
+    return Ok(results);
+}
+
+// ============================================================================
+// Get Candidate Entries (trust state < OracleCompared)
+// ============================================================================
+
+fn get_candidate_entries(map: &TranslationMap) -> Result[Array[TranslationEntry, 1024], TranslationMapError]
+    effects: [compute]
+{
+    let mut results: Array[TranslationEntry, 1024] = Array[TranslationEntry, 1024]::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..map.entry_count {
+        if map.entries[i].trust_state < TrustState::OracleCompared {
+            if count < 1024 {
+                results[count] = map.entries[i];
+                count = count + 1;
+            }
+        }
+    }
+
+    return Ok(results);
+}
+
+// ============================================================================
+// Get Confirmed Entries (trust state >= OracleCompared)
+// ============================================================================
+
+fn get_confirmed_entries(map: &TranslationMap) -> Result[Array[TranslationEntry, 1024], TranslationMapError]
+    effects: [compute]
+{
+    let mut results: Array[TranslationEntry, 1024] = Array[TranslationEntry, 1024]::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..map.entry_count {
+        if map.entries[i].trust_state >= TrustState::OracleCompared {
+            if count < 1024 {
+                results[count] = map.entries[i];
+                count = count + 1;
+            }
+        }
+    }
+
+    return Ok(results);
+}
+
+// ============================================================================
+// Get Entry Count
+// ============================================================================
+
+fn get_entry_count(map: &TranslationMap) -> u64
+    effects: [compute]
+{
+    return map.entry_count;
+}
+
+// ============================================================================
+// Get Map Statistics
+// ============================================================================
+
+type TranslationMapStats = struct {
+    total_entries: u64,
+    total_observations: u64,
+    successful_translations: u64,
+    failed_translations: u64,
+    pending_review: u64,
+    unknown_count: u64,
+    observed_count: u64,
+    replayed_count: u64,
+    oracle_compared_count: u64,
+    residual_stable_count: u64,
+    sealed_count: u64,
+    promoted_count: u64,
+    average_confidence: u64,
+    map_hash: Hash256,
+}
+
+fn get_map_statistics(map: &TranslationMap) -> TranslationMapStats
+    effects: [compute]
+{
+    let mut unknown: u64 = 0;
+    let mut observed: u64 = 0;
+    let mut replayed: u64 = 0;
+    let mut oracle_compared: u64 = 0;
+    let mut residual_stable: u64 = 0;
+    let mut sealed: u64 = 0;
+    let mut promoted: u64 = 0;
+    let mut total_confidence: u64 = 0;
+
+    for i in 0..map.entry_count {
+        match map.entries[i].trust_state {
+            TrustState::Unknown => unknown = unknown + 1,
+            TrustState::Observed => observed = observed + 1,
+            TrustState::Replayed => replayed = replayed + 1,
+            TrustState::OracleCompared => oracle_compared = oracle_compared + 1,
+            TrustState::ResidualStable => residual_stable = residual_stable + 1,
+            TrustState::Sealed => sealed = sealed + 1,
+            TrustState::Promoted => promoted = promoted + 1,
+        }
+        total_confidence = total_confidence + map.entries[i].confidence_score;
+    }
+
+    let avg_conf: u64 = if map.entry_count > 0 { total_confidence / map.entry_count } else { 0 };
+
+    return TranslationMapStats {
+        total_entries: map.entry_count,
+        total_observations: map.total_observations,
+        successful_translations: map.successful_translations,
+        failed_translations: map.failed_translations,
+        pending_review: map.pending_review_count,
+        unknown_count: unknown,
+        observed_count: observed,
+        replayed_count: replayed,
+        oracle_compared_count: oracle_compared,
+        residual_stable_count: residual_stable,
+        sealed_count: sealed,
+        promoted_count: promoted,
+        average_confidence: avg_conf,
+        map_hash: map.map_hash,
+    };
+}
+
+// ============================================================================
+// Update Native Operation
+// ============================================================================
+// Updates the native operation mapping for an entry (before it is locked).
+
+fn update_native_operation(map: &mut TranslationMap, entry_id: u64, native: &OperationSignature) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    let entry: &mut TranslationEntry = get_entry_by_id_mut(map, entry_id)?;
+
+    if entry.is_locked {
+        return Err(TranslationMapError::EntryLocked);
+    }
+
+    if native.operation_name.len == 0 {
+        return Err(TranslationMapError::InvalidNativeOp);
+    }
+
+    // Demote to Observed since the mapping changed
+    entry.native_operation = *native;
+    if entry.trust_state > TrustState::Observed {
+        entry.trust_state = TrustState::Observed;
+        entry.oracle_verified = false;
+        entry.court_verified = false;
+        entry.confidence_score = 20;
+    }
+
+    @emit_residual("translation_map.update_native", "native_operation_updated", entry_id);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Remove Entry
+// ============================================================================
+// Removes an entry from the translation map. Only allowed for entries
+// that are not locked and have not been promoted.
+
+fn remove_entry(map: &mut TranslationMap, entry_id: u64) -> Result<(), TranslationMapError>
+    effects: [compute, residual]
+{
+    for i in 0..map.entry_count {
+        if map.entries[i].entry_id == entry_id {
+            if map.entries[i].is_locked {
+                return Err(TranslationMapError::EntryLocked);
+            }
+
+            // Shift entries down
+            for j in i..map.entry_count - 1 {
+                map.entries[j] = map.entries[j + 1];
+            }
+            map.entry_count = map.entry_count - 1;
+
+            // Recompute map hash
+            map.map_hash = recompute_map_hash(map);
+
+            @emit_residual("translation_map.remove", "entry_removed", entry_id);
+
+            return Ok(());
+        }
+    }
+
+    return Err(TranslationMapError::EntryNotFound);
+}
+
+// ============================================================================
+// Recompute Map Hash
+// ============================================================================
+
+fn recompute_map_hash(map: &TranslationMap) -> Hash256
+    effects: [compute]
+{
+    let mut result: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+
+    for i in 0..map.entry_count {
+        let entry: TranslationEntry = map.entries[i];
+        // Mix entry ID and trust state into hash
+        for j in 0..8 {
+            let idx: u64 = (i + j) & 31;
+            let byte_val: u8 = ((entry.entry_id >> (j * 8)) & 0xFF) as u8;
+            result.bytes[idx] = result.bytes[idx] ^ byte_val;
+        }
+        // Mix trust state
+        let state_idx: u64 = (i + 16) & 31;
+        result.bytes[state_idx] = result.bytes[state_idx] ^ (entry.trust_state as u8);
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Merge Translation Maps
+// ============================================================================
+// Merges two translation maps, combining entries from both.
+
+fn merge_translation_maps(dest: &mut TranslationMap, src: &TranslationMap) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    for i in 0..src.entry_count {
+        if dest.entry_count >= 1024 {
+            return Err(TranslationMapError::MapFull);
+        }
+
+        let src_entry: TranslationEntry = src.entries[i];
+
+        // Check if entry already exists in destination
+        let mut found: bool = false;
+        for j in 0..dest.entry_count {
+            if dest.entries[j].foreign_operation.operation_name ==
+               src_entry.foreign_operation.operation_name {
+                // Merge: take the higher trust state and aggregate observations
+                found = true;
+                if src_entry.trust_state > dest.entries[j].trust_state {
+                    dest.entries[j].trust_state = src_entry.trust_state;
+                }
+                dest.entries[j].observation_count = dest.entries[j].observation_count + src_entry.observation_count;
+                dest.entries[j].confidence_score = if dest.entries[j].confidence_score > src_entry.confidence_score {
+                    dest.entries[j].confidence_score
+                } else {
+                    src_entry.confidence_score
+                };
+
+                // Merge residual references
+                let ref_count: u64 = dest.entries[j].residual_count;
+                let src_refs_avail: u64 = if 64 - ref_count < src_entry.residual_count {
+                    64 - ref_count
+                } else {
+                    src_entry.residual_count
+                };
+                for k in 0..src_refs_avail {
+                    dest.entries[j].residual_references[ref_count + k] = src_entry.residual_references[k];
+                }
+                dest.entries[j].residual_count = ref_count + src_refs_avail;
+
+                break;
+            }
+        }
+
+        if !found {
+            // Copy entry into destination
+            dest.entries[dest.entry_count] = src_entry;
+            dest.entry_count = dest.entry_count + 1;
+        }
+    }
+
+    // Update destination statistics
+    dest.total_observations = dest.total_observations + src.total_observations;
+    dest.successful_translations = dest.successful_translations + src.successful_translations;
+    dest.failed_translations = dest.failed_translations + src.failed_translations;
+
+    // Recompute hash
+    dest.map_hash = recompute_map_hash(dest);
+
+    @emit_residual("translation_map.merge", "maps_merged", dest.map_hash);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Clear Map
+// ============================================================================
+// Removes all entries from the translation map. Only allowed if no
+// entries are locked.
+
+fn clear_translation_map(map: &mut TranslationMap) -> Result[(), TranslationMapError]
+    effects: [compute, residual]
+{
+    // Check for locked entries
+    for i in 0..map.entry_count {
+        if map.entries[i].is_locked {
+            return Err(TranslationMapError::EntryLocked);
+        }
+    }
+
+    let empty_entries: Array[TranslationEntry, 1024] = Array[TranslationEntry, 1024]::zeroed();
+    let zero_hash: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+
+    map.entries = empty_entries;
+    map.entry_count = 0;
+    map.total_observations = 0;
+    map.successful_translations = 0;
+    map.failed_translations = 0;
+    map.pending_review_count = 0;
+    map.map_hash = zero_hash;
+
+    @emit_residual("translation_map.clear", "map_cleared", 0);
+
+    return Ok(());
+}
+
+// ============================================================================
+// Export Map as Report
+// ============================================================================
+
+type TranslationMapReport = struct {
+    entry_count: u64,
+    promoted_count: u64,
+    pending_count: u64,
+    average_confidence: u64,
+    map_hash: Hash256,
+    entries: Array[TranslationEntry, 1024],
+}
+
+fn export_map_report(map: &TranslationMap) -> TranslationMapReport
+    effects: [compute]
+{
+    let mut avg_conf: u64 = 0;
+    if map.entry_count > 0 {
+        let mut total: u64 = 0;
+        for i in 0..map.entry_count {
+            total = total + map.entries[i].confidence_score;
+        }
+        avg_conf = total / map.entry_count;
+    }
+
+    let mut promoted: u64 = 0;
+    let mut pending: u64 = 0;
+    for i in 0..map.entry_count {
+        if map.entries[i].trust_state >= TrustState::Promoted {
+            promoted = promoted + 1;
+        }
+        if map.entries[i].trust_state <= TrustState::Observed {
+            pending = pending + 1;
+        }
+    }
+
+    return TranslationMapReport {
+        entry_count: map.entry_count,
+        promoted_count: promoted,
+        pending_count: pending,
+        average_confidence: avg_conf,
+        map_hash: map.map_hash,
+        entries: map.entries,
+    };
+}

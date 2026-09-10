@@ -1,0 +1,828 @@
+// file: virtio_gpu.phor
+// purpose: Virtio GPU device with resource management, scanning, cursor,
+//          2D/3D commands, fence synchronization, and capability-gated access.
+// evidence: VGPU-ARCH-001 through VGPU-ARCH-200
+// residual: All operations bounded loops and effect-declared.
+
+package "phorensic:virtio:virtio_gpu:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::math::*
+use core::errors::*
+use core::collections::*
+
+use virtio::virtio_transport::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-CONST-001 through VGPU-CONST-030
+
+const VIRTIO_GPU_F_VIRGL        : u64 = 1 << 0
+const VIRTIO_GPU_F_EDID         : u64 = 1 << 1
+const VIRTIO_GPU_F_RESOURCE_UUID: u64 = 1 << 2
+const VIRTIO_GPU_F_CONTEXT_INIT : u64 = 1 << 3
+
+const VIRTIO_GPU_MAX_RESOURCES  : u32 = 256
+const VIRTIO_GPU_MAX_SCANOUTS   : u32 = 16
+const VIRTIO_GPU_MAX_CURSORS    : u32 = 4
+const VIRTIO_GPU_MAX_WIDTH      : u32 = 16384
+const VIRTIO_GPU_MAX_HEIGHT     : u32 = 16384
+const VIRTIO_GPU_MAX_FENCES     : u32 = 64
+
+// ──────────────────────────────────────────────
+// GPU Commands
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-CMD-001 through VGPU-CMD-025
+
+pub type VirtioGpuCmd : u32 = enum {
+    GetDisplayInfo       = 0x0100,
+    ResourceCreate2D     = 0x0101,
+    ResourceUnref        = 0x0102,
+    ResourceFlush        = 0x0104,
+    TransferToHost2D     = 0x0105,
+    SetScanout           = 0x0106,
+    ResourceAttachBacking = 0x0107,
+    ResourceDetachBacking = 0x0108,
+    UpdateCursor         = 0x0109,
+    MoveCursor           = 0x010A,
+    CtxCreate            = 0x0200,
+    CtxDestroy           = 0x0201,
+    CtxAttachResource    = 0x0202,
+    CtxDetachResource    = 0x0203,
+    ResourceCreate3D     = 0x0204,
+    TransferToHost3D     = 0x0205,
+    SubmitCmd3D          = 0x0206,
+    ResourceMapBlob      = 0x0301,
+    ResourceUnmapBlob    = 0x0302,
+    CtxAttachResourceBlob = 0x0303,
+}
+
+pub type VirtioGpuResp : u32 = enum {
+    OkNoData     = 0x1100,
+    OkData       = 0x1101,
+    NotImplemented = 0x1200,
+    OutOfMemory  = 0x1201,
+    InvalidParam = 0x1202,
+}
+
+// ──────────────────────────────────────────────
+// GPU Formats
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-FMT-001 through VGPU-FMT-015
+
+pub type VirtioGpuFormat : u32 = enum {
+    B8G8R8A8_UNORM  = 1,
+    B8G8R8X8_UNORM  = 2,
+    A8R8G8B8_UNORM  = 3,
+    X8R8G8B8_UNORM  = 4,
+    R8G8B8A8_UNORM  = 67,
+    X8B8G8R8_UNORM  = 68,
+    A8B8G8R8_UNORM  = 69,
+    R8G8B8A8_SRGB   = 70,
+}
+
+// ──────────────────────────────────────────────
+// Scanout (Display) Information
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-SCAN-001 through VGPU-SCAN-020
+
+pub type VirtioGpuScanout : struct {
+    scanout_id: u32,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    enabled: bool,
+    has_cursor: bool,
+    cursor_x: u32,
+    cursor_y: u32,
+}
+
+impl VirtioGpuScanout {
+    pub fn new(id: u32) -> VirtioGpuScanout
+        effects: [deterministic]
+    {
+        VirtioGpuScanout {
+            scanout_id: id,
+            resource_id: 0,
+            width: 0,
+            height: 0,
+            x: 0,
+            y: 0,
+            enabled: false,
+            has_cursor: false,
+            cursor_x: 0,
+            cursor_y: 0,
+        }
+    }
+
+    pub fn set_mode(self: ref mut, width: u32, height: u32)
+        effects: [deterministic]
+    {
+        self.width = width
+        self.height = height
+        self.enabled = true
+    }
+
+    pub fn disable(self: ref mut)
+        effects: [deterministic]
+    {
+        self.enabled = false
+    }
+}
+
+// ──────────────────────────────────────────────
+// GPU Resource
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-RES-001 through VGPU-RES-040
+
+pub type VirtioGpuResource : struct {
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    nr_samples: u32,
+    flags: u32,
+    is_3d: bool,
+    backing_pages: u64,
+    backing_size: u64,
+    attached: bool,
+    flush_pending: bool,
+    uuid: Byte[16],
+}
+
+impl VirtioGpuResource {
+    pub fn new(id: u32, width: u32, height: u32, format: u32) -> VirtioGpuResource
+        effects: [deterministic]
+    {
+        VirtioGpuResource {
+            resource_id: id,
+            width: width,
+            height: height,
+            format: format,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: 0,
+            is_3d: false,
+            backing_pages: 0,
+            backing_size: 0,
+            attached: false,
+            flush_pending: false,
+            uuid: [Byte::from_u8(0); 16],
+        }
+    }
+
+    pub fn stride(self) -> u32
+        effects: [deterministic]
+    {
+        let bpp: u32 = match self.format {
+            f if f == (VirtioGpuFormat::B8G8R8A8_UNORM as u32) => 4,
+            f if f == (VirtioGpuFormat::R8G8B8A8_UNORM as u32) => 4,
+            f if f == (VirtioGpuFormat::A8R8G8B8_UNORM as u32) => 4,
+            _ => 4,  // Default 4 bytes per pixel
+        }
+        self.width * bpp
+    }
+
+    pub fn pixel_count(self) -> u64
+        effects: [deterministic]
+    {
+        (self.width as u64) * (self.height as u64)
+    }
+
+    pub fn byte_size(self) -> u64
+        effects: [deterministic]
+    {
+        self.pixel_count() * 4
+    }
+}
+
+// ──────────────────────────────────────────────
+// GPU Fence
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-FENCE-001 through VGPU-FENCE-020
+
+pub type VirtioGpuFence : struct {
+    fence_id: u32,
+    ctx_id: u32,
+    signaled: bool,
+    wait_count: u64,
+}
+
+impl VirtioGpuFence {
+    pub fn new(id: u32, ctx: u32) -> VirtioGpuFence
+        effects: [deterministic]
+    {
+        VirtioGpuFence {
+            fence_id: id,
+            ctx_id: ctx,
+            signaled: false,
+            wait_count: 0,
+        }
+    }
+
+    pub fn signal(self: ref mut)
+        effects: [deterministic]
+    {
+        self.signaled = true
+    }
+
+    pub fn is_signaled(self) -> bool
+        effects: [deterministic]
+    {
+        self.signaled
+    }
+
+    pub fn wait(self: ref mut)
+        effects: [deterministic]
+    {
+        self.wait_count = self.wait_count + 1
+    }
+
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.signaled = false
+        self.wait_count = 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// GPU Context
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-CTX-001 through VGPU-CTX-020
+
+pub type VirtioGpuContext : struct {
+    ctx_id: u32,
+    name: FixedString[64],
+    is_3d: bool,
+    resources: FixedArray[32, u32],
+    resource_count: u32,
+    pending_fences: FixedArray[16, u32],
+    fence_count: u32,
+    initiator: u32,
+}
+
+impl VirtioGpuContext {
+    pub fn new(id: u32, name: FixedString[64], is_3d: bool) -> VirtioGpuContext
+        effects: [deterministic]
+    {
+        VirtioGpuContext {
+            ctx_id: id,
+            name: name,
+            is_3d: is_3d,
+            resources: FixedArray::new(),
+            resource_count: 0,
+            pending_fences: FixedArray::new(),
+            fence_count: 0,
+            initiator: 0,
+        }
+    }
+
+    pub fn attach_resource(self: ref mut, res_id: u32) -> bool
+        effects: [deterministic]
+    {
+        if self.resource_count >= 32 {
+            return false
+        }
+        let _ = self.resources.push(res_id)
+        self.resource_count = self.resource_count + 1
+        true
+    }
+
+    pub fn detach_resource(self: ref mut, res_id: u32) -> bool
+        effects: [deterministic]
+    {
+        let mut found: bool = false
+        // loop: bounds[BOUND_SMALL] — bounded by 32
+        loop: bounds[BOUND_SMALL] for i in 0..self.resource_count {
+            if self.resources[i as usize] == res_id {
+                found = true
+            }
+            if found && i + 1 < self.resource_count {
+                self.resources[i as usize] = self.resources[(i + 1) as usize]
+            }
+        }
+        if found {
+            self.resource_count = self.resource_count - 1
+        }
+        found
+    }
+}
+
+// ──────────────────────────────────────────────
+// GPU Device
+// ──────────────────────────────────────────────
+// Evidence path: VGPU-DEVICE-001 through VGPU-DEVICE-060
+
+pub type VirtioGpuDevice : struct {
+    transport: VirtioMMIOTransport,
+    features: u64,
+    resources: FixedArray[256, VirtioGpuResource],
+    resource_count: u32,
+    scanouts: FixedArray[16, VirtioGpuScanout],
+    scanout_count: u32,
+    cursors: FixedArray[4, u32],
+    cursor_count: u32,
+    fences: FixedArray[64, VirtioGpuFence],
+    fence_count: u32,
+    contexts: FixedArray[8, VirtioGpuContext],
+    context_count: u32,
+    next_resource_id: u32,
+    next_fence_id: u32,
+    next_ctx_id: u32,
+    has_virgl: bool,
+    has_edid: bool,
+    capabilities: u64,
+}
+
+impl VirtioGpuDevice {
+    pub fn new(transport: VirtioMMIOTransport) -> VirtioGpuDevice
+        effects: [deterministic]
+    {
+        let mut dev: VirtioGpuDevice = VirtioGpuDevice {
+            transport: transport,
+            features: 0,
+            resources: FixedArray::new(),
+            resource_count: 0,
+            scanouts: FixedArray::new(),
+            scanout_count: 1,
+            cursors: FixedArray::new(),
+            cursor_count: 0,
+            fences: FixedArray::new(),
+            fence_count: 0,
+            contexts: FixedArray::new(),
+            context_count: 0,
+            next_resource_id: 1,
+            next_fence_id: 1,
+            next_ctx_id: 1,
+            has_virgl: false,
+            has_edid: false,
+            capabilities: 0,
+        }
+
+        // Create default scanout
+        let mut scanout: VirtioGpuScanout = VirtioGpuScanout::new(0)
+        scanout.set_mode(1024, 768)
+        let _ = dev.scanouts.push(scanout)
+
+        dev
+    }
+
+    // Initialize the GPU device.
+    pub fn initialize(self: ref mut) -> Result<(), VirtioError>
+        effects: [io:read, io:write]
+    {
+        self.transport.initialize()?
+        Result::Ok(())
+    }
+
+    // Create a 2D resource.
+    pub fn create_resource_2d(self: ref mut, width: u32, height: u32, format: u32) -> Result<u32, VirtioError>
+        effects: [deterministic]
+    {
+        if self.resource_count >= VIRTIO_GPU_MAX_RESOURCES {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x400),
+                FixedString[128]::from_slice("gpu: max resources reached")))
+        }
+        if width > VIRTIO_GPU_MAX_WIDTH || height > VIRTIO_GPU_MAX_HEIGHT {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x401),
+                FixedString[128]::from_slice("gpu: resource dimensions too large")))
+        }
+
+        let id: u32 = self.next_resource_id
+        self.next_resource_id = self.next_resource_id + 1
+
+        let res: VirtioGpuResource = VirtioGpuResource::new(id, width, height, format)
+        let _ = self.resources.push(res)
+        self.resource_count = self.resource_count + 1
+
+        Result::Ok(id)
+    }
+
+    // Unref (destroy) a resource.
+    pub fn unref_resource(self: ref mut, resource_id: u32) -> Result<(), VirtioError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by resource count
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.resource_count {
+            if self.resources[i as usize].resource_id == resource_id {
+                found_idx = i
+                found = true
+            }
+        }
+
+        if !found {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x402),
+                FixedString[128]::from_slice("gpu: resource not found")))
+        }
+
+        // Remove by shifting
+        // loop: bounds[BOUND_MEDIUM] — bounded by resource count
+        loop: bounds[BOUND_MEDIUM] for i in found_idx..(self.resource_count - 1) {
+            self.resources[i as usize] = self.resources[(i + 1) as usize]
+        }
+        self.resource_count = self.resource_count - 1
+        Result::Ok(())
+    }
+
+    // Set the scanout to display a resource.
+    pub fn set_scanout(self: ref mut, scanout_id: u32, resource_id: u32) -> Result<(), VirtioError>
+        effects: [deterministic]
+    {
+        if scanout_id >= self.scanout_count {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x410),
+                FixedString[128]::from_slice("gpu: scanout not found")))
+        }
+        self.scanouts[scanout_id as usize].resource_id = resource_id
+        Result::Ok(())
+    }
+
+    // Flush a resource to the display.
+    pub fn flush_resource(self: ref mut, resource_id: u32)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by resource count
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.resource_count {
+            if self.resources[i as usize].resource_id == resource_id {
+                self.resources[i as usize].flush_pending = false
+            }
+        }
+    }
+
+    // Transfer data to host (for 2D).
+    pub fn transfer_to_host_2d(self: ref mut, resource_id: u32, x: u32, y: u32, width: u32, height: u32)
+        effects: [io:write]
+    {
+        let _ = x
+        let _ = y
+        let _ = width
+        let _ = height
+        // Signal that data needs to be transferred
+    }
+
+    // Update cursor image.
+    pub fn update_cursor(self: ref mut, scanout_id: u32, resource_id: u32, hot_x: u32, hot_y: u32)
+        effects: [deterministic]
+    {
+        if scanout_id < self.scanout_count {
+            self.scanouts[scanout_id as usize].has_cursor = true
+            self.scanouts[scanout_id as usize].cursor_x = hot_x
+            self.scanouts[scanout_id as usize].cursor_y = hot_y
+
+            // Add cursor resource to cursor list
+            let _ = self.cursors.push(resource_id)
+            self.cursor_count = self.cursor_count + 1
+        }
+    }
+
+    // Move cursor.
+    pub fn move_cursor(self: ref mut, scanout_id: u32, x: u32, y: u32)
+        effects: [deterministic]
+    {
+        if scanout_id < self.scanout_count {
+            self.scanouts[scanout_id as usize].cursor_x = x
+            self.scanouts[scanout_id as usize].cursor_y = y
+        }
+    }
+
+    // Create a rendering context.
+    pub fn create_context(self: ref mut, name: FixedString[64], is_3d: bool) -> Result<u32, VirtioError>
+        effects: [deterministic]
+    {
+        if self.context_count >= 8 {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x420),
+                FixedString[128]::from_slice("gpu: max contexts reached")))
+        }
+
+        let id: u32 = self.next_ctx_id
+        self.next_ctx_id = self.next_ctx_id + 1
+
+        let ctx: VirtioGpuContext = VirtioGpuContext::new(id, name, is_3d)
+        let _ = self.contexts.push(ctx)
+        self.context_count = self.context_count + 1
+
+        Result::Ok(id)
+    }
+
+    // Destroy a context.
+    pub fn destroy_context(self: ref mut, ctx_id: u32) -> Result<(), VirtioError>
+        effects: [deterministic]
+    {
+        let mut found: bool = false
+        // loop: bounds[BOUND_SMALL] — bounded by context count
+        loop: bounds[BOUND_SMALL] for i in 0..self.context_count {
+            if self.contexts[i as usize].ctx_id == ctx_id {
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x421),
+                FixedString[128]::from_slice("gpu: context not found")))
+        }
+        Result::Ok(())
+    }
+
+    // Attach a resource to a context.
+    pub fn attach_resource(self: ref mut, ctx_id: u32, res_id: u32) -> Result<(), VirtioError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by context count
+        loop: bounds[BOUND_SMALL] for i in 0..self.context_count {
+            if self.contexts[i as usize].ctx_id == ctx_id {
+                self.contexts[i as usize].attach_resource(res_id)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(VirtioError::new(
+            Word64::from_u64(DIAG_VIRTIO_BASE | 0x422),
+            FixedString[128]::from_slice("gpu: context not found")))
+    }
+
+    // Create a fence for synchronization.
+    pub fn create_fence(self: ref mut, ctx_id: u32) -> u32
+        effects: [deterministic]
+    {
+        let id: u32 = self.next_fence_id
+        self.next_fence_id = self.next_fence_id + 1
+
+        let fence: VirtioGpuFence = VirtioGpuFence::new(id, ctx_id)
+        let _ = self.fences.push(fence)
+        self.fence_count = self.fence_count + 1
+
+        id
+    }
+
+    // Signal a fence.
+    pub fn signal_fence(self: ref mut, fence_id: u32)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by fence count
+        loop: bounds[BOUND_SMALL] for i in 0..self.fence_count {
+            if self.fences[i as usize].fence_id == fence_id {
+                self.fences[i as usize].signal()
+            }
+        }
+    }
+
+    // Wait for a fence.
+    pub fn wait_fence(self: ref mut, fence_id: u32)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by fence count
+        loop: bounds[BOUND_SMALL] for i in 0..self.fence_count {
+            if self.fences[i as usize].fence_id == fence_id {
+                if !self.fences[i as usize].is_signaled() {
+                    self.fences[i as usize].wait()
+                }
+            }
+        }
+    }
+
+    // Check if a capability is available.
+    pub fn has_capability(self, cap: u64) -> bool
+        effects: [deterministic]
+    {
+        (self.capabilities & cap) != 0
+    }
+
+    // Set capabilities.
+    pub fn set_capabilities(self: ref mut, caps: u64)
+        effects: [deterministic]
+    {
+        self.capabilities = caps
+    }
+
+    // Get a resource by ID.
+    pub fn get_resource(self, resource_id: u32) -> Option[VirtioGpuResource]
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by resource count
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.resource_count {
+            if self.resources[i as usize].resource_id == resource_id {
+                return Option::Some(self.resources[i as usize])
+            }
+        }
+        Option::None
+    }
+
+    // Get scanout count.
+    pub fn scanout_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.scanout_count
+    }
+
+    // Get resource count.
+    pub fn resource_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.resource_count
+    }
+
+    // Get fence count.
+    pub fn fence_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.fence_count
+    }
+
+    // Submit a 3D command (requires virgl).
+    pub fn submit_3d(self: ref mut, ctx_id: u32, cmd_data: ref Byte[], length: u32) -> Result<(), VirtioError>
+        effects: [io:write]
+    {
+        if !self.has_virgl {
+            return Result::Err(VirtioError::new(
+                Word64::from_u64(DIAG_VIRTIO_BASE | 0x430),
+                FixedString[128]::from_slice("gpu: 3D not supported (no virgl)")))
+        }
+        let _ = ctx_id
+        let _ = cmd_data
+        let _ = length
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// Capability-Gated GPU Access
+// ──────────────────────────────────────────────
+
+pub type GpuCapability : u64 = enum {
+    DisplayControl = 0x0000_0000_0000_0001,
+    ResourceCreate = 0x0000_0000_0000_0002,
+    ResourceDestroy = 0x0000_0000_0000_0004,
+    CursorControl = 0x0000_0000_0000_0008,
+    ContextCreate = 0x0000_0000_0000_0010,
+    FenceSync = 0x0000_0000_0000_0020,
+    Virgl3D = 0x0000_0000_0000_0040,
+    AllGpu = 0x0000_0000_0000_007F,
+}
+
+// ──────────────────────────────────────────────
+// Test Vectors
+// ──────────────────────────────────────────────
+
+pub fn run_virtio_gpu_tests() -> bool
+    effects: [deterministic, residual]
+{
+    // Test scanout
+    let mut scanout: VirtioGpuScanout = VirtioGpuScanout::new(0)
+    assert(scanout.scanout_id == 0, "vgpu: scanout id 0")
+    assert(!scanout.enabled, "vgpu: scanout disabled")
+
+    scanout.set_mode(1920, 1080)
+    assert(scanout.width == 1920, "vgpu: scanout width 1920")
+    assert(scanout.height == 1080, "vgpu: scanout height 1080")
+    assert(scanout.enabled, "vgpu: scanout enabled")
+
+    scanout.disable()
+    assert(!scanout.enabled, "vgpu: scanout disabled after disable")
+
+    // Test resource
+    let res: VirtioGpuResource = VirtioGpuResource::new(1, 800, 600, VirtioGpuFormat::B8G8R8A8_UNORM as u32)
+    assert(res.resource_id == 1, "vgpu: resource id 1")
+    assert(res.width == 800, "vgpu: resource width 800")
+    assert(res.stride() == 3200, "vgpu: stride = 800 * 4")
+    assert(res.pixel_count() == 480000, "vgpu: pixel count 480000")
+    assert(res.byte_size() == 1920000, "vgpu: byte size 1920000")
+
+    // Test fence
+    let mut fence: VirtioGpuFence = VirtioGpuFence::new(1, 0)
+    assert(!fence.is_signaled(), "vgpu: fence not signaled")
+    fence.signal()
+    assert(fence.is_signaled(), "vgpu: fence signaled")
+    fence.wait()
+    assert(fence.wait_count == 1, "vgpu: fence waited once")
+    fence.reset()
+    assert(!fence.is_signaled(), "vgpu: fence reset")
+    assert(fence.wait_count == 0, "vgpu: fence wait count reset")
+
+    // Test context
+    let mut ctx: VirtioGpuContext = VirtioGpuContext::new(1, FixedString::from_slice("render"), true)
+    assert(ctx.ctx_id == 1, "vgpu: context id 1")
+    assert(ctx.is_3d, "vgpu: context is 3D")
+    assert(ctx.resource_count == 0, "vgpu: no resources attached")
+
+    let attached: bool = ctx.attach_resource(5)
+    assert(attached, "vgpu: resource 5 attached")
+    assert(ctx.resource_count == 1, "vgpu: 1 resource")
+
+    let detached: bool = ctx.detach_resource(5)
+    assert(detached, "vgpu: resource 5 detached")
+    assert(ctx.resource_count == 0, "vgpu: 0 resources")
+
+    // Test GPU device
+    let mut dev: VirtioGpuDevice = VirtioGpuDevice::new(VirtioMMIOTransport::new(0xFEB00000))
+    assert(dev.scanout_count() == 1, "vgpu: 1 default scanout")
+    assert(dev.resource_count() == 0, "vgpu: 0 initial resources")
+    assert(dev.fence_count() == 0, "vgpu: 0 initial fences")
+
+    // Create resources
+    let res1: u32 = dev.create_resource_2d(1024, 768, VirtioGpuFormat::R8G8B8A8_UNORM as u32)?
+    assert(res1 == 1, "vgpu: resource 1 created")
+    assert(dev.resource_count() == 1, "vgpu: 1 resource")
+
+    let res2: u32 = dev.create_resource_2d(640, 480, VirtioGpuFormat::B8G8R8A8_UNORM as u32)?
+    assert(res2 == 2, "vgpu: resource 2 created")
+    assert(dev.resource_count() == 2, "vgpu: 2 resources")
+
+    // Get resource
+    let retrieved: Option[VirtioGpuResource] = dev.get_resource(1)
+    match retrieved {
+        Option::Some(r) => assert(r.width == 1024, "vgpu: retrieved resource width 1024"),
+        Option::None => assert(false, "vgpu: should find resource"),
+    }
+
+    // Unref resource
+    let _ = dev.unref_resource(2)
+    assert(dev.resource_count() == 1, "vgpu: 1 resource after unref")
+
+    // Set scanout
+    let _ = dev.set_scanout(0, res1)
+    assert(dev.scanouts[0].resource_id == res1, "vgpu: scanout points to resource 1")
+
+    // Cursor operations
+    dev.update_cursor(0, res1, 16, 16)
+    assert(dev.scanouts[0].has_cursor, "vgpu: cursor set")
+    assert(dev.cursor_count == 1, "vgpu: 1 cursor")
+
+    dev.move_cursor(0, 100, 200)
+    assert(dev.scanouts[0].cursor_x == 100, "vgpu: cursor x=100")
+    assert(dev.scanouts[0].cursor_y == 200, "vgpu: cursor y=200")
+
+    // Fence operations
+    let fence_id: u32 = dev.create_fence(0)
+    assert(fence_id == 1, "vgpu: fence id 1")
+    assert(dev.fence_count() == 1, "vgpu: 1 fence")
+
+    dev.wait_fence(fence_id)
+    dev.signal_fence(fence_id)
+
+    // Context operations
+    let ctx_id: u32 = dev.create_context(FixedString::from_slice("render"), true)?
+    assert(ctx_id == 1, "vgpu: context 1")
+    assert(dev.context_count == 1, "vgpu: 1 context")
+
+    let _ = dev.attach_resource(ctx_id, res1)
+    let _ = dev.destroy_context(ctx_id)
+
+    // Flush
+    dev.flush_resource(res1)
+
+    // Capabilities
+    assert(!dev.has_capability(GpuCapability::Virgl3D as u64), "vgpu: no virgl by default")
+    dev.set_capabilities(GpuCapability::AllGpu as u64)
+    assert(dev.has_capability(GpuCapability::DisplayControl as u64), "vgpu: display control cap")
+
+    // 3D submit (should fail without virgl)
+    let cmd_data: Byte[16] = [Byte::from_u8(0); 16]
+    let submit_result: Result<(), VirtioError> = dev.submit_3d(0, &cmd_data, 16)
+    let mut submit_failed: bool = false
+    match submit_result {
+        Result::Ok(_) => {},
+        Result::Err(_) => { submit_failed = true },
+    }
+    assert(submit_failed, "vgpu: 3D submit fails without virgl")
+
+    // Transfer to host
+    dev.transfer_to_host_2d(res1, 0, 0, 1024, 768)
+
+    // Resource with 3D properties
+    let res3: VirtioGpuResource = VirtioGpuResource::new(3, 256, 256, VirtioGpuFormat::A8B8G8R8_UNORM as u32)
+    assert(res3.is_3d == false, "vgpu: 2D resource by default")
+
+    residual emit {
+        op: "virtio_gpu.tests",
+        scanout: true,
+        resource: true,
+        fence: true,
+        context: true,
+        create_2d: true,
+        unref: true,
+        set_scanout: true,
+        cursor: true,
+        fence_sync: true,
+        ctx_create: true,
+        capabilities: true,
+        submit_3d_fail: submit_failed,
+    }
+
+    true
+}

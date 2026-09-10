@@ -1,0 +1,1244 @@
+// file: rt_mutex.phor
+// purpose: Real-time mutex with priority inheritance protocol (PIP),
+//          priority ceiling protocol (PCP), bounded deadlock detection
+//          via resource allocation graph, lock ordering validation,
+//          and full residual recording for forensic verifiability.
+// evidence: RTMUTEX-ARCH-001 through RTMUTEX-ARCH-230
+// residual: Every lock acquisition, release, inheritance event, and
+//           deadlock detection result is recorded for court verifiability.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Mutex Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_RT_MUTEX_BASE : Word64 = DIAG_RTOS_BASE | 0x0400
+
+const MUTEX_MAX_MUTEXES       : u32 = 32
+const MUTEX_MAX_WAITERS       : u32 = 16
+const MUTEX_MAX_OWNERS        : u32 = 8
+const MUTEX_RESOURCE_GRAPH_CAP: u32 = 64
+const MUTEX_ORDERING_DEPTH    : u32 = 32
+const MUTEX_RESIDUAL_LOG      : u32 = 64
+const MUTEX_LOCK_HISTORY_CAP  : u32 = 128
+const MUTEX_INHERITANCE_DEPTH : u32 = 8
+const MUTEX_DEADLOCK_PATH_CAP : u32 = 16
+
+// ──────────────────────────────────────────────
+// Mutex Protocol Enum
+// ──────────────────────────────────────────────
+pub type MutexProtocol : u8 = enum {
+    MutexProtocol_None              = 0x00,
+    MutexProtocol_PriorityInherit   = 0x01,
+    MutexProtocol_PriorityCeiling   = 0x02,
+    MutexProtocol_ImmediateCeiling  = 0x03,
+}
+
+// ──────────────────────────────────────────────
+// Mutex State Enum
+// ──────────────────────────────────────────────
+pub type MutexState : u8 = enum {
+    MutexState_Unlocked = 0x00,
+    MutexState_Locked   = 0x01,
+    MutexState_Contended= 0x02,
+    MutexState_Destroyed= 0x03,
+}
+
+// ──────────────────────────────────────────────
+// Mutex ID Type
+// ──────────────────────────────────────────────
+pub type MutexId : u32 = struct {
+    value: Word32,
+}
+
+impl MutexId {
+    pub fn new(val: Word32) -> MutexId
+        effects: [deterministic]
+    {
+        MutexId { value: val }
+    }
+
+    pub fn from_u32(val: u32) -> MutexId
+        effects: [deterministic]
+    {
+        MutexId { value: Word32::from_u32(val) }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value.to_u32()
+    }
+
+    pub fn eq(self, other: MutexId) -> bool
+        effects: [deterministic]
+    {
+        self.value.eq(other.value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Task ID (reused from scheduler for mutex context)
+// ──────────────────────────────────────────────
+pub type TaskId : u8 = struct {
+    value: u8,
+}
+
+impl TaskId {
+    pub fn new(val: u8) -> TaskId
+        effects: [deterministic]
+    {
+        TaskId { value: val }
+    }
+
+    pub fn value(self) -> u8
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn eq(self, other: TaskId) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// Priority Value (for PIP/PCP)
+// ──────────────────────────────────────────────
+pub type Priority : u8 = struct {
+    value: u8,
+}
+
+impl Priority {
+    pub fn new(val: u8) -> Priority
+        effects: [deterministic]
+    {
+        Priority { value: val & 0x1F }
+    }
+
+    pub fn value(self) -> u8
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn higher_than(self, other: Priority) -> bool
+        effects: [deterministic]
+    {
+        self.value < other.value
+    }
+
+    pub fn lower_than(self, other: Priority) -> bool
+        effects: [deterministic]
+    {
+        self.value > other.value
+    }
+
+    pub fn eq(self, other: Priority) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// Wait Queue Node (for blocked tasks)
+// ──────────────────────────────────────────────
+pub type WaitNode : struct {
+    task: TaskId,
+    priority: Priority,
+    wait_since: Word64,
+}
+
+impl WaitNode {
+    pub fn new(t: TaskId, p: Priority, ts: Word64) -> WaitNode
+        effects: [deterministic]
+    {
+        WaitNode {
+            task: t,
+            priority: p,
+            wait_since: ts,
+        }
+    }
+
+    pub fn task_id(self) -> TaskId
+        effects: [deterministic]
+    {
+        self.task
+    }
+
+    pub fn wait_time(self, now: Word64) -> Word64
+        effects: [deterministic]
+    {
+        now.sub(self.wait_since)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Mutex Entry
+// ──────────────────────────────────────────────
+pub type MutexEntry : struct {
+    id: MutexId,
+    protocol: MutexProtocol,
+    state: MutexState,
+    owner: TaskId,
+    ceiling_priority: Priority,
+    original_owner_priority: Priority,
+    inherited_priority: Priority,
+    inheritance_active: bool,
+    wait_queue: FixedArray[WaitNode, MUTEX_MAX_WAITERS],
+    wait_count: u32,
+    lock_count: Word64,
+    contention_count: Word64,
+    max_wait_time: Word64,
+    total_wait_time: Word64,
+    wait_samples: Word64,
+    name: FixedString[32],
+    created: Word64,
+}
+
+impl MutexEntry {
+    pub fn new(mid: MutexId, proto: MutexProtocol, ceiling: Priority) -> MutexEntry
+        effects: [deterministic]
+    {
+        MutexEntry {
+            id: mid,
+            protocol: proto,
+            state: MutexState::MutexState_Unlocked,
+            owner: TaskId::new(0),
+            ceiling_priority: ceiling,
+            original_owner_priority: Priority::new(0),
+            inherited_priority: Priority::new(0),
+            inheritance_active: false,
+            wait_queue: FixedArray::new(),
+            wait_count: 0,
+            lock_count: Word64::zero(),
+            contention_count: Word64::zero(),
+            max_wait_time: Word64::zero(),
+            total_wait_time: Word64::zero(),
+            wait_samples: Word64::zero(),
+            name: FixedString::new(),
+            created: Word64::zero(),
+        }
+    }
+
+    pub fn try_lock(self: ref mut, task: TaskId, task_priority: Priority, now: Word64) -> bool
+        effects: [deterministic]
+    {
+        if self.state == MutexState::MutexState_Locked || self.state == MutexState::MutexState_Contended {
+            return false
+        }
+        self.state = MutexState::MutexState_Locked
+        self.owner = task
+        self.original_owner_priority = task_priority
+        self.lock_count = self.lock_count.increment_or_max()
+
+        // Apply priority ceiling protocol if configured
+        if self.protocol == MutexProtocol::MutexProtocol_ImmediateCeiling {
+            self.apply_immediate_ceiling(task, task_priority)
+        }
+        true
+    }
+
+    pub fn lock(self: ref mut, task: TaskId, task_priority: Priority, now: Word64) -> Result[bool, Word64>
+        effects: [deterministic]
+    {
+        if self.state == MutexState::MutexState_Destroyed {
+            return Result::Err(Word64::from_u64(0))
+        }
+
+        let acquired: bool = self.try_lock(task, task_priority, now)
+        if acquired {
+            return Result::Ok(true)
+        }
+
+        // Mutex is contended — apply protocol
+        self.contention_count = self.contention_count.increment_or_max()
+        self.state = MutexState::MutexState_Contended
+
+        // Add to wait queue
+        if self.wait_count < MUTEX_MAX_WAITERS {
+            let node: WaitNode = WaitNode::new(task, task_priority, now)
+            // Insert sorted by priority (highest first)
+            let mut insert_idx: u32 = self.wait_count
+            for i in 0..self.wait_count {
+                let existing: WaitNode = match self.wait_queue.get(i) {
+                    Result::Ok(n) => n,
+                    Result::Err(_) => continue,
+                }
+                if task_priority.higher_than(existing.priority) {
+                    insert_idx = i
+                    for j in (i..self.wait_count).rev() {
+                        let n: WaitNode = match self.wait_queue.get(j) {
+                            Result::Ok(v) => v,
+                            Result::Err(_) => continue,
+                        }
+                        let r: Result<(), BoundsError> = self.wait_queue.set(j + 1, n)
+                    }
+                }
+            }
+            let r: Result<(), BoundsError> = self.wait_queue.set(insert_idx, node)
+            if r.is_ok() {
+                self.wait_count = self.wait_count + 1
+            }
+        }
+
+        // Priority inheritance protocol
+        if self.protocol == MutexProtocol::MutexProtocol_PriorityInherit {
+            if task_priority.higher_than(self.inherited_priority) || !self.inheritance_active {
+                self.inherit_priority(task_priority)
+            }
+        }
+
+        Result::Ok(false)
+    }
+
+    pub fn unlock(self: ref mut, task: TaskId) -> Result<(), u8>
+        effects: [deterministic]
+    {
+        if self.state == MutexState::MutexState_Unlocked {
+            return Result::Err(1) // Not locked
+        }
+        if !self.owner.eq(task) {
+            return Result::Err(2) // Not owner
+        }
+
+        // Restore original priority (PIP)
+        if self.inheritance_active {
+            self.restore_priority()
+        }
+
+        // Dequeue highest priority waiter
+        if self.wait_count > 0 {
+            let next_owner: WaitNode = match self.wait_queue.get(0) {
+                Result::Ok(n) => n,
+                Result::Err(_) => {
+                    self.state = MutexState::MutexState_Unlocked
+                    return Result::Ok(())
+                }
+            }
+            self.owner = next_owner.task
+            self.original_owner_priority = next_owner.priority
+            let wait_time: Word64 = next_owner.wait_time(Word64::from_u64(0))
+            if wait_time.gt(self.max_wait_time) {
+                self.max_wait_time = wait_time
+            }
+            self.total_wait_time = self.total_wait_time.add(wait_time)
+            self.wait_samples = self.wait_samples.increment_or_max()
+
+            // Compact wait queue
+            for i in 0..(self.wait_count - 1) {
+                let n: WaitNode = match self.wait_queue.get(i + 1) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => continue,
+                }
+                let r: Result<(), BoundsError> = self.wait_queue.set(i, n)
+            }
+            self.wait_count = self.wait_count - 1
+            self.state = MutexState::MutexState_Locked
+        } else {
+            self.state = MutexState::MutexState_Unlocked
+        }
+
+        Result::Ok(())
+    }
+
+    pub fn inherit_priority(self: ref mut, higher_prio: Priority)
+        effects: [deterministic]
+    {
+        if !self.inheritance_active {
+            self.inherited_priority = self.original_owner_priority
+            self.inheritance_active = true
+        }
+        if higher_prio.higher_than(self.inherited_priority) {
+            self.inherited_priority = higher_prio
+        }
+    }
+
+    pub fn restore_priority(self: ref mut)
+        effects: [deterministic]
+    {
+        self.inherited_priority = self.original_owner_priority
+        self.inheritance_active = false
+    }
+
+    pub fn apply_immediate_ceiling(self: ref mut, task: TaskId, task_priority: Priority)
+        effects: [deterministic]
+    {
+        // Immediate ceiling: priority is raised to ceiling immediately on lock
+        if self.ceiling_priority.higher_than(task_priority) {
+            self.original_owner_priority = task_priority
+            self.inherited_priority = self.ceiling_priority
+            self.inheritance_active = true
+        }
+    }
+
+    pub fn effective_owner_priority(self) -> Priority
+        effects: [deterministic]
+    {
+        if self.inheritance_active {
+            self.inherited_priority
+        } else {
+            self.original_owner_priority
+        }
+    }
+
+    pub fn avg_wait_time(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.wait_samples.is_zero() {
+            return Word64::zero()
+        }
+        self.total_wait_time.div(self.wait_samples)
+    }
+
+    pub fn is_locked(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == MutexState::MutexState_Locked || self.state == MutexState::MutexState_Contended
+    }
+
+    pub fn has_waiters(self) -> bool
+        effects: [deterministic]
+    {
+        self.wait_count > 0
+    }
+
+    pub fn waiter_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.wait_count
+    }
+}
+
+// ──────────────────────────────────────────────
+// Resource Allocation Graph Node (for deadlock detection)
+// ──────────────────────────────────────────────
+pub type GraphNode : u8 = enum {
+    GraphNode_Task       = 0x00,
+    GraphNode_Mutex      = 0x01,
+}
+
+pub type AllocationEdge : struct {
+    from_type: GraphNode,
+    from_id: u32,
+    to_type: GraphNode,
+    to_id: u32,
+    edge_type: u8,
+}
+
+impl AllocationEdge {
+    pub fn new(f_type: GraphNode, f_id: u32, t_type: GraphNode, t_id: u32, e_type: u8) -> AllocationEdge
+        effects: [deterministic]
+    {
+        AllocationEdge {
+            from_type: f_type,
+            from_id: f_id,
+            to_type: t_type,
+            to_id: t_id,
+            edge_type: e_type,
+        }
+    }
+
+    pub fn matches(self, f_type: GraphNode, f_id: u32, t_type: GraphNode, t_id: u32) -> bool
+        effects: [deterministic]
+    {
+        self.from_type as u8 == f_type as u8 &&
+        self.from_id == f_id &&
+        self.to_type as u8 == t_type as u8 &&
+        self.to_id == t_id
+    }
+}
+
+// ──────────────────────────────────────────────
+// Resource Allocation Graph (bounded, for deadlock detection)
+// ──────────────────────────────────────────────
+pub type ResourceGraph : struct {
+    edges: FixedArray[AllocationEdge, MUTEX_RESOURCE_GRAPH_CAP],
+    edge_count: u32,
+}
+
+impl ResourceGraph {
+    pub fn new() -> ResourceGraph
+        effects: [deterministic]
+    {
+        ResourceGraph {
+            edges: FixedArray::new(),
+            edge_count: 0,
+        }
+    }
+
+    pub fn add_edge(self: ref mut, edge: AllocationEdge) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.edge_count >= MUTEX_RESOURCE_GRAPH_CAP {
+            return Result::Err(bounds_capacity_exceeded(MUTEX_RESOURCE_GRAPH_CAP))
+        }
+        let r: Result<(), BoundsError> = self.edges.set(self.edge_count, edge)
+        if r.is_ok() {
+            self.edge_count = self.edge_count + 1
+        }
+        r
+    }
+
+    pub fn remove_edge(self: ref mut, edge: AllocationEdge) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.edge_count {
+            let e: AllocationEdge = match self.edges.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if e.matches(edge.from_type, edge.from_id, edge.to_type, edge.to_id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(bounds_index_out_of_range(0, self.edge_count))
+        }
+        for i in found_idx..(self.edge_count - 1) {
+            let e: AllocationEdge = match self.edges.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let r: Result<(), BoundsError> = self.edges.set(i, e)
+        }
+        self.edge_count = self.edge_count - 1
+        Result::Ok(())
+    }
+
+    pub fn detect_cycle(self) -> bool
+        effects: [deterministic]
+    {
+        // DFS-based cycle detection in resource allocation graph
+        // Visit each task node and follow edges
+        let mut visited: FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP] = FixedArray::new()
+        let mut in_stack: FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP] = FixedArray::new()
+
+        for i in 0..self.edge_count {
+            let edge: AllocationEdge = match self.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if edge.from_type == GraphNode::GraphNode_Task && visited.is_empty() {
+                if self.dfs_cycle(edge.from_id, visited, in_stack, 0) {
+                    return true
+                }
+            }
+        }
+        false
+    }
+
+    fn dfs_cycle(self, node_id: u32, visited: ref mut FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP], in_stack: ref mut FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP], depth: u32) -> bool
+        effects: [deterministic]
+    {
+        let mut local_visited: FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP] = visited
+        let mut local_stack: FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP] = in_stack
+
+        // Check if node is already in current DFS stack
+        for i in 0..depth {
+            let s: u8 = match local_stack.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => 0,
+            }
+            if (s as u32) == node_id {
+                return true // Cycle detected
+            }
+        }
+
+        if depth >= MUTEX_DEADLOCK_PATH_CAP {
+            return false
+        }
+
+        let _ = local_stack.set(depth, node_id as u8)
+        let _ = local_visited.set(depth, node_id as u8)
+
+        // Find all outgoing edges from this node
+        for i in 0..self.edge_count {
+            let edge: AllocationEdge = match self.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if edge.from_id == node_id {
+                // Follow to the target node
+                if edge.to_type == GraphNode::GraphNode_Mutex {
+                    // Find which task holds this mutex (edges from mutex to task)
+                    for j in 0..self.edge_count {
+                        let edge2: AllocationEdge = match self.edges.get(j) {
+                            Result::Ok(e) => e,
+                            Result::Err(_) => continue,
+                        }
+                        if edge2.from_type == GraphNode::GraphNode_Mutex &&
+                           edge2.from_id == edge.to_id &&
+                           edge2.to_type == GraphNode::GraphNode_Task {
+                            if self.dfs_cycle(edge2.to_id, local_visited, local_stack, depth + 1) {
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn find_deadlocked_tasks(self) -> FixedArray[u32, MUTEX_DEADLOCK_PATH_CAP]
+        effects: [deterministic]
+    {
+        let mut deadlocked: FixedArray[u32, MUTEX_DEADLOCK_PATH_CAP] = FixedArray::new()
+        let mut count: u32 = 0
+
+        if !self.detect_cycle() {
+            return deadlocked
+        }
+
+        // Find all tasks in cycles
+        for i in 0..self.edge_count {
+            let start_edge: AllocationEdge = match self.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if start_edge.from_type == GraphNode::GraphNode_Task {
+                let mut visited_local: FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP] = FixedArray::new()
+                let mut stack_local: FixedArray[u8, MUTEX_DEADLOCK_PATH_CAP] = FixedArray::new()
+                if self.dfs_cycle(start_edge.from_id, visited_local, stack_local, 0) {
+                    if count < MUTEX_DEADLOCK_PATH_CAP {
+                        let _ = deadlocked.set(count, start_edge.from_id)
+                        count = count + 1
+                    }
+                }
+            }
+        }
+        deadlocked
+    }
+}
+
+// ──────────────────────────────────────────────
+// Mutex Error Types
+// ──────────────────────────────────────────────
+pub type MutexError : struct {
+    code: Word64,
+    msg: FixedString[128],
+}
+
+impl MutexError {
+    pub fn new(c: Word64, m: FixedString[128]) -> MutexError
+        effects: [deterministic]
+    {
+        MutexError { code: c, msg: m }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn msg(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+}
+
+pub fn mutex_not_found(id: u32) -> MutexError
+    effects: [deterministic]
+{
+    MutexError::new(Word64::from_u64(DIAG_RT_MUTEX_BASE | 0x001),
+        FixedString[128]::from_slice("Mutex not found in table"))
+}
+
+pub fn mutex_deadlock_detected() -> MutexError
+    effects: [deterministic]
+{
+    MutexError::new(Word64::from_u64(DIAG_RT_MUTEX_BASE | 0x002),
+        FixedString[128]::from_slice("Deadlock detected in resource allocation graph"))
+}
+
+pub fn mutex_not_owner(tid: u8) -> MutexError
+    effects: [deterministic]
+{
+    MutexError::new(Word64::from_u64(DIAG_RT_MUTEX_BASE | 0x003),
+        FixedString[128]::from_slice("Task does not own the mutex"))
+}
+
+pub fn mutex_already_locked() -> MutexError
+    effects: [deterministic]
+{
+    MutexError::new(Word64::from_u64(DIAG_RT_MUTEX_BASE | 0x004),
+        FixedString[128]::from_slice("Mutex is already locked"))
+}
+
+pub fn mutex_ordering_violation() -> MutexError
+    effects: [deterministic]
+{
+    MutexError::new(Word64::from_u64(DIAG_RT_MUTEX_BASE | 0x005),
+        FixedString[128]::from_slice("Lock ordering violation detected"))
+}
+
+pub fn mutex_destroyed() -> MutexError
+    effects: [deterministic]
+{
+    MutexError::new(Word64::from_u64(DIAG_RT_MUTEX_BASE | 0x006),
+        FixedString[128]::from_slice("Mutex has been destroyed"))
+}
+
+// ──────────────────────────────────────────────
+// Lock Ordering Validator
+// ──────────────────────────────────────────────
+pub type LockOrderRule : struct {
+    first_id: u32,
+    second_id: u32,
+}
+
+impl LockOrderRule {
+    pub fn new(f: u32, s: u32) -> LockOrderRule
+        effects: [deterministic]
+    {
+        LockOrderRule { first_id: f, second_id: s }
+    }
+
+    pub fn allows(self, before: u32, after: u32) -> bool
+        effects: [deterministic]
+    {
+        // Lock order rule: first_id must be locked before second_id
+        // So if we're locking after before, it must match first_id, and after must match second_id
+        (before == self.first_id && after == self.second_id) ||
+        (before != self.second_id) // Not violating this rule
+    }
+}
+
+pub type LockOrderValidator : struct {
+    rules: FixedArray[LockOrderRule, MUTEX_ORDERING_DEPTH],
+    rule_count: u32,
+}
+
+impl LockOrderValidator {
+    pub fn new() -> LockOrderValidator
+        effects: [deterministic]
+    {
+        LockOrderValidator {
+            rules: FixedArray::new(),
+            rule_count: 0,
+        }
+    }
+
+    pub fn add_rule(self: ref mut, first: u32, second: u32) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.rule_count >= MUTEX_ORDERING_DEPTH {
+            return Result::Err(bounds_capacity_exceeded(MUTEX_ORDERING_DEPTH))
+        }
+        let rule: LockOrderRule = LockOrderRule::new(first, second)
+        let r: Result<(), BoundsError> = self.rules.set(self.rule_count, rule)
+        if r.is_ok() {
+            self.rule_count = self.rule_count + 1
+        }
+        r
+    }
+
+    pub fn validate(self, locked_sequence: FixedArray[u32, MUTEX_ORDERING_DEPTH], seq_len: u32) -> bool
+        effects: [deterministic]
+    {
+        if seq_len < 2 {
+            return true
+        }
+        for i in 0..(seq_len - 1) {
+            let before: u32 = match locked_sequence.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let after: u32 = match locked_sequence.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            for j in 0..self.rule_count {
+                let rule: LockOrderRule = match self.rules.get(j) {
+                    Result::Ok(r) => r,
+                    Result::Err(_) => continue,
+                }
+                // If we locked second before first, that's a violation
+                if before == rule.second_id && after == rule.first_id {
+                    return false
+                }
+            }
+        }
+        true
+    }
+
+    pub fn clear(self: ref mut)
+        effects: [deterministic]
+    {
+        self.rule_count = 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Mutex Manager
+// ──────────────────────────────────────────────
+pub type MutexManager : struct {
+    mutexes: FixedArray[MutexEntry, MUTEX_MAX_MUTEXES],
+    mutex_count: u32,
+    next_id: u32,
+    resource_graph: ResourceGraph,
+    lock_order_validator: LockOrderValidator,
+    global_lock_sequence: FixedArray[u32, MUTEX_ORDERING_DEPTH],
+    sequence_length: u32,
+    residuals: FixedArray[MutexError, MUTEX_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl MutexManager {
+    pub fn new() -> MutexManager
+        effects: [deterministic]
+    {
+        MutexManager {
+            mutexes: FixedArray::new(),
+            mutex_count: 0,
+            next_id: 1,
+            resource_graph: ResourceGraph::new(),
+            lock_order_validator: LockOrderValidator::new(),
+            global_lock_sequence: FixedArray::new(),
+            sequence_length: 0,
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+    }
+
+    pub fn create_mutex(self: ref mut, protocol: MutexProtocol, ceiling: u8) -> Result[MutexId, MutexError>
+        effects: [deterministic, residual]
+    {
+        if self.mutex_count >= MUTEX_MAX_MUTEXES {
+            return Result::Err(mutex_not_found(0))
+        }
+        let id: MutexId = MutexId::from_u32(self.next_id)
+        self.next_id = self.next_id + 1
+        let ceiling_prio: Priority = Priority::new(ceiling)
+        let entry: MutexEntry = MutexEntry::new(id, protocol, ceiling_prio)
+        let r: Result<(), BoundsError> = self.mutexes.set(self.mutex_count, entry)
+        if r.is_err() {
+            return Result::Err(mutex_not_found(0))
+        }
+        self.mutex_count = self.mutex_count + 1
+
+        residual emit {
+            mutex_op: "mutex.created",
+            mutex_id: id.value() as u64,
+            protocol: protocol as u64,
+            ceiling: ceiling as u64,
+        }
+        Result::Ok(id)
+    }
+
+    pub fn destroy_mutex(self: ref mut, mid: MutexId) -> Result<(), MutexError>
+        effects: [deterministic, residual]
+    {
+        let mutex: ref mut MutexEntry = match self.find_mutex_mut(mid) {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(e),
+        }
+        if mutex.is_locked() {
+            return Result::Err(mutex_not_found(mid.value()))
+        }
+        mutex.state = MutexState::MutexState_Destroyed
+
+        residual emit {
+            mutex_op: "mutex.destroyed",
+            mutex_id: mid.value() as u64,
+            lock_count: mutex.lock_count.to_u64(),
+            contention_count: mutex.contention_count.to_u64(),
+        }
+        Result::Ok(())
+    }
+
+    pub fn lock_mutex(self: ref mut, mid: MutexId, task: TaskId, priority: Priority, now: Word64) -> Result<bool, MutexError>
+        effects: [deterministic, residual]
+    {
+        let mutex: ref mut MutexEntry = match self.find_mutex_mut(mid) {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(e),
+        }
+
+        // Lock ordering validation
+        let mutex_val: u32 = mid.value()
+        self.global_lock_sequence.set(self.sequence_length, mutex_val)
+        self.sequence_length = self.sequence_length + 1
+        if !self.lock_order_validator.validate(self.global_lock_sequence, self.sequence_length) {
+            self.sequence_length = self.sequence_length - 1
+            residual emit {
+                mutex_op: "ordering.violation",
+                task_id: task.value() as u64,
+                mutex_id: mid.value() as u64,
+            }
+            return Result::Err(mutex_ordering_violation())
+        }
+
+        let result: Result[bool, Word64> = mutex.lock(task, priority, now)
+        match result {
+            Result::Ok(locked) => {
+                if locked {
+                    // Add edge to resource graph: task -> mutex
+                    let edge: AllocationEdge = AllocationEdge::new(
+                        GraphNode::GraphNode_Task, task.value() as u32,
+                        GraphNode::GraphNode_Mutex, mid.value(), 0)
+                    let _ = self.resource_graph.add_edge(edge)
+
+                    // Deadlock detection
+                    if self.resource_graph.detect_cycle() {
+                        let deadlocked: FixedArray[u32, MUTEX_DEADLOCK_PATH_CAP> = self.resource_graph.find_deadlocked_tasks()
+                        residual emit {
+                            mutex_op: "deadlock.detected",
+                            task_id: task.value() as u64,
+                            mutex_id: mid.value() as u64,
+                            waiters: mutex.wait_count as u64,
+                        }
+                        // Undo the lock
+                        let _ = mutex.unlock(task)
+                        self.sequence_length = self.sequence_length - 1
+                        let r_edge: AllocationEdge = AllocationEdge::new(
+                            GraphNode::GraphNode_Task, task.value() as u32,
+                            GraphNode::GraphNode_Mutex, mid.value(), 0)
+                        let _ = self.resource_graph.remove_edge(r_edge)
+                        return Result::Err(mutex_deadlock_detected())
+                    }
+
+                    // Priority inheritance (PIP)
+                    if mutex.protocol == MutexProtocol::MutexProtocol_PriorityInherit && mutex.has_waiters() {
+                        let highest_waiter: WaitNode = match mutex.wait_queue.get(0) {
+                            Result::Ok(n) => n,
+                            Result::Err(_) => WaitNode::new(TaskId::new(0), Priority::new(0), Word64::zero()),
+                        }
+                        if highest_waiter.priority.higher_than(priority) {
+                            mutex.inherit_priority(highest_waiter.priority)
+                            residual emit {
+                                mutex_op: "priority.inheritance",
+                                owner: task.value() as u64,
+                                inherited_from: highest_waiter.task.value() as u64,
+                                new_priority: mutex.effective_owner_priority().value() as u64,
+                            }
+                        }
+                    }
+
+                    residual emit {
+                        mutex_op: "mutex.locked",
+                        mutex_id: mid.value() as u64,
+                        task_id: task.value() as u64,
+                        lock_count: mutex.lock_count.to_u64(),
+                    }
+                } else {
+                    // Contention: resource graph edge for waiting
+                    let wait_edge: AllocationEdge = AllocationEdge::new(
+                        GraphNode::GraphNode_Task, task.value() as u32,
+                        GraphNode::GraphNode_Mutex, mid.value(), 1)
+                    let _ = self.resource_graph.add_edge(wait_edge)
+
+                    // Deadlock detection on contention
+                    if self.resource_graph.detect_cycle() {
+                        let _ = self.resource_graph.remove_edge(wait_edge)
+                        self.sequence_length = self.sequence_length - 1
+                        residual emit {
+                            mutex_op: "deadlock.detected.contention",
+                            task_id: task.value() as u64,
+                            mutex_id: mid.value() as u64,
+                        }
+                        return Result::Err(mutex_deadlock_detected())
+                    }
+
+                    residual emit {
+                        mutex_op: "mutex.contention",
+                        mutex_id: mid.value() as u64,
+                        task_id: task.value() as u64,
+                        waiters: mutex.wait_count as u64,
+                    }
+                }
+                Result::Ok(locked)
+            }
+            Result::Err(_) => {
+                self.sequence_length = self.sequence_length - 1
+                Result::Err(mutex_already_locked())
+            }
+        }
+    }
+
+    pub fn unlock_mutex(self: ref mut, mid: MutexId, task: TaskId) -> Result<(), MutexError>
+        effects: [deterministic, residual]
+    {
+        let mutex: ref mut MutexEntry = match self.find_mutex_mut(mid) {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let result: Result<(), u8> = mutex.unlock(task)
+        match result {
+            Result::Ok(_) => {
+                // Remove edge from resource graph
+                let edge: AllocationEdge = AllocationEdge::new(
+                    GraphNode::GraphNode_Task, task.value() as u32,
+                    GraphNode::GraphNode_Mutex, mid.value(), 0)
+                let _ = self.resource_graph.remove_edge(edge)
+
+                // Remove wait edges
+                let wait_edge: AllocationEdge = AllocationEdge::new(
+                    GraphNode::GraphNode_Task, task.value() as u32,
+                    GraphNode::GraphNode_Mutex, mid.value(), 1)
+                let _ = self.resource_graph.remove_edge(wait_edge)
+
+                // Clear from lock sequence
+                if self.sequence_length > 0 {
+                    self.sequence_length = self.sequence_length - 1
+                }
+
+                residual emit {
+                    mutex_op: "mutex.unlocked",
+                    mutex_id: mid.value() as u64,
+                    task_id: task.value() as u64,
+                    contention_count: mutex.contention_count.to_u64(),
+                    avg_wait_ns: mutex.avg_wait_time().to_u64(),
+                }
+                Result::Ok(())
+            }
+            Result::Err(e) => {
+                if e == 1 {
+                    Result::Err(mutex_not_found(mid.value()))
+                } else {
+                    Result::Err(mutex_not_owner(task.value()))
+                }
+            }
+        }
+    }
+
+    pub fn try_lock_mutex(self: ref mut, mid: MutexId, task: TaskId, priority: Priority, now: Word64) -> Result<bool, MutexError>
+        effects: [deterministic, residual]
+    {
+        let mutex: ref mut MutexEntry = match self.find_mutex_mut(mid) {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let acquired: bool = mutex.try_lock(task, priority, now)
+        if acquired {
+            residual emit {
+                mutex_op: "mutex.try_lock.acquired",
+                mutex_id: mid.value() as u64,
+                task_id: task.value() as u64,
+            }
+        }
+        Result::Ok(acquired)
+    }
+
+    pub fn add_lock_order_rule(self: ref mut, first: u32, second: u32) -> Result<(), MutexError>
+        effects: [deterministic]
+    {
+        let r: Result<(), BoundsError> = self.lock_order_validator.add_rule(first, second)
+        match r {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err(_) => Result::Err(mutex_ordering_violation()),
+        }
+    }
+
+    pub fn mutex_info(self, mid: MutexId) -> Result<MutexEntry, MutexError>
+        effects: [deterministic]
+    {
+        for i in 0..self.mutex_count {
+            let m: MutexEntry = match self.mutexes.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if m.id.eq(mid) {
+                return Result::Ok(m)
+            }
+        }
+        Result::Err(mutex_not_found(mid.value()))
+    }
+
+    pub fn has_deadlock(self) -> bool
+        effects: [deterministic]
+    {
+        self.resource_graph.detect_cycle()
+    }
+
+    pub fn mutex_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.mutex_count
+    }
+
+    pub fn get_deadlock_report(self) -> FixedString[256]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[256] = FixedString::new()
+        if self.resource_graph.detect_cycle() {
+            report.append(FixedString[32]::from_slice("DEADLOCK DETECTED\n"))
+            report.append(FixedString[32]::from_slice("Deadlocked task IDs: "))
+            let tasks: FixedArray[u32, MUTEX_DEADLOCK_PATH_CAP] = self.resource_graph.find_deadlocked_tasks()
+            for i in 0..MUTEX_DEADLOCK_PATH_CAP {
+                let tid: u32 = match tasks.get(i) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => continue,
+                }
+                if tid > 0 {
+                    report.append_u64(tid as u64)
+                    report.append(FixedString[2]::from_slice(", "))
+                }
+            }
+        } else {
+            report.append(FixedString[32]::from_slice("No deadlock detected"))
+        }
+        report
+    }
+
+    pub fn flush_residuals(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            mutex_op: "residuals.flushed",
+            mutex_count: self.mutex_count as u64,
+            has_deadlock: if self.resource_graph.detect_cycle() { 1 } else { 0 },
+        }
+    }
+
+    fn find_mutex_mut(self: ref mut, mid: MutexId) -> Result<ref mut MutexEntry, MutexError>
+        effects: [deterministic]
+    {
+        for i in 0..self.mutex_count {
+            let m: ref mut MutexEntry = match self.mutexes.ref_at_mut(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if m.id.eq(mid) {
+                return Result::Ok(m)
+            }
+        }
+        Result::Err(mutex_not_found(mid.value()))
+    }
+}
+
+// ──────────────────────────────────────────────
+// High-Level Mutex API
+// ──────────────────────────────────────────────
+pub fn create_pip_mutex(manager: ref mut MutexManager) -> Result[MutexId, MutexError>
+    effects: [deterministic, residual]
+{
+    // Priority Inheritance Protocol mutex
+    manager.create_mutex(MutexProtocol::MutexProtocol_PriorityInherit, 0)
+}
+
+pub fn create_pcp_mutex(manager: ref mut MutexManager, ceiling: u8) -> Result[MutexId, MutexError>
+    effects: [deterministic, residual]
+{
+    // Priority Ceiling Protocol mutex with explicit ceiling
+    manager.create_mutex(MutexProtocol::MutexProtocol_PriorityCeiling, ceiling)
+}
+
+pub fn create_icp_mutex(manager: ref mut MutexManager, ceiling: u8) -> Result[MutexId, MutexError>
+    effects: [deterministic, residual]
+{
+    // Immediate Ceiling Protocol mutex
+    manager.create_mutex(MutexProtocol::MutexProtocol_ImmediateCeiling, ceiling)
+}
+
+pub fn create_std_mutex(manager: ref mut MutexManager) -> Result[MutexId, MutexError>
+    effects: [deterministic, residual]
+{
+    // Standard mutex with no priority protocol
+    manager.create_mutex(MutexProtocol::MutexProtocol_None, 0)
+}
+
+pub fn verify_no_deadlock(manager: ref mut MutexManager) -> bool
+    effects: [deterministic, residual]
+{
+    let has_deadlock: bool = manager.has_deadlock()
+    if has_deadlock {
+        residual emit {
+            mutex_op: "deadlock.verification.failed",
+            edge_count: manager.resource_graph.edge_count as u64,
+        }
+    } else {
+        residual emit {
+            mutex_op: "deadlock.verification.passed",
+        }
+    }
+    !has_deadlock
+}
+
+// ──────────────────────────────────────────────
+// Mutex Verification
+// ──────────────────────────────────────────────
+pub fn verify_mutex_consistency(manager: ref MutexManager) -> bool
+    effects: [deterministic]
+{
+    for i in 0..manager.mutex_count {
+        let m: MutexEntry = match manager.mutexes.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => return false,
+        }
+        if m.state == MutexState::MutexState_Destroyed {
+            continue
+        }
+        if m.is_locked() && m.owner.value() == 0 {
+            return false
+        }
+        if m.wait_count > MUTEX_MAX_WAITERS {
+            return false
+        }
+    }
+    true
+}
+
+pub fn get_mutex_statistics(manager: ref MutexManager) -> FixedString[512]
+    effects: [deterministic]
+{
+    let mut report: FixedString[512] = FixedString::new()
+    report.append(FixedString[32]::from_slice("Mutex Report:\n"))
+    report.append(FixedString[32]::from_slice("  Total mutexes: "))
+    report.append_u64(manager.mutex_count as u64)
+    report.append(FixedString[32]::from_slice("\n  Resource graph edges: "))
+    report.append_u64(manager.resource_graph.edge_count as u64)
+
+    let mut total_locks: Word64 = Word64::zero()
+    let mut total_contentions: Word64 = Word64::zero()
+    for i in 0..manager.mutex_count {
+        let m: MutexEntry = match manager.mutexes.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        total_locks = total_locks.add(m.lock_count)
+        total_contentions = total_contentions.add(m.contention_count)
+    }
+    report.append(FixedString[32]::from_slice("\n  Total locks: "))
+    report.append_u64(total_locks.to_u64())
+    report.append(FixedString[32]::from_slice("\n  Total contentions: "))
+    report.append_u64(total_contentions.to_u64())
+    report.append(FixedString[32]::from_slice("\n  Deadlocks: "))
+    report.append(if manager.has_deadlock() {
+        FixedString[7]::from_slice("DETECTED")
+    } else {
+        FixedString[2]::from_slice("No")
+    })
+    report
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_mutex_manager() -> MutexManager
+    effects: [deterministic, residual]
+{
+    let manager: MutexManager = MutexManager::new()
+    residual emit {
+        mutex_op: "mutex.subsystem.init",
+        max_mutexes: MUTEX_MAX_MUTEXES as u64,
+        max_waiters: MUTEX_MAX_WAITERS as u64,
+        graph_capacity: MUTEX_RESOURCE_GRAPH_CAP as u64,
+    }
+    manager
+}

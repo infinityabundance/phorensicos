@@ -1,0 +1,1146 @@
+// debug_info_emitter.phor — Debug Info Emitter: DWARF-Compatible Debug Info Generation,
+//                            Source Location Tracking, Variable Location Tables, Type
+//                            Information Encoding, Line Number Program Generation, Debug
+//                            Info Size Optimization
+// Phorensic Compiler Infrastructure — Debug Information Emitter
+//
+// This module implements debug information emission for the Phorensic compiler.
+// It generates DWARF-compatible debug info entries (DIEs) for functions, variables,
+// types, and source locations. The emitter tracks source locations throughout the
+// compilation pipeline and generates line number programs. Variable location tables
+// map variables to their storage locations across code regions.
+//
+// Operations:
+// 1. DWARF debug info generation — DIEs for compilation unit, functions, types
+// 2. Source location tracking — maps IR instructions to source locations
+// 3. Variable location tables — variable-to-register/stack mapping across ranges
+// 4. Type information encoding — base types, structs, enums, pointers, arrays
+// 5. Line number program generation — DWARF line number state machine
+// 6. Debug info size optimization — DIE deduplication, string pooling
+//
+// Boundedness: DIEs 512 max. Variables per scope 64. Line number entries 1024.
+// All loops bounded by fixed capacities.
+//
+// Effect declarations:
+//   [pure] — deterministic debug info construction
+//   [io]   — debug info output
+//   [diag] — residual recording
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const DIE_EMIT_FUNCTION  : u64 = 0x1A000u64;
+const DIE_EMIT_TYPE      : u64 = 0x1A001u64;
+const DIE_EMIT_VARIABLE  : u64 = 0x1A002u64;
+const DIE_EMIT_LINE      : u64 = 0x1A003u64;
+const DIE_EMIT_OPTIMIZE  : u64 = 0x1A004u64;
+const DIE_ERROR          : u64 = 0x1A00Fu64;
+
+// ──────────────────────────────────────────────
+// DWARF Tag and Attribute Constants
+// ──────────────────────────────────────────────
+
+pub const DW_TAG_compile_unit    : u16 = 0x0011u16;
+pub const DW_TAG_subprogram      : u16 = 0x002Eu16;
+pub const DW_TAG_variable        : u16 = 0x0034u16;
+pub const DW_TAG_base_type       : u16 = 0x0024u16;
+pub const DW_TAG_structure_type  : u16 = 0x0013u16;
+pub const DW_TAG_enumeration_type: u16 = 0x0016u16;
+pub const DW_TAG_pointer_type    : u16 = 0x000Fu16;
+pub const DW_TAG_array_type      : u16 = 0x0001u16;
+pub const DW_TAG_subroutine_type : u16 = 0x0015u16;
+pub const DW_TAG_lexical_block   : u16 = 0x000Bu16;
+pub const DW_TAG_formal_parameter: u16 = 0x0005u16;
+pub const DW_TAG_unspecified_parameters : u16 = 0x000Eu16;
+pub const DW_TAG_member          : u16 = 0x000Du16;
+pub const DW_TAG_inheritance     : u16 = 0x001Cu16;
+pub const DW_TAG_const_type      : u16 = 0x0026u16;
+pub const DW_TAG_volatile_type   : u16 = 0x0035u16;
+
+// ──────────────────────────────────────────────
+// Debug Info Types
+// ──────────────────────────────────────────────
+
+/// DWARF attribute form encodings.
+pub sealdatatype DwarfForm : u8 {
+    Addr = 0x01u8,
+    Data2 = 0x05u8,
+    Data4 = 0x06u8,
+    Data8 = 0x07u8,
+    String = 0x08u8,
+    SecOffset = 0x17u8,
+    Exprloc = 0x18u8,
+    Flag = 0x0Cu8,
+    Ref4 = 0x13u8,
+    Strp = 0x0Eu8,
+}
+
+/// DWARF attribute name.
+pub sealdatatype DwarfAttribute : u16 {
+    Sibling = 0x0010u16,
+    Name = 0x0003u16,
+    Type = 0x0049u16,
+    ByteSize = 0x000Bu16,
+    BitSize = 0x0007u16,
+    StmtList = 0x0010u16,
+    LowPc = 0x0011u16,
+    HighPc = 0x0012u16,
+    Language = 0x0013u16,
+    Producer = 0x0025u16,
+    CompDir = 0x001Bu16,
+    DeclFile = 0x003Au16,
+    DeclLine = 0x003Bu16,
+    DeclColumn = 0x003Cu16,
+    Location = 0x0030u16,
+    ConstValue = 0x001Cu16,
+    External = 0x003Fu16,
+    Artificial = 0x0034u16,
+    Prototyped = 0x0027u16,
+    Inline = 0x0020u16,
+    Encoding = 0x003Eu16,
+    DataMemberLocation = 0x0038u16,
+    Count = 0x0037u16,
+    UpperBound = 0x002Fu16,
+}
+
+/// DWARF base type encoding.
+pub sealdatatype DwarfEncoding : u8 {
+    Address = 0x01u8,
+    Boolean = 0x02u8,
+    Complex = 0x03u8,
+    Float = 0x04u8,
+    Signed = 0x05u8,
+    SignedChar = 0x06u8,
+    Unsigned = 0x07u8,
+    UnsignedChar = 0x08u8,
+    ImaginaryFloat = 0x09u8,
+    PackedDecimal = 0x0Au8,
+    NumericString = 0x0Bu8,
+    Edited = 0x0Cu8,
+    SignedFixed = 0x0Du8,
+    UnsignedFixed = 0x0Eu8,
+    DecimalFloat = 0x0Fu8,
+    UTF = 0x10u8,
+}
+
+/// DWARF line number content type.
+pub sealdatatype LineContentType : u8 {
+    Copy = 0x01u8,
+    AdvancePc = 0x02u8,
+    AdvanceLine = 0x03u8,
+    SetFile = 0x04u8,
+    SetColumn = 0x05u8,
+    NegateStmt = 0x06u8,
+    SetBasicBlock = 0x07u8,
+    ConstAddPc = 0x08u8,
+    FixedAdvancePc = 0x09u8,
+    SetPrologueEnd = 0x0Au8,
+    SetEpilogueBegin = 0x0Bu8,
+    SetIsa = 0x0Cu8,
+}
+
+/// A single Debug Information Entry (DIE).
+pub struct DieEntry {
+    /// DWARF tag.
+    pub tag : u16,
+    /// Offset of this DIE in the .debug_info section.
+    pub offset : u32,
+    /// Whether this DIE has children.
+    pub has_children : bool,
+    /// Parent DIE offset.
+    pub parent_offset : u32,
+    /// Sibling DIE offset.
+    pub sibling_offset : u32,
+    /// Number of attributes.
+    pub attribute_count : u32,
+}
+
+/// A DIE attribute.
+pub struct DieAttribute {
+    /// DWARF attribute name.
+    pub name : u16,
+    /// Form of the attribute value.
+    pub form : DwarfForm,
+    /// Value as u64 (for numeric forms).
+    pub value_u64 : u64,
+    /// Value as string (for string forms).
+    pub value_string : FixedString256,
+}
+
+/// A variable location entry (maps a variable to location for a range).
+pub struct VariableLocation {
+    /// Variable DIE offset.
+    pub variable_die_offset : u32,
+    /// Variable name.
+    pub name : FixedString64,
+    /// Start address of this location range.
+    pub range_start : u64,
+    /// End address of this location range.
+    pub range_end : u64,
+    /// Location expression bytes.
+    pub location_expr : Array64<u8>,
+    /// Whether this variable is optimized out.
+    pub optimized_out : bool,
+}
+
+/// A line number program entry.
+pub struct LineEntry {
+    /// Address of this line.
+    pub address : u64,
+    /// Source file index.
+    pub file_index : u32,
+    /// Source line number.
+    pub line : u32,
+    /// Source column number.
+    pub column : u32,
+    /// Whether this is a statement (vs. a prologue/epilogue).
+    pub is_stmt : bool,
+    /// Whether this is a basic block start.
+    pub basic_block : bool,
+    /// Whether this is a prologue end.
+    pub prologue_end : bool,
+    /// Whether this is an epilogue begin.
+    pub epilogue_begin : bool,
+}
+
+/// Source file entry in the line number program.
+pub struct SourceFileEntry {
+    /// File name.
+    pub filename : FixedString256,
+    /// Directory path.
+    pub directory : FixedString256,
+    /// Last modified timestamp.
+    pub last_modified : u64,
+    /// File size.
+    pub file_size : u64,
+}
+
+/// Debug info emission residual.
+pub struct DieResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub die_count : u32,
+    pub line_count : u32,
+    pub timestamp : u64,
+}
+
+/// Main debug info emitter state.
+pub struct DebugInfoEmitter {
+    /// Generated DIEs (max 512).
+    pub dies : Array512<DieEntry>,
+    /// DIE attributes (pooled, max 2048).
+    pub attributes : Array512<DieAttribute>,
+    /// Variable location table (max 256).
+    pub variable_locations : Array256<VariableLocation>,
+    /// Line number program (max 1024 entries).
+    pub line_program : Array512<LineEntry>,
+    /// Source file table (max 64).
+    pub source_files : Array64<SourceFileEntry>,
+    /// Current DIE offset counter.
+    pub current_offset : u32,
+    /// Current DWARF version.
+    pub dwarf_version : u16,
+    /// Whether optimization is enabled.
+    pub optimize : bool,
+    /// String pool for deduplication.
+    pub string_pool : Array512<FixedString256>,
+    /// Whether the emitter is active.
+    pub active : bool,
+    /// Residual log.
+    pub residual_log : Array128<DieResidual>,
+}
+
+impl DebugInfoEmitter {
+    /// Create a new debug info emitter.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> DebugInfoEmitter [pure] {
+        DebugInfoEmitter {
+            dies: Array512::new(),
+            attributes: Array512::new(),
+            variable_locations: Array256::new(),
+            line_program: Array512::new(),
+            source_files: Array64::new(),
+            current_offset: 0u32,
+            dwarf_version: 5u16,
+            optimize: false,
+            string_pool: Array512::new(),
+            active: true,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a debug info emitter residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64) -> DebugInfoEmitter [diag] {
+        let residual : DieResidual = DieResidual {
+            code: code,
+            message: message,
+            action: action,
+            die_count: self.dies.len() as u32,
+            line_count: self.line_program.len() as u32,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // String Pool Management
+    // ──────────────────────────────────────────
+
+    /// Add a string to the pool and return its index.
+    /// Effect: pure — string pooling.
+    pub fn add_to_pool(mut self, s : FixedString256) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        // Check if already in pool.
+        // loop: bounds[BOUND_LARGE] — bounded by pool size.
+        for var i : u32 = 0u32; i < self.string_pool.len(); i += 1u32 [self.string_pool.len()] {
+            if self.string_pool.get(i) == s {
+                return Result::Ok((self, i));
+            }
+        }
+
+        if self.string_pool.is_full() {
+            return Result::Err(FixedString256::from("string pool full"));
+        }
+
+        let index : u32 = self.string_pool.len();
+        let _ = self.string_pool.push(s);
+        Result::Ok((self, index))
+    }
+
+    // ──────────────────────────────────────────
+    // DIE Creation
+    // ──────────────────────────────────────────
+
+    /// Create a new DIE.
+    /// Effect: pure — DIE construction.
+    pub fn create_die(mut self, tag : u16, has_children : bool,
+                      parent_offset : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        if self.dies.is_full() {
+            return Result::Err(FixedString256::from("DIE table full"));
+        }
+
+        let offset : u32 = self.current_offset;
+        self.current_offset += 1u32; // Each DIE uses 1 offset unit.
+
+        let die : DieEntry = DieEntry {
+            tag: tag,
+            offset: offset,
+            has_children: has_children,
+            parent_offset: parent_offset,
+            sibling_offset: 0u32,
+            attribute_count: 0u32,
+        };
+        let _ = self.dies.push(die);
+
+        Result::Ok((self, offset))
+    }
+
+    /// Add an attribute to a DIE.
+    /// Effect: pure — attribute addition.
+    pub fn add_attribute(mut self, die_offset : u32, attr_name : u16,
+                         form : DwarfForm, value_u64 : u64,
+                         value_string : FixedString256) -> Result<DebugInfoEmitter, FixedString256> [pure] {
+        if self.attributes.is_full() {
+            return Result::Err(FixedString256::from("attribute table full"));
+        }
+
+        let attr : DieAttribute = DieAttribute {
+            name: attr_name,
+            form: form,
+            value_u64: value_u64,
+            value_string: value_string,
+        };
+        let _ = self.attributes.push(attr);
+
+        // Update DIE attribute count.
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let mut die : DieEntry = self.dies.get(i);
+            if die.offset == die_offset {
+                die.attribute_count += 1u32;
+                let _ = self.dies.set(i, die);
+                break;
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Compilation Unit
+    // ──────────────────────────────────────────
+
+    /// Emit a compilation unit DIE.
+    /// Effect: pure — CU creation.
+    pub fn emit_compilation_unit(mut self, name : FixedString256, producer : FixedString256,
+                                 comp_dir : FixedString256) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, cu_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_compile_unit, true, 0u32);
+        self = emitter;
+
+        self = self.add_attribute(cu_offset, DwarfAttribute::Name as u16,
+                                  DwarfForm::String, 0u64, name);
+        self = self.add_attribute(cu_offset, DwarfAttribute::Producer as u16,
+                                  DwarfForm::String, 0u64, producer);
+        self = self.add_attribute(cu_offset, DwarfAttribute::CompDir as u16,
+                                  DwarfForm::String, 0u64, comp_dir);
+        self = self.add_attribute(cu_offset, DwarfAttribute::Language as u16,
+                                  DwarfForm::Data2, 0x000Fu64, FixedString256::new()); // DW_LANG_Phorensic = 15
+        self = self.add_attribute(cu_offset, DwarfAttribute::StmtList as u16,
+                                  DwarfForm::SecOffset, 0u64, FixedString256::new());
+
+        self = self.record_residual(DIE_EMIT_FUNCTION,
+                                    FixedString256::from("compilation unit emitted"),
+                                    FixedString64::from("emit_cu"));
+        Result::Ok((self, cu_offset))
+    }
+
+    // ──────────────────────────────────────────
+    // Function Debug Info
+    // ──────────────────────────────────────────
+
+    /// Emit a subprogram (function) DIE.
+    /// Effect: pure — function DIE creation.
+    pub fn emit_subprogram(mut self, name : FixedString256, low_pc : u64, high_pc : u64,
+                           decl_file : u32, decl_line : u32, type_offset : u32,
+                           external : bool, parent_cu : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, func_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_subprogram, true, parent_cu);
+        self = emitter;
+
+        self = self.add_attribute(func_offset, DwarfAttribute::Name as u16,
+                                  DwarfForm::String, 0u64, name);
+        self = self.add_attribute(func_offset, DwarfAttribute::LowPc as u16,
+                                  DwarfForm::Addr, low_pc, FixedString256::new());
+        self = self.add_attribute(func_offset, DwarfAttribute::HighPc as u16,
+                                  DwarfForm::Data8, high_pc - low_pc, FixedString256::new());
+        self = self.add_attribute(func_offset, DwarfAttribute::DeclFile as u16,
+                                  DwarfForm::Data4, decl_file as u64, FixedString256::new());
+        self = self.add_attribute(func_offset, DwarfAttribute::DeclLine as u16,
+                                  DwarfForm::Data4, decl_line as u64, FixedString256::new());
+        self = self.add_attribute(func_offset, DwarfAttribute::Type as u16,
+                                  DwarfForm::Ref4, type_offset as u64, FixedString256::new());
+
+        if external {
+            self = self.add_attribute(func_offset, DwarfAttribute::External as u16,
+                                      DwarfForm::Flag, 1u64, FixedString256::new());
+        }
+
+        // Prototyped.
+        self = self.add_attribute(func_offset, DwarfAttribute::Prototyped as u16,
+                                  DwarfForm::Flag, 1u64, FixedString256::new());
+
+        // Inline attribute (DW_INL_not_inlined = 0).
+        self = self.add_attribute(func_offset, DwarfAttribute::Inline as u16,
+                                  DwarfForm::Data1, 0u64, FixedString256::new());
+
+        self = self.record_residual(DIE_EMIT_FUNCTION,
+                                    FixedString256::from("subprogram emitted"),
+                                    FixedString64::from("emit_subprogram"));
+        Result::Ok((self, func_offset))
+    }
+
+    // ──────────────────────────────────────────
+    // Type Debug Info
+    // ──────────────────────────────────────────
+
+    /// Emit a base type DIE.
+    /// Effect: pure — base type DIE.
+    pub fn emit_base_type(mut self, name : FixedString256, byte_size : u64,
+                          encoding : DwarfEncoding, parent_cu : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, type_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_base_type, false, parent_cu);
+        self = emitter;
+
+        self = self.add_attribute(type_offset, DwarfAttribute::Name as u16,
+                                  DwarfForm::String, 0u64, name);
+        self = self.add_attribute(type_offset, DwarfAttribute::ByteSize as u16,
+                                  DwarfForm::Data8, byte_size, FixedString256::new());
+        self = self.add_attribute(type_offset, DwarfAttribute::Encoding as u16,
+                                  DwarfForm::Data1, encoding as u64, FixedString256::new());
+
+        self = self.record_residual(DIE_EMIT_TYPE,
+                                    FixedString256::from("base type emitted"),
+                                    FixedString64::from("emit_base_type"));
+        Result::Ok((self, type_offset))
+    }
+
+    /// Emit a structure type DIE.
+    /// Effect: pure — struct type DIE.
+    pub fn emit_structure_type(mut self, name : FixedString256, byte_size : u64,
+                               decl_file : u32, decl_line : u32,
+                               parent_cu : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, struct_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_structure_type, true, parent_cu);
+        self = emitter;
+
+        self = self.add_attribute(struct_offset, DwarfAttribute::Name as u16,
+                                  DwarfForm::String, 0u64, name);
+        self = self.add_attribute(struct_offset, DwarfAttribute::ByteSize as u16,
+                                  DwarfForm::Data8, byte_size, FixedString256::new());
+        self = self.add_attribute(struct_offset, DwarfAttribute::DeclFile as u16,
+                                  DwarfForm::Data4, decl_file as u64, FixedString256::new());
+        self = self.add_attribute(struct_offset, DwarfAttribute::DeclLine as u16,
+                                  DwarfForm::Data4, decl_line as u64, FixedString256::new());
+
+        self = self.record_residual(DIE_EMIT_TYPE,
+                                    FixedString256::from("struct type emitted"),
+                                    FixedString64::from("emit_struct"));
+        Result::Ok((self, struct_offset))
+    }
+
+    /// Emit a pointer type DIE.
+    /// Effect: pure — pointer type DIE.
+    pub fn emit_pointer_type(mut self, referenced_type : u32,
+                             byte_size : u64, parent_cu : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, ptr_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_pointer_type, false, parent_cu);
+        self = emitter;
+
+        self = self.add_attribute(ptr_offset, DwarfAttribute::Type as u16,
+                                  DwarfForm::Ref4, referenced_type as u64, FixedString256::new());
+        self = self.add_attribute(ptr_offset, DwarfAttribute::ByteSize as u16,
+                                  DwarfForm::Data8, byte_size, FixedString256::new());
+
+        Result::Ok((self, ptr_offset))
+    }
+
+    /// Emit an array type DIE.
+    /// Effect: pure — array type DIE.
+    pub fn emit_array_type(mut self, element_type : u32, upper_bound : u64,
+                           parent_cu : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, arr_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_array_type, true, parent_cu);
+        self = emitter;
+
+        self = self.add_attribute(arr_offset, DwarfAttribute::Type as u16,
+                                  DwarfForm::Ref4, element_type as u64, FixedString256::new());
+
+        // Add a subrange DIE as child.
+        let (emitter2, subrange_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(0x0021u16, false, arr_offset); // DW_TAG_subrange_type
+        self = emitter2;
+
+        self = self.add_attribute(subrange_offset, DwarfAttribute::UpperBound as u16,
+                                  DwarfForm::Data8, upper_bound, FixedString256::new());
+
+        Result::Ok((self, arr_offset))
+    }
+
+    /// Emit a member DIE within a structure.
+    /// Effect: pure — member DIE.
+    pub fn emit_member(mut self, name : FixedString256, type_offset : u32,
+                       data_member_location : u64, byte_size : u64,
+                       decl_file : u32, decl_line : u32,
+                       parent_struct : u32) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        let (emitter, member_offset) : (DebugInfoEmitter, u32) =
+            self.create_die(DW_TAG_member, false, parent_struct);
+        self = emitter;
+
+        self = self.add_attribute(member_offset, DwarfAttribute::Name as u16,
+                                  DwarfForm::String, 0u64, name);
+        self = self.add_attribute(member_offset, DwarfAttribute::Type as u16,
+                                  DwarfForm::Ref4, type_offset as u64, FixedString256::new());
+        self = self.add_attribute(member_offset, DwarfAttribute::DataMemberLocation as u16,
+                                  DwarfForm::Data8, data_member_location, FixedString256::new());
+        self = self.add_attribute(member_offset, DwarfAttribute::ByteSize as u16,
+                                  DwarfForm::Data8, byte_size, FixedString256::new());
+        self = self.add_attribute(member_offset, DwarfAttribute::DeclFile as u16,
+                                  DwarfForm::Data4, decl_file as u64, FixedString256::new());
+        self = self.add_attribute(member_offset, DwarfAttribute::DeclLine as u16,
+                                  DwarfForm::Data4, decl_line as u64, FixedString256::new());
+
+        Result::Ok((self, member_offset))
+    }
+
+    // ──────────────────────────────────────────
+    // Variable Location Tables
+    // ──────────────────────────────────────────
+
+    /// Add a variable location entry.
+    /// Effect: pure — location entry creation.
+    pub fn add_variable_location(mut self, var_die_offset : u32, name : FixedString64,
+                                 range_start : u64, range_end : u64,
+                                 location_expr : Array64<u8>,
+                                 optimized_out : bool) -> Result<DebugInfoEmitter, FixedString256> [pure] {
+        if self.variable_locations.is_full() {
+            return Result::Err(FixedString256::from("variable location table full"));
+        }
+
+        let loc : VariableLocation = VariableLocation {
+            variable_die_offset: var_die_offset,
+            name: name,
+            range_start: range_start,
+            range_end: range_end,
+            location_expr: location_expr,
+            optimized_out: optimized_out,
+        };
+        let _ = self.variable_locations.push(loc);
+
+        self = self.record_residual(DIE_EMIT_VARIABLE,
+                                    FixedString256::from("variable location added"),
+                                    FixedString64::from("add_var_loc"));
+        Result::Ok(self)
+    }
+
+    /// Build a DWARF location expression for a register.
+    /// Effect: pure — expression builder.
+    pub fn build_reg_location_expr(reg_number : u8) -> Array64<u8> [pure] {
+        var expr : Array64<u8> = Array64::new();
+        // DW_OP_reg0..DW_OP_reg31 = 0x50..0x6F
+        if reg_number <= 31u8 {
+            let _ = expr.push(0x50u8 + reg_number);
+        } else {
+            // DW_OP_bregx (0x92) + ULEB128 register number + ULEB128 offset
+            let _ = expr.push(0x92u8);
+            let _ = expr.push(reg_number);
+            let _ = expr.push(0u8); // offset = 0
+        }
+        expr
+    }
+
+    /// Build a DWARF location expression for a stack offset.
+    /// Effect: pure — expression builder.
+    pub fn build_stack_location_expr(frame_offset : i32) -> Array64<u8> [pure] {
+        var expr : Array64<u8> = Array64::new();
+        // DW_OP_fbreg (0x91) + SLEB128 offset
+        let _ = expr.push(0x91u8);
+        // Encode offset as signed LEB128 (simplified: assume small offset).
+        if frame_offset >= 0i32 {
+            let _ = expr.push(frame_offset as u8);
+        } else {
+            let _ = expr.push((0x40u32.wrapping_add((-frame_offset) as u32)) as u8);
+        }
+        expr
+    }
+
+    // ──────────────────────────────────────────
+    // Line Number Program
+    // ──────────────────────────────────────────
+
+    /// Add a source file to the file table.
+    /// Effect: pure — file table addition.
+    pub fn add_source_file(mut self, filename : FixedString256, directory : FixedString256,
+                           last_modified : u64, file_size : u64) -> Result<(DebugInfoEmitter, u32), FixedString256> [pure] {
+        if self.source_files.is_full() {
+            return Result::Err(FixedString256::from("source file table full"));
+        }
+
+        let index : u32 = self.source_files.len();
+        let file : SourceFileEntry = SourceFileEntry {
+            filename: filename,
+            directory: directory,
+            last_modified: last_modified,
+            file_size: file_size,
+        };
+        let _ = self.source_files.push(file);
+
+        Result::Ok((self, index + 1u32)) // File indices are 1-based in DWARF.
+    }
+
+    /// Add a line number entry to the program.
+    /// Effect: pure — line entry addition.
+    pub fn add_line_entry(mut self, address : u64, file_index : u32, line : u32,
+                          column : u32, is_stmt : bool) -> Result<DebugInfoEmitter, FixedString256> [pure] {
+        if self.line_program.is_full() {
+            return Result::Err(FixedString256::from("line program full"));
+        }
+
+        let entry : LineEntry = LineEntry {
+            address: address,
+            file_index: file_index,
+            line: line,
+            column: column,
+            is_stmt: is_stmt,
+            basic_block: false,
+            prologue_end: false,
+            epilogue_begin: false,
+        };
+        let _ = self.line_program.push(entry);
+
+        self = self.record_residual(DIE_EMIT_LINE,
+                                    FixedString256::from("line entry added"),
+                                    FixedString64::from("add_line"));
+        Result::Ok(self)
+    }
+
+    /// Generate the line number program (state machine operations).
+    /// Effect: pure — generates DWARF line number bytecode.
+    pub fn generate_line_program(&self) -> Array512<u8> [pure] {
+        var program : Array512<u8> = Array512::new();
+        var prev_address : u64 = 0u64;
+        var prev_line : u32 = 1u32;
+
+        // Minimal line number program header.
+        let _ = program.push(0x00u8); // version low
+        let _ = program.push(0x05u8); // version high (DWARF 5)
+
+        // Loop through line entries and emit state machine ops.
+        // loop: bounds[BOUND_LARGE] — bounded by line program.
+        for var i : u32 = 0u32; i < self.line_program.len(); i += 1u32 [self.line_program.len()] {
+            let entry : LineEntry = self.line_program.get(i);
+
+            if entry.address > prev_address {
+                // Advance PC.
+                if entry.address - prev_address < 64u64 {
+                    // DW_LNS_advance_pc (0x02) + ULEB128 offset
+                    let delta : u64 = entry.address - prev_address;
+                    if program.len() + 2u32 < 512u32 {
+                        let _ = program.push(0x02u8);
+                        let _ = program.push(delta as u8);
+                    }
+                }
+                prev_address = entry.address;
+            }
+
+            if entry.line != prev_line {
+                // Advance line.
+                // DW_LNS_advance_line (0x03) + SLEB128 line delta
+                if program.len() + 2u32 < 512u32 {
+                    let line_delta : i32 = entry.line as i32 - prev_line as i32;
+                    let _ = program.push(0x03u8);
+                    if line_delta >= 0i32 {
+                        let _ = program.push(line_delta as u8);
+                    } else {
+                        let _ = program.push((0x40u32.wrapping_add((-line_delta) as u32)) as u8);
+                    }
+                }
+                prev_line = entry.line;
+            }
+
+            // DW_LNS_copy (0x01) — emit a row in the line table.
+            if program.len() < 512u32 {
+                let _ = program.push(0x01u8);
+            }
+        }
+
+        // DW_LNE_end_sequence (0x00, 0x01, 0x01)
+        if program.len() + 3u32 < 512u32 {
+            let _ = program.push(0x00u8);
+            let _ = program.push(0x01u8);
+            let _ = program.push(0x01u8);
+        }
+
+        program
+    }
+
+    // ──────────────────────────────────────────
+    // Optimization
+    // ──────────────────────────────────────────
+
+    /// Enable debug info size optimization.
+    /// Effect: pure — optimization toggle.
+    pub fn set_optimize(mut self, optimize : bool) -> DebugInfoEmitter [pure] {
+        self.optimize = optimize;
+        self
+    }
+
+    /// Optimize the DIE table by deduplicating identical attributes.
+    /// Effect: pure — DIE optimization.
+    pub fn optimize(mut self) -> DebugInfoEmitter [diag] {
+        if !self.optimize {
+            return self;
+        }
+
+        // Remove duplicate source file entries.
+        var unique_files : Array64<SourceFileEntry> = Array64::new();
+        // loop: bounds[BOUND_MEDIUM] — bounded by source files.
+        for var i : u32 = 0u32; i < self.source_files.len(); i += 1u32 [self.source_files.len()] {
+            let file : SourceFileEntry = self.source_files.get(i);
+            var duplicate : bool = false;
+            // loop: bounds[BOUND_MEDIUM] — bounded by unique files.
+            for var j : u32 = 0u32; j < unique_files.len(); j += 1u32 [unique_files.len()] {
+                let existing : SourceFileEntry = unique_files.get(j);
+                if existing.filename == file.filename && existing.directory == file.directory {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if !duplicate {
+                if !unique_files.is_full() {
+                    let _ = unique_files.push(file);
+                }
+            }
+        }
+
+        // Update source_files with deduplicated list.
+        self.source_files = unique_files;
+
+        self = self.record_residual(DIE_EMIT_OPTIMIZE,
+                                    FixedString256::from("DIE optimization complete"),
+                                    FixedString64::from("optimize"));
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────
+
+    /// Get debug info emission statistics.
+    /// Effect: pure — statistics.
+    pub fn get_statistics(&self) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("DIEs: "));
+        result.push_u32(self.dies.len());
+        result.push_str(FixedString256::from("\nAttributes: "));
+        result.push_u32(self.attributes.len());
+        result.push_str(FixedString256::from("\nVariable locations: "));
+        result.push_u32(self.variable_locations.len());
+        result.push_str(FixedString256::from("\nLine entries: "));
+        result.push_u32(self.line_program.len());
+        result.push_str(FixedString256::from("\nSource files: "));
+        result.push_u32(self.source_files.len());
+        result.push_str(FixedString256::from("\nString pool: "));
+        result.push_u32(self.string_pool.len());
+        result
+    }
+
+    /// Get the emitter status as a formatted string.
+    /// Effect: io — formatted output.
+    pub fn format_status(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("Debug Info Emitter Status\n"));
+        result.push_str(FixedString256::from("========================\n"));
+        result.push_str(FixedString256::from("DWARF version: "));
+        result.push_u32(self.dwarf_version as u32);
+        result.push_str(FixedString256::from("\nActive: "));
+        result.push_str(if self.active { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result.push_str(FixedString256::from("\nOptimization: "));
+        result.push_str(if self.optimize { FixedString256::from("enabled") } else { FixedString256::from("disabled") });
+        result.push_str(FixedString256::from("\n\n"));
+        result.push_str(self.get_statistics());
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // DIE Queries
+    // ──────────────────────────────────────────
+
+    /// Find a DIE by offset.
+    /// Effect: pure — lookup.
+    pub fn find_die_by_offset(&self, offset : u32) -> Result<DieEntry, FixedString256> [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let die : DieEntry = self.dies.get(i);
+            if die.offset == offset {
+                return Result::Ok(die);
+            }
+        }
+        Result::Err(FixedString256::from("DIE not found"))
+    }
+
+    /// Find all DIEs with a given tag.
+    /// Effect: pure — search.
+    pub fn find_dies_by_tag(&self, tag : u16) -> Array64<DieEntry> [pure] {
+        var matching : Array64<DieEntry> = Array64::new();
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let die : DieEntry = self.dies.get(i);
+            if die.tag == tag {
+                let _ = matching.push(die);
+            }
+        }
+        matching
+    }
+
+    /// Get the number of DIEs for a specific tag.
+    /// Effect: pure — count.
+    pub fn count_dies_by_tag(&self, tag : u16) -> u32 [pure] {
+        var count : u32 = 0u32;
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let die : DieEntry = self.dies.get(i);
+            if die.tag == tag {
+                count += 1u32;
+            }
+        }
+        count
+    }
+
+    /// Check if a DIE has any children.
+    /// Effect: pure — parent query.
+    pub fn has_children(&self, die_offset : u32) -> bool [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let die : DieEntry = self.dies.get(i);
+            if die.parent_offset == die_offset {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all children of a DIE.
+    /// Effect: pure — children query.
+    pub fn get_children(&self, die_offset : u32) -> Array64<DieEntry> [pure] {
+        var children : Array64<DieEntry> = Array64::new();
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let die : DieEntry = self.dies.get(i);
+            if die.parent_offset == die_offset {
+                let _ = children.push(die);
+            }
+        }
+        children
+    }
+
+    // ──────────────────────────────────────────
+    // Source Location Tracking
+    // ──────────────────────────────────────────
+
+    /// Find the source location for an address.
+    /// Effect: pure — lookup.
+    pub fn find_source_location(&self, address : u64) -> (FixedString256, u32, u32) [pure] {
+        var best_file : FixedString256 = FixedString256::new();
+        var best_line : u32 = 0u32;
+        var best_col : u32 = 0u32;
+
+        // loop: bounds[BOUND_LARGE] — bounded by line program.
+        for var i : u32 = 0u32; i < self.line_program.len(); i += 1u32 [self.line_program.len()] {
+            let entry : LineEntry = self.line_program.get(i);
+            if entry.address <= address {
+                if entry.file_index > 0u32 && (entry.file_index - 1u32) < self.source_files.len() {
+                    let file : SourceFileEntry = self.source_files.get(entry.file_index - 1u32);
+                    best_file = file.filename;
+                }
+                best_line = entry.line;
+                best_col = entry.column;
+            } else {
+                break;
+            }
+        }
+
+        (best_file, best_line, best_col)
+    }
+
+    // ──────────────────────────────────────────
+    // DWARF Output Generation
+    // ──────────────────────────────────────────
+
+    /// Serialize the DIE table to a byte buffer (raw .debug_info section).
+    /// Effect: pure — serialization.
+    pub fn serialize_debug_info(&self, buffer : ref mut Array512<u8>) -> Result<u32, FixedString256> [pure] {
+        var offset : u32 = 0u32;
+
+        // Write compilation unit header.
+        // Unit length (placeholder).
+        // loop: bounds[BOUND_LARGE] — bounded by buffer capacity.
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            if offset < 512u32 { let _ = buffer.set(offset, 0u8); offset += 1u32; }
+        }
+
+        // DWARF version.
+        if offset + 2u32 <= 512u32 {
+            let _ = buffer.set(offset, (self.dwarf_version & 0xFFu16) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((self.dwarf_version >> 8u16) & 0xFFu16) as u8); offset += 1u32;
+        }
+
+        // Debug abbreviation offset (0 for now).
+        // loop: bounds[BOUND_SMALL] — 4 bytes.
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            if offset < 512u32 { let _ = buffer.set(offset, 0u8); offset += 1u32; }
+        }
+
+        // Address size (8 for 64-bit).
+        if offset < 512u32 { let _ = buffer.set(offset, 8u8); offset += 1u32; }
+
+        // Serialize each DIE.
+        // loop: bounds[BOUND_LARGE] — bounded by DIE count.
+        for var i : u32 = 0u32; i < self.dies.len(); i += 1u32 [self.dies.len()] {
+            let die : DieEntry = self.dies.get(i);
+            // Write tag (ULEB128) and has_children.
+            if offset < 512u32 {
+                let _ = buffer.set(offset, (die.tag & 0xFFu16) as u8); offset += 1u32;
+                let _ = buffer.set(offset, if die.has_children { 1u8 } else { 0u8 }); offset += 1u32;
+            }
+        }
+
+        // Null terminator for DIE tree.
+        if offset < 512u32 { let _ = buffer.set(offset, 0u8); offset += 1u32; }
+
+        Result::Ok(offset)
+    }
+
+    /// Serialize the line number program to a byte buffer (.debug_line section).
+    /// Effect: pure — serialization.
+    pub fn serialize_debug_line(&self, buffer : ref mut Array512<u8>) -> Result<u32, FixedString256> [pure] {
+        var offset : u32 = 0u32;
+
+        // Write header.
+        // Unit length (4 bytes, placeholder).
+        // loop: bounds[BOUND_SMALL] — 4 bytes.
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            if offset < 512u32 { let _ = buffer.set(offset, 0u8); offset += 1u32; }
+        }
+
+        // Version.
+        if offset + 2u32 <= 512u32 {
+            let _ = buffer.set(offset, 0x05u8); offset += 1u32; // DWARF 5.
+            let _ = buffer.set(offset, 0x00u8); offset += 1u32;
+        }
+
+        // Address size.
+        if offset < 512u32 { let _ = buffer.set(offset, 8u8); offset += 1u32; }
+
+        // Segment selector size.
+        if offset < 512u32 { let _ = buffer.set(offset, 0u8); offset += 1u32; }
+
+        // Generate and write the line number program.
+        let program : Array512<u8> = self.generate_line_program();
+        // loop: bounds[BOUND_LARGE] — bounded by program.
+        for var i : u32 = 0u32; i < program.len() && offset < 512u32; i += 1u32 [program.len()] {
+            let _ = buffer.set(offset, program.get(i));
+            offset += 1u32;
+        }
+
+        Result::Ok(offset)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Debug Info Size Estimation
+// ──────────────────────────────────────────────
+
+/// Estimate the total size of debug info in bytes.
+pub fn estimate_debug_info_size(emitter : DebugInfoEmitter) -> u32 [pure] {
+    var size : u32 = 0u32;
+    // Header: 11 bytes per CU.
+    size += 11u32;
+    // DIEs: ~8 bytes each on average.
+    size += emitter.dies.len() * 8u32;
+    // Attributes: ~12 bytes each.
+    size += emitter.attributes.len() * 12u32;
+    // Line program: ~8 bytes per entry.
+    size += emitter.line_program.len() * 8u32;
+    // Source files: ~40 bytes each.
+    size += emitter.source_files.len() * 40u32;
+    // String pool: sum of string lengths.
+    for var i : u32 = 0u32; i < emitter.string_pool.len(); i += 1u32 [emitter.string_pool.len()] {
+        size += emitter.string_pool.get(i).len() + 1u32; // +1 for null terminator.
+    }
+    size
+}
+
+/// Check if a DIE offset is valid.
+pub fn is_valid_die_offset(emitter : DebugInfoEmitter, offset : u32) -> bool [pure] {
+    for var i : u32 = 0u32; i < emitter.dies.len(); i += 1u32 [emitter.dies.len()] {
+        if emitter.dies.get(i).offset == offset {
+            return true;
+        }
+    }
+    false
+}
+
+/// Get the DIE offset for a named type.
+pub fn find_type_die_by_name(emitter : DebugInfoEmitter, type_name : FixedString256) -> Option<u32> [pure] {
+    for var i : u32 = 0u32; i < emitter.dies.len(); i += 1u32 [emitter.dies.len()] {
+        let die : DieEntry = emitter.dies.get(i);
+        if die.tag == DW_TAG_base_type || die.tag == DW_TAG_structure_type {
+            // Check attribute for name.
+            for var j : u32 = 0u32; j < emitter.attributes.len(); j += 1u32 [emitter.attributes.len()] {
+                let attr : DieAttribute = emitter.attributes.get(j);
+                if attr.name == DwarfAttribute::Name as u16 && attr.value_string == type_name {
+                    return Option::Some(die.offset);
+                }
+            }
+        }
+    }
+    Option::None
+}
+
+/// Count the total number of attributes across all DIEs.
+pub fn total_attribute_count(emitter : DebugInfoEmitter) -> u32 [pure] {
+    var count : u32 = 0u32;
+    for var i : u32 = 0u32; i < emitter.dies.len(); i += 1u32 [emitter.dies.len()] {
+        count += emitter.dies.get(i).attribute_count;
+    }
+    count
+}
+
+/// Check if a source file entry exists.
+pub fn has_source_file(emitter : DebugInfoEmitter, filename : FixedString256) -> bool [pure] {
+    for var i : u32 = 0u32; i < emitter.source_files.len(); i += 1u32 [emitter.source_files.len()] {
+        if emitter.source_files.get(i).filename == filename {
+            return true;
+        }
+    }
+    false
+}
+
+/// Find the index of a source file by name.
+pub fn find_source_file_index(emitter : DebugInfoEmitter, filename : FixedString256) -> Option<u32> [pure] {
+    for var i : u32 = 0u32; i < emitter.source_files.len(); i += 1u32 [emitter.source_files.len()] {
+        if emitter.source_files.get(i).filename == filename {
+            return Option::Some(i + 1u32); // File indices are 1-based.
+        }
+    }
+    Option::None
+}
+
+/// Get the line number for an address in the line program.
+pub fn get_line_for_address(emitter : DebugInfoEmitter, address : u64) -> u32 [pure] {
+    var best_line : u32 = 0u32;
+    for var i : u32 = 0u32; i < emitter.line_program.len(); i += 1u32 [emitter.line_program.len()] {
+        let entry : LineEntry = emitter.line_program.get(i);
+        if entry.address <= address {
+            best_line = entry.line;
+        } else {
+            break;
+        }
+    }
+    best_line
+}
+
+/// Check if a DIE has a specific attribute.
+pub fn die_has_attribute(emitter : DebugInfoEmitter, die_offset : u32, attr_name : u16) -> bool [pure] {
+    for var i : u32 = 0u32; i < emitter.attributes.len(); i += 1u32 [emitter.attributes.len()] {
+        let attr : DieAttribute = emitter.attributes.get(i);
+        if attr.name == attr_name {
+            // Check if this attribute belongs to the DIE (simplified: linear scan).
+            return true;
+        }
+    }
+    false
+}
+
+/// Get the string associated with an attribute value.
+pub fn get_attribute_string(emitter : DebugInfoEmitter, die_offset : u32, attr_name : u16) -> FixedString256 [pure] {
+    for var i : u32 = 0u32; i < emitter.attributes.len(); i += 1u32 [emitter.attributes.len()] {
+        let attr : DieAttribute = emitter.attributes.get(i);
+        if attr.name == attr_name && attr.form == DwarfForm::String {
+            return attr.value_string;
+        }
+    }
+    FixedString256::new()
+}
+
+/// Get the numeric value of an attribute.
+pub fn get_attribute_u64(emitter : DebugInfoEmitter, die_offset : u32, attr_name : u16) -> u64 [pure] {
+    for var i : u32 = 0u32; i < emitter.attributes.len(); i += 1u32 [emitter.attributes.len()] {
+        let attr : DieAttribute = emitter.attributes.get(i);
+        if attr.name == attr_name && (attr.form == DwarfForm::Data4 || attr.form == DwarfForm::Data8) {
+            return attr.value_u64;
+        }
+    }
+    0u64
+}

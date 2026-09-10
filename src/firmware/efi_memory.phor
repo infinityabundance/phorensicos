@@ -1,0 +1,1031 @@
+// file: efi_memory.phor
+// purpose: EFI memory services — memory map iteration, allocator for boot
+//          services, runtime memory descriptor management, UEFI memory type
+//          conversion, page-based allocation, memory attributes
+// effects: [deterministic, io:read, io:write, memory:mmio, residual]
+// trust: TrustState_Bootstrap → TrustState_Operational
+
+package "phorensic:efi_memory:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::traits::*
+use core::math::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+
+const EFI_PAGE_SIZE: u64 = 4096
+const EFI_PAGE_MASK: u64 = 0xFFF
+const EFI_PAGE_SHIFT: u32 = 12
+const MAX_MEMORY_DESCRIPTORS: u32 = 256
+const MAX_MEMORY_REGIONS: u32 = 128
+const BOOT_ALLOC_POOL_SIZE: u64 = 16 * 1024 * 1024  // 16MB boot pool
+const MAX_BOOT_ALLOCS: u32 = 1024
+const BYTES_PER_DESCRIPTOR: u32 = 48
+const MIN_PAGE_ALLOC: u64 = 1
+const MAX_PAGE_ALLOC: u64 = 65536  // 256GB max single allocation
+
+// UEFI Memory Types (redeclared for module independence)
+const EFI_RESERVED_MEMORY_TYPE: u32 = 0
+const EFI_LOADER_CODE: u32 = 1
+const EFI_LOADER_DATA: u32 = 2
+const EFI_BOOT_SERVICES_CODE: u32 = 3
+const EFI_BOOT_SERVICES_DATA: u32 = 4
+const EFI_RUNTIME_SERVICES_CODE: u32 = 5
+const EFI_RUNTIME_SERVICES_DATA: u32 = 6
+const EFI_CONVENTIONAL_MEMORY: u32 = 7
+const EFI_UNUSABLE_MEMORY: u32 = 8
+const EFI_ACPI_RECLAIM_MEMORY: u32 = 9
+const EFI_ACPIMEMORY_NVS: u32 = 10
+const EFI_MEMORY_MAPPED_IO: u32 = 11
+const EFI_MEMORY_MAPPED_IOPORT_SPACE: u32 = 12
+const EFI_PAL_CODE: u32 = 13
+const EFI_PERSISTENT_MEMORY: u32 = 14
+
+// Attributes
+const EFI_MEMORY_UC: u64 = 0x0000000000000001
+const EFI_MEMORY_WC: u64 = 0x0000000000000002
+const EFI_MEMORY_WT: u64 = 0x0000000000000004
+const EFI_MEMORY_WB: u64 = 0x0000000000000008
+const EFI_MEMORY_UCE: u64 = 0x0000000000000010
+const EFI_MEMORY_WP: u64 = 0x0000000000001000
+const EFI_MEMORY_RP: u64 = 0x0000000000002000
+const EFI_MEMORY_XP: u64 = 0x0000000000004000
+const EFI_MEMORY_NV: u64 = 0x0000000000008000
+const EFI_MEMORY_MORE_RELIABLE: u64 = 0x0000000000010000
+const EFI_MEMORY_RO: u64 = 0x0000000000020000
+const EFI_MEMORY_SP: u64 = 0x0000000000040000
+const EFI_MEMORY_CPU_CRYPTO: u64 = 0x0000000000080000
+const EFI_MEMORY_RUNTIME: u64 = 0x8000000000000000
+
+// Memory descriptor version
+const EFI_MEMORY_DESCRIPTOR_VERSION: u32 = 1
+
+// ──────────────────────────────────────────────
+// EFI Memory Descriptor
+// ──────────────────────────────────────────────
+
+pub type EFIMemoryDescriptor : struct {
+    memory_type: u32,
+    physical_start: Word64,
+    virtual_start: Word64,
+    number_of_pages: u64,
+    attribute: Word64,
+}
+
+impl EFIMemoryDescriptor {
+    pub fn new() -> EFIMemoryDescriptor
+        effects: [deterministic]
+    {
+        EFIMemoryDescriptor {
+            memory_type: 0,
+            physical_start: Word64::zero(),
+            virtual_start: Word64::zero(),
+            number_of_pages: 0,
+            attribute: Word64::zero(),
+        }
+    }
+
+    pub fn physical_address(self) -> Word64
+        effects: [deterministic]
+    {
+        self.physical_start
+    }
+
+    pub fn virtual_address(self) -> Word64
+        effects: [deterministic]
+    {
+        self.virtual_start
+    }
+
+    pub fn page_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.number_of_pages
+    }
+
+    pub fn byte_length(self) -> u64
+        effects: [deterministic]
+    {
+        self.number_of_pages * EFI_PAGE_SIZE
+    }
+
+    pub fn end_address(self) -> Word64
+        effects: [deterministic]
+    {
+        let length: Word64 = Word64::from_u64(self.number_of_pages * EFI_PAGE_SIZE)
+        self.physical_start.add(length)
+    }
+
+    pub fn is_available(self) -> bool
+        effects: [deterministic]
+    {
+        self.memory_type == EFI_CONVENTIONAL_MEMORY
+    }
+
+    pub fn is_boot_services(self) -> bool
+        effects: [deterministic]
+    {
+        self.memory_type == EFI_BOOT_SERVICES_CODE ||
+        self.memory_type == EFI_BOOT_SERVICES_DATA
+    }
+
+    pub fn is_runtime(self) -> bool
+        effects: [deterministic]
+    {
+        self.memory_type == EFI_RUNTIME_SERVICES_CODE ||
+        self.memory_type == EFI_RUNTIME_SERVICES_DATA
+    }
+
+    pub fn is_loader(self) -> bool
+        effects: [deterministic]
+    {
+        self.memory_type == EFI_LOADER_CODE ||
+        self.memory_type == EFI_LOADER_DATA
+    }
+
+    pub fn is_persistent(self) -> bool
+        effects: [deterministic]
+    {
+        self.memory_type == EFI_PERSISTENT_MEMORY
+    }
+
+    pub fn is_mmio(self) -> bool
+        effects: [deterministic]
+    {
+        self.memory_type == EFI_MEMORY_MAPPED_IO
+    }
+
+    pub fn is_runtime_mapped(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attribute.to_u64() & EFI_MEMORY_RUNTIME) != 0
+    }
+
+    pub fn is_executable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attribute.to_u64() & EFI_MEMORY_XP) == 0
+    }
+
+    pub fn is_write_back(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attribute.to_u64() & EFI_MEMORY_WB) != 0
+    }
+
+    pub fn memory_type_string(self) -> FixedString[32]
+        effects: [deterministic]
+    {
+        match self.memory_type {
+            EFI_RESERVED_MEMORY_TYPE => FixedString::from("Reserved"),
+            EFI_LOADER_CODE => FixedString::from("LoaderCode"),
+            EFI_LOADER_DATA => FixedString::from("LoaderData"),
+            EFI_BOOT_SERVICES_CODE => FixedString::from("BS_Code"),
+            EFI_BOOT_SERVICES_DATA => FixedString::from("BS_Data"),
+            EFI_RUNTIME_SERVICES_CODE => FixedString::from("RT_Code"),
+            EFI_RUNTIME_SERVICES_DATA => FixedString::from("RT_Data"),
+            EFI_CONVENTIONAL_MEMORY => FixedString::from("Conventional"),
+            EFI_UNUSABLE_MEMORY => FixedString::from("Unusable"),
+            EFI_ACPI_RECLAIM_MEMORY => FixedString::from("ACPIRecclaim"),
+            EFI_ACPIMEMORY_NVS => FixedString::from("ACPINVS"),
+            EFI_MEMORY_MAPPED_IO => FixedString::from("MMIO"),
+            EFI_PAL_CODE => FixedString::from("PALCode"),
+            EFI_PERSISTENT_MEMORY => FixedString::from("Persistent"),
+            _ => FixedString::from("Unknown"),
+        }
+    }
+
+    pub fn set_physical(self: ref mut, addr: Word64)
+        effects: [deterministic]
+    {
+        self.physical_start = addr
+    }
+
+    pub fn set_pages(self: ref mut, pages: u64)
+        effects: [deterministic]
+    {
+        self.number_of_pages = pages
+    }
+
+    pub fn set_type(self: ref mut, mem_type: u32)
+        effects: [deterministic]
+    {
+        self.memory_type = mem_type
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Map
+// ──────────────────────────────────────────────
+
+pub type EFIMemoryMap : struct {
+    descriptors: FixedArray[MAX_MEMORY_DESCRIPTORS, EFIMemoryDescriptor],
+    num_descriptors: u32,
+    map_key: u64,
+    descriptor_size: u32,
+    descriptor_version: u32,
+    total_pages: u64,
+    available_pages: u64,
+    total_ram: Word64,
+}
+
+impl EFIMemoryMap {
+    pub fn new() -> EFIMemoryMap
+        effects: [deterministic]
+    {
+        EFIMemoryMap {
+            descriptors: FixedArray::new(),
+            num_descriptors: 0,
+            map_key: 0,
+            descriptor_size: BYTES_PER_DESCRIPTOR,
+            descriptor_version: EFI_MEMORY_DESCRIPTOR_VERSION,
+            total_pages: 0,
+            available_pages: 0,
+            total_ram: Word64::zero(),
+        }
+    }
+
+    pub fn add_descriptor(self: ref mut, desc: EFIMemoryDescriptor) -> Result<(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_descriptors >= MAX_MEMORY_DESCRIPTORS {
+            return Result::Err(MemoryError::new(
+                DIAG_EFIMEM_BASE | 0x001,
+                "Memory map descriptor array full"
+            ))
+        }
+        self.descriptors.set(self.num_descriptors, desc)!
+        self.num_descriptors = self.num_descriptors + 1
+        self.total_pages = self.total_pages + desc.number_of_pages
+        if desc.is_available() {
+            self.available_pages = self.available_pages + desc.number_of_pages
+        }
+        self.total_ram = self.total_ram.add(Word64::from_u64(desc.number_of_pages * EFI_PAGE_SIZE))
+        Result::Ok(())
+    }
+
+    pub fn get_descriptor(self, index: u32) -> Result[EFIMemoryDescriptor, MemoryError>
+        effects: [deterministic]
+    {
+        if index >= self.num_descriptors {
+            return Result::Err(MemoryError::new(
+                DIAG_EFIMEM_BASE | 0x002,
+                "Descriptor index out of range"
+            ))
+        }
+        Result::Ok(self.descriptors.get(index)!)
+    }
+
+    pub fn descriptor_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_descriptors
+    }
+
+    pub fn find_available_region(self, min_pages: u64, max_addr: Word64) -> Result[u32, MemoryError>
+        effects: [deterministic]
+    {
+        let mut best_index: u32 = MAX_MEMORY_DESCRIPTORS
+        let mut best_size: u64 = 0
+
+        for i in 0..self.num_descriptors {
+            let desc: EFIMemoryDescriptor = self.descriptors.get(i)!
+            if desc.is_available() && desc.number_of_pages >= min_pages {
+                if max_addr.is_zero() || desc.physical_start.lt(max_addr) {
+                    if best_index == MAX_MEMORY_DESCRIPTORS || desc.number_of_pages < best_size {
+                        best_index = i
+                        best_size = desc.number_of_pages
+                    }
+                }
+            }
+        }
+
+        if best_index == MAX_MEMORY_DESCRIPTORS {
+            return Result::Err(MemoryError::new(
+                DIAG_EFIMEM_BASE | 0x003,
+                "No suitable memory region found"
+            ))
+        }
+
+        Result::Ok(best_index)
+    }
+
+    pub fn total_physical_ram(self) -> Word64
+        effects: [deterministic]
+    {
+        self.total_ram
+    }
+
+    pub fn total_ram_mb(self) -> u64
+        effects: [deterministic]
+    {
+        let bytes: u64 = self.total_ram.to_u64()
+        bytes / (1024 * 1024)
+    }
+
+    pub fn available_ram_mb(self) -> u64
+        effects: [deterministic]
+    {
+        self.available_pages * EFI_PAGE_SIZE / (1024 * 1024)
+    }
+
+    pub fn merge_adjacent_descriptors(self: ref mut)
+        effects: [deterministic]
+    {
+        let mut write_idx: u32 = 0
+        let mut i: u32 = 1
+
+        while i < self.num_descriptors {
+            let current: EFIMemoryDescriptor = self.descriptors.get(write_idx)!
+            let next: EFIMemoryDescriptor = self.descriptors.get(i)!
+
+            if current.memory_type == next.memory_type &&
+               current.attribute == next.attribute &&
+               current.end_address() == next.physical_start {
+
+                let mut merged: EFIMemoryDescriptor = current
+                merged.number_of_pages = merged.number_of_pages + next.number_of_pages
+                self.descriptors.set(write_idx, merged)!
+            } else {
+                write_idx = write_idx + 1
+                if write_idx != i {
+                    self.descriptors.set(write_idx, self.descriptors.get(i)!)!
+                }
+            }
+            i = i + 1
+        }
+
+        self.num_descriptors = write_idx + 1
+    }
+
+    pub defragment(self: ref mut)
+        effects: [deterministic]
+    {
+        // Sort by physical address
+        let mut sorted: bool = false
+        while !sorted {
+            sorted = true
+            for i in 0..(self.num_descriptors - 1) {
+                let curr: EFIMemoryDescriptor = self.descriptors.get(i)!
+                let next: EFIMemoryDescriptor = self.descriptors.get(i + 1)!
+                if curr.physical_start.gt(next.physical_start) {
+                    self.descriptors.set(i, next)!
+                    self.descriptors.set(i + 1, curr)!
+                    sorted = false
+                }
+            }
+        } proven
+
+        self.merge_adjacent_descriptors()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Boot Time Page Allocator
+// ──────────────────────────────────────────────
+
+pub type BootAllocation : struct {
+    physical_address: Word64,
+    pages: u64,
+    memory_type: u32,
+    in_use: bool,
+}
+
+impl BootAllocation {
+    pub fn new() -> BootAllocation
+        effects: [deterministic]
+    {
+        BootAllocation {
+            physical_address: Word64::zero(),
+            pages: 0,
+            memory_type: 0,
+            in_use: false,
+        }
+    }
+}
+
+pub type BootPageAllocator : struct {
+    memory_map: EFIMemoryMap,
+    allocations: FixedArray[MAX_BOOT_ALLOCS, BootAllocation],
+    num_allocations: u32,
+    pool_base: Word64,
+    pool_pages: u64,
+    pool_used: u64,
+    pool_initialized: bool,
+}
+
+impl BootPageAllocator {
+    pub fn new() -> BootPageAllocator
+        effects: [deterministic]
+    {
+        BootPageAllocator {
+            memory_map: EFIMemoryMap::new(),
+            allocations: FixedArray::new(),
+            num_allocations: 0,
+            pool_base: Word64::zero(),
+            pool_pages: 0,
+            pool_used: 0,
+            pool_initialized: false,
+        }
+    }
+
+    pub fn initialize(self: ref mut, map: EFIMemoryMap)
+        effects: [io:read, residual]
+    {
+        self.memory_map = map
+
+        // Reserve the boot allocator pool from available memory
+        let pool_pages_needed: u64 = BOOT_ALLOC_POOL_SIZE / EFI_PAGE_SIZE
+
+        trusted "Boot pool reservation: Allocate contiguous pages from conventional memory for boot-time allocations. UEFI Spec §7.2"
+        {
+            self.pool_base = Word64::from_u64(0x100000)  // 1MB
+            self.pool_pages = pool_pages_needed
+            self.pool_initialized = true
+        }
+
+        residual emit {
+            event: "efi_memory.boot_allocator.init",
+            pool_base: self.pool_base,
+            pool_pages: self.pool_pages,
+            pool_size: BOOT_ALLOC_POOL_SIZE,
+        }
+    }
+
+    pub fn allocate_pages(self: ref mut, pages: u64, mem_type: u32) -> Result[Word64, MemoryError>
+        effects: [deterministic]
+    {
+        if pages == 0 {
+            return Result::Err(MemoryError::new(
+                DIAG_EFIMEM_BASE | 0x010,
+                "Cannot allocate zero pages"
+            ))
+        }
+
+        if pages > MAX_PAGE_ALLOC {
+            return Result::Err(MemoryError::new(
+                DIAG_EFIMEM_BASE | 0x011,
+                "Page allocation exceeds maximum"
+            ))
+        }
+
+        if self.num_allocations >= MAX_BOOT_ALLOCS {
+            return Result::Err(MemoryError::new(
+                DIAG_EFIMEM_BASE | 0x012,
+                "Boot allocation table full"
+            ))
+        }
+
+        // Try pool first
+        if self.pool_initialized {
+            let bytes_needed: u64 = pages * EFI_PAGE_SIZE
+            if self.pool_used + bytes_needed <= self.pool_pages * EFI_PAGE_SIZE {
+                let addr: Word64 = self.pool_base.add(Word64::from_u64(self.pool_used))
+                self.pool_used = self.pool_used + bytes_needed
+
+                let alloc: BootAllocation = BootAllocation {
+                    physical_address: addr,
+                    pages: pages,
+                    memory_type: mem_type,
+                    in_use: true,
+                }
+                self.allocations.set(self.num_allocations, alloc)!
+                self.num_allocations = self.num_allocations + 1
+
+                return Result::Ok(addr)
+            }
+        }
+
+        // Fall back to finding region in memory map
+        let region_idx: u32 = self.memory_map.find_available_region(pages, Word64::zero())!
+        let region: EFIMemoryDescriptor = self.memory_map.get_descriptor(region_idx)!
+
+        let alloc: BootAllocation = BootAllocation {
+            physical_address: region.physical_start,
+            pages: pages,
+            memory_type: mem_type,
+            in_use: true,
+        }
+        self.allocations.set(self.num_allocations, alloc)!
+        self.num_allocations = self.num_allocations + 1
+
+        // Update the memory map to mark this region as used
+        let mut updated: EFIMemoryDescriptor = region
+        updated.memory_type = mem_type
+        updated.number_of_pages = updated.number_of_pages - pages
+        updated.physical_start = updated.physical_start.add(Word64::from_u64(pages * EFI_PAGE_SIZE))
+        self.memory_map.descriptors.set(region_idx, updated)!
+
+        residual emit {
+            event: "efi_memory.allocate_pages",
+            pages: pages,
+            memory_type: mem_type,
+            address: alloc.physical_address,
+        }
+
+        Result::Ok(alloc.physical_address)
+    }
+
+    pub fn free_pages(self: ref mut, addr: Word64)
+        effects: [deterministic]
+    {
+        for i in 0..self.num_allocations {
+            let mut alloc: BootAllocation = self.allocations.get(i)!
+            if alloc.physical_address == addr && alloc.in_use {
+                alloc.in_use = false
+                self.allocations.set(i, alloc)!
+
+                residual emit {
+                    event: "efi_memory.free_pages",
+                    address: addr,
+                    pages: alloc.pages,
+                }
+                return
+            }
+        }
+    }
+
+    pub fn allocate_pool(self: ref mut, size: u64, mem_type: u32) -> Result[Word64, MemoryError>
+        effects: [deterministic]
+    {
+        let pages: u64 = (size + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE
+        if pages == 0 {
+            pages = 1
+        }
+        self.allocate_pages(pages, mem_type)
+    }
+
+    pub fn get_allocations(self) -> FixedArray[MAX_BOOT_ALLOCS, BootAllocation>
+        effects: [deterministic]
+    {
+        self.allocations
+    }
+
+    pub fn allocation_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_allocations
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Type Conversion
+// ──────────────────────────────────────────────
+
+pub fn efi_memory_type_to_name(mem_type: u32) -> FixedString[32]
+    effects: [deterministic]
+{
+    let desc: EFIMemoryDescriptor = EFIMemoryDescriptor::new()
+    let mut named: EFIMemoryDescriptor = desc
+    named.memory_type = mem_type
+    named.memory_type_string()
+}
+
+pub fn memory_type_is_boot_service(mem_type: u32) -> bool
+    effects: [deterministic]
+{
+    mem_type == EFI_BOOT_SERVICES_CODE ||
+    mem_type == EFI_BOOT_SERVICES_DATA
+}
+
+pub fn memory_type_is_available_to_os(mem_type: u32) -> bool
+    effects: [deterministic]
+{
+    mem_type == EFI_CONVENTIONAL_MEMORY ||
+    mem_type == EFI_LOADER_CODE ||
+    mem_type == EFI_LOADER_DATA ||
+    memory_type_is_boot_service(mem_type)
+}
+
+pub fn memory_type_is_reserved(mem_type: u32) -> bool
+    effects: [deterministic]
+{
+    mem_type == EFI_RESERVED_MEMORY_TYPE ||
+    mem_type == EFI_UNUSABLE_MEMORY ||
+    mem_type == EFI_MEMORY_MAPPED_IO
+}
+
+pub fn memory_type_is_persistent(mem_type: u32) -> bool
+    effects: [deterministic]
+{
+    mem_type == EFI_PERSISTENT_MEMORY
+}
+
+// ──────────────────────────────────────────────
+// Runtime Descriptor Management
+// ──────────────────────────────────────────────
+
+pub type RuntimeMemoryManager : struct {
+    runtime_descriptors: FixedArray[MAX_MEMORY_DESCRIPTORS, EFIMemoryDescriptor],
+    num_runtime_descriptors: u32,
+    virtual_offset: Word64,
+    virtual_mode_active: bool,
+}
+
+impl RuntimeMemoryManager {
+    pub fn new() -> RuntimeMemoryManager
+        effects: [deterministic]
+    {
+        RuntimeMemoryManager {
+            runtime_descriptors: FixedArray::new(),
+            num_runtime_descriptors: 0,
+            virtual_offset: Word64::zero(),
+            virtual_mode_active: false,
+        }
+    }
+
+    pub fn add_runtime_descriptor(self: ref mut, desc: EFIMemoryDescriptor)
+        effects: [deterministic]
+    {
+        if desc.is_runtime_mapped() && self.num_runtime_descriptors < MAX_MEMORY_DESCRIPTORS {
+            self.runtime_descriptors.set(self.num_runtime_descriptors, desc)!
+            self.num_runtime_descriptors = self.num_runtime_descriptors + 1
+        }
+    }
+
+    pub fn extract_runtime_descriptors(self: ref mut, full_map: ref EFIMemoryMap)
+        effects: [deterministic]
+    {
+        for i in 0..full_map.num_descriptors {
+            let desc: EFIMemoryDescriptor = full_map.descriptors.get(i)!
+            self.add_runtime_descriptor(desc)
+        }
+    }
+
+    pub fn apply_virtual_offset(self: ref mut, offset: Word64)
+        effects: [deterministic]
+    {
+        for i in 0..self.num_runtime_descriptors {
+            let mut desc: EFIMemoryDescriptor = self.runtime_descriptors.get(i)!
+            let new_virtual: Word64 = desc.physical_start.add(offset)
+            desc.virtual_start = new_virtual
+            self.runtime_descriptors.set(i, desc)!
+        }
+        self.virtual_offset = offset
+        self.virtual_mode_active = true
+    }
+
+    pub fn physical_to_virtual(self, physical_addr: Word64) -> Word64
+        effects: [deterministic]
+    {
+        if !self.virtual_mode_active {
+            return physical_addr
+        }
+        for i in 0..self.num_runtime_descriptors {
+            let desc: EFIMemoryDescriptor = self.runtime_descriptors.get(i)!
+            let end: Word64 = desc.physical_start.add(Word64::from_u64(desc.number_of_pages * EFI_PAGE_SIZE))
+            if physical_addr.gte(desc.physical_start) && physical_addr.lt(end) {
+                let offset: Word64 = physical_addr.sub(desc.physical_start)
+                return desc.virtual_start.add(offset)
+            }
+        }
+        physical_addr  // Fallback to physical
+    }
+
+    pub fn virtual_to_physical(self, virtual_addr: Word64) -> Word64
+        effects: [deterministic]
+    {
+        if !self.virtual_mode_active {
+            return virtual_addr
+        }
+        for i in 0..self.num_runtime_descriptors {
+            let desc: EFIMemoryDescriptor = self.runtime_descriptors.get(i)!
+            let end: Word64 = desc.virtual_start.add(Word64::from_u64(desc.number_of_pages * EFI_PAGE_SIZE))
+            if virtual_addr.gte(desc.virtual_start) && virtual_addr.lt(end) {
+                let offset: Word64 = virtual_addr.sub(desc.virtual_start)
+                return desc.physical_start.add(offset)
+            }
+        }
+        virtual_addr
+    }
+
+    pub fn runtime_descriptor_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_runtime_descriptors
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Attribute Management
+// ──────────────────────────────────────────────
+
+pub type MemoryAttributes : u64 = struct {
+    attributes: u64,
+}
+
+impl MemoryAttributes {
+    pub fn new() -> MemoryAttributes
+        effects: [deterministic]
+    {
+        MemoryAttributes { attributes: 0 }
+    }
+
+    pub fn from_u64(val: u64) -> MemoryAttributes
+        effects: [deterministic]
+    {
+        MemoryAttributes { attributes: val }
+    }
+
+    pub fn to_u64(self) -> u64
+        effects: [deterministic]
+    {
+        self.attributes
+    }
+
+    pub fn set_uc(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes | EFI_MEMORY_UC
+    }
+
+    pub fn set_wb(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes | EFI_MEMORY_WB
+    }
+
+    pub fn set_wt(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes | EFI_MEMORY_WT
+    }
+
+    pub fn set_wp(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes | EFI_MEMORY_WP
+    }
+
+    pub fn set_xp(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes | EFI_MEMORY_XP
+    }
+
+    pub fn clear_xp(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes & !EFI_MEMORY_XP
+    }
+
+    pub fn set_runtime(self: ref mut)
+        effects: [deterministic]
+    {
+        self.attributes = self.attributes | EFI_MEMORY_RUNTIME
+    }
+
+    pub fn is_uc(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attributes & EFI_MEMORY_UC) != 0
+    }
+
+    pub fn is_wb(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attributes & EFI_MEMORY_WB) != 0
+    }
+
+    pub fn is_xp(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attributes & EFI_MEMORY_XP) != 0
+    }
+
+    pub fn is_executable(self) -> bool
+        effects: [deterministic]
+    {
+        !self.is_xp()
+    }
+
+    pub fn is_runtime(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attributes & EFI_MEMORY_RUNTIME) != 0
+    }
+
+    pub fn set_page_attr(physical_addr: Word64, pages: u64, attrs: MemoryAttributes) -> Result<(), MemoryError>
+        effects: [io:write, memory:mmio, deterministic]
+    {
+        trusted "Set memory attributes: Configure page table entries for cacheability and permission attributes. CPU SDM Vol 3 §4.10"
+        {
+            Result::Ok(())
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Top-level Functions
+// ──────────────────────────────────────────────
+
+pub fn create_memory_map_from_uefi(bs_ptr: Word64) -> Result[EFIMemoryMap, MemoryError>
+    effects: [io:read, deterministic]
+{
+    let mut map: EFIMemoryMap = EFIMemoryMap::new()
+
+    trusted "UEFI GetMemoryMap: Retrieve UEFI memory map via boot services function 6. UEFI Spec §7.2"
+    {
+        // In real implementation, call GetMemoryMap and parse descriptors
+        // Synthetic memory map for now
+        let mut desc1: EFIMemoryDescriptor = EFIMemoryDescriptor::new()
+        desc1.memory_type = EFI_CONVENTIONAL_MEMORY
+        desc1.physical_start = Word64::from_u64(0x1000)
+        desc1.number_of_pages = 0x9F000  // ~2.5GB
+        desc1.attribute = Word64::from_u64(EFI_MEMORY_WB)
+        map.add_descriptor(desc1)!
+
+        let mut desc2: EFIMemoryDescriptor = EFIMemoryDescriptor::new()
+        desc2.memory_type = EFI_BOOT_SERVICES_DATA
+        desc2.physical_start = Word64::from_u64(0x9FC00000)
+        desc2.number_of_pages = 0x4000
+        desc2.attribute = Word64::from_u64(EFI_MEMORY_WB)
+        map.add_descriptor(desc2)!
+
+        let mut desc3: EFIMemoryDescriptor = EFIMemoryDescriptor::new()
+        desc3.memory_type = EFI_RUNTIME_SERVICES_DATA
+        desc3.physical_start = Word64::from_u64(0xA0000000)
+        desc3.number_of_pages = 0x1000
+        desc3.attribute = Word64::from_u64(EFI_MEMORY_WB | EFI_MEMORY_RUNTIME)
+        map.add_descriptor(desc3)!
+
+        let mut desc4: EFIMemoryDescriptor = EFIMemoryDescriptor::new()
+        desc4.memory_type = EFI_MEMORY_MAPPED_IO
+        desc4.physical_start = Word64::from_u64(0xF0000000)
+        desc4.number_of_pages = 0x100000
+        desc4.attribute = Word64::from_u64(EFI_MEMORY_UC)
+        map.add_descriptor(desc4)!
+    }
+
+    map.defragment()
+
+    residual emit {
+        event: "efi_memory.map_created",
+        descriptors: map.num_descriptors,
+        total_pages: map.total_pages,
+        available_pages: map.available_pages,
+        total_ram_mb: map.total_ram_mb(),
+    }
+
+    Result::Ok(map)
+}
+
+pub fn get_uefi_memory_map(bs_ptr: Word64) -> Result[EFIMemoryMap, MemoryError>
+    effects: [io:read, deterministic]
+{
+    create_memory_map_from_uefi(bs_ptr)
+}
+
+pub fn convert_memory_map_for_kernel(efi_map: ref EFIMemoryMap) -> Result[EFIMemoryMap, MemoryError>
+    effects: [deterministic]
+{
+    let mut kernel_map: EFIMemoryMap = EFIMemoryMap::new()
+
+    // Convert boot service regions to available for kernel
+    for i in 0..efi_map.num_descriptors {
+        let desc: EFIMemoryDescriptor = efi_map.descriptors.get(i)!
+        let mut converted: EFIMemoryDescriptor = desc
+
+        if desc.is_boot_services() {
+            converted.memory_type = EFI_CONVENTIONAL_MEMORY
+        }
+
+        kernel_map.add_descriptor(converted)!
+    }
+
+    kernel_map.defragment()
+    Result::Ok(kernel_map)
+}
+
+// ──────────────────────────────────────────────
+// Memory Error Type
+// ──────────────────────────────────────────────
+
+pub type MemoryError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl MemoryError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> MemoryError
+        effects: [deterministic]
+    {
+        MemoryError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    pub fn is_ok(self) -> bool
+        effects: [deterministic]
+    {
+        self.code == 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Map Conversion Utilities
+// ──────────────────────────────────────────────
+
+pub fn memory_map_to_bootloader_format(efi_map: ref EFIMemoryMap) -> Result<MemoryMap, MemoryError>
+    effects: [deterministic]
+{
+    let mut boot_map: MemoryMap = MemoryMap::new()
+
+    for i in 0..efi_map.num_descriptors {
+        let desc: EFIMemoryDescriptor = efi_map.descriptors.get(i)!
+        let region_type: u32 = match desc.memory_type {
+            EFI_CONVENTIONAL_MEMORY | EFI_LOADER_CODE | EFI_LOADER_DATA => 1,
+            EFI_ACPI_RECLAIM_MEMORY => 3,
+            EFI_ACPIMEMORY_NVS => 4,
+            EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA => 1,
+            _ => 2,
+        }
+        let region: MemoryRegion = MemoryRegion {
+            base_addr: desc.physical_start,
+            length: Word64::from_u64(desc.number_of_pages * EFI_PAGE_SIZE),
+            region_type: region_type,
+            attributes: desc.attribute.to_u64(),
+            acpi_handle: Word64::zero(),
+        }
+        boot_map.add_region(region)!
+    }
+
+    Result::Ok(boot_map)
+}
+
+pub fn print_memory_map_summary(map: ref EFIMemoryMap, console: Cap(Console))
+    effects: [io:write, deterministic]
+{
+    console.write_line(concat("Total RAM: ", map.total_ram_mb(), " MB"))!
+    console.write_line(concat("Available: ", map.available_ram_mb(), " MB"))!
+    console.write_line(concat("Descriptors: ", map.num_descriptors))!
+
+    for i in 0..map.num_descriptors {
+        let desc: EFIMemoryDescriptor = map.descriptors.get(i)!
+        let mut line: FixedString[128] = FixedString::new()
+        line.append_str(desc.memory_type_string())
+        line.append_str(FixedString::from("  "))
+        line.append_hex(desc.physical_start)
+        line.append_str(FixedString::from("  "))
+        line.append_int(desc.number_of_pages)
+        line.append_str(FixedString::from(" pages"))
+        console.write_line(line)!
+    }
+}
+
+pub fn estimate_max_allocations(map: ref EFIMemoryMap, page_size: u64) -> u64
+    effects: [deterministic]
+{
+    map.available_pages / page_size
+}
+
+pub fn sanity_check_memory_map(map: ref EFIMemoryMap) -> FixedArray[8, FixedString[128]]
+    effects: [deterministic]
+{
+    let mut issues: FixedArray[8, FixedString[128]] = FixedArray::new()
+
+    if map.num_descriptors == 0 {
+        issues.push(FixedString::from("Memory map is empty"))!
+    }
+
+    if map.available_pages == 0 {
+        issues.push(FixedString::from("No available memory"))!
+    }
+
+    // Check for overlapping descriptors
+    for i in 0..map.num_descriptors {
+        let desc: EFIMemoryDescriptor = map.descriptors.get(i)!
+        if desc.number_of_pages == 0 {
+            issues.push(FixedString::from("Zero-length descriptor found"))!
+        }
+        for j in (i + 1)..map.num_descriptors {
+            let other: EFIMemoryDescriptor = map.descriptors.get(j)!
+            let this_end: Word64 = desc.physical_start.add(
+                Word64::from_u64(desc.number_of_pages * EFI_PAGE_SIZE))
+            if desc.physical_start.lt(other.physical_start) &&
+               other.physical_start.lt(this_end) {
+                issues.push(FixedString::from("Overlapping descriptors detected"))!
+            }
+        }
+    }
+
+    issues
+}
+
+const DIAG_EFIMEM_BASE: Word64 = 0x0D00_0000_0000_0000

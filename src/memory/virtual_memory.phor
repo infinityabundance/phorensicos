@@ -1,0 +1,1606 @@
+// file: virtual_memory.phor
+// purpose: Virtual memory management: page table management (x86_64 4-level paging),
+//          address space creation/destruction, page mapping/unmapping, TLB management,
+//          huge pages (2MB, 1GB), MMIO mapping. All operations use bounded loops and
+//          record residuals for all state changes.
+// evidence: MEM-VM-ARCH-001 through MEM-VM-ARCH-280
+// residual: Every page table modification records a residual for auditability.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use memory::phys_page_allocator::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-DIAG-001 through MEM-VM-DIAG-015
+
+const DIAG_VM_BASE          : Word64 = Word64::from_u64(0xA100)
+const DIAG_VM_OK            : Word64 = DIAG_VM_BASE | 0x000
+const DIAG_VM_NO_MEM        : Word64 = DIAG_VM_BASE | 0x001
+const DIAG_VM_INVALID_ADDR  : Word64 = DIAG_VM_BASE | 0x002
+const DIAG_VM_ALIGNMENT     : Word64 = DIAG_VM_BASE | 0x003
+const DIAG_VM_ALREADY_MAPPED: Word64 = DIAG_VM_BASE | 0x004
+const DIAG_VM_NOT_MAPPED    : Word64 = DIAG_VM_BASE | 0x005
+const DIAG_VM_PERM_DENIED   : Word64 = DIAG_VM_BASE | 0x006
+const DIAG_VM_TLB_FAIL      : Word64 = DIAG_VM_BASE | 0x007
+const DIAG_VM_HUGE_UNSUPP   : Word64 = DIAG_VM_BASE | 0x008
+const DIAG_VM_MMIO_FAIL     : Word64 = DIAG_VM_BASE | 0x009
+const DIAG_VM_TABLE_FULL    : Word64 = DIAG_VM_BASE | 0x00A
+const DIAG_VM_INVALID_ARG   : Word64 = DIAG_VM_BASE | 0x00B
+
+// ──────────────────────────────────────────────
+// x86_64 4-Level Paging Constants
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-CONST-001 through MEM-VM-CONST-025
+
+const PAGE_TABLE_ENTRIES    : u32 = 512   // Entries per page table (9 bits)
+const PAGE_4K_SIZE          : u64 = 0x1000  // 4KB
+const PAGE_2M_SIZE          : u64 = 0x20_0000 // 2MB
+const PAGE_1G_SIZE          : u64 = 0x4000_0000 // 1GB
+const PAGE_4K_MASK          : u64 = 0xFFFF_FFFF_FFFF_F000
+const PAGE_2M_MASK          : u64 = 0xFFFF_FFFF_FFE0_0000
+const PAGE_1G_MASK          : u64 = 0xFFFF_FFFF_C000_0000
+const PAGE_OFFSET_4K        : u64 = 12
+const PAGE_OFFSET_2M        : u64 = 21
+const PAGE_OFFSET_1G        : u64 = 30
+const PAGE_TABLE_SHIFT      : u64 = 12
+const PAGE_DIRECTORY_SHIFT  : u64 = 21
+const PAGE_DIR_PTR_SHIFT    : u64 = 30
+const PAGE_PML4_SHIFT       : u64 = 39
+
+// Page Table Entry Flags (x86_64)
+const PTE_PRESENT           : u64 = 0x001
+const PTE_WRITABLE          : u64 = 0x002
+const PTE_USER              : u64 = 0x004
+const PTE_WRITETHROUGH      : u64 = 0x008
+const PTE_CACHE_DISABLED    : u64 = 0x010
+const PTE_ACCESSED          : u64 = 0x020
+const PTE_DIRTY             : u64 = 0x040
+const PTE_HUGE              : u64 = 0x080
+const PTE_GLOBAL            : u64 = 0x100
+const PTE_NO_EXECUTE        : u64 = 0x8000_0000_0000_0000
+const PTE_PFN_MASK          : u64 = 0x0000_FFFF_FFFF_F000
+const PTE_FLAGS_MASK        : u64 = 0x0000_0000_0000_0FFF
+
+// Page table level indices
+const TABLE_LVL_PML4        : u32 = 0
+const TABLE_LVL_PDP         : u32 = 1
+const TABLE_LVL_PD          : u32 = 2
+const TABLE_LVL_PT          : u32 = 3
+
+// TLB flush types
+const TLB_FLUSH_LOCAL       : u8 = 0
+const TLB_FLUSH_GLOBAL      : u8 = 1
+const TLB_FLUSH_ALL         : u8 = 2
+const TLB_FLUSH_ADDR        : u8 = 3
+const TLB_FLUSH_RANGE       : u8 = 4
+
+// Maximum number of address spaces
+const MAX_ADDRESS_SPACES    : u32 = 64
+const MAX_MMIO_REGIONS      : u32 = 32
+const MAX_VM_OPERATIONS     : u32 = 64
+
+// ──────────────────────────────────────────────
+// Permissions
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-PERM-001 through MEM-VM-PERM-010
+
+pub type PagePermissions : u8 = struct {
+    value: u8,
+}
+
+impl PagePermissions {
+    pub fn new() -> PagePermissions
+        effects: [deterministic]
+    {
+        PagePermissions { value: 0 }
+    }
+
+    pub fn from_flags(read: bool, write: bool, execute: bool, user: bool) -> PagePermissions
+        effects: [deterministic]
+    {
+        let mut val: u8 = 0
+        if read { val = val | 0x01 }
+        if write { val = val | 0x02 }
+        if execute { val = val | 0x04 }
+        if user { val = val | 0x08 }
+        PagePermissions { value: val }
+    }
+
+    pub fn read(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x01) != 0
+    }
+
+    pub fn write(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x02) != 0
+    }
+
+    pub fn execute(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x04) != 0
+    }
+
+    pub fn user(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x08) != 0
+    }
+
+    pub fn to_pte_flags(self) -> u64
+        effects: [deterministic]
+    {
+        let mut flags: u64 = PTE_PRESENT
+        if self.write() { flags = flags | PTE_WRITABLE }
+        if self.user() { flags = flags | PTE_USER }
+        if !self.execute() { flags = flags | PTE_NO_EXECUTE }
+        flags
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Table Entry (64-bit)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-PTE-001 through MEM-VM-PTE-020
+
+pub type PageTableEntry : u64 = struct {
+    value: u64,
+}
+
+impl PageTableEntry {
+    pub fn new(value: u64) -> PageTableEntry
+        effects: [deterministic]
+    {
+        PageTableEntry { value: value }
+    }
+
+    pub fn is_present(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_PRESENT) != 0
+    }
+
+    pub fn is_huge(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_HUGE) != 0
+    }
+
+    pub fn is_writable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_WRITABLE) != 0
+    }
+
+    pub fn is_user(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_USER) != 0
+    }
+
+    pub fn is_executable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_NO_EXECUTE) == 0
+    }
+
+    pub fn is_dirty(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_DIRTY) != 0
+    }
+
+    pub fn is_accessed(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_ACCESSED) != 0
+    }
+
+    pub fn is_global(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & PTE_GLOBAL) != 0
+    }
+
+    pub fn pfn(self) -> PhysicalPageNumber
+        effects: [deterministic]
+    {
+        let pfn_val: u64 = (self.value & PTE_PFN_MASK) >> PAGE_TABLE_SHIFT
+        PhysicalPageNumber::new(pfn_val)
+    }
+
+    pub fn set_pfn(self: ref mut, pfn: PhysicalPageNumber)
+        effects: [deterministic]
+    {
+        let flags: u64 = self.value & PTE_FLAGS_MASK
+        self.value = flags | (pfn.value() << PAGE_TABLE_SHIFT)
+    }
+
+    pub fn flags(self) -> u64
+        effects: [deterministic]
+    {
+        self.value & PTE_FLAGS_MASK
+    }
+
+    pub fn set_flags(self: ref mut, flags: u64)
+        effects: [deterministic]
+    {
+        let pfn_bits: u64 = self.value & PTE_PFN_MASK
+        self.value = pfn_bits | (flags & PTE_FLAGS_MASK)
+    }
+
+    pub fn make_present(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value | PTE_PRESENT
+    }
+
+    pub fn set_not_present(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value & !PTE_PRESENT
+    }
+
+    pub fn clear_dirty(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value & !PTE_DIRTY
+    }
+
+    pub fn mark_dirty(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value | PTE_DIRTY
+    }
+
+    pub fn mark_accessed(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value | PTE_ACCESSED
+    }
+
+    pub fn set_not_writable(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value & !PTE_WRITABLE
+    }
+
+    pub fn make_writable(self: ref mut)
+        effects: [deterministic]
+    {
+        self.value = self.value | PTE_WRITABLE
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Table (512 entries = one 4KB page)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-PT-001 through MEM-VM-PT-025
+
+pub type PageTable : struct {
+    entries: FixedArray[PAGE_TABLE_ENTRIES, PageTableEntry],
+    phys_addr: u64,
+    level: u32,
+}
+
+impl PageTable {
+    pub fn new(phys_addr: u64, level: u32) -> PageTable
+        effects: [deterministic]
+    {
+        let mut pt: PageTable = PageTable {
+            entries: FixedArray::new(),
+            phys_addr: phys_addr,
+            level: level,
+        }
+        // loop: bounds[BOUND_SMALL] — exactly 512 iterations
+        loop: bounds[BOUND_SMALL] for i in 0..PAGE_TABLE_ENTRIES {
+            pt.entries.push(PageTableEntry::new(0))
+        }
+        pt
+    }
+
+    pub fn get_entry(self: ref, index: u32) -> Result[ref PageTableEntry, MemoryError]
+        effects: [deterministic]
+    {
+        if index >= PAGE_TABLE_ENTRIES {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_BOUNDS,
+                FixedString[128]::from_slice("Page table index out of range")))
+        }
+        // trust: index bounds-checked
+        trusted("page table entry access: index within [0,512)") {
+            Result::Ok(self.entries.get(index))
+        }
+    }
+
+    pub fn get_entry_mut(self: ref mut, index: u32) -> Result[ref mut PageTableEntry, MemoryError]
+        effects: [deterministic]
+    {
+        if index >= PAGE_TABLE_ENTRIES {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_BOUNDS,
+                FixedString[128]::from_slice("Page table index out of range")))
+        }
+        // trust: index bounds-checked
+        trusted("page table entry mutable access: index within [0,512)") {
+            Result::Ok(self.entries.get_mut(index))
+        }
+    }
+
+    pub fn physical_address(self) -> u64
+        effects: [deterministic]
+    {
+        self.phys_addr
+    }
+
+    pub fn table_level(self) -> u32
+        effects: [deterministic]
+    {
+        self.level
+    }
+}
+
+// ──────────────────────────────────────────────
+// Address Space Identifier
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-ASID-001 through MEM-VM-ASID-010
+
+pub type AddressSpaceId : u32 = struct {
+    value: u32,
+}
+
+impl AddressSpaceId {
+    pub fn new(value: u32) -> AddressSpaceId
+        effects: [deterministic]
+    {
+        AddressSpaceId { value: value % MAX_ADDRESS_SPACES }
+    }
+
+    pub fn zero() -> AddressSpaceId
+        effects: [deterministic]
+    {
+        AddressSpaceId { value: 0 }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn eq(self, other: AddressSpaceId) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// Virtual Address
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-VADDR-001 through MEM-VM-VADDR-015
+
+pub type VirtualAddress : u64 = struct {
+    value: u64,
+}
+
+impl VirtualAddress {
+    pub fn new(value: u64) -> VirtualAddress
+        effects: [deterministic]
+    {
+        VirtualAddress { value: value }
+    }
+
+    pub fn value(self) -> u64
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn add(self, delta: u64) -> VirtualAddress
+        effects: [deterministic]
+    {
+        VirtualAddress { value: self.value + delta }
+    }
+
+    pub fn sub(self, delta: u64) -> VirtualAddress
+        effects: [deterministic]
+    {
+        VirtualAddress { value: self.value - delta }
+    }
+
+    pub fn page_aligned(self, page_size: u64) -> bool
+        effects: [deterministic]
+    {
+        (self.value & (page_size - 1)) == 0
+    }
+
+    pub fn align_down(self, alignment: u64) -> VirtualAddress
+        effects: [deterministic]
+    {
+        VirtualAddress { value: self.value & !(alignment - 1) }
+    }
+
+    pub fn align_up(self, alignment: u64) -> VirtualAddress
+        effects: [deterministic]
+    {
+        let mask: u64 = alignment - 1
+        if (self.value & mask) == 0 {
+            self
+        } else {
+            VirtualAddress { value: (self.value + alignment) & !mask }
+        }
+    }
+
+    pub fn pml4_index(self) -> u32
+        effects: [deterministic]
+    {
+        ((self.value >> 39) & 0x1FF) as u32
+    }
+
+    pub fn pdp_index(self) -> u32
+        effects: [deterministic]
+    {
+        ((self.value >> 30) & 0x1FF) as u32
+    }
+
+    pub fn pd_index(self) -> u32
+        effects: [deterministic]
+    {
+        ((self.value >> 21) & 0x1FF) as u32
+    }
+
+    pub fn pt_index(self) -> u32
+        effects: [deterministic]
+    {
+        ((self.value >> 12) & 0x1FF) as u32
+    }
+
+    pub fn offset_4k(self) -> u64
+        effects: [deterministic]
+    {
+        self.value & 0xFFF
+    }
+
+    pub fn canonalize(self) -> VirtualAddress
+        effects: [deterministic]
+    {
+        let mask: u64 = 0xFFFF_8000_0000_0000
+        if (self.value & 0x8000_0000_0000_0000) != 0 {
+            VirtualAddress { value: self.value | mask }
+        } else {
+            VirtualAddress { value: self.value & !mask }
+        }
+    }
+
+    pub fn is_canonical(self) -> bool
+        effects: [deterministic]
+    {
+        let high_bits: u64 = self.value >> 47
+        high_bits == 0 || high_bits == 0x1FFFF
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Mapping Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-MAP-001 through MEM-VM-MAP-015
+
+pub type PageMapping : struct {
+    virt_addr: VirtualAddress,
+    phys_addr: u64,
+    page_size: u64,
+    permissions: PagePermissions,
+    is_huge: bool,
+    is_mmio: bool,
+    asid: AddressSpaceId,
+}
+
+impl PageMapping {
+    pub fn new(
+        virt: VirtualAddress,
+        phys: u64,
+        size: u64,
+        perms: PagePermissions,
+        huge: bool,
+        mmio: bool,
+        asid: AddressSpaceId,
+    ) -> PageMapping
+        effects: [deterministic]
+    {
+        PageMapping {
+            virt_addr: virt,
+            phys_addr: phys,
+            page_size: size,
+            permissions: perms,
+            is_huge: huge,
+            is_mmio: mmio,
+            asid: asid,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// MMIO Region
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-MMIO-001 through MEM-VM-MMIO-015
+
+pub type MmioRegion : struct {
+    virt_base: VirtualAddress,
+    phys_base: u64,
+    size: u64,
+    is_active: bool,
+    owning_driver: Word64,
+    generation: Word32,
+}
+
+impl MmioRegion {
+    pub fn new(
+        virt_base: VirtualAddress,
+        phys_base: u64,
+        size: u64,
+        driver_id: Word64,
+    ) -> MmioRegion
+        effects: [deterministic]
+    {
+        MmioRegion {
+            virt_base: virt_base,
+            phys_base: phys_base,
+            size: size,
+            is_active: true,
+            owning_driver: driver_id,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn contains(self, addr: VirtualAddress) -> bool
+        effects: [deterministic]
+    {
+        let start: u64 = self.virt_base.value()
+        let end: u64 = start + self.size
+        addr.value() >= start && addr.value() < end
+    }
+
+    pub fn deactivate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_active = false
+    }
+}
+
+// ──────────────────────────────────────────────
+// Address Space
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-AS-001 through MEM-VM-AS-045
+
+pub type AddressSpace : struct {
+    asid: AddressSpaceId,
+    pml4_phys: u64,
+    pml4_table: PageTable,
+    mmio_regions: FixedArray[MAX_MMIO_REGIONS, MmioRegion],
+    num_mmio_regions: u32,
+    mappings: FixedArray[1024, PageMapping],
+    num_mappings: u32,
+    generation: Word32,
+    is_active: bool,
+    kernel_mapped: bool,
+    user_base: VirtualAddress,
+    user_limit: VirtualAddress,
+}
+
+impl AddressSpace {
+    pub fn new(
+        asid: AddressSpaceId,
+        pml4_phys: u64,
+        kernel_base: VirtualAddress,
+        kernel_limit: VirtualAddress,
+    ) -> AddressSpace
+        effects: [deterministic]
+    {
+        let pml4_table: PageTable = PageTable::new(pml4_phys, TABLE_LVL_PML4)
+        AddressSpace {
+            asid: asid,
+            pml4_phys: pml4_phys,
+            pml4_table: pml4_table,
+            mmio_regions: FixedArray::new(),
+            num_mmio_regions: 0,
+            mappings: FixedArray::new(),
+            num_mappings: 0,
+            generation: Word32::initial(),
+            is_active: false,
+            kernel_mapped: false,
+            user_base: kernel_limit,
+            user_limit: kernel_base,
+        }
+    }
+
+    pub fn activate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_active = true
+    }
+
+    pub fn deactivate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_active = false
+    }
+
+    pub fn asid(self) -> AddressSpaceId
+        effects: [deterministic]
+    {
+        self.asid
+    }
+
+    pub fn pml4_address(self) -> u64
+        effects: [deterministic]
+    {
+        self.pml4_phys
+    }
+
+    pub fn set_user_range(self: ref mut, base: VirtualAddress, limit: VirtualAddress)
+        effects: [deterministic]
+    {
+        self.user_base = base
+        self.user_limit = limit
+    }
+
+    pub fn add_mapping(self: ref mut, mapping: PageMapping)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if self.num_mappings >= 1024 {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_TABLE_FULL,
+                FixedString[128]::from_slice("Mapping table full")))
+        }
+        self.mappings.push(mapping);
+        self.num_mappings = self.num_mappings + 1
+        Result::Ok(())
+    }
+
+    pub fn remove_mapping(self: ref mut, virt: VirtualAddress)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_mappings (<=1024)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_mappings {
+            let mapping: ref PageMapping = self.mappings.get(i)
+            if mapping.virt_addr.value() == virt.value() {
+                // Mark as inactive by clearing
+                let mut new_mapping: PageMapping = PageMapping::new(
+                    VirtualAddress::new(0), 0, 0,
+                    PagePermissions::new(), false, false,
+                    AddressSpaceId::zero())
+                self.mappings.set(i, new_mapping)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_vm_error(
+            DIAG_VM_NOT_MAPPED,
+            FixedString[128]::from_slice("Address not mapped")))
+    }
+}
+
+// ──────────────────────────────────────────────
+// TLB Manager
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-TLB-001 through MEM-VM-TLB-030
+
+pub type TlbManager : struct {
+    flush_count: u64,
+    last_flush_type: u8,
+    last_flush_addr: u64,
+    generation: Word32,
+}
+
+impl TlbManager {
+    pub fn new() -> TlbManager
+        effects: [deterministic]
+    {
+        TlbManager {
+            flush_count: 0,
+            last_flush_type: TLB_FLUSH_LOCAL,
+            last_flush_addr: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn flush_all(self: ref mut)
+        effects: [deterministic]
+    {
+        // trust: TLB flush is a privileged CPU instruction
+        trusted("TLB flush all: executes invpcid or mov cr3") {
+            __builtin_tlb_flush_all()
+        }
+        self.flush_count = self.flush_count + 1
+        self.last_flush_type = TLB_FLUSH_ALL
+        self.generation.bump();
+        self.record_tlb_flush_residual(TLB_FLUSH_ALL, 0)
+    }
+
+    pub fn flush_address(self: ref mut, addr: VirtualAddress)
+        effects: [deterministic]
+    {
+        // trust: TLB invalidation for a single address
+        trusted("TLB flush address: executes invlpg") {
+            __builtin_tlb_flush_addr(addr.value())
+        }
+        self.flush_count = self.flush_count + 1
+        self.last_flush_type = TLB_FLUSH_ADDR
+        self.last_flush_addr = addr.value()
+        self.generation.bump();
+        self.record_tlb_flush_residual(TLB_FLUSH_ADDR, addr.value())
+    }
+
+    pub fn flush_range(self: ref mut, start: VirtualAddress, end: VirtualAddress)
+        effects: [deterministic]
+    {
+        let mut current: VirtualAddress = start
+        // loop: bounds[BOUND_MEDIUM] — bounded by range size
+        loop: bounds[BOUND_MEDIUM] for i in 0..1024 {
+            if current.value() >= end.value() {
+                break
+            }
+            // trust: single-address TLB invalidation
+            trusted("TLB flush range: per-address invlpg") {
+                __builtin_tlb_flush_addr(current.value())
+            }
+            current = current.add(PAGE_4K_SIZE)
+            self.flush_count = self.flush_count + 1
+        }
+        self.last_flush_type = TLB_FLUSH_RANGE
+        self.generation.bump();
+        self.record_tlb_flush_residual(TLB_FLUSH_RANGE, start.value())
+    }
+
+    pub fn flush_global(self: ref mut)
+        effects: [deterministic]
+    {
+        // trust: Global TLB flush requires CR3 reload
+        trusted("TLB flush global: reloads CR3") {
+            __builtin_tlb_flush_global()
+        }
+        self.flush_count = self.flush_count + 1
+        self.last_flush_type = TLB_FLUSH_GLOBAL
+        self.generation.bump();
+        self.record_tlb_flush_residual(TLB_FLUSH_GLOBAL, 0)
+    }
+
+    pub fn flush_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.flush_count
+    }
+
+    fn record_tlb_flush_residual(self, flush_type: u8, addr: u64)
+        effects: [deterministic]
+    {
+        // residual: Record TLB flush operation
+        @emit_residual(
+            message: "TLB flush",
+            code: DIAG_VM_OK,
+            data: (flush_type, addr),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Virtual Memory Manager
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-MGR-001 through MEM-VM-MGR-120
+
+pub type VirtualMemoryManager : struct {
+    address_spaces: FixedArray[MAX_ADDRESS_SPACES, AddressSpace],
+    num_address_spaces: u32,
+    active_asid: AddressSpaceId,
+    tlb_mgr: TlbManager,
+    allocator: Handle,
+    generation: Word32,
+    page_table_pool_base: u64,
+    page_table_pool_size: u64,
+    page_table_alloc_count: u32,
+    map_count: u64,
+    unmap_count: u64,
+    fault_count: u64,
+}
+
+impl VirtualMemoryManager {
+    pub fn new(
+        page_table_pool_base: u64,
+        page_table_pool_size: u64,
+    ) -> VirtualMemoryManager
+        effects: [deterministic]
+    {
+        VirtualMemoryManager {
+            address_spaces: FixedArray::new(),
+            num_address_spaces: 0,
+            active_asid: AddressSpaceId::zero(),
+            tlb_mgr: TlbManager::new(),
+            allocator: Handle::null(),
+            generation: Word32::initial(),
+            page_table_pool_base: page_table_pool_base,
+            page_table_pool_size: page_table_pool_size,
+            page_table_alloc_count: 0,
+            map_count: 0,
+            unmap_count: 0,
+            fault_count: 0,
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Address Space Management
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-AS-MGMT-001 through MEM-VM-AS-MGMT-030
+
+    pub fn create_address_space(self: ref mut,
+                                 kernel_base: VirtualAddress,
+                                 kernel_limit: VirtualAddress)
+        -> Result[AddressSpaceId, MemoryError]
+        effects: [deterministic]
+    {
+        if self.num_address_spaces >= MAX_ADDRESS_SPACES {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_TABLE_FULL,
+                FixedString[128]::from_slice("Max address spaces reached")))
+        }
+        // Allocate a physical page for the PML4 table
+        let pml4_phys: u64 = self.allocate_page_table()?
+        let asid_value: u32 = self.num_address_spaces
+        let asid: AddressSpaceId = AddressSpaceId::new(asid_value)
+        let as: AddressSpace = AddressSpace::new(
+            asid, pml4_phys, kernel_base, kernel_limit)
+        self.address_spaces.push(as);
+        self.num_address_spaces = self.num_address_spaces + 1
+        self.generation.bump();
+        self.record_as_creation_residual(asid, pml4_phys)
+        Result::Ok(asid)
+    }
+
+    pub fn destroy_address_space(self: ref mut, asid: AddressSpaceId)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let index: u32 = asid.value()
+        if index >= self.num_address_spaces {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("Invalid address space ID")))
+        }
+        let as: ref mut AddressSpace = self.address_spaces.get_mut(index)
+        // Free the PML4 page
+        self.free_page_table(as.pml4_phys)?;
+        as.deactivate();
+        self.generation.bump();
+        self.record_as_destruction_residual(asid)
+        Result::Ok(())
+    }
+
+    pub fn activate_address_space(self: ref mut, asid: AddressSpaceId)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let index: u32 = asid.value()
+        if index >= self.num_address_spaces {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("Invalid address space ID")))
+        }
+        let as: ref AddressSpace = self.address_spaces.get(index)
+        let pml4_phys: u64 = as.pml4_address()
+        // trust: Load CR3 with the new PML4 physical address
+        trusted("activate address space: load CR3 with PML4 physical address") {
+            __builtin_load_cr3(pml4_phys)
+        }
+        self.active_asid = asid
+        self.tlb_mgr.flush_all();
+        self.record_as_activate_residual(asid, pml4_phys)
+        Result::Ok(())
+    }
+
+    pub fn get_address_space(self: ref, asid: AddressSpaceId)
+        -> Result[ref AddressSpace, MemoryError]
+        effects: [deterministic]
+    {
+        let index: u32 = asid.value()
+        if index >= self.num_address_spaces {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("Invalid address space ID")))
+        }
+        // trust: index bounds-checked
+        trusted("get address space: index within range") {
+            Result::Ok(self.address_spaces.get(index))
+        }
+    }
+
+    pub fn get_address_space_mut(self: ref mut, asid: AddressSpaceId)
+        -> Result[ref mut AddressSpace, MemoryError]
+        effects: [deterministic]
+    {
+        let index: u32 = asid.value()
+        if index >= self.num_address_spaces {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("Invalid address space ID")))
+        }
+        // trust: index bounds-checked
+        trusted("get address space mutable: index within range") {
+            Result::Ok(self.address_spaces.get_mut(index))
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Page Table Allocation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-PT-ALLOC-001 through MEM-VM-PT-ALLOC-015
+
+    fn allocate_page_table(self: ref mut) -> Result[u64, MemoryError]
+        effects: [deterministic]
+    {
+        if self.page_table_alloc_count >= 256 {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_NO_MEM,
+                FixedString[128]::from_slice("Page table pool exhausted")))
+        }
+        let pfn: u64 = self.page_table_pool_base +
+                       (self.page_table_alloc_count as u64) * PAGE_4K_SIZE
+        self.page_table_alloc_count = self.page_table_alloc_count + 1
+        // trust: page table pool range is pre-allocated and reserved
+        trusted("page table allocation: pool-based, bounds-checked") {
+            __builtin_zero_page(pfn)
+        }
+        Result::Ok(pfn)
+    }
+
+    fn free_page_table(self: ref mut, phys_addr: u64) -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if self.page_table_alloc_count == 0 {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("No page tables to free")))
+        }
+        self.page_table_alloc_count = self.page_table_alloc_count - 1
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Page Mapping
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-MAP-CORE-001 through MEM-VM-MAP-CORE-050
+
+    pub fn map_page(self: ref mut, asid: AddressSpaceId,
+                    virt: VirtualAddress, phys: PhysicalPageNumber,
+                    perms: PagePermissions, page_size: u64)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        if !virt.is_canonical() {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("Non-canonical virtual address")))
+        }
+        if page_size != PAGE_4K_SIZE && page_size != PAGE_2M_SIZE && page_size != PAGE_1G_SIZE {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ARG,
+                FixedString[128]::from_slice("Invalid page size")))
+        }
+        if page_size == PAGE_2M_SIZE && !virt.page_aligned(PAGE_2M_SIZE) {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_ALIGNMENT,
+                FixedString[128]::from_slice("2MB page requires 2MB alignment")))
+        }
+        if page_size == PAGE_1G_SIZE && !virt.page_aligned(PAGE_1G_SIZE) {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_ALIGNMENT,
+                FixedString[128]::from_slice("1GB page requires 1GB alignment")))
+        }
+        let as: ref mut AddressSpace = self.get_address_space_mut(asid)?
+        let is_huge: bool = page_size > PAGE_4K_SIZE
+        let mapping: PageMapping = PageMapping::new(
+            virt, phys.to_address(), page_size, perms, is_huge, false, asid)
+        as.add_mapping(mapping)?;
+        let pte_flags: u64 = perms.to_pte_flags()
+        let is_huge_page: bool = page_size > PAGE_4K_SIZE
+        if is_huge_page {
+            let huge_flags: u64 = pte_flags | PTE_HUGE
+            self.install_huge_page_mapping(as.pml4_phys, virt, phys, huge_flags, page_size)?
+        } else {
+            self.install_4k_page_mapping(as.pml4_phys, virt, phys, pte_flags)?
+        }
+        self.map_count = self.map_count + 1
+        self.generation.bump();
+        self.record_map_residual(asid, virt, phys, page_size)
+        Result::Ok(())
+    }
+
+    // Install a 4KB page mapping through the 4-level page table walk
+    fn install_4k_page_mapping(self: ref mut, pml4_phys: u64,
+                                virt: VirtualAddress, phys: PhysicalPageNumber,
+                                flags: u64) -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let pml4_index: u32 = virt.pml4_index()
+        let pdp_index: u32 = virt.pdp_index()
+        let pd_index: u32 = virt.pd_index()
+        let pt_index: u32 = virt.pt_index()
+        // trust: raw memory access to page table entries
+        trusted("4K page mapping: walk page table and set PTE") {
+            // Read PML4 entry
+            let pml4_entry_value: u64 = __builtin_read_phys_u64(
+                pml4_phys + (pml4_index as u64) * 8)
+            let mut pml4_entry: PageTableEntry = PageTableEntry::new(pml4_entry_value)
+            // Create PDP if not present
+            if !pml4_entry.is_present() {
+                let pdp_phys: u64 = self.allocate_page_table()?
+                let new_entry: u64 = pdp_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+                __builtin_write_phys_u64(pml4_phys + (pml4_index as u64) * 8, new_entry)
+                pml4_entry = PageTableEntry::new(new_entry)
+            }
+            let pdp_phys: u64 = pml4_entry.pfn().to_address()
+            // Read PDP entry
+            let pdp_entry_value: u64 = __builtin_read_phys_u64(
+                pdp_phys + (pdp_index as u64) * 8)
+            let mut pdp_entry: PageTableEntry = PageTableEntry::new(pdp_entry_value)
+            if !pdp_entry.is_present() {
+                let pd_phys: u64 = self.allocate_page_table()?
+                let new_entry: u64 = pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+                __builtin_write_phys_u64(pdp_phys + (pdp_index as u64) * 8, new_entry)
+                pdp_entry = PageTableEntry::new(new_entry)
+            }
+            let pd_phys: u64 = pdp_entry.pfn().to_address()
+            // Read PD entry
+            let pd_entry_value: u64 = __builtin_read_phys_u64(
+                pd_phys + (pd_index as u64) * 8)
+            let mut pd_entry: PageTableEntry = PageTableEntry::new(pd_entry_value)
+            if !pd_entry.is_present() {
+                let pt_phys: u64 = self.allocate_page_table()?
+                let new_entry: u64 = pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+                __builtin_write_phys_u64(pd_phys + (pd_index as u64) * 8, new_entry)
+                pd_entry = PageTableEntry::new(new_entry)
+            }
+            let pt_phys: u64 = pd_entry.pfn().to_address()
+            // Write the final PTE
+            let pte: u64 = (phys.value() << PAGE_TABLE_SHIFT) | flags
+            __builtin_write_phys_u64(pt_phys + (pt_index as u64) * 8, pte)
+        }
+        // Flush TLB for this address
+        self.tlb_mgr.flush_address(virt)
+        Result::Ok(())
+    }
+
+    // Install a huge page mapping (2MB or 1GB)
+    fn install_huge_page_mapping(self: ref mut, pml4_phys: u64,
+                                  virt: VirtualAddress, phys: PhysicalPageNumber,
+                                  flags: u64, page_size: u64)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        // trust: raw memory access for huge page installation
+        trusted("huge page mapping: walk to the appropriate level and set huge PTE") {
+            let pml4_index: u32 = virt.pml4_index()
+            let pdp_index: u32 = virt.pdp_index()
+            // Read PML4 entry
+            let pml4_entry_value: u64 = __builtin_read_phys_u64(
+                pml4_phys + (pml4_index as u64) * 8)
+            let mut pml4_entry: PageTableEntry = PageTableEntry::new(pml4_entry_value)
+            if !pml4_entry.is_present() {
+                let pdp_phys: u64 = self.allocate_page_table()?
+                let new_entry: u64 = pdp_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+                __builtin_write_phys_u64(pml4_phys + (pml4_index as u64) * 8, new_entry)
+                pml4_entry = PageTableEntry::new(new_entry)
+            }
+            let pdp_phys: u64 = pml4_entry.pfn().to_address()
+            if page_size == PAGE_1G_SIZE {
+                // 1GB huge page: set huge flag at PDP level
+                let pdp_entry: u64 = (phys.value() << PAGE_TABLE_SHIFT) | flags | PTE_HUGE
+                __builtin_write_phys_u64(pdp_phys + (pdp_index as u64) * 8, pdp_entry)
+            } else {
+                // 2MB huge page: set huge flag at PD level
+                let pd_index: u32 = virt.pd_index()
+                let pd_phys: u64 = pdp_phys  // read PDP to get PD address
+                // Read PDP entry
+                let pdp_entry_value: u64 = __builtin_read_phys_u64(
+                    pdp_phys + (pdp_index as u64) * 8)
+                let pdp_entry: PageTableEntry = PageTableEntry::new(pdp_entry_value)
+                let pd_phys_addr: u64
+                if !pdp_entry.is_present() || pdp_entry.is_huge() {
+                    pd_phys_addr = self.allocate_page_table()?
+                    let new_entry: u64 = pd_phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+                    __builtin_write_phys_u64(pdp_phys + (pdp_index as u64) * 8, new_entry)
+                } else {
+                    pd_phys_addr = pdp_entry.pfn().to_address()
+                }
+                let pd_entry: u64 = (phys.value() << PAGE_TABLE_SHIFT) | flags | PTE_HUGE
+                __builtin_write_phys_u64(pd_phys_addr + (pd_index as u64) * 8, pd_entry)
+            }
+        }
+        self.tlb_mgr.flush_address(virt)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Page Unmapping
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-UNMAP-001 through MEM-VM-UNMAP-030
+
+    pub fn unmap_page(self: ref mut, asid: AddressSpaceId, virt: VirtualAddress)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        if !virt.is_canonical() {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_INVALID_ADDR,
+                FixedString[128]::from_slice("Non-canonical virtual address")))
+        }
+        let as: ref mut AddressSpace = self.get_address_space_mut(asid)?
+        as.remove_mapping(virt)?;
+        let phys: PhysicalPageNumber = self.clear_page_table_entry(as.pml4_phys, virt)?
+        self.unmap_count = self.unmap_count + 1
+        self.generation.bump();
+        self.record_unmap_residual(asid, virt, phys)
+        Result::Ok(phys)
+    }
+
+    // Clear a page table entry and return the physical page
+    fn clear_page_table_entry(self: ref mut, pml4_phys: u64, virt: VirtualAddress)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        // trust: raw memory access to clear PTE
+        trusted("clear page table entry: walk and zero out the PTE") {
+            let pml4_index: u32 = virt.pml4_index()
+            let pdp_index: u32 = virt.pdp_index()
+            let pd_index: u32 = virt.pd_index()
+            let pt_index: u32 = virt.pt_index()
+            // Walk to PT
+            let pml4_entry_value: u64 = __builtin_read_phys_u64(
+                pml4_phys + (pml4_index as u64) * 8)
+            let pml4_entry: PageTableEntry = PageTableEntry::new(pml4_entry_value)
+            if !pml4_entry.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PML4 entry not present")))
+            }
+            let pdp_phys: u64 = pml4_entry.pfn().to_address()
+            let pdp_entry_value: u64 = __builtin_read_phys_u64(
+                pdp_phys + (pdp_index as u64) * 8)
+            let pdp_entry: PageTableEntry = PageTableEntry::new(pdp_entry_value)
+            if !pdp_entry.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PDP entry not present")))
+            }
+            if pdp_entry.is_huge() {
+                // 1GB huge page
+                let pfn: PhysicalPageNumber = pdp_entry.pfn()
+                __builtin_write_phys_u64(pdp_phys + (pdp_index as u64) * 8, 0)
+                self.tlb_mgr.flush_address(virt)
+                return Result::Ok(pfn)
+            }
+            let pd_phys: u64 = pdp_entry.pfn().to_address()
+            let pd_entry_value: u64 = __builtin_read_phys_u64(
+                pd_phys + (pd_index as u64) * 8)
+            let pd_entry: PageTableEntry = PageTableEntry::new(pd_entry_value)
+            if !pd_entry.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PD entry not present")))
+            }
+            if pd_entry.is_huge() {
+                // 2MB huge page
+                let pfn: PhysicalPageNumber = pd_entry.pfn()
+                __builtin_write_phys_u64(pd_phys + (pd_index as u64) * 8, 0)
+                self.tlb_mgr.flush_address(virt)
+                return Result::Ok(pfn)
+            }
+            let pt_phys: u64 = pd_entry.pfn().to_address()
+            let pte_value: u64 = __builtin_read_phys_u64(
+                pt_phys + (pt_index as u64) * 8)
+            let pte: PageTableEntry = PageTableEntry::new(pte_value)
+            if !pte.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PTE not present")))
+            }
+            let pfn: PhysicalPageNumber = pte.pfn()
+            // Zero the PTE
+            __builtin_write_phys_u64(pt_phys + (pt_index as u64) * 8, 0)
+            self.tlb_mgr.flush_address(virt)
+            Result::Ok(pfn)
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // MMIO Mapping
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-MMIO-MAP-001 through MEM-VM-MMIO-MAP-025
+
+    pub fn map_mmio(self: ref mut, asid: AddressSpaceId,
+                     virt: VirtualAddress, phys_base: u64,
+                     size: u64, driver_id: Word64)
+        -> Result[MmioRegion, MemoryError]
+        effects: [deterministic]
+    {
+        if size == 0 || size > PAGE_1G_SIZE {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_MMIO_FAIL,
+                FixedString[128]::from_slice("Invalid MMIO size")))
+        }
+        let as: ref mut AddressSpace = self.get_address_space_mut(asid)?
+        if as.num_mmio_regions >= MAX_MMIO_REGIONS {
+            return Result::Err(mem_vm_error(
+                DIAG_VM_MMIO_FAIL,
+                FixedString[128]::from_slice("Max MMIO regions reached")))
+        }
+        let num_pages: u32 = ((size + PAGE_4K_SIZE - 1) / PAGE_4K_SIZE) as u32
+        let mmio_perms: PagePermissions = PagePermissions::from_flags(true, true, false, false)
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_pages
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_pages {
+            let page_virt: VirtualAddress = virt.add((i as u64) * PAGE_4K_SIZE)
+            let page_phys: PhysicalPageNumber = PhysicalPageNumber::from_address(
+                phys_base + (i as u64) * PAGE_4K_SIZE)
+            let pte_flags: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_CACHE_DISABLED |
+                                 PTE_WRITETHROUGH | PTE_NO_EXECUTE
+            // trust: MMIO mapping with cache-disabled flags
+            trusted("MMIO page mapping: cache-disabled, non-executable") {
+                self.install_4k_page_mapping(as.pml4_phys, page_virt, page_phys, pte_flags)?
+            }
+        }
+        let region: MmioRegion = MmioRegion::new(virt, phys_base, size, driver_id)
+        as.mmio_regions.push(region);
+        as.num_mmio_regions = as.num_mmio_regions + 1
+        self.map_count = self.map_count + 1
+        self.generation.bump();
+        self.record_mmio_map_residual(asid, virt, phys_base, size)
+        Result::Ok(region)
+    }
+
+    pub fn unmap_mmio(self: ref mut, asid: AddressSpaceId, virt: VirtualAddress)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let as: ref mut AddressSpace = self.get_address_space_mut(asid)?
+        // loop: bounds[BOUND_SMALL] — bounded by MAX_MMIO_REGIONS
+        loop: bounds[BOUND_SMALL] for i in 0..as.num_mmio_regions {
+            let region: ref MmioRegion = as.mmio_regions.get(i)
+            if region.is_active && region.virt_base.value() == virt.value() {
+                let num_pages: u32 = ((region.size + PAGE_4K_SIZE - 1) / PAGE_4K_SIZE) as u32
+                // loop: bounds[BOUND_MEDIUM] — bounded by num_pages
+                loop: bounds[BOUND_MEDIUM] for j in 0..num_pages {
+                    let page_virt: VirtualAddress = virt.add((j as u64) * PAGE_4K_SIZE)
+                    self.clear_page_table_entry(as.pml4_phys, page_virt)?
+                }
+                let region_mut: ref mut MmioRegion = as.mmio_regions.get_mut(i)
+                region_mut.deactivate();
+                self.unmap_count = self.unmap_count + 1
+                self.generation.bump();
+                self.record_mmio_unmap_residual(asid, virt)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_vm_error(
+            DIAG_VM_NOT_MAPPED,
+            FixedString[128]::from_slice("MMIO region not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Page Table Walk (for lookup)
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-WALK-001 through MEM-VM-WALK-020
+
+    pub fn translate(self, asid: AddressSpaceId, virt: VirtualAddress)
+        -> Result[PhysicalPageNumber, MemoryError]
+        effects: [deterministic]
+    {
+        let as: ref AddressSpace = self.get_address_space(asid)?
+        // trust: raw page table walk
+        trusted("page table walk: read page table entries to translate virtual address") {
+            let pml4_index: u32 = virt.pml4_index()
+            let pdp_index: u32 = virt.pdp_index()
+            let pd_index: u32 = virt.pd_index()
+            let pt_index: u32 = virt.pt_index()
+            let pml4_entry_value: u64 = __builtin_read_phys_u64(
+                as.pml4_phys + (pml4_index as u64) * 8)
+            let pml4_entry: PageTableEntry = PageTableEntry::new(pml4_entry_value)
+            if !pml4_entry.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PML4 entry not present")))
+            }
+            let pdp_phys: u64 = pml4_entry.pfn().to_address()
+            let pdp_entry_value: u64 = __builtin_read_phys_u64(
+                pdp_phys + (pdp_index as u64) * 8)
+            let pdp_entry: PageTableEntry = PageTableEntry::new(pdp_entry_value)
+            if !pdp_entry.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PDP entry not present")))
+            }
+            if pdp_entry.is_huge() {
+                // 1GB huge page: compute physical address
+                let base: u64 = pdp_entry.pfn().to_address()
+                let offset: u64 = virt.value() & (PAGE_1G_SIZE - 1)
+                return Result::Ok(PhysicalPageNumber::from_address(base | offset))
+            }
+            let pd_phys: u64 = pdp_entry.pfn().to_address()
+            let pd_entry_value: u64 = __builtin_read_phys_u64(
+                pd_phys + (pd_index as u64) * 8)
+            let pd_entry: PageTableEntry = PageTableEntry::new(pd_entry_value)
+            if !pd_entry.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PD entry not present")))
+            }
+            if pd_entry.is_huge() {
+                // 2MB huge page
+                let base: u64 = pd_entry.pfn().to_address()
+                let offset: u64 = virt.value() & (PAGE_2M_SIZE - 1)
+                return Result::Ok(PhysicalPageNumber::from_address(base | offset))
+            }
+            let pt_phys: u64 = pd_entry.pfn().to_address()
+            let pte_value: u64 = __builtin_read_phys_u64(
+                pt_phys + (pt_index as u64) * 8)
+            let pte: PageTableEntry = PageTableEntry::new(pte_value)
+            if !pte.is_present() {
+                return Result::Err(mem_vm_error(DIAG_VM_NOT_MAPPED,
+                    FixedString[128]::from_slice("PTE not present")))
+            }
+            Result::Ok(pte.pfn())
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Change Page Permissions
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-CHPERM-001 through MEM-VM-CHPERM-015
+
+    pub fn set_page_permissions(self: ref mut, asid: AddressSpaceId,
+                                 virt: VirtualAddress, perms: PagePermissions)
+        -> Result[(), MemoryError]
+        effects: [deterministic]
+    {
+        let phys: PhysicalPageNumber = self.translate(asid, virt)?;
+        let as: ref AddressSpace = self.get_address_space(asid)?
+        let pte_flags: u64 = perms.to_pte_flags()
+        // trust: update PTE flags while preserving PFN
+        trusted("set page permissions: update PTE flags preserving PFN") {
+            let pml4_index: u32 = virt.pml4_index()
+            let pdp_index: u32 = virt.pdp_index()
+            let pd_index: u32 = virt.pd_index()
+            let pt_index: u32 = virt.pt_index()
+            let pml4_entry_value: u64 = __builtin_read_phys_u64(
+                as.pml4_phys + (pml4_index as u64) * 8)
+            let pml4_entry: PageTableEntry = PageTableEntry::new(pml4_entry_value)
+            let pdp_phys: u64 = pml4_entry.pfn().to_address()
+            let pdp_entry_value: u64 = __builtin_read_phys_u64(
+                pdp_phys + (pdp_index as u64) * 8)
+            let pdp_entry: PageTableEntry = PageTableEntry::new(pdp_entry_value)
+            let pd_phys: u64 = pdp_entry.pfn().to_address()
+            let pd_entry_value: u64 = __builtin_read_phys_u64(
+                pd_phys + (pd_index as u64) * 8)
+            let pd_entry: PageTableEntry = PageTableEntry::new(pd_entry_value)
+            let pt_phys: u64 = pd_entry.pfn().to_address()
+            let pte_value: u64 = __builtin_read_phys_u64(
+                pt_phys + (pt_index as u64) * 8)
+            let pte: PageTableEntry = PageTableEntry::new(pte_value)
+            let pfn_bits: u64 = pte.value() & PTE_PFN_MASK
+            let new_pte: u64 = pfn_bits | (pte_flags & PTE_FLAGS_MASK)
+            __builtin_write_phys_u64(pt_phys + (pt_index as u64) * 8, new_pte)
+        }
+        self.tlb_mgr.flush_address(virt)
+        self.record_chperm_residual(asid, virt, perms)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-STATS-001 through MEM-VM-STATS-015
+
+    pub fn map_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.map_count
+    }
+
+    pub fn unmap_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.unmap_count
+    }
+
+    pub fn fault_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.fault_count
+    }
+
+    pub fn increment_fault_count(self: ref mut)
+        effects: [deterministic]
+    {
+        self.fault_count = self.fault_count + 1
+    }
+
+    pub fn active_asid(self) -> AddressSpaceId
+        effects: [deterministic]
+    {
+        self.active_asid
+    }
+
+    pub fn tlb_flush_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.tlb_mgr.flush_count()
+    }
+
+    pub fn address_space_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_address_spaces
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-VM-RESID-001 through MEM-VM-RESID-020
+
+    fn record_as_creation_residual(self, asid: AddressSpaceId, pml4_phys: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Address space creation",
+            code: DIAG_VM_OK,
+            data: (asid.value(), pml4_phys),
+        )
+    }
+
+    fn record_as_destruction_residual(self, asid: AddressSpaceId)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Address space destruction",
+            code: DIAG_VM_OK,
+            data: asid.value(),
+        )
+    }
+
+    fn record_as_activate_residual(self, asid: AddressSpaceId, pml4_phys: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Address space activation",
+            code: DIAG_VM_OK,
+            data: (asid.value(), pml4_phys),
+        )
+    }
+
+    fn record_map_residual(self, asid: AddressSpaceId,
+                            virt: VirtualAddress, phys: PhysicalPageNumber,
+                            page_size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page mapping",
+            code: DIAG_VM_OK,
+            data: (asid.value(), virt.value(), phys.value(), page_size),
+        )
+    }
+
+    fn record_unmap_residual(self, asid: AddressSpaceId,
+                              virt: VirtualAddress, phys: PhysicalPageNumber)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page unmapping",
+            code: DIAG_VM_OK,
+            data: (asid.value(), virt.value(), phys.value()),
+        )
+    }
+
+    fn record_mmio_map_residual(self, asid: AddressSpaceId,
+                                 virt: VirtualAddress, phys: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "MMIO mapping",
+            code: DIAG_VM_OK,
+            data: (asid.value(), virt.value(), phys, size),
+        )
+    }
+
+    fn record_mmio_unmap_residual(self, asid: AddressSpaceId, virt: VirtualAddress)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "MMIO unmapping",
+            code: DIAG_VM_OK,
+            data: (asid.value(), virt.value()),
+        )
+    }
+
+    fn record_chperm_residual(self, asid: AddressSpaceId,
+                               virt: VirtualAddress, perms: PagePermissions)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page permission change",
+            code: DIAG_VM_OK,
+            data: (asid.value(), virt.value(), perms.value),
+        )
+    }
+
+    fn record_tlb_flush_residual(self, flush_type: u8, addr: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "TLB flush",
+            code: DIAG_VM_OK,
+            data: (flush_type, addr),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Error Helper
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-ERR-001 through MEM-VM-ERR-005
+
+pub fn mem_vm_error(code: Word64, message: FixedString[128]) -> MemoryError
+    effects: [deterministic]
+{
+    MemoryError::new(code, message)
+}
+
+// ──────────────────────────────────────────────
+// Module-Level Initialization
+// ──────────────────────────────────────────────
+// Evidence path: MEM-VM-INIT-001 through MEM-VM-INIT-010
+
+pub fn init_virtual_memory_manager(
+    page_table_pool_base: u64,
+    page_table_pool_size: u64,
+    kernel_asid: AddressSpaceId,
+    pml4_phys: u64,
+) -> VirtualMemoryManager
+    effects: [deterministic]
+{
+    let mut vmm: VirtualMemoryManager = VirtualMemoryManager::new(
+        page_table_pool_base, page_table_pool_size)
+    let kernel_base: VirtualAddress = VirtualAddress::new(0xFFFF_8000_0000_0000)
+    let kernel_limit: VirtualAddress = VirtualAddress::new(0xFFFF_FFFF_FFFF_FFFF)
+    let k_as: AddressSpace = AddressSpace::new(
+        kernel_asid, pml4_phys, kernel_base, kernel_limit)
+    vmm.address_spaces.push(k_as);
+    vmm.num_address_spaces = 1
+    vmm.active_asid = kernel_asid
+    vmm
+}
+
+pub fn create_user_address_space(vmm: ref mut VirtualMemoryManager)
+    -> Result[AddressSpaceId, MemoryError]
+    effects: [deterministic]
+{
+    let kernel_base: VirtualAddress = VirtualAddress::new(0xFFFF_8000_0000_0000)
+    let kernel_limit: VirtualAddress = VirtualAddress::new(0xFFFF_FFFF_FFFF_FFFF)
+    vmm.create_address_space(kernel_base, kernel_limit)
+}
+
+pub fn is_user_address(vaddr: VirtualAddress) -> bool
+    effects: [deterministic]
+{
+    vaddr.value() < 0xFFFF_8000_0000_0000
+}
+
+pub fn is_kernel_address(vaddr: VirtualAddress) -> bool
+    effects: [deterministic]
+{
+    vaddr.value() >= 0xFFFF_8000_0000_0000
+}

@@ -1,0 +1,1301 @@
+// arp.phor — ARP protocol: packet format, cache (fixed-capacity), resolution, probe, gratuitous ARP, timeouts
+// Implements RFC 826 Address Resolution Protocol with residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/arp.phor
+// Court: arp:v1
+
+package network.arp;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ethernet.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// ARP sub-range: 0xE100 - 0xE1FF
+
+type ArpError = enum {
+    ArpPacketTooShort       = 0xE100,  // NE100: ARP packet shorter than minimum header
+    ArpHardwareTypeUnknown  = 0xE101,  // NE101: Unknown hardware type
+    ArpProtocolTypeUnknown  = 0xE102,  // NE102: Unknown protocol type
+    ArpOpcodeUnknown        = 0xE103,  // NE103: Unknown ARP operation code
+    ArpCacheFull            = 0xE104,  // NE104: ARP cache at capacity
+    ArpEntryNotFound        = 0xE105,  // NE105: ARP entry not found in cache
+    ArpEntryStale           = 0xE106,  // NE106: ARP cache entry is stale
+    ArpResolutionFailed     = 0xE107,  // NE107: ARP resolution failed
+    ArpTimeout              = 0xE108,  // NE108: ARP resolution timed out
+    ArpDuplicateAddress     = 0xE109,  // NE109: Duplicate IP address detected on network
+    ArpCapabilityError      = 0xE10A,  // NE10A: Insufficient capability for ARP operation
+    ArpInvalidMac           = 0xE10B,  // NE10B: Invalid MAC address in ARP packet
+    ArpInvalidIp            = 0xE10C,  // NE10C: Invalid IP address in ARP packet
+    ArpSelfResponse         = 0xE10D,  // NE10D: ARP response to own request
+    ArpGratuitousConflict   = 0xE10E,  // NE10E: Gratuitous ARP indicates address conflict
+    ArpProbeFailed          = 0xE10F,  // NE10F: ARP probe failed (address in use)
+    ArpRateLimitExceeded    = 0xE110,  // NE110: ARP rate limit exceeded
+    ArpBufferOverflow       = 0xE111,  // NE111: ARP buffer overflow
+    ArpInterfaceNotFound    = 0xE112,  // NE112: Network interface not found
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const ARP_HDR_LEN             : u64 = 8;
+const ARP_ENTRY_MIN           : u64 = 28;
+const ARP_CACHE_CAPACITY      : u64 = 256;
+const ARP_PENDING_CAPACITY    : u64 = 32;
+const ARP_DEFAULT_TIMEOUT_MS  : u64 = 30000;
+const ARP_PROBE_TIMEOUT_MS    : u64 = 3000;
+const ARP_RETRY_COUNT         : u64 = 3;
+const ARP_RATE_LIMIT_MS       : u64 = 1000;
+const ARP_MAX_REQUESTS_RATE   : u64 = 10;
+const ARP_STALE_TIMEOUT_MS    : u64 = 600000;
+const ARP_PURGE_INTERVAL_MS   : u64 = 30000;
+
+// ─────────────────────────────────────────────────────────────
+// Hardware Type Constants
+// ─────────────────────────────────────────────────────────────
+
+type ArpHardwareType = enum {
+    HwEthernet      = 1,
+    HwIeee802       = 6,
+    HwArcNet        = 7,
+    HwFrameRelay    = 15,
+    HwFiberChannel  = 18,
+    HwInfiniBand    = 32,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Protocol Type Constants
+// ─────────────────────────────────────────────────────────────
+
+type ArpProtocolType = enum {
+    ProtoIpv4       = 0x0800,
+    ProtoIpv6       = 0x86DD,
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Operation Codes
+// ─────────────────────────────────────────────────────────────
+
+type ArpOpcode = enum {
+    Request         = 1,
+    Reply           = 2,
+    RarpRequest     = 3,
+    RarpReply       = 4,
+    DrarpRequest    = 5,
+    DrarpReply      = 6,
+    DrarpError      = 7,
+    InArpRequest    = 8,
+    InArpReply      = 9,
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Entry State
+// ─────────────────────────────────────────────────────────────
+
+type ArpEntryState = enum {
+    Incomplete      = 0,  // Resolution in progress
+    Complete        = 1,  // Valid resolved entry
+    Stale           = 2,  // Past stale timeout
+    Probe           = 3,  // Probing address
+    Failed          = 4,  // Resolution permanently failed
+    Permanent       = 5,  // Manually configured, never expires
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Packet Header
+// ─────────────────────────────────────────────────────────────
+
+struct ArpPacket {
+    hw_type: u16,
+    proto_type: u16,
+    hw_addr_len: u8,
+    proto_addr_len: u8,
+    opcode: u16,
+    sender_mac: Array(u8, ETH_ADDR_LEN),
+    sender_ip: Array(u8, 4),
+    target_mac: Array(u8, ETH_ADDR_LEN),
+    target_ip: Array(u8, 4),
+    generation: u64,
+}
+
+impl ArpPacket {
+    fn new_request(
+        sender_mac: Array(u8, ETH_ADDR_LEN),
+        sender_ip: Array(u8, 4),
+        target_ip: Array(u8, 4),
+    ) -> ArpPacket
+        effect [deterministic]
+    {
+        return ArpPacket {
+            hw_type: 1,
+            proto_type: 0x0800,
+            hw_addr_len: ETH_ADDR_LEN as u8,
+            proto_addr_len: 4,
+            opcode: 1,
+            sender_mac: sender_mac,
+            sender_ip: sender_ip,
+            target_mac: Array::zeroed(),
+            target_ip: target_ip,
+            generation: 0,
+        };
+    }
+
+    fn new_reply(
+        sender_mac: Array(u8, ETH_ADDR_LEN),
+        sender_ip: Array(u8, 4),
+        target_mac: Array(u8, ETH_ADDR_LEN),
+        target_ip: Array(u8, 4),
+    ) -> ArpPacket
+        effect [deterministic]
+    {
+        return ArpPacket {
+            hw_type: 1,
+            proto_type: 0x0800,
+            hw_addr_len: ETH_ADDR_LEN as u8,
+            proto_addr_len: 4,
+            opcode: 2,
+            sender_mac: sender_mac,
+            sender_ip: sender_ip,
+            target_mac: target_mac,
+            target_ip: target_ip,
+            generation: 0,
+        };
+    }
+
+    fn new_gratuitous(
+        sender_mac: Array(u8, ETH_ADDR_LEN),
+        sender_ip: Array(u8, 4),
+    ) -> ArpPacket
+        effect [deterministic]
+    {
+        return ArpPacket {
+            hw_type: 1,
+            proto_type: 0x0800,
+            hw_addr_len: ETH_ADDR_LEN as u8,
+            proto_addr_len: 4,
+            opcode: 2,
+            sender_mac: sender_mac,
+            sender_ip: sender_ip,
+            target_mac: sender_mac,
+            target_ip: sender_ip,
+            generation: 0,
+        };
+    }
+
+    fn new_probe(
+        sender_mac: Array(u8, ETH_ADDR_LEN),
+        probe_ip: Array(u8, 4),
+    ) -> ArpPacket
+        effect [deterministic]
+    {
+        return ArpPacket {
+            hw_type: 1,
+            proto_type: 0x0800,
+            hw_addr_len: ETH_ADDR_LEN as u8,
+            proto_addr_len: 4,
+            opcode: 1,
+            sender_mac: sender_mac,
+            sender_ip: Array::zeroed(),
+            target_mac: Array::zeroed(),
+            target_ip: probe_ip,
+            generation: 0,
+        };
+    }
+
+    fn parse(data: Array(u8, 1518), len: u64) -> Result(ArpPacket, ArpError)
+        effect [deterministic]
+        court "arp_packet_parse:v1"
+    {
+        if len < ARP_ENTRY_MIN {
+            return Result::Err(ArpError::ArpPacketTooShort);
+        };
+        let hw_type: u16 = ((data[0] as u16) << 8) | (data[1] as u16);
+        let proto_type: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        let hw_addr_len: u8 = data[4];
+        let proto_addr_len: u8 = data[5];
+        let opcode: u16 = ((data[6] as u16) << 8) | (data[7] as u16);
+        if hw_type != 1 {
+            return Result::Err(ArpError::ArpHardwareTypeUnknown);
+        };
+        if hw_addr_len != ETH_ADDR_LEN as u8 {
+            return Result::Err(ArpError::ArpHardwareTypeUnknown);
+        };
+        if proto_addr_len != 4 {
+            return Result::Err(ArpError::ArpProtocolTypeUnknown);
+        };
+        if opcode != 1 && opcode != 2 {
+            return Result::Err(ArpError::ArpOpcodeUnknown);
+        };
+        let mut sender_mac: Array(u8, ETH_ADDR_LEN) = Array::zeroed();
+        let mut sender_ip: Array(u8, 4) = Array::zeroed();
+        let mut target_mac: Array(u8, ETH_ADDR_LEN) = Array::zeroed();
+        let mut target_ip: Array(u8, 4) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            sender_mac[i] = data[8 + i];
+        };
+        loop bound 4 {
+            sender_ip[i] = data[14 + i];
+        };
+        loop bound ETH_ADDR_LEN {
+            target_mac[i] = data[18 + i];
+        };
+        loop bound 4 {
+            target_ip[i] = data[24 + i];
+        };
+        return Result::Ok(ArpPacket {
+            hw_type: hw_type,
+            proto_type: proto_type,
+            hw_addr_len: hw_addr_len,
+            proto_addr_len: proto_addr_len,
+            opcode: opcode,
+            sender_mac: sender_mac,
+            sender_ip: sender_ip,
+            target_mac: target_mac,
+            target_ip: target_ip,
+            generation: 0,
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, 1518), ArpError)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, 1518) = Array::zeroed();
+        buf[0] = ((self.hw_type >> 8) & 0xFF) as u8;
+        buf[1] = (self.hw_type & 0xFF) as u8;
+        buf[2] = ((self.proto_type >> 8) & 0xFF) as u8;
+        buf[3] = (self.proto_type & 0xFF) as u8;
+        buf[4] = self.hw_addr_len;
+        buf[5] = self.proto_addr_len;
+        buf[6] = ((self.opcode >> 8) & 0xFF) as u8;
+        buf[7] = (self.opcode & 0xFF) as u8;
+        loop bound ETH_ADDR_LEN {
+            buf[8 + i] = self.sender_mac[i];
+        };
+        loop bound 4 {
+            buf[14 + i] = self.sender_ip[i];
+        };
+        loop bound ETH_ADDR_LEN {
+            buf[18 + i] = self.target_mac[i];
+        };
+        loop bound 4 {
+            buf[24 + i] = self.target_ip[i];
+        };
+        return Result::Ok(buf);
+    }
+
+    fn is_request(self) -> bool
+        effect [deterministic]
+    {
+        return self.opcode == 1;
+    }
+
+    fn is_reply(self) -> bool
+        effect [deterministic]
+    {
+        return self.opcode == 2;
+    }
+
+    fn is_gratuitous(self) -> bool
+        effect [deterministic]
+    {
+        if self.opcode != 2 {
+            return false;
+        };
+        loop bound 4 {
+            if self.sender_ip[i] != self.target_ip[i] {
+                return false;
+            };
+        };
+        loop bound ETH_ADDR_LEN {
+            if self.sender_mac[i] != self.target_mac[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_probe(self) -> bool
+        effect [deterministic]
+    {
+        if self.opcode != 1 {
+            return false;
+        };
+        loop bound 4 {
+            if self.sender_ip[i] != 0 {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_sender_zero_ip(self) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.sender_ip[i] != 0 {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn sender_mac_eq(self, mac: Array(u8, ETH_ADDR_LEN)) -> bool
+        effect [deterministic]
+    {
+        loop bound ETH_ADDR_LEN {
+            if self.sender_mac[i] != mac[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn sender_ip_eq(self, ip: Array(u8, 4)) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.sender_ip[i] != ip[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn target_ip_eq(self, ip: Array(u8, 4)) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.target_ip[i] != ip[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Cache Entry
+// ─────────────────────────────────────────────────────────────
+
+struct ArpCacheEntry {
+    ip_address: Array(u8, 4),
+    mac_address: Array(u8, ETH_ADDR_LEN),
+    state: ArpEntryState,
+    timestamp: u64,
+    timeout_ms: u64,
+    retry_count: u64,
+    last_used: u64,
+    is_static: bool,
+    generation: u64,
+}
+
+impl ArpCacheEntry {
+    fn empty() -> ArpCacheEntry
+        effect [deterministic]
+    {
+        return ArpCacheEntry {
+            ip_address: Array::zeroed(),
+            mac_address: Array::zeroed(),
+            state: ArpEntryState::Incomplete,
+            timestamp: 0,
+            timeout_ms: ARP_DEFAULT_TIMEOUT_MS,
+            retry_count: 0,
+            last_used: 0,
+            is_static: false,
+            generation: 0,
+        };
+    }
+
+    fn new_complete(
+        ip: Array(u8, 4),
+        mac: Array(u8, ETH_ADDR_LEN),
+        now: u64,
+    ) -> ArpCacheEntry
+        effect [deterministic]
+    {
+        return ArpCacheEntry {
+            ip_address: ip,
+            mac_address: mac,
+            state: ArpEntryState::Complete,
+            timestamp: now,
+            timeout_ms: ARP_STALE_TIMEOUT_MS,
+            retry_count: 0,
+            last_used: now,
+            is_static: false,
+            generation: 1,
+        };
+    }
+
+    fn new_static(
+        ip: Array(u8, 4),
+        mac: Array(u8, ETH_ADDR_LEN),
+    ) -> ArpCacheEntry
+        effect [deterministic]
+    {
+        return ArpCacheEntry {
+            ip_address: ip,
+            mac_address: mac,
+            state: ArpEntryState::Permanent,
+            timestamp: 0,
+            timeout_ms: 0,
+            retry_count: 0,
+            last_used: 0,
+            is_static: true,
+            generation: 1,
+        };
+    }
+
+    fn is_expired(self, now: u64) -> bool
+        effect [deterministic]
+    {
+        if self.is_static {
+            return false;
+        };
+        if self.state == ArpEntryState::Permanent {
+            return false;
+        };
+        return (now - self.timestamp) >= self.timeout_ms;
+    }
+
+    fn is_resolved(self) -> bool
+        effect [deterministic]
+    {
+        return self.state == ArpEntryState::Complete || self.state == ArpEntryState::Permanent;
+    }
+
+    fn mark_stale(self: ref mut)
+        effect [deterministic]
+    {
+        if !self.is_static {
+            self.state = ArpEntryState::Stale;
+        };
+    }
+
+    fn touch(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        self.last_used = now;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Cache (Fixed-Capacity)
+// ─────────────────────────────────────────────────────────────
+
+struct ArpCache {
+    entries: Array(ArpCacheEntry, ARP_CACHE_CAPACITY),
+    entry_count: u64,
+    next_generation: u64,
+}
+
+impl ArpCache {
+    fn new() -> ArpCache
+        effect [deterministic]
+    {
+        return ArpCache {
+            entries: Array::zeroed(),
+            entry_count: 0,
+            next_generation: 1,
+        };
+    }
+
+    fn lookup(self, ip: Array(u8, 4)) -> Result(ArpCacheEntry, ArpError)
+        effect [deterministic]
+    {
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let entry: ArpCacheEntry = self.entries[i];
+            if entry.state == ArpEntryState::Incomplete {
+                continue;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if entry.ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                return Result::Ok(entry);
+            };
+        };
+        return Result::Err(ArpError::ArpEntryNotFound);
+    }
+
+    fn lookup_mac(self, ip: Array(u8, 4)) -> Result(Array(u8, ETH_ADDR_LEN), ArpError)
+        effect [deterministic]
+    {
+        let entry_res: Result(ArpCacheEntry, ArpError) = self.lookup(ip);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ArpCacheEntry = entry_res.unwrap();
+        if !entry.is_resolved() {
+            return Result::Err(ArpError::ArpEntryStale);
+        };
+        return Result::Ok(entry.mac_address);
+    }
+
+    fn update(self: ref mut, ip: Array(u8, 4), mac: Array(u8, ETH_ADDR_LEN), now: u64)
+        effect [deterministic]
+    {
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if self.entries[i].ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                self.entries[i].mac_address = mac;
+                self.entries[i].state = ArpEntryState::Complete;
+                self.entries[i].timestamp = now;
+                self.entries[i].retry_count = 0;
+                self.entries[i].generation = self.next_generation;
+                self.next_generation = self.next_generation + 1;
+                return;
+            };
+        };
+        // Add new entry
+        if self.entry_count < ARP_CACHE_CAPACITY {
+            self.entries[self.entry_count] = ArpCacheEntry::new_complete(ip, mac, now);
+            self.entries[self.entry_count].generation = self.next_generation;
+            self.next_generation = self.next_generation + 1;
+            self.entry_count = self.entry_count + 1;
+        };
+    }
+
+    fn insert_incomplete(self: ref mut, ip: Array(u8, 4), now: u64)
+        effect [deterministic]
+    {
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if self.entries[i].ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                self.entries[i].state = ArpEntryState::Incomplete;
+                self.entries[i].timestamp = now;
+                self.entries[i].timeout_ms = ARP_PROBE_TIMEOUT_MS;
+                return;
+            };
+        };
+        if self.entry_count < ARP_CACHE_CAPACITY {
+            let mut entry: ArpCacheEntry = ArpCacheEntry::empty();
+            entry.ip_address = ip;
+            entry.state = ArpEntryState::Incomplete;
+            entry.timestamp = now;
+            entry.timeout_ms = ARP_PROBE_TIMEOUT_MS;
+            entry.generation = self.next_generation;
+            self.next_generation = self.next_generation + 1;
+            self.entries[self.entry_count] = entry;
+            self.entry_count = self.entry_count + 1;
+        };
+    }
+
+    fn remove(self: ref mut, ip: Array(u8, 4))
+        effect [deterministic]
+    {
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if self.entries[i].ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                // Shift entries left
+                loop bound ARP_CACHE_CAPACITY {
+                    let src: u64 = i + j + 1;
+                    if src >= self.entry_count {
+                        break;
+                    };
+                    self.entries[i + j] = self.entries[src];
+                };
+                self.entry_count = self.entry_count - 1;
+                return;
+            };
+        };
+    }
+
+    fn purge_expired(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        let mut i: u64 = 0;
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].is_expired(now) && !self.entries[i].is_static {
+                self.entries[i] = self.entries[self.entry_count - 1];
+                self.entry_count = self.entry_count - 1;
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+
+    fn is_full(self) -> bool
+        effect [deterministic]
+    {
+        return self.entry_count >= ARP_CACHE_CAPACITY;
+    }
+
+    fn resolve_or_fail(self: ref mut, ip: Array(u8, 4), now: u64) -> Result(Array(u8, ETH_ADDR_LEN), ArpError)
+        effect [deterministic]
+    {
+        let entry_res: Result(ArpCacheEntry, ArpError) = self.lookup(ip);
+        if entry_res.is_err() {
+            return Result::Err(ArpError::ArpEntryNotFound);
+        };
+        let entry: ArpCacheEntry = entry_res.unwrap();
+        if entry.is_resolved() {
+            return Result::Ok(entry.mac_address);
+        };
+        if entry.state == ArpEntryState::Incomplete {
+            if (now - entry.timestamp) > ARP_PROBE_TIMEOUT_MS {
+                if entry.retry_count >= ARP_RETRY_COUNT {
+                    self.mark_failed(ip);
+                    return Result::Err(ArpError::ArpResolutionFailed);
+                };
+                return Result::Err(ArpError::ArpTimeout);
+            };
+            return Result::Err(ArpError::ArpEntryStale);
+        };
+        return Result::Err(ArpError::ArpEntryStale);
+    }
+
+    fn mark_failed(self: ref mut, ip: Array(u8, 4))
+        effect [deterministic]
+    {
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if self.entries[i].ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                self.entries[i].state = ArpEntryState::Failed;
+                return;
+            };
+        };
+    }
+
+    fn add_static(self: ref mut, ip: Array(u8, 4), mac: Array(u8, ETH_ADDR_LEN)) -> Result(void, ArpError)
+        effect [deterministic]
+    {
+        if self.entry_count >= ARP_CACHE_CAPACITY {
+            return Result::Err(ArpError::ArpCacheFull);
+        };
+        self.entries[self.entry_count] = ArpCacheEntry::new_static(ip, mac);
+        self.entry_count = self.entry_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn for_each(self, callback: fn(u64, ArpCacheEntry) -> void effect [deterministic])
+        effect [deterministic]
+    {
+        loop bound ARP_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            callback(i, self.entries[i]);
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pending ARP Resolution
+// ─────────────────────────────────────────────────────────────
+
+struct PendingResolution {
+    ip_address: Array(u8, 4),
+    timestamp: u64,
+    retry_count: u64,
+    timeout_ms: u64,
+    callback: Option(Handle),
+    generation: u64,
+}
+
+impl PendingResolution {
+    fn new(ip: Array(u8, 4), now: u64, cb: Option(Handle)) -> PendingResolution
+        effect [deterministic]
+    {
+        return PendingResolution {
+            ip_address: ip,
+            timestamp: now,
+            retry_count: 0,
+            timeout_ms: ARP_PROBE_TIMEOUT_MS,
+            callback: cb,
+            generation: 1,
+        };
+    }
+}
+
+struct PendingQueue {
+    entries: Array(PendingResolution, ARP_PENDING_CAPACITY),
+    count: u64,
+}
+
+impl PendingQueue {
+    fn new() -> PendingQueue
+        effect [deterministic]
+    {
+        return PendingQueue {
+            entries: Array::zeroed(),
+            count: 0,
+        };
+    }
+
+    fn enqueue(self: ref mut, pending: PendingResolution) -> Result(void, ArpError)
+        effect [deterministic]
+    {
+        if self.count >= ARP_PENDING_CAPACITY {
+            return Result::Err(ArpError::ArpCacheFull);
+        };
+        self.entries[self.count] = pending;
+        self.count = self.count + 1;
+        return Result::Ok(void);
+    }
+
+    fn find(self, ip: Array(u8, 4)) -> Result(u64, ArpError)
+        effect [deterministic]
+    {
+        loop bound ARP_PENDING_CAPACITY {
+            if i >= self.count {
+                break;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if self.entries[i].ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(ArpError::ArpEntryNotFound);
+    }
+
+    fn remove(self: ref mut, ip: Array(u8, 4))
+        effect [deterministic]
+    {
+        loop bound ARP_PENDING_CAPACITY {
+            if i >= self.count {
+                break;
+            };
+            let mut match_ip: bool = true;
+            loop bound 4 {
+                if self.entries[i].ip_address[j] != ip[j] {
+                    match_ip = false;
+                    break;
+                };
+            };
+            if match_ip {
+                self.entries[i] = self.entries[self.count - 1];
+                self.count = self.count - 1;
+                return;
+            };
+        };
+    }
+
+    fn process_expired(self: ref mut, now: u64, callback: fn(u64, Array(u8, 4)) -> void effect [deterministic])
+        effect [deterministic]
+    {
+        let mut i: u64 = 0;
+        loop bound ARP_PENDING_CAPACITY {
+            if i >= self.count {
+                break;
+            };
+            let elapsed: u64 = now - self.entries[i].timestamp;
+            if elapsed >= self.entries[i].timeout_ms {
+                if self.entries[i].retry_count >= ARP_RETRY_COUNT {
+                    callback(i, self.entries[i].ip_address);
+                    self.entries[i] = self.entries[self.count - 1];
+                    self.count = self.count - 1;
+                } else {
+                    self.entries[i].retry_count = self.entries[i].retry_count + 1;
+                    self.entries[i].timestamp = now;
+                };
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+
+    fn count_pending(self) -> u64
+        effect [deterministic]
+    {
+        return self.count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Rate Limiter
+// ─────────────────────────────────────────────────────────────
+
+struct ArpRateLimiter {
+    request_count: u64,
+    window_start: u64,
+    window_ms: u64,
+    max_requests: u64,
+}
+
+impl ArpRateLimiter {
+    fn new() -> ArpRateLimiter
+        effect [deterministic]
+    {
+        return ArpRateLimiter {
+            request_count: 0,
+            window_start: 0,
+            window_ms: ARP_RATE_LIMIT_MS,
+            max_requests: ARP_MAX_REQUESTS_RATE,
+        };
+    }
+
+    fn allow_request(self: ref mut, now: u64) -> bool
+        effect [deterministic]
+    {
+        if (now - self.window_start) >= self.window_ms {
+            self.request_count = 0;
+            self.window_start = now;
+        };
+        if self.request_count >= self.max_requests {
+            return false;
+        };
+        self.request_count = self.request_count + 1;
+        return true;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP State Machine
+// ─────────────────────────────────────────────────────────────
+
+struct ArpState {
+    cache: ArpCache,
+    pending: PendingQueue,
+    rate_limiter: ArpRateLimiter,
+    local_mac: Array(u8, ETH_ADDR_LEN),
+    local_ip: Array(u8, 4),
+    cache_timestamp: u64,
+    probe_count: u64,
+    gratuitous_count: u64,
+    resolution_count: u64,
+    failure_count: u64,
+    generation: u64,
+}
+
+impl ArpState {
+    fn new(local_mac: Array(u8, ETH_ADDR_LEN), local_ip: Array(u8, 4)) -> ArpState
+        effect [deterministic]
+    {
+        return ArpState {
+            cache: ArpCache::new(),
+            pending: PendingQueue::new(),
+            rate_limiter: ArpRateLimiter::new(),
+            local_mac: local_mac,
+            local_ip: local_ip,
+            cache_timestamp: 0,
+            probe_count: 0,
+            gratuitous_count: 0,
+            resolution_count: 0,
+            failure_count: 0,
+            generation: 1,
+        };
+    }
+
+    fn resolve(
+        self: ref mut,
+        target_ip: Array(u8, 4),
+        now: u64,
+    ) -> (Result(Array(u8, ETH_ADDR_LEN), ArpError), Option(ArpPacket))
+        effect [deterministic]
+        court "arp_resolve:v1"
+    {
+        // Check cache first
+        let cached_res: Result(Array(u8, ETH_ADDR_LEN), ArpError) = self.cache.lookup_mac(target_ip);
+        if cached_res.is_ok() {
+            let mac: Array(u8, ETH_ADDR_LEN) = cached_res.unwrap();
+            let entry_res: Result(ArpCacheEntry, ArpError) = self.cache.lookup(target_ip);
+            if entry_res.is_ok() {
+                let entry: ArpCacheEntry = entry_res.unwrap();
+                if entry.is_resolved() && !entry.is_expired(now) {
+                    self.cache.update(target_ip, mac, now);
+                    return (Result::Ok(mac), Option::None);
+                };
+            };
+        };
+        // Rate limit check
+        if !self.rate_limiter.allow_request(now) {
+            return (Result::Err(ArpError::ArpRateLimitExceeded), Option::None);
+        };
+        // Insert incomplete entry
+        self.cache.insert_incomplete(target_ip, now);
+        // Create ARP request packet
+        let request: ArpPacket = ArpPacket::new_request(self.local_mac, self.local_ip, target_ip);
+        // Add to pending queue
+        let pending: PendingResolution = PendingResolution::new(target_ip, now, Option::None);
+        let enq_res: Result(void, ArpError) = self.pending.enqueue(pending);
+        if enq_res.is_err() {
+            return (Result::Err(ArpError::ArpCacheFull), Option::Some(request));
+        };
+        self.resolution_count = self.resolution_count + 1;
+
+        residual emit {
+            op: "arp.resolve",
+            target_ip: target_ip,
+            timestamp: now,
+            pending_count: self.pending.count_pending(),
+            cache_count: self.cache.count(),
+        };
+
+        return (Result::Err(ArpError::ArpTimeout), Option::Some(request));
+    }
+
+    fn handle_packet(
+        self: ref mut,
+        packet: ArpPacket,
+        now: u64,
+    ) -> (Result(void, ArpError), Option(ArpPacket))
+        effect [deterministic]
+        court "arp_handle_packet:v1"
+    {
+        // Validate hardware and protocol types
+        if packet.hw_type != 1 {
+            return (Result::Err(ArpError::ArpHardwareTypeUnknown), Option::None);
+        };
+        if packet.proto_type != 0x0800 {
+            return (Result::Err(ArpError::ArpProtocolTypeUnknown), Option::None);
+        };
+        // Handle ARP Request
+        if packet.is_request() {
+            // Check if target IP matches ours
+            if self.is_my_ip(packet.target_ip) {
+                // Ignore if sender IP is zero (probe)
+                if packet.is_probe() {
+                    // Duplicate address detection
+                    if !self.is_zero_mac(packet.sender_mac) {
+                        let conflict: bool = self.check_duplicate(packet.sender_mac, packet.sender_ip);
+                        if conflict {
+                            self.failure_count = self.failure_count + 1;
+                            return (Result::Err(ArpError::ArpDuplicateAddress), Option::None);
+                        };
+                    };
+                    return (Result::Ok(void), Option::None);
+                };
+                // Update cache with sender info
+                if !packet.is_sender_zero_ip() {
+                    self.cache.update(packet.sender_ip, packet.sender_mac, now);
+                };
+                // Create ARP reply
+                let reply: ArpPacket = ArpPacket::new_reply(
+                    self.local_mac,
+                    self.local_ip,
+                    packet.sender_mac,
+                    packet.sender_ip,
+                );
+                return (Result::Ok(void), Option::Some(reply));
+            };
+            // Not for us, but update cache if we have info
+            if !packet.is_sender_zero_ip() {
+                self.cache.update(packet.sender_ip, packet.sender_mac, now);
+            };
+            return (Result::Ok(void), Option::None);
+        };
+        // Handle ARP Reply
+        if packet.is_reply() {
+            // Remove from pending queue
+            let was_pending: bool = self.pending.find(packet.sender_ip).is_ok();
+            if was_pending {
+                self.pending.remove(packet.sender_ip);
+            };
+            // Update cache
+            self.cache.update(packet.sender_ip, packet.sender_mac, now);
+            // Handle gratuitous ARP
+            if packet.is_gratuitous() {
+                let conflict: bool = self.handle_gratuitous(packet, now);
+                if conflict {
+                    return (Result::Err(ArpError::ArpGratuitousConflict), Option::None);
+                };
+                return (Result::Ok(void), Option::None);
+            };
+            return (Result::Ok(void), Option::None);
+        };
+        return (Result::Err(ArpError::ArpOpcodeUnknown), Option::None);
+    }
+
+    fn send_probe(self: ref mut, probe_ip: Array(u8, 4), now: u64) -> ArpPacket
+        effect [deterministic]
+    {
+        self.probe_count = self.probe_count + 1;
+
+        residual emit {
+            op: "arp.probe",
+            probe_ip: probe_ip,
+            timestamp: now,
+            probe_count: self.probe_count,
+        };
+
+        return ArpPacket::new_probe(self.local_mac, probe_ip);
+    }
+
+    fn send_gratuitous(self: ref mut, now: u64) -> ArpPacket
+        effect [deterministic]
+    {
+        self.gratuitous_count = self.gratuitous_count + 1;
+
+        residual emit {
+            op: "arp.gratuitous",
+            mac: self.local_mac,
+            ip: self.local_ip,
+            timestamp: now,
+            gratuitous_count: self.gratuitous_count,
+        };
+
+        return ArpPacket::new_gratuitous(self.local_mac, self.local_ip);
+    }
+
+    fn handle_gratuitous(self: ref mut, packet: ArpPacket, now: u64) -> bool
+        effect [deterministic]
+    {
+        // Check if gratuitous ARP conflicts with our address
+        if packet.is_gratuitous() {
+            if self.is_my_ip(packet.sender_ip) {
+                if !self.is_my_mac(packet.sender_mac) {
+                    self.failure_count = self.failure_count + 1;
+
+                    residual emit {
+                        op: "arp.duplicate_detected",
+                        our_mac: self.local_mac,
+                        their_mac: packet.sender_mac,
+                        ip: packet.sender_ip,
+                        timestamp: now,
+                    };
+
+                    return true;
+                };
+            };
+        };
+        return false;
+    }
+
+    fn check_duplicate(self, other_mac: Array(u8, ETH_ADDR_LEN), other_ip: Array(u8, 4)) -> bool
+        effect [deterministic]
+    {
+        if self.is_my_ip(other_ip) {
+            return !self.is_my_mac(other_mac);
+        };
+        return false;
+    }
+
+    fn is_my_ip(self, ip: Array(u8, 4)) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.local_ip[i] != ip[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_my_mac(self, mac: Array(u8, ETH_ADDR_LEN)) -> bool
+        effect [deterministic]
+    {
+        loop bound ETH_ADDR_LEN {
+            if self.local_mac[i] != mac[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_zero_mac(self, mac: Array(u8, ETH_ADDR_LEN)) -> bool
+        effect [deterministic]
+    {
+        loop bound ETH_ADDR_LEN {
+            if mac[i] != 0 {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn update_local_ip(self: ref mut, new_ip: Array(u8, 4), now: u64)
+        effect [deterministic]
+    {
+        self.local_ip = new_ip;
+
+        residual emit {
+            op: "arp.local_ip_change",
+            old_ip: self.local_ip,
+            new_ip: new_ip,
+            timestamp: now,
+        };
+    }
+
+    fn update_local_mac(self: ref mut, new_mac: Array(u8, ETH_ADDR_LEN), now: u64)
+        effect [deterministic]
+    {
+        self.local_mac = new_mac;
+
+        residual emit {
+            op: "arp.local_mac_change",
+            old_mac: self.local_mac,
+            new_mac: new_mac,
+            timestamp: now,
+        };
+    }
+
+    fn periodic_maintenance(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        self.cache.purge_expired(now);
+
+        // Process expired pending resolutions
+        self.pending.process_expired(now, fn(idx: u64, ip: Array(u8, 4)) -> void effect [deterministic] {
+            self.cache.mark_failed(ip);
+            self.failure_count = self.failure_count + 1;
+        });
+    }
+
+    fn get_cache_stats(self) -> (u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        let mut complete: u64 = 0;
+        let mut incomplete: u64 = 0;
+        let mut stale: u64 = 0;
+        let mut permanent: u64 = 0;
+        self.cache.for_each(fn(idx: u64, entry: ArpCacheEntry) -> void effect [deterministic] {
+            if entry.state == ArpEntryState::Complete {
+                complete = complete + 1;
+            } else if entry.state == ArpEntryState::Incomplete {
+                incomplete = incomplete + 1;
+            } else if entry.state == ArpEntryState::Stale {
+                stale = stale + 1;
+            } else if entry.state == ArpEntryState::Permanent {
+                permanent = permanent + 1;
+            };
+        });
+        return (complete, incomplete, stale, permanent);
+    }
+
+    fn get_stats(self) -> (u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.resolution_count,
+            self.failure_count,
+            self.probe_count,
+            self.gratuitous_count,
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ARP Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn arp_init(local_mac: Array(u8, ETH_ADDR_LEN), local_ip: Array(u8, 4)) -> Result(ArpState, ArpError)
+    effect [deterministic]
+    court "arp_init:v1"
+{
+    residual emit {
+        op: "arp.init",
+        status: "ready",
+        local_ip: local_ip,
+        local_mac: local_mac,
+    };
+    return Result::Ok(ArpState::new(local_mac, local_ip));
+}
+
+fn arp_packet_from_eth(payload: Array(u8, 1518), payload_len: u64) -> Result(ArpPacket, ArpError)
+    effect [deterministic]
+{
+    return ArpPacket::parse(payload, payload_len);
+}
+
+fn arp_packet_to_eth_bytes(packet: ArpPacket) -> Result(Array(u8, 1518), ArpError)
+    effect [deterministic]
+{
+    return packet.serialize();
+}
+
+fn arp_is_my_packet(packet: ArpPacket, local_ip: Array(u8, 4)) -> bool
+    effect [deterministic]
+{
+    if packet.is_request() {
+        loop bound 4 {
+            if packet.target_ip[i] != local_ip[i] {
+                return false;
+            };
+        };
+        return true;
+    };
+    if packet.is_reply() {
+        loop bound 4 {
+            if packet.sender_ip[i] != local_ip[i] {
+                return false;
+            };
+        };
+        return true;
+    };
+    return false;
+}
+
+fn arp_hardware_type_to_string(hw: u16) -> Array(u8, 32)
+    effect [deterministic]
+{
+    if hw == 1 {
+        return Array::from_literal("Ethernet");
+    } else if hw == 6 {
+        return Array::from_literal("IEEE 802");
+    } else if hw == 7 {
+        return Array::from_literal("ARCnet");
+    } else {
+        return Array::from_literal("Unknown");
+    };
+}

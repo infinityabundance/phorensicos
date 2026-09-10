@@ -1,0 +1,1405 @@
+// ipv6.phor — IPv6: packet parsing, header chain (extension headers), address types, ND, SLAAC
+// Implements RFC 8200 Internet Protocol Version 6 with Neighbor Discovery and SLAAC.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/ipv6.phor
+// Court: ipv6:v1
+
+package network.ipv6;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import network.ethernet.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// IPv6 sub-range: 0xE300 - 0xE3FF
+
+type Ipv6Error = enum {
+    Ipv6PacketTooShort      = 0xE300,  // NE300: IPv6 packet shorter than 40 bytes
+    Ipv6VersionMismatch     = 0xE301,  // NE301: Version field is not 6
+    Ipv6UnknownNextHeader   = 0xE302,  // NE302: Unknown next header type
+    Ipv6ExtensionChainTooLong = 0xE303, // NE303: Extension header chain too long
+    Ipv6HopLimitExpired     = 0xE304,  // NE304: Hop limit reached zero
+    Ipv6FragNotSupported    = 0xE305,  // NE305: IPv6 fragmentation not supported
+    Ipv6FragOverlap         = 0xE306,  // NE306: Fragment overlap detected
+    Ipv6FragTimeout         = 0xE307,  // NE307: Fragment reassembly timeout
+    Ipv6FragBufFull         = 0xE308,  // NE308: Fragment buffer full
+    Ipv6AddrInvalid         = 0xE309,  // NE309: Invalid IPv6 address
+    Ipv6AddrScopeError      = 0xE30A,  // NE30A: Address scope error
+    Ipv6NdpPacketInvalid    = 0xE30B,  // NE30B: Invalid Neighbor Discovery packet
+    Ipv6NdpOptionUnknown    = 0xE30C,  // NE30C: Unknown NDP option type
+    Ipv6SlaacFailed         = 0xE30D,  // NE30D: SLAAC address configuration failed
+    Ipv6SlaacDupAddrDetect  = 0xE30E,  // NE30E: Duplicate address detected (DAD)
+    Ipv6SlaacNoPrefix       = 0xE30F,  // NE30F: No valid prefix for SLAAC
+    Ipv6BufOverflow         = 0xE310,  // NE310: Buffer overflow
+    Ipv6CapabilityError     = 0xE311,  // NE311: Insufficient capability
+    Ipv6RoutingFailed       = 0xE312,  // NE312: No route to destination
+    Ipv6PacketTooBig        = 0xE313,  // NE313: Packet exceeds MTU
+    Ipv6OptionMalformed     = 0xE314,  // NE314: Malformed option in extension header
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const IPV6_VERSION          : u8 = 6;
+const IPV6_HDR_LEN          : u64 = 40;
+const IPV6_ADDR_LEN         : u64 = 16;
+const IPV6_DEFAULT_HOP_LIMIT: u8 = 64;
+const IPV6_MAX_PACKET       : u64 = 65535;
+const IPV6_MAX_HBH_OPTIONS  : u64 = 16;
+const IPV6_MTU_MIN          : u64 = 1280;
+const IPV6_FRAG_TIMEOUT_MS  : u64 = 60000;
+const IPV6_MAX_FRAGMENTS    : u64 = 64;
+const IPV6_NDP_MAX_RTR_SOL  : u64 = 3;
+const IPV6_NDP_RTR_SOL_MS   : u64 = 4000;
+const IPV6_SLAAC_VALID_LIFETIME : u64 = 86400;
+const IPV6_SLAAC_PREF_LIFETIME  : u64 = 14400;
+const IPV6_DAD_NS_COUNT     : u64 = 3;
+const IPV6_DAD_TIMEOUT_MS   : u64 = 1000;
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Next Header Values
+// ─────────────────────────────────────────────────────────────
+
+type Ipv6NextHeader = enum {
+    HopByHop       = 0,
+    Icmp           = 58,
+    Tcp            = 6,
+    Udp            = 17,
+    Routing        = 43,
+    Fragment       = 44,
+    Esp            = 50,
+    Ah             = 51,
+    DestOpts       = 60,
+    NoNext         = 59,
+    Mobility       = 135,
+    Hip            = 139,
+    Shim6          = 140,
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Address
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv6Address {
+    octets: Array(u8, IPV6_ADDR_LEN),
+}
+
+impl Ipv6Address {
+    fn from_bytes(octets: Array(u8, IPV6_ADDR_LEN)) -> Ipv6Address
+        effect [deterministic]
+    {
+        return Ipv6Address { octets: octets };
+    }
+
+    fn any() -> Ipv6Address
+        effect [deterministic]
+    {
+        return Ipv6Address { octets: Array::zeroed() };
+    }
+
+    fn loopback() -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        octets[15] = 1;
+        return Ipv6Address { octets: octets };
+    }
+
+    fn sol_node_multicast(addr: Ipv6Address) -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        octets[0] = 0xFF;
+        octets[1] = 0x02;
+        octets[2] = 0x00;
+        octets[3] = 0x00;
+        octets[4] = 0x00;
+        octets[5] = 0x00;
+        octets[6] = 0x00;
+        octets[7] = 0x00;
+        octets[8] = 0x00;
+        octets[9] = 0x00;
+        octets[10] = 0x00;
+        octets[11] = 0x01;
+        octets[12] = 0xFF;
+        octets[13] = addr.octets[13];
+        octets[14] = addr.octets[14];
+        octets[15] = addr.octets[15];
+        return Ipv6Address { octets: octets };
+    }
+
+    fn all_nodes_multicast() -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        octets[0] = 0xFF;
+        octets[1] = 0x02;
+        octets[2] = 0x00;
+        octets[3] = 0x00;
+        octets[4] = 0x00;
+        octets[5] = 0x00;
+        octets[6] = 0x00;
+        octets[7] = 0x00;
+        octets[8] = 0x00;
+        octets[9] = 0x00;
+        octets[10] = 0x00;
+        octets[11] = 0x00;
+        octets[12] = 0x00;
+        octets[13] = 0x00;
+        octets[14] = 0x00;
+        octets[15] = 0x01;
+        return Ipv6Address { octets: octets };
+    }
+
+    fn all_routers_multicast() -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        octets[0] = 0xFF;
+        octets[1] = 0x02;
+        octets[2] = 0x00;
+        octets[3] = 0x00;
+        octets[4] = 0x00;
+        octets[5] = 0x00;
+        octets[6] = 0x00;
+        octets[7] = 0x00;
+        octets[8] = 0x00;
+        octets[9] = 0x00;
+        octets[10] = 0x00;
+        octets[11] = 0x00;
+        octets[12] = 0x00;
+        octets[13] = 0x00;
+        octets[14] = 0x00;
+        octets[15] = 0x02;
+        return Ipv6Address { octets: octets };
+    }
+
+    fn from_eui64(prefix: Ipv6Address, prefix_len: u64, mac: Array(u8, ETH_ADDR_LEN)) -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        let prefix_bytes: u64 = prefix_len / 8;
+        loop bound 16 {
+            if i < prefix_bytes {
+                octets[i] = prefix.octets[i];
+            };
+        };
+        octets[8] = mac[0] ^ 0x02; // Invert U/L bit
+        octets[9] = mac[1];
+        octets[10] = mac[2];
+        octets[11] = 0xFF;
+        octets[12] = 0xFE;
+        octets[13] = mac[3];
+        octets[14] = mac[4];
+        octets[15] = mac[5];
+        return Ipv6Address { octets: octets };
+    }
+
+    fn link_local(mac: Array(u8, ETH_ADDR_LEN)) -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut prefix: Ipv6Address = Ipv6Address::any();
+        prefix.octets[0] = 0xFE;
+        prefix.octets[1] = 0x80;
+        return Ipv6Address::from_eui64(prefix, 64, mac);
+    }
+
+    fn multicast_from_unicast(unicast: Ipv6Address) -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        octets[0] = 0xFF;
+        octets[1] = 0x02;
+        octets[2] = 0x00;
+        octets[3] = 0x00;
+        octets[4] = 0x00;
+        octets[5] = 0x00;
+        octets[6] = 0x00;
+        octets[7] = 0x00;
+        octets[8] = 0x00;
+        octets[9] = 0x00;
+        octets[10] = 0x00;
+        octets[11] = 0x01;
+        octets[12] = 0xFF;
+        octets[13] = unicast.octets[13];
+        octets[14] = unicast.octets[14];
+        octets[15] = unicast.octets[15];
+        return Ipv6Address { octets: octets };
+    }
+
+    fn is_unspecified(self) -> bool
+        effect [deterministic]
+    {
+        loop bound 16 {
+            if self.octets[i] != 0 {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_loopback(self) -> bool
+        effect [deterministic]
+    {
+        loop bound 15 {
+            if self.octets[i] != 0 {
+                return false;
+            };
+        };
+        return self.octets[15] == 1;
+    }
+
+    fn is_multicast(self) -> bool
+        effect [deterministic]
+    {
+        return self.octets[0] == 0xFF;
+    }
+
+    fn is_link_local(self) -> bool
+        effect [deterministic]
+    {
+        return self.octets[0] == 0xFE && (self.octets[1] & 0xC0) == 0x80;
+    }
+
+    fn is_unique_local(self) -> bool
+        effect [deterministic]
+    {
+        return self.octets[0] == 0xFD;
+    }
+
+    fn is_global_unicast(self) -> bool
+        effect [deterministic]
+    {
+        if self.is_multicast() || self.is_link_local() || self.is_unique_local() || self.is_loopback() || self.is_unspecified() {
+            return false;
+        };
+        return (self.octets[0] & 0xE0) == 0x20;
+    }
+
+    fn is_solicited_node(self) -> bool
+        effect [deterministic]
+    {
+        if !self.is_multicast() {
+            return false;
+        };
+        loop bound 14 {
+            if i == 0 { if self.octets[0] != 0xFF { return false; }; };
+            if i == 1 { if self.octets[1] != 0x02 { return false; }; };
+            if i >= 2 && i < 11 {
+                if self.octets[i] != 0 { return false; };
+            };
+            if i == 11 { if self.octets[11] != 0x01 { return false; }; };
+        };
+        return self.octets[12] == 0xFF;
+    }
+
+    fn scope(self) -> u8
+        effect [deterministic]
+    {
+        if self.is_multicast() {
+            return self.octets[1] & 0x0F;
+        };
+        if self.is_link_local() {
+            return 2;
+        };
+        if self.is_loopback() {
+            return 0x10;
+        };
+        if self.is_unique_local() || self.is_global_unicast() {
+            return 0x0E;
+        };
+        return 0;
+    }
+
+    fn eq(self, other: Ipv6Address) -> bool
+        effect [deterministic]
+    {
+        loop bound 16 {
+            if self.octets[i] != other.octets[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn to_bytes(self) -> Array(u8, 16)
+        effect [deterministic]
+    {
+        return self.octets;
+    }
+
+    fn to_string(self) -> Array(u8, 40)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, 40) = Array::zeroed();
+        let mut pos: u64 = 0;
+        let mut zero_run: bool = false;
+        let hex_chars: Array(u8, 16) = Array::from_literal("0123456789abcdef");
+        loop bound 8 {
+            let idx: u64 = i * 2;
+            let group: u16 = ((self.octets[idx] as u16) << 8) | (self.octets[idx + 1] as u16);
+            if group == 0 {
+                if !zero_run {
+                    if i > 0 {
+                        buf[pos] = ':';
+                        pos = pos + 1;
+                    };
+                    zero_run = true;
+                };
+                // Check if all remaining groups are zero for ::
+                let mut all_zero: bool = true;
+                loop bound 8 {
+                    let jdx: u64 = (i + 1 + j) * 2;
+                    if (i + 1 + j) >= 8 {
+                        break;
+                    };
+                    let r: u16 = ((self.octets[jdx] as u16) << 8) | (self.octets[jdx + 1] as u16);
+                    if r != 0 {
+                        all_zero = false;
+                        break;
+                    };
+                };
+                if all_zero && i > 0 && i < 7 {
+                    buf[pos] = ':';
+                    pos = pos + 1;
+                    break;
+                };
+                continue;
+            } else {
+                if zero_run && i > 0 {
+                    buf[pos] = ':';
+                    pos = pos + 1;
+                    zero_run = false;
+                } else if i > 0 && !zero_run {
+                    buf[pos] = ':';
+                    pos = pos + 1;
+                };
+                zero_run = false;
+                // Convert group to hex digits
+                let mut started: bool = false;
+                loop bound 4 {
+                    let hex_digit: u8 = ((group >> ((3 - j) * 4)) & 0x0F) as u8;
+                    if hex_digit != 0 || started {
+                        buf[pos] = hex_chars[hex_digit as u64];
+                        pos = pos + 1;
+                        started = true;
+                    };
+                };
+                if !started {
+                    buf[pos] = '0';
+                    pos = pos + 1;
+                };
+            };
+        };
+        return buf;
+    }
+
+    fn write_to_buf(self, buf: ref mut Array(u8, IPV6_MAX_PACKET), offset: u64) -> Result(void, Ipv6Error)
+        effect [deterministic]
+    {
+        if (offset + 16) > IPV6_MAX_PACKET {
+            return Result::Err(Ipv6Error::Ipv6BufOverflow);
+        };
+        loop bound 16 {
+            buf[offset + i] = self.octets[i];
+        };
+        return Result::Ok(void);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Fixed Header
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv6Header {
+    version_class_flow: Array(u8, 4), // Version(4), Traffic Class(8), Flow Label(20)
+    payload_length: u16,
+    next_header: u8,
+    hop_limit: u8,
+    source: Ipv6Address,
+    destination: Ipv6Address,
+}
+
+impl Ipv6Header {
+    fn new(src: Ipv6Address, dst: Ipv6Address, next: u8, payload_len: u64) -> Ipv6Header
+        effect [deterministic]
+    {
+        let ver: u32 = (IPV6_VERSION as u32) << 28;
+        return Ipv6Header {
+            version_class_flow: [
+                ((ver >> 24) & 0xFF) as u8,
+                ((ver >> 16) & 0xFF) as u8,
+                ((ver >> 8) & 0xFF) as u8,
+                (ver & 0xFF) as u8,
+            ],
+            payload_length: payload_len as u16,
+            next_header: next,
+            hop_limit: IPV6_DEFAULT_HOP_LIMIT,
+            source: src,
+            destination: dst,
+        };
+    }
+
+    fn version(self) -> u8
+        effect [deterministic]
+    {
+        return (self.version_class_flow[0] >> 4) & 0x0F;
+    }
+
+    fn traffic_class(self) -> u8
+        effect [deterministic]
+    {
+        return ((self.version_class_flow[0] & 0x0F) << 4) | ((self.version_class_flow[1] >> 4) & 0x0F);
+    }
+
+    fn flow_label(self) -> u32
+        effect [deterministic]
+    {
+        return ((self.version_class_flow[1] as u32) & 0x0F) << 16 |
+               ((self.version_class_flow[2] as u32) << 8) |
+               (self.version_class_flow[3] as u32);
+    }
+
+    fn set_traffic_class(self: ref mut, tc: u8)
+        effect [deterministic]
+    {
+        self.version_class_flow[0] = (self.version_class_flow[0] & 0xF0) | ((tc >> 4) & 0x0F);
+        self.version_class_flow[1] = (self.version_class_flow[1] & 0x0F) | ((tc & 0x0F) << 4);
+    }
+
+    fn set_flow_label(self: ref mut, fl: u32)
+        effect [deterministic]
+    {
+        self.version_class_flow[1] = (self.version_class_flow[1] & 0xF0) | (((fl >> 16) & 0x0F) as u8);
+        self.version_class_flow[2] = ((fl >> 8) & 0xFF) as u8;
+        self.version_class_flow[3] = (fl & 0xFF) as u8;
+    }
+
+    fn decrement_hop_limit(self: ref mut) -> Result(void, Ipv6Error)
+        effect [deterministic]
+    {
+        if self.hop_limit <= 1 {
+            return Result::Err(Ipv6Error::Ipv6HopLimitExpired);
+        };
+        self.hop_limit = self.hop_limit - 1;
+        return Result::Ok(void);
+    }
+
+    fn parse(data: Array(u8, IPV6_MTU_MIN), len: u64) -> Result(Ipv6Header, Ipv6Error)
+        effect [deterministic]
+        court "ipv6_header_parse:v1"
+    {
+        if len < IPV6_HDR_LEN {
+            return Result::Err(Ipv6Error::Ipv6PacketTooShort);
+        };
+        let mut ver_class_flow: Array(u8, 4) = Array::zeroed();
+        loop bound 4 {
+            ver_class_flow[i] = data[i];
+        };
+        let version: u8 = (ver_class_flow[0] >> 4) & 0x0F;
+        if version != IPV6_VERSION {
+            return Result::Err(Ipv6Error::Ipv6VersionMismatch);
+        };
+        let payload_length: u16 = ((data[4] as u16) << 8) | (data[5] as u16);
+        let next_header: u8 = data[6];
+        let hop_limit: u8 = data[7];
+        let mut src_octets: Array(u8, 16) = Array::zeroed();
+        let mut dst_octets: Array(u8, 16) = Array::zeroed();
+        loop bound 16 {
+            src_octets[i] = data[8 + i];
+            dst_octets[i] = data[24 + i];
+        };
+        return Result::Ok(Ipv6Header {
+            version_class_flow: ver_class_flow,
+            payload_length: payload_length,
+            next_header: next_header,
+            hop_limit: hop_limit,
+            source: Ipv6Address::from_bytes(src_octets),
+            destination: Ipv6Address::from_bytes(dst_octets),
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, IPV6_MTU_MIN), Ipv6Error)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, IPV6_MTU_MIN) = Array::zeroed();
+        loop bound 4 {
+            buf[i] = self.version_class_flow[i];
+        };
+        buf[4] = ((self.payload_length >> 8) & 0xFF) as u8;
+        buf[5] = (self.payload_length & 0xFF) as u8;
+        buf[6] = self.next_header;
+        buf[7] = self.hop_limit;
+        loop bound 16 {
+            buf[8 + i] = self.source.octets[i];
+            buf[24 + i] = self.destination.octets[i];
+        };
+        return Result::Ok(buf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Extension Headers
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv6ExtensionHeader {
+    next_header: u8,
+    hdr_ext_len: u8,
+    data: Array(u8, 2048),
+    data_len: u64,
+}
+
+impl Ipv6ExtensionHeader {
+    fn parse(data: Array(u8, IPV6_MTU_MIN), offset: u64, available: u64,
+             next_hdr: u8) -> Result((Ipv6ExtensionHeader, u64, u8), Ipv6Error)
+        effect [deterministic]
+    {
+        if available < 2 {
+            return Result::Err(Ipv6Error::Ipv6PacketTooShort);
+        };
+        let nh: u8 = data[offset];
+        let ext_len_field: u8 = data[offset + 1];
+        let ext_len: u64;
+        let total_len: u64;
+        if next_hdr == 0 {
+            ext_len = (ext_len_field as u64 + 1) * 8;
+            total_len = ext_len;
+            if offset + total_len > available {
+                return Result::Err(Ipv6Error::Ipv6PacketTooShort);
+            };
+        } else if next_hdr == 44 {
+            ext_len = 8;
+            total_len = ext_len;
+        } else if next_hdr == 43 || next_hdr == 60 || next_hdr == 135 {
+            ext_len = (ext_len_field as u64 + 1) * 8;
+            total_len = ext_len;
+        } else {
+            return Result::Err(Ipv6Error::Ipv6UnknownNextHeader);
+        };
+        let mut ext_data: Array(u8, 2048) = Array::zeroed();
+        let data_start: u64 = offset + 2;
+        let copy_len: u64 = if ext_len >= 2 { ext_len - 2 } else { 0 };
+        loop bound 2048 {
+            if j >= copy_len {
+                break;
+            };
+            if (data_start + j) < available {
+                ext_data[j] = data[data_start + j];
+            };
+        };
+        return Result::Ok((
+            Ipv6ExtensionHeader {
+                next_header: nh,
+                hdr_ext_len: ext_len_field,
+                data: ext_data,
+                data_len: copy_len,
+            },
+            total_len,
+            nh,
+        ));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Fragment Extension Header
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv6FragmentHeader {
+    next_header: u8,
+    fragment_offset: u16,
+    more_fragments: bool,
+    identification: u32,
+}
+
+impl Ipv6FragmentHeader {
+    fn parse(data: Array(u8, IPV6_MTU_MIN), offset: u64, available: u64,
+             next_hdr: u8) -> Result((Ipv6FragmentHeader, u64, u8), Ipv6Error)
+        effect [deterministic]
+    {
+        if (offset + 8) > available {
+            return Result::Err(Ipv6Error::Ipv6PacketTooShort);
+        };
+        let nh: u8 = data[offset];
+        let frag_hi: u16 = ((data[offset + 2] as u16) << 8) | (data[offset + 3] as u16);
+        let frag_offset: u16 = (frag_hi >> 3) & 0x1FFF;
+        let mf: bool = (frag_hi & 0x01) != 0;
+        let identification: u32 = ((data[offset + 4] as u32) << 24) |
+                                  ((data[offset + 5] as u32) << 16) |
+                                  ((data[offset + 6] as u32) << 8) |
+                                  (data[offset + 7] as u32);
+        return Result::Ok((
+            Ipv6FragmentHeader {
+                next_header: nh,
+                fragment_offset: frag_offset,
+                more_fragments: mf,
+                identification: identification,
+            },
+            8,
+            nh,
+        ));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Packet (Header Chain + Payload)
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv6Packet {
+    header: Ipv6Header,
+    extensions: Array(Ipv6ExtensionHeader, 8),
+    extension_count: u64,
+    fragment: Option(Ipv6FragmentHeader),
+    payload: Array(u8, IPV6_MAX_PACKET),
+    payload_length: u64,
+    upper_protocol: u8,
+}
+
+impl Ipv6Packet {
+    fn new(hdr: Ipv6Header, payload_data: Array(u8, IPV6_MAX_PACKET), payload_len: u64, proto: u8) -> Ipv6Packet
+        effect [deterministic]
+    {
+        return Ipv6Packet {
+            header: hdr,
+            extensions: Array::zeroed(),
+            extension_count: 0,
+            fragment: Option::None,
+            payload: payload_data,
+            payload_length: payload_len,
+            upper_protocol: proto,
+        };
+    }
+
+    fn parse(raw: Array(u8, IPV6_MTU_MIN), len: u64) -> Result(Ipv6Packet, Ipv6Error)
+        effect [deterministic]
+        court "ipv6_packet_parse:v1"
+    {
+        let hdr_res: Result(Ipv6Header, Ipv6Error) = Ipv6Header::parse(raw, len);
+        if hdr_res.is_err() {
+            return Result::Err(hdr_res.unwrap_err());
+        };
+        let hdr: Ipv6Header = hdr_res.unwrap();
+        let mut offset: u64 = IPV6_HDR_LEN;
+        let mut next_hdr: u8 = hdr.next_header;
+        let mut extensions: Array(Ipv6ExtensionHeader, 8) = Array::zeroed();
+        let mut ext_count: u64 = 0;
+        let mut frag_hdr: Option(Ipv6FragmentHeader) = Option::None;
+        // Walk extension header chain
+        loop bound 8 {
+            if next_hdr == 59 { // No Next Header
+                break;
+            };
+            if next_hdr == 58 || next_hdr == 6 || next_hdr == 17 {
+                // Upper layer protocol
+                break;
+            };
+            if ext_count >= 8 {
+                return Result::Err(Ipv6Error::Ipv6ExtensionChainTooLong);
+            };
+            if next_hdr == 44 { // Fragment
+                let frag_res: Result((Ipv6FragmentHeader, u64, u8), Ipv6Error) =
+                    Ipv6FragmentHeader::parse(raw, offset, len - offset, next_hdr);
+                if frag_res.is_err() {
+                    return Result::Err(frag_res.unwrap_err());
+                };
+                let (frag, consumed, nh): (Ipv6FragmentHeader, u64, u8) = frag_res.unwrap();
+                frag_hdr = Option::Some(frag);
+                offset = offset + consumed;
+                next_hdr = nh;
+            } else {
+                let ext_res: Result((Ipv6ExtensionHeader, u64, u8), Ipv6Error) =
+                    Ipv6ExtensionHeader::parse(raw, offset, len - offset, next_hdr);
+                if ext_res.is_err() {
+                    return Result::Err(ext_res.unwrap_err());
+                };
+                let (ext, consumed, nh): (Ipv6ExtensionHeader, u64, u8) = ext_res.unwrap();
+                extensions[ext_count] = ext;
+                ext_count = ext_count + 1;
+                offset = offset + consumed;
+                next_hdr = nh;
+            };
+        };
+        let payload_len: u64 = if len > offset { len - offset } else { 0 };
+        let mut payload: Array(u8, IPV6_MAX_PACKET) = Array::zeroed();
+        loop bound IPV6_MAX_PACKET {
+            if i >= payload_len {
+                break;
+            };
+            if (offset + i) < len {
+                payload[i] = raw[offset + i];
+            };
+        };
+        return Result::Ok(Ipv6Packet {
+            header: hdr,
+            extensions: extensions,
+            extension_count: ext_count,
+            fragment: frag_hdr,
+            payload: payload,
+            payload_length: payload_len,
+            upper_protocol: next_hdr,
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, IPV6_MTU_MIN), Ipv6Error)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, IPV6_MTU_MIN) = Array::zeroed();
+        let hdr_buf_res: Result(Array(u8, IPV6_MTU_MIN), Ipv6Error) = self.header.serialize();
+        if hdr_buf_res.is_err() {
+            return Result::Err(hdr_buf_res.unwrap_err());
+        };
+        let hdr_buf: Array(u8, IPV6_MTU_MIN) = hdr_buf_res.unwrap();
+        loop bound IPV6_HDR_LEN {
+            buf[i] = hdr_buf[i];
+        };
+        let mut offset: u64 = IPV6_HDR_LEN;
+        loop bound 8 {
+            if i >= self.extension_count {
+                break;
+            };
+            let ext: Ipv6ExtensionHeader = self.extensions[i];
+            buf[offset] = ext.next_header;
+            buf[offset + 1] = ext.hdr_ext_len;
+            let copy_len: u64 = if ext.data_len < 2048 { ext.data_len } else { 2048 };
+            loop bound 2048 {
+                if j >= copy_len {
+                    break;
+                };
+                buf[offset + 2 + j] = ext.data[j];
+            };
+            if i == 0 || i == 3 || i == 5 || i == 6 || i == 7 {
+                offset = offset + (ext.hdr_ext_len as u64 + 1) * 8;
+            } else {
+                offset = offset + (ext.hdr_ext_len as u64 + 1) * 8;
+            };
+        };
+        loop bound IPV6_MAX_PACKET {
+            if j >= self.payload_length {
+                break;
+            };
+            buf[offset + j] = self.payload[j];
+        };
+        return Result::Ok(buf);
+    }
+
+    fn is_fragment(self) -> bool
+        effect [deterministic]
+    {
+        return self.fragment.is_some();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Neighbor Discovery Protocol (NDP)
+// ─────────────────────────────────────────────────────────────
+
+type NdpOptionType = enum {
+    NdpSrcLlAddr    = 1,
+    NdpTgtLlAddr    = 2,
+    NdpPrefixInfo   = 3,
+    NdpRedirect     = 4,
+    NdpMtu          = 5,
+}
+
+struct NdpOption {
+    option_type: u8,
+    length: u8,
+    data: Array(u8, 256),
+    data_len: u64,
+}
+
+impl NdpOption {
+    fn new(opt_type: u8, opt_data: Array(u8, 256), data_len: u64) -> NdpOption
+        effect [deterministic]
+    {
+        let total_len: u8 = ((2 + data_len + 7) / 8) as u8;
+        return NdpOption {
+            option_type: opt_type,
+            length: total_len,
+            data: opt_data,
+            data_len: data_len,
+        };
+    }
+
+    fn parse(data: Array(u8, IPV6_MTU_MIN), offset: u64, remaining: u64) -> Result(NdpOption, Ipv6Error)
+        effect [deterministic]
+    {
+        if remaining < 2 {
+            return Result::Err(Ipv6Error::Ipv6NdpPacketInvalid);
+        };
+        let opt_type: u8 = data[offset];
+        let length: u8 = data[offset + 1];
+        if length == 0 {
+            return Result::Err(Ipv6Error::Ipv6NdpOptionUnknown);
+        };
+        let total_bytes: u64 = (length as u64) * 8;
+        if total_bytes > remaining {
+            return Result::Err(Ipv6Error::Ipv6NdpOptionUnknown);
+        };
+        let data_len: u64 = if total_bytes >= 2 { total_bytes - 2 } else { 0 };
+        let mut opt_data: Array(u8, 256) = Array::zeroed();
+        loop bound 256 {
+            if i >= data_len {
+                break;
+            };
+            opt_data[i] = data[offset + 2 + i];
+        };
+        return Result::Ok(NdpOption {
+            option_type: opt_type,
+            length: length,
+            data: opt_data,
+            data_len: data_len,
+        });
+    }
+
+    fn serialize(self, buf: ref mut Array(u8, IPV6_MTU_MIN), offset: ref mut u64)
+        effect [deterministic]
+    {
+        buf[*offset] = self.option_type;
+        buf[*offset + 1] = self.length;
+        let write_len: u64 = if self.data_len < 256 { self.data_len } else { 256 };
+        loop bound 256 {
+            if i >= write_len {
+                break;
+            };
+            buf[*offset + 2 + i] = self.data[i];
+        };
+        *offset = *offset + (self.length as u64) * 8;
+    }
+}
+
+struct NdpPacket {
+    packet_type: u8,
+    code: u8,
+    checksum: u16,
+    body: Array(u8, IPV6_MTU_MIN),
+    body_len: u64,
+    options: Array(NdpOption, 8),
+    option_count: u64,
+}
+
+impl NdpPacket {
+    fn neighbor_solicitation(target: Ipv6Address, src_mac: Array(u8, ETH_ADDR_LEN)) -> NdpPacket
+        effect [deterministic]
+    {
+        let mut body: Array(u8, IPV6_MTU_MIN) = Array::zeroed();
+        // Reserved 4 bytes + target address
+        loop bound 16 {
+            body[4 + i] = target.octets[i];
+        };
+        // Source link-layer address option
+        let mac_data: Array(u8, 256) = NdpPacket::mac_to_option_data(src_mac);
+        let opt: NdpOption = NdpOption::new(1, mac_data, ETH_ADDR_LEN);
+        let mut options: Array(NdpOption, 8) = Array::zeroed();
+        options[0] = opt;
+        return NdpPacket {
+            packet_type: 135,
+            code: 0,
+            checksum: 0,
+            body: body,
+            body_len: 20 + 8,
+            options: options,
+            option_count: 1,
+        };
+    }
+
+    fn neighbor_advertisement(target: Ipv6Address, tgt_mac: Array(u8, ETH_ADDR_LEN),
+                               solicited: bool, override_flag: bool) -> NdpPacket
+        effect [deterministic]
+    {
+        let mut body: Array(u8, IPV6_MTU_MIN) = Array::zeroed();
+        let flags: u32 = if solicited { 0x40000000 } else { 0 } |
+                         if override_flag { 0x20000000 } else { 0 };
+        body[0] = ((flags >> 24) & 0xFF) as u8;
+        body[1] = ((flags >> 16) & 0xFF) as u8;
+        loop bound 16 {
+            body[4 + i] = target.octets[i];
+        };
+        let mac_data: Array(u8, 256) = NdpPacket::mac_to_option_data(tgt_mac);
+        let opt: NdpOption = NdpOption::new(2, mac_data, ETH_ADDR_LEN);
+        let mut options: Array(NdpOption, 8) = Array::zeroed();
+        options[0] = opt;
+        return NdpPacket {
+            packet_type: 136,
+            code: 0,
+            checksum: 0,
+            body: body,
+            body_len: 20 + 8,
+            options: options,
+            option_count: 1,
+        };
+    }
+
+    fn router_solicitation() -> NdpPacket
+        effect [deterministic]
+    {
+        return NdpPacket {
+            packet_type: 133,
+            code: 0,
+            checksum: 0,
+            body: Array::zeroed(),
+            body_len: 4,
+            options: Array::zeroed(),
+            option_count: 0,
+        };
+    }
+
+    fn router_advertisement(mtu: u32, reachable_ms: u32, retrans_ms: u32,
+                             managed: bool, other: bool, cur_hop_limit: u8,
+                             router_lifetime: u16) -> NdpPacket
+        effect [deterministic]
+    {
+        let mut body: Array(u8, IPV6_MTU_MIN) = Array::zeroed();
+        let flags: u8 = if managed { 0x80 } else { 0 } | if other { 0x40 } else { 0 };
+        body[0] = cur_hop_limit;
+        body[1] = flags;
+        body[2] = ((router_lifetime >> 8) & 0xFF) as u8;
+        body[3] = (router_lifetime & 0xFF) as u8;
+        body[4] = ((reachable_ms >> 24) & 0xFF) as u8;
+        body[5] = ((reachable_ms >> 16) & 0xFF) as u8;
+        body[6] = ((reachable_ms >> 8) & 0xFF) as u8;
+        body[7] = (reachable_ms & 0xFF) as u8;
+        body[8] = ((retrans_ms >> 24) & 0xFF) as u8;
+        body[9] = ((retrans_ms >> 16) & 0xFF) as u8;
+        body[10] = ((retrans_ms >> 8) & 0xFF) as u8;
+        body[11] = (retrans_ms & 0xFF) as u8;
+        return NdpPacket {
+            packet_type: 134,
+            code: 0,
+            checksum: 0,
+            body: body,
+            body_len: 12,
+            options: Array::zeroed(),
+            option_count: 0,
+        };
+    }
+
+    fn mac_to_option_data(mac: Array(u8, ETH_ADDR_LEN)) -> Array(u8, 256)
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            data[i] = mac[i];
+        };
+        return data;
+    }
+
+    fn add_prefix_option(self: ref mut, prefix: Ipv6Address, prefix_len: u8,
+                          on_link: bool, auto_addr: bool, valid_lifetime: u32,
+                          preferred_lifetime: u32)
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        let flags: u8 = if on_link { 0x80 } else { 0 } | if auto_addr { 0x40 } else { 0 };
+        data[0] = prefix_len;
+        data[1] = flags;
+        data[2] = ((valid_lifetime >> 24) & 0xFF) as u8;
+        data[3] = ((valid_lifetime >> 16) & 0xFF) as u8;
+        data[4] = ((valid_lifetime >> 8) & 0xFF) as u8;
+        data[5] = (valid_lifetime & 0xFF) as u8;
+        data[6] = ((preferred_lifetime >> 24) & 0xFF) as u8;
+        data[7] = ((preferred_lifetime >> 16) & 0xFF) as u8;
+        data[8] = ((preferred_lifetime >> 8) & 0xFF) as u8;
+        data[9] = (preferred_lifetime & 0xFF) as u8;
+        data[10] = 0; // Reserved
+        data[11] = 0; // Reserved
+        loop bound 16 {
+            data[12 + i] = prefix.octets[i];
+        };
+        let opt: NdpOption = NdpOption::new(3, data, 28);
+        if self.option_count < 8 {
+            self.options[self.option_count] = opt;
+            self.option_count = self.option_count + 1;
+        };
+    }
+
+    fn add_mtu_option(self: ref mut, mtu_val: u32)
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        data[0] = ((mtu_val >> 24) & 0xFF) as u8;
+        data[1] = ((mtu_val >> 16) & 0xFF) as u8;
+        data[2] = ((mtu_val >> 8) & 0xFF) as u8;
+        data[3] = (mtu_val & 0xFF) as u8;
+        let opt: NdpOption = NdpOption::new(5, data, 4);
+        if self.option_count < 8 {
+            self.options[self.option_count] = opt;
+            self.option_count = self.option_count + 1;
+        };
+    }
+
+    fn target_address(self) -> Ipv6Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        if self.packet_type == 135 || self.packet_type == 136 {
+            loop bound 16 {
+                octets[i] = self.body[4 + i];
+            };
+        };
+        return Ipv6Address::from_bytes(octets);
+    }
+
+    fn is_solicitation(self) -> bool
+        effect [deterministic]
+    {
+        return self.packet_type == 135;
+    }
+
+    fn is_advertisement(self) -> bool
+        effect [deterministic]
+    {
+        return self.packet_type == 136;
+    }
+
+    fn parse_ndp(raw: Array(u8, IPV6_MTU_MIN), len: u64) -> Result(NdpPacket, Ipv6Error)
+        effect [deterministic]
+    {
+        if len < 4 {
+            return Result::Err(Ipv6Error::Ipv6NdpPacketInvalid);
+        };
+        let ndp_type: u8 = raw[0];
+        if ndp_type < 133 || ndp_type > 137 {
+            return Result::Err(Ipv6Error::Ipv6NdpPacketInvalid);
+        };
+        let code: u8 = raw[1];
+        if code != 0 {
+            return Result::Err(Ipv6Error::Ipv6NdpPacketInvalid);
+        };
+        let mut body: Array(u8, IPV6_MTU_MIN) = Array::zeroed();
+        let mut options: Array(NdpOption, 8) = Array::zeroed();
+        let mut opt_count: u64 = 0;
+        // Determine fixed body length based on type
+        let fixed_len: u64;
+        if ndp_type == 133 {
+            fixed_len = 4;
+        } else if ndp_type == 134 {
+            fixed_len = 12;
+        } else if ndp_type == 135 || ndp_type == 136 {
+            fixed_len = 24;
+        } else {
+            fixed_len = 24;
+        };
+        loop bound IPV6_MTU_MIN {
+            if i >= fixed_len {
+                break;
+            };
+            if i < len {
+                body[i] = raw[i];
+            };
+        };
+        // Parse options after fixed body
+        let mut opt_offset: u64 = fixed_len;
+        loop bound 8 {
+            if (opt_offset + 2) > len {
+                break;
+            };
+            let opt_res: Result(NdpOption, Ipv6Error) = NdpOption::parse(raw, opt_offset, len - opt_offset);
+            if opt_res.is_err() {
+                break;
+            };
+            let opt: NdpOption = opt_res.unwrap();
+            if opt_count < 8 {
+                options[opt_count] = opt;
+                opt_count = opt_count + 1;
+            };
+            opt_offset = opt_offset + (opt.length as u64) * 8;
+        };
+        return Result::Ok(NdpPacket {
+            packet_type: ndp_type,
+            code: code,
+            checksum: 0,
+            body: body,
+            body_len: fixed_len,
+            options: options,
+            option_count: opt_count,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SLAAC (Stateless Address Autoconfiguration)
+// ─────────────────────────────────────────────────────────────
+
+struct SlaacPrefix {
+    prefix: Ipv6Address,
+    prefix_len: u8,
+    valid_lifetime: u32,
+    preferred_lifetime: u32,
+    on_link: bool,
+    auto_addr: bool,
+    timestamp: u64,
+}
+
+impl SlaacPrefix {
+    fn new(prefix: Ipv6Address, prefix_len: u8, valid: u32, preferred: u32,
+           on_link: bool, auto_addr: bool, now: u64) -> SlaacPrefix
+        effect [deterministic]
+    {
+        return SlaacPrefix {
+            prefix: prefix,
+            prefix_len: prefix_len,
+            valid_lifetime: valid,
+            preferred_lifetime: preferred,
+            on_link: on_link,
+            auto_addr: auto_addr,
+            timestamp: now,
+        };
+    }
+
+    fn is_expired(self, now: u64) -> bool
+        effect [deterministic]
+    {
+        return (now - self.timestamp) >= (self.valid_lifetime as u64);
+    }
+
+    fn preferred_expired(self, now: u64) -> bool
+        effect [deterministic]
+    {
+        return (now - self.timestamp) >= (self.preferred_lifetime as u64);
+    }
+}
+
+const SLAAC_MAX_PREFIXES: u64 = 16;
+
+struct SlaacState {
+    prefixes: Array(SlaacPrefix, SLAAC_MAX_PREFIXES),
+    prefix_count: u64,
+    link_local_addr: Ipv6Address,
+    global_addrs: Array(Ipv6Address, 4),
+    global_addr_count: u64,
+    dad_in_progress: bool,
+    dad_count: u64,
+    generation: u64,
+}
+
+impl SlaacState {
+    fn new(mac: Array(u8, ETH_ADDR_LEN)) -> SlaacState
+        effect [deterministic]
+    {
+        return SlaacState {
+            prefixes: Array::zeroed(),
+            prefix_count: 0,
+            link_local_addr: Ipv6Address::link_local(mac),
+            global_addrs: Array::zeroed(),
+            global_addr_count: 0,
+            dad_in_progress: false,
+            dad_count: 0,
+            generation: 1,
+        };
+    }
+
+    fn add_prefix(self: ref mut, prefix: SlaacPrefix)
+        effect [deterministic]
+    {
+        // Check if prefix already exists
+        loop bound SLAAC_MAX_PREFIXES {
+            if i >= self.prefix_count {
+                break;
+            };
+            if self.prefixes[i].prefix.eq(prefix.prefix) &&
+               self.prefixes[i].prefix_len == prefix.prefix_len {
+                self.prefixes[i] = prefix;
+                return;
+            };
+        };
+        if self.prefix_count < SLAAC_MAX_PREFIXES {
+            self.prefixes[self.prefix_count] = prefix;
+            self.prefix_count = self.prefix_count + 1;
+        };
+    }
+
+    fn generate_global_addr(self, mac: Array(u8, ETH_ADDR_LEN)) -> Result(Ipv6Address, Ipv6Error)
+        effect [deterministic]
+    {
+        loop bound SLAAC_MAX_PREFIXES {
+            if i >= self.prefix_count {
+                break;
+            };
+            if self.prefixes[i].auto_addr && !self.prefixes[i].preferred_expired(0) {
+                return Result::Ok(Ipv6Address::from_eui64(
+                    self.prefixes[i].prefix,
+                    self.prefixes[i].prefix_len as u64,
+                    mac,
+                ));
+            };
+        };
+        return Result::Err(Ipv6Error::Ipv6SlaacNoPrefix);
+    }
+
+    fn add_global_addr(self: ref mut, addr: Ipv6Address)
+        effect [deterministic]
+    {
+        if self.global_addr_count < 4 {
+            self.global_addrs[self.global_addr_count] = addr;
+            self.global_addr_count = self.global_addr_count + 1;
+            self.generation = self.generation + 1;
+        };
+    }
+
+    fn remove_expired(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        let mut i: u64 = 0;
+        loop bound SLAAC_MAX_PREFIXES {
+            if i >= self.prefix_count {
+                break;
+            };
+            if self.prefixes[i].is_expired(now) {
+                self.prefixes[i] = self.prefixes[self.prefix_count - 1];
+                self.prefix_count = self.prefix_count - 1;
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv6 Route Entry
+// ─────────────────────────────────────────────────────────────
+
+const IPV6_MAX_ROUTES: u64 = 64;
+
+struct Ipv6RouteEntry {
+    destination: Ipv6Address,
+    prefix_length: u8,
+    gateway: Ipv6Address,
+    interface_index: u64,
+    metric: u32,
+}
+
+impl Ipv6RouteEntry {
+    fn matches(self, addr: Ipv6Address) -> bool
+        effect [deterministic]
+    {
+        let bytes: u64 = (self.prefix_length as u64) / 8;
+        let bits: u64 = (self.prefix_length as u64) % 8;
+        loop bound 16 {
+            if i >= bytes {
+                break;
+            };
+            if self.destination.octets[i] != addr.octets[i] {
+                return false;
+            };
+        };
+        if bits > 0 && bytes < 16 {
+            let mask: u8 = 0xFF << (8 - bits);
+            if (self.destination.octets[bytes] & mask) != (addr.octets[bytes] & mask) {
+                return false;
+            };
+        };
+        return true;
+    }
+}
+
+struct Ipv6RoutingTable {
+    entries: Array(Ipv6RouteEntry, IPV6_MAX_ROUTES),
+    entry_count: u64,
+}
+
+impl Ipv6RoutingTable {
+    fn new() -> Ipv6RoutingTable
+        effect [deterministic]
+    {
+        return Ipv6RoutingTable {
+            entries: Array::zeroed(),
+            entry_count: 0,
+        };
+    }
+
+    fn add_route(self: ref mut, route: Ipv6RouteEntry) -> Result(void, Ipv6Error)
+        effect [deterministic]
+    {
+        if self.entry_count >= IPV6_MAX_ROUTES {
+            return Result::Err(Ipv6Error::Ipv6RoutingFailed);
+        };
+        self.entries[self.entry_count] = route;
+        self.entry_count = self.entry_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn lookup(self, dest: Ipv6Address) -> Result(Ipv6RouteEntry, Ipv6Error)
+        effect [deterministic]
+    {
+        let mut best_match: Option(Ipv6RouteEntry) = Option::None;
+        let mut best_prefix: u8 = 0;
+        loop bound IPV6_MAX_ROUTES {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].matches(dest) {
+                if self.entries[i].prefix_length > best_prefix {
+                    best_match = Option::Some(self.entries[i]);
+                    best_prefix = self.entries[i].prefix_length;
+                };
+            };
+        };
+        if best_match.is_none() {
+            return Result::Err(Ipv6Error::Ipv6RoutingFailed);
+        };
+        return Result::Ok(best_match.unwrap());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn ipv6_init() -> Result(void, Ipv6Error)
+    effect [deterministic]
+    court "ipv6_init:v1"
+{
+    residual emit {
+        op: "ipv6.init",
+        status: "ready",
+    };
+    return Result::Ok(void);
+}
+
+fn ipv6_mac_to_solicited_node(mac: Array(u8, ETH_ADDR_LEN)) -> Ipv6Address
+    effect [deterministic]
+{
+    let mut octets: Array(u8, 16) = Array::zeroed();
+    octets[0] = 0xFF;
+    octets[1] = 0x02;
+    octets[2] = 0x00;
+    octets[3] = 0x00;
+    octets[4] = 0x00;
+    octets[5] = 0x00;
+    octets[6] = 0x00;
+    octets[7] = 0x00;
+    octets[8] = 0x00;
+    octets[9] = 0x00;
+    octets[10] = 0x00;
+    octets[11] = 0x01;
+    octets[12] = 0xFF;
+    octets[13] = mac[3];
+    octets[14] = mac[4];
+    octets[15] = mac[5];
+    return Ipv6Address::from_bytes(octets);
+}
+
+fn ipv6_multicast_ether_addr(ipv6_mcast: Ipv6Address) -> Array(u8, ETH_ADDR_LEN)
+    effect [deterministic]
+{
+    let mut mac: Array(u8, ETH_ADDR_LEN) = Array::zeroed();
+    mac[0] = 0x33;
+    mac[1] = 0x33;
+    mac[2] = ipv6_mcast.octets[12];
+    mac[3] = ipv6_mcast.octets[13];
+    mac[4] = ipv6_mcast.octets[14];
+    mac[5] = ipv6_mcast.octets[15];
+    return mac;
+}

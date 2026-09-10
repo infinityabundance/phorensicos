@@ -1,0 +1,1186 @@
+// file: elf_loader.phor
+// purpose: ELF binary loader: segment loading, relocation, symbol resolution,
+//          dynamic linking, interpreter setup, .phor-spec container loader.
+//          All operations use bounded loops and record residuals.
+// evidence: PROC-ELF-ARCH-001 through PROC-ELF-ARCH-250
+// residual: Every ELF segment load, relocation, and symbol resolution records
+//           a residual for binary provenance verification.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use process::process::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-DIAG-001 through PROC-ELF-DIAG-010
+
+const DIAG_ELF_BASE         : Word64 = Word64::from_u64(0xB200)
+const DIAG_ELF_OK           : Word64 = DIAG_ELF_BASE | 0x000
+const DIAG_ELF_PARSE_ERROR  : Word64 = DIAG_ELF_BASE | 0x001
+const DIAG_ELF_NO_MEM       : Word64 = DIAG_ELF_BASE | 0x002
+const DIAG_ELF_INVALID_ARCH : Word64 = DIAG_ELF_BASE | 0x003
+const DIAG_ELF_RELOC_ERROR  : Word64 = DIAG_ELF_BASE | 0x004
+const DIAG_ELF_SYMBOL_NOT_FOUND: Word64 = DIAG_ELF_BASE | 0x005
+const DIAG_ELF_SEGMENT_OVF  : Word64 = DIAG_ELF_BASE | 0x006
+const DIAG_ELF_INTERP_FAIL  : Word64 = DIAG_ELF_BASE | 0x007
+const DIAG_ELF_DL_FAIL      : Word64 = DIAG_ELF_BASE | 0x008
+const DIAG_ELF_CONTAINER_ERR: Word64 = DIAG_ELF_BASE | 0x009
+const DIAG_ELF_BOUNDS       : Word64 = DIAG_ELF_BASE | 0x00A
+
+// ──────────────────────────────────────────────
+// ELF Constants
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-CONST-001 through PROC-ELF-CONST-030
+
+const ELF_MAGIC             : u32 = 0x464C457F  // "\x7fELF"
+const ELF_CLASS_64          : u8 = 2
+const ELF_DATA_2LSB         : u8 = 1
+const ELF_ARCH_X86_64       : u16 = 0x3E
+const ELF_MAX_SEGMENTS      : u32 = 16
+const ELF_MAX_SECTIONS      : u32 = 64
+const ELF_MAX_SYMBOLS       : u32 = 256
+const ELF_MAX_RELOCATIONS   : u32 = 256
+const ELF_MAX_NEEDED_LIBS   : u32 = 32
+const ELF_MAX_PHDR          : u32 = 16
+const ELF_PAGE_ALIGN        : u64 = 0x1000
+const ELF_SYM_NAME_MAX      : u32 = 128
+
+// ELF Segment Types (p_type)
+const PT_NULL               : u32 = 0
+const PT_LOAD               : u32 = 1
+const PT_DYNAMIC            : u32 = 2
+const PT_INTERP             : u32 = 3
+const PT_NOTE               : u32 = 4
+const PT_SHLIB              : u32 = 5
+const PT_PHDR               : u32 = 6
+const PT_TLS                : u32 = 7
+const PT_GNU_EH_FRAME       : u32 = 0x6474e550
+const PT_GNU_STACK          : u32 = 0x6474e551
+const PT_GNU_RELRO          : u32 = 0x6474e552
+
+// ELF Segment Flags (p_flags)
+const PF_X                  : u32 = 0x01
+const PF_W                  : u32 = 0x02
+const PF_R                  : u32 = 0x04
+
+// ELF Section Types (sh_type)
+const SHT_NULL              : u32 = 0
+const SHT_PROGBITS          : u32 = 1
+const SHT_SYMTAB            : u32 = 2
+const SHT_STRTAB            : u32 = 3
+const SHT_RELA              : u32 = 4
+const SHT_HASH              : u32 = 5
+const SHT_DYNAMIC           : u32 = 6
+const SHT_NOTE              : u32 = 7
+const SHT_NOBITS            : u32 = 8
+const SHT_REL               : u32 = 9
+const SHT_DYNSYM            : u32 = 11
+const SHT_INIT_ARRAY        : u32 = 14
+const SHT_FINI_ARRAY        : u32 = 15
+
+// ELF Symbol Bindings
+const STB_LOCAL             : u8 = 0
+const STB_GLOBAL            : u8 = 1
+const STB_WEAK              : u8 = 2
+
+// ELF Symbol Types
+const STT_NOTYPE            : u8 = 0
+const STT_OBJECT            : u8 = 1
+const STT_FUNC              : u8 = 2
+const STT_SECTION           : u8 = 3
+const STT_FILE              : u8 = 4
+
+// ELF Relocation Types (x86_64)
+const R_X86_64_NONE         : u32 = 0
+const R_X86_64_64           : u32 = 1
+const R_X86_64_PC32         : u32 = 2
+const R_X86_64_GOT32        : u32 = 3
+const R_X86_64_PLT32        : u32 = 4
+const R_X86_64_COPY         : u32 = 5
+const R_X86_64_GLOB_DAT     : u32 = 6
+const R_X86_64_JUMP_SLOT    : u32 = 7
+const R_X86_64_RELATIVE     : u32 = 8
+const R_X86_64_GOTPCREL     : u32 = 9
+const R_X86_64_32           : u32 = 10
+const R_X86_64_32S          : u32 = 11
+const R_X86_64_16           : u32 = 12
+const R_X86_64_PC16         : u32 = 13
+const R_X86_64_8            : u32 = 14
+const R_X86_64_PC8          : u32 = 15
+const R_X86_64_DTPMOD64     : u32 = 16
+const R_X86_64_DTPOFF64     : u32 = 17
+const R_X86_64_TPOFF64      : u32 = 18
+const R_X86_64_TLSGD        : u32 = 19
+const R_X86_64_TLSLD        : u32 = 20
+const R_X86_64_DTPOFF32     : u32 = 21
+const R_X86_64_GOTTPOFF     : u32 = 22
+const R_X86_64_TPOFF32      : u32 = 23
+const R_X86_64_PC64         : u32 = 24
+const R_X86_64_GOTOFF64     : u32 = 25
+const R_X86_64_GOTPC32      : u32 = 26
+const R_X86_64_GOT64        : u32 = 27
+const R_X86_64_GOTPCREL64   : u32 = 28
+const R_X86_64_GOTPCRELX    : u32 = 29
+const R_X86_64_REX_GOTPCRELX: u32 = 30
+
+// Dynamic Tag Types
+const DT_NULL               : u64 = 0
+const DT_NEEDED             : u64 = 1
+const DT_PLTRELSZ           : u64 = 2
+const DT_PLTGOT             : u64 = 3
+const DT_HASH               : u64 = 4
+const DT_STRTAB             : u64 = 5
+const DT_SYMTAB             : u64 = 6
+const DT_RELA               : u64 = 7
+const DT_RELASZ             : u64 = 8
+const DT_RELAENT            : u64 = 9
+const DT_STRSZ              : u64 = 10
+const DT_SYMENT             : u64 = 11
+const DT_INIT               : u64 = 12
+const DT_FINI               : u64 = 13
+const DT_SONAME             : u64 = 14
+const DT_RPATH              : u64 = 15
+const DT_SYMBOLIC           : u64 = 16
+const DT_REL                : u64 = 17
+const DT_RELSZ              : u64 = 18
+const DT_RELENT             : u64 = 19
+const DT_PLTREL             : u64 = 20
+const DT_DEBUG              : u64 = 21
+const DT_TEXTREL            : u64 = 22
+const DT_JMPREL             : u64 = 23
+const DT_BIND_NOW           : u64 = 24
+const DT_INIT_ARRAY         : u64 = 25
+const DT_FINI_ARRAY         : u64 = 26
+const DT_INIT_ARRAYSZ       : u64 = 27
+const DT_FINI_ARRAYSZ       : u64 = 28
+const DT_RUNPATH            : u64 = 29
+const DT_FLAGS              : u64 = 30
+const DT_FLAGS_1            : u64 = 0x6ffffffb
+
+// ──────────────────────────────────────────────
+// ELF Header (64-bit)
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-HDR-001 through PROC-ELF-HDR-015
+
+pub type Elf64Header : struct {
+    e_ident: FixedArray[16, u8],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+impl Elf64Header {
+    pub fn new() -> Elf64Header
+        effects: [deterministic]
+    {
+        Elf64Header {
+            e_ident: FixedArray::new(),
+            e_type: 0, e_machine: 0, e_version: 0,
+            e_entry: 0, e_phoff: 0, e_shoff: 0, e_flags: 0,
+            e_ehsize: 0, e_phentsize: 0, e_phnum: 0,
+            e_shentsize: 0, e_shnum: 0, e_shstrndx: 0,
+        }
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        let magic: u32 = __builtin_read_u32_from_array(self.e_ident, 0)
+        magic == ELF_MAGIC &&
+        self.e_ident.get(4) == ELF_CLASS_64 &&
+        self.e_machine == ELF_ARCH_X86_64
+    }
+
+    pub fn is_executable(self) -> bool
+        effects: [deterministic]
+    {
+        self.e_type == 2  // ET_EXEC
+    }
+
+    pub fn is_shared(self) -> bool
+        effects: [deterministic]
+    {
+        self.e_type == 3  // ET_DYN
+    }
+}
+
+// ──────────────────────────────────────────────
+// ELF Program Header
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-PHDR-001 through PROC-ELF-PHDR-015
+
+pub type Elf64ProgramHeader : struct {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+impl Elf64ProgramHeader {
+    pub fn new() -> Elf64ProgramHeader
+        effects: [deterministic]
+    {
+        Elf64ProgramHeader {
+            p_type: 0, p_flags: 0, p_offset: 0,
+            p_vaddr: 0, p_paddr: 0, p_filesz: 0,
+            p_memsz: 0, p_align: 0,
+        }
+    }
+
+    pub fn is_loadable(self) -> bool
+        effects: [deterministic]
+    {
+        self.p_type == PT_LOAD
+    }
+
+    pub fn is_interp(self) -> bool
+        effects: [deterministic]
+    {
+        self.p_type == PT_INTERP
+    }
+
+    pub fn is_dynamic(self) -> bool
+        effects: [deterministic]
+    {
+        self.p_type == PT_DYNAMIC
+    }
+
+    pub fn is_tls(self) -> bool
+        effects: [deterministic]
+    {
+        self.p_type == PT_TLS
+    }
+
+    pub fn perms_to_page_flags(self) -> u8
+        effects: [deterministic]
+    {
+        let mut flags: u8 = 0
+        if (self.p_flags & PF_R) != 0 { flags = flags | 0x01 }
+        if (self.p_flags & PF_W) != 0 { flags = flags | 0x02 }
+        if (self.p_flags & PF_X) != 0 { flags = flags | 0x04 }
+        flags
+    }
+}
+
+// ──────────────────────────────────────────────
+// ELF Section Header
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-SHDR-001 through PROC-ELF-SHDR-012
+
+pub type Elf64SectionHeader : struct {
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
+}
+
+impl Elf64SectionHeader {
+    pub fn new() -> Elf64SectionHeader
+        effects: [deterministic]
+    {
+        Elf64SectionHeader {
+            sh_name: 0, sh_type: 0, sh_flags: 0,
+            sh_addr: 0, sh_offset: 0, sh_size: 0,
+            sh_link: 0, sh_info: 0,
+            sh_addralign: 0, sh_entsize: 0,
+        }
+    }
+
+    pub fn is_symtab(self) -> bool
+        effects: [deterministic]
+    {
+        self.sh_type == SHT_SYMTAB || self.sh_type == SHT_DYNSYM
+    }
+
+    pub fn is_strtab(self) -> bool
+        effects: [deterministic]
+    {
+        self.sh_type == SHT_STRTAB
+    }
+
+    pub fn is_rela(self) -> bool
+        effects: [deterministic]
+    {
+        self.sh_type == SHT_RELA
+    }
+}
+
+// ──────────────────────────────────────────────
+// ELF Symbol
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-SYM-001 through PROC-ELF-SYM-015
+
+pub type Elf64Symbol : struct {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+impl Elf64Symbol {
+    pub fn new() -> Elf64Symbol
+        effects: [deterministic]
+    {
+        Elf64Symbol {
+            st_name: 0, st_info: 0, st_other: 0,
+            st_shndx: 0, st_value: 0, st_size: 0,
+        }
+    }
+
+    pub fn bind(self) -> u8
+        effects: [deterministic]
+    {
+        self.st_info >> 4
+    }
+
+    pub fn sym_type(self) -> u8
+        effects: [deterministic]
+    {
+        self.st_info & 0x0F
+    }
+
+    pub fn is_global(self) -> bool
+        effects: [deterministic]
+    {
+        self.bind() == STB_GLOBAL || self.bind() == STB_WEAK
+    }
+
+    pub fn is_func(self) -> bool
+        effects: [deterministic]
+    {
+        self.sym_type() == STT_FUNC
+    }
+
+    pub fn is_object(self) -> bool
+        effects: [deterministic]
+    {
+        self.sym_type() == STT_OBJECT
+    }
+}
+
+// ──────────────────────────────────────────────
+// ELF Relocation Entry (RELA)
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-REL-001 through PROC-ELF-REL-012
+
+pub type Elf64Rela : struct {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+}
+
+impl Elf64Rela {
+    pub fn new() -> Elf64Rela
+        effects: [deterministic]
+    {
+        Elf64Rela {
+            r_offset: 0, r_info: 0, r_addend: 0,
+        }
+    }
+
+    pub fn r_type(self) -> u32
+        effects: [deterministic]
+    {
+        (self.r_info & 0xFFFF_FFFF) as u32
+    }
+
+    pub fn r_sym(self) -> u32
+        effects: [deterministic]
+    {
+        (self.r_info >> 32) as u32
+    }
+}
+
+// ──────────────────────────────────────────────
+// Dynamic Entry
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-DYN-001 through PROC-ELF-DYN-010
+
+pub type Elf64Dyn : struct {
+    d_tag: u64,
+    d_val: u64,
+}
+
+impl Elf64Dyn {
+    pub fn new() -> Elf64Dyn
+        effects: [deterministic]
+    {
+        Elf64Dyn { d_tag: 0, d_val: 0 }
+    }
+
+    pub fn is_null(self) -> bool
+        effects: [deterministic]
+    {
+        self.d_tag == DT_NULL
+    }
+
+    pub fn is_needed(self) -> bool
+        effects: [deterministic]
+    {
+        self.d_tag == DT_NEEDED
+    }
+}
+
+// ──────────────────────────────────────────────
+// Loaded Segment
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-SEG-001 through PROC-ELF-SEG-012
+
+pub type LoadedSegment : struct {
+    vaddr: u64,
+    memsz: u64,
+    filesz: u64,
+    flags: u32,
+    is_loadable: bool,
+    file_offset: u64,
+}
+
+impl LoadedSegment {
+    pub fn new() -> LoadedSegment
+        effects: [deterministic]
+    {
+        LoadedSegment {
+            vaddr: 0, memsz: 0, filesz: 0,
+            flags: 0, is_loadable: false,
+            file_offset: 0,
+        }
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.vaddr + self.memsz
+    }
+
+    pub fn contains(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        addr >= self.vaddr && addr < self.vaddr + self.memsz
+    }
+}
+
+// ──────────────────────────────────────────────
+// Resolved Symbol (Loader's representation)
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-RESYM-001 through PROC-ELF-RESYM-010
+
+pub type ResolvedSymbol : struct {
+    name: FixedString[ELF_SYM_NAME_MAX],
+    address: u64,
+    size: u64,
+    is_resolved: bool,
+    is_weak: bool,
+}
+
+impl ResolvedSymbol {
+    pub fn new() -> ResolvedSymbol
+        effects: [deterministic]
+    {
+        ResolvedSymbol {
+            name: FixedString::new(),
+            address: 0, size: 0,
+            is_resolved: false, is_weak: false,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Dynamic Link Information
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-DLINFO-001 through PROC-ELF-DLINFO-020
+
+pub type DynamicLinkInfo : struct {
+    symtab_addr: u64,
+    symtab_size: u64,
+    strtab_addr: u64,
+    strtab_size: u64,
+    rela_addr: u64,
+    rela_size: u64,
+    rela_ent: u64,
+    pltrel_addr: u64,
+    pltrel_size: u64,
+    pltrel_type: u64,
+    init_addr: u64,
+    fini_addr: u64,
+    init_array_addr: u64,
+    init_array_size: u64,
+    fini_array_addr: u64,
+    fini_array_size: u64,
+    hash_addr: u64,
+    gnu_hash_addr: u64,
+}
+
+impl DynamicLinkInfo {
+    pub fn new() -> DynamicLinkInfo
+        effects: [deterministic]
+    {
+        DynamicLinkInfo {
+            symtab_addr: 0, symtab_size: 0,
+            strtab_addr: 0, strtab_size: 0,
+            rela_addr: 0, rela_size: 0, rela_ent: 0,
+            pltrel_addr: 0, pltrel_size: 0, pltrel_type: 0,
+            init_addr: 0, fini_addr: 0,
+            init_array_addr: 0, init_array_size: 0,
+            fini_array_addr: 0, fini_array_size: 0,
+            hash_addr: 0, gnu_hash_addr: 0,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// ELF Loader
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-LOADER-001 through PROC-ELF-LOADER-120
+
+pub type ElfLoader : struct {
+    header: Elf64Header,
+    segments: FixedArray[ELF_MAX_SEGMENTS, LoadedSegment],
+    num_segments: u32,
+    sections: FixedArray[ELF_MAX_SECTIONS, Elf64SectionHeader],
+    num_sections: u32,
+    symbols: FixedArray[ELF_MAX_SYMBOLS, ResolvedSymbol],
+    num_symbols: u32,
+    needed_libs: FixedArray[ELF_MAX_NEEDED_LIBS, FixedString[64]],
+    num_needed: u32,
+    dl_info: DynamicLinkInfo,
+    base_addr: u64,
+    entry_point: u64,
+    interp_path: FixedString[64],
+    is_dynamic: bool,
+    generation: Word32,
+}
+
+impl ElfLoader {
+    pub fn new() -> ElfLoader
+        effects: [deterministic]
+    {
+        ElfLoader {
+            header: Elf64Header::new(),
+            segments: FixedArray::new(),
+            num_segments: 0,
+            sections: FixedArray::new(),
+            num_sections: 0,
+            symbols: FixedArray::new(),
+            num_symbols: 0,
+            needed_libs: FixedArray::new(),
+            num_needed: 0,
+            dl_info: DynamicLinkInfo::new(),
+            base_addr: 0,
+            entry_point: 0,
+            interp_path: FixedString::new(),
+            is_dynamic: false,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Parse ELF Header from binary data
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-PARSE-001 through PROC-ELF-PARSE-030
+
+    pub fn parse_header(self: ref mut, data: ref Byte[], size: u64)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if size < 64 {
+            return Result::Err(proc_error(
+                DIAG_ELF_PARSE_ERROR,
+                FixedString[128]::from_slice("Binary too small for ELF header")))
+        }
+        // trust: parse raw ELF header bytes
+        let hdr: Elf64Header = trusted("ELF header parsing from byte buffer") {
+            let mut h: Elf64Header = Elf64Header::new()
+            // Read e_ident (16 bytes)
+            // loop: bounds[BOUND_TINY] — exactly 16 bytes
+            loop: bounds[BOUND_TINY] for i in 0..16 {
+                h.e_ident.set(i, data.get(i))
+            }
+            h.e_type = __builtin_read_u16(data, 16)
+            h.e_machine = __builtin_read_u16(data, 18)
+            h.e_version = __builtin_read_u32(data, 20)
+            h.e_entry = __builtin_read_u64(data, 24)
+            h.e_phoff = __builtin_read_u64(data, 32)
+            h.e_shoff = __builtin_read_u64(data, 40)
+            h.e_flags = __builtin_read_u32(data, 48)
+            h.e_ehsize = __builtin_read_u16(data, 52)
+            h.e_phentsize = __builtin_read_u16(data, 54)
+            h.e_phnum = __builtin_read_u16(data, 56)
+            h.e_shentsize = __builtin_read_u16(data, 58)
+            h.e_shnum = __builtin_read_u16(data, 60)
+            h.e_shstrndx = __builtin_read_u16(data, 62)
+            h
+        }
+        if !hdr.is_valid() {
+            return Result::Err(proc_error(
+                DIAG_ELF_PARSE_ERROR,
+                FixedString[128]::from_slice("Invalid ELF magic or architecture")))
+        }
+        self.header = hdr
+        self.entry_point = self.header.e_entry
+        self.is_dynamic = self.header.is_shared()
+        self.record_parse_residual()
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Parse Program Headers
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-PHDR-PARSE-001 through PROC-ELF-PHDR-PARSE-020
+
+    pub fn parse_program_headers(self: ref mut, data: ref Byte[])
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let phoff: u64 = self.header.e_phoff
+        let phentsize: u32 = self.header.e_phentsize as u32
+        let phnum: u32 = self.header.e_phnum as u32
+        if phnum > ELF_MAX_PHDR {
+            return Result::Err(proc_error(
+                DIAG_ELF_PARSE_ERROR,
+                FixedString[128]::from_slice("Too many program headers")))
+        }
+        // loop: bounds[BOUND_SMALL] — bounded by phnum
+        loop: bounds[BOUND_SMALL] for i in 0..phnum {
+            let offset: u64 = phoff + (i as u64) * (phentsize as u64)
+            if offset + 56 > data.len() as u64 {
+                break
+            }
+            let phdr: Elf64ProgramHeader = trusted("parse program header") {
+                let mut ph: Elf64ProgramHeader = Elf64ProgramHeader::new()
+                ph.p_type = __builtin_read_u32(data, offset)
+                ph.p_flags = __builtin_read_u32(data, offset + 4)
+                ph.p_offset = __builtin_read_u64(data, offset + 8)
+                ph.p_vaddr = __builtin_read_u64(data, offset + 16)
+                ph.p_paddr = __builtin_read_u64(data, offset + 24)
+                ph.p_filesz = __builtin_read_u64(data, offset + 32)
+                ph.p_memsz = __builtin_read_u64(data, offset + 40)
+                ph.p_align = __builtin_read_u64(data, offset + 48)
+                ph
+            }
+            if phdr.is_loadable() {
+                let mut seg: LoadedSegment = LoadedSegment::new()
+                seg.vaddr = phdr.p_vaddr
+                seg.memsz = phdr.p_memsz
+                seg.filesz = phdr.p_filesz
+                seg.flags = phdr.p_flags
+                seg.is_loadable = true
+                seg.file_offset = phdr.p_offset
+                self.segments.push(seg);
+                self.num_segments = self.num_segments + 1
+            }
+            if phdr.is_interp() {
+                // Read interpreter path
+                let interp: FixedString[64] = trusted("parse interpreter path") {
+                    let mut s: FixedString[64] = FixedString::new()
+                    let interp_off: u64 = phdr.p_offset
+                    // loop: bounds[BOUND_SMALL] — bounded by path length
+                    loop: bounds[BOUND_SMALL] for j in 0..64 {
+                        let c: u8 = data.get((interp_off + j as u64) as u32)
+                        if c == 0 { break }
+                        s.push_char(c as char)
+                    }
+                    s
+                }
+                self.interp_path = interp
+            }
+            if phdr.is_dynamic() {
+                // Parse dynamic section
+                self.parse_dynamic_section(data, phdr.p_vaddr, phdr.p_filesz)?
+            }
+        }
+        self.record_phdr_parse_residual(phnum)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Parse Dynamic Section
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-DYN-PARSE-001 through PROC-ELF-DYN-PARSE-025
+
+    fn parse_dynamic_section(self: ref mut, data: ref Byte[],
+                              dyn_vaddr: u64, dyn_size: u64)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let num_entries: u32 = (dyn_size / 16) as u32
+        if num_entries > 128 {
+            return Result::Err(proc_error(
+                DIAG_ELF_PARSE_ERROR,
+                FixedString[128]::from_slice("Too many dynamic entries")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_entries
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_entries {
+            let offset: u64 = dyn_vaddr + (i as u64) * 16
+            let dyn_entry: Elf64Dyn = trusted("parse dynamic entry") {
+                let mut d: Elf64Dyn = Elf64Dyn::new()
+                d.d_tag = __builtin_read_u64(data, offset)
+                d.d_val = __builtin_read_u64(data, offset + 8)
+                d
+            }
+            if dyn_entry.is_null() {
+                break
+            }
+            match dyn_entry.d_tag {
+                DT_NEEDED => {
+                    // Library name is at strtab + d_val
+                    let lib_name: FixedString[64] = self.read_string(data, dyn_entry.d_val)
+                    self.needed_libs.push(lib_name);
+                    self.num_needed = self.num_needed + 1
+                },
+                DT_SYMTAB => { self.dl_info.symtab_addr = dyn_entry.d_val },
+                DT_STRTAB => { self.dl_info.strtab_addr = dyn_entry.d_val },
+                DT_STRSZ => { self.dl_info.strtab_size = dyn_entry.d_val },
+                DT_SYMENT => { self.dl_info.symtab_size = dyn_entry.d_val },
+                DT_RELA => { self.dl_info.rela_addr = dyn_entry.d_val },
+                DT_RELASZ => { self.dl_info.rela_size = dyn_entry.d_val },
+                DT_RELAENT => { self.dl_info.rela_ent = dyn_entry.d_val },
+                DT_JMPREL => { self.dl_info.pltrel_addr = dyn_entry.d_val },
+                DT_PLTRELSZ => { self.dl_info.pltrel_size = dyn_entry.d_val },
+                DT_PLTREL => { self.dl_info.pltrel_type = dyn_entry.d_val },
+                DT_INIT => { self.dl_info.init_addr = dyn_entry.d_val },
+                DT_FINI => { self.dl_info.fini_addr = dyn_entry.d_val },
+                DT_INIT_ARRAY => { self.dl_info.init_array_addr = dyn_entry.d_val },
+                DT_INIT_ARRAYSZ => { self.dl_info.init_array_size = dyn_entry.d_val },
+                DT_FINI_ARRAY => { self.dl_info.fini_array_addr = dyn_entry.d_val },
+                DT_FINI_ARRAYSZ => { self.dl_info.fini_array_size = dyn_entry.d_val },
+                _ => {},
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Parse Section Headers
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-SHDR-PARSE-001 through PROC-ELF-SHDR-PARSE-015
+
+    pub fn parse_section_headers(self: ref mut, data: ref Byte[])
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let shoff: u64 = self.header.e_shoff
+        let shentsize: u32 = self.header.e_shentsize as u32
+        let shnum: u32 = self.header.e_shnum as u32
+        if shnum > ELF_MAX_SECTIONS {
+            return Result::Err(proc_error(
+                DIAG_ELF_PARSE_ERROR,
+                FixedString[128]::from_slice("Too many sections")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by shnum
+        loop: bounds[BOUND_MEDIUM] for i in 0..shnum {
+            let offset: u64 = shoff + (i as u64) * (shentsize as u64)
+            if offset + 64 > data.len() as u64 {
+                break
+            }
+            let shdr: Elf64SectionHeader = trusted("parse section header") {
+                let mut sh: Elf64SectionHeader = Elf64SectionHeader::new()
+                sh.sh_name = __builtin_read_u32(data, offset)
+                sh.sh_type = __builtin_read_u32(data, offset + 4)
+                sh.sh_flags = __builtin_read_u64(data, offset + 8)
+                sh.sh_addr = __builtin_read_u64(data, offset + 16)
+                sh.sh_offset = __builtin_read_u64(data, offset + 24)
+                sh.sh_size = __builtin_read_u64(data, offset + 32)
+                sh.sh_link = __builtin_read_u32(data, offset + 40)
+                sh.sh_info = __builtin_read_u32(data, offset + 44)
+                sh.sh_addralign = __builtin_read_u64(data, offset + 48)
+                sh.sh_entsize = __builtin_read_u64(data, offset + 56)
+                sh
+            }
+            self.sections.push(shdr);
+            self.num_sections = self.num_sections + 1
+            // Parse symbols if this is a symtab
+            if shdr.is_symtab() && shdr.sh_entsize > 0 {
+                self.parse_symbols(data, shdr)?
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Parse Symbols
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-SYM-PARSE-001 through PROC-ELF-SYM-PARSE-020
+
+    fn parse_symbols(self: ref mut, data: ref Byte[], shdr: Elf64SectionHeader)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        let num_syms: u32 = (shdr.sh_size / shdr.sh_entsize) as u32
+        if num_syms > ELF_MAX_SYMBOLS {
+            return Result::Err(proc_error(
+                DIAG_ELF_PARSE_ERROR,
+                FixedString[128]::from_slice("Too many symbols")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_syms
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_syms {
+            let offset: u64 = shdr.sh_offset + (i as u64) * shdr.sh_entsize
+            if offset + 24 > data.len() as u64 {
+                break
+            }
+            let sym: Elf64Symbol = trusted("parse symbol entry") {
+                let mut s: Elf64Symbol = Elf64Symbol::new()
+                s.st_name = __builtin_read_u32(data, offset)
+                s.st_info = data.get(offset + 4)
+                s.st_other = data.get(offset + 5)
+                s.st_shndx = __builtin_read_u16(data, offset + 6)
+                s.st_value = __builtin_read_u64(data, offset + 8)
+                s.st_size = __builtin_read_u64(data, offset + 16)
+                s
+            }
+            if sym.is_global() && sym.st_name != 0 {
+                let sym_name: FixedString[ELF_SYM_NAME_MAX] = self.read_string(
+                    data, sym.st_name as u64)
+                let mut resolved: ResolvedSymbol = ResolvedSymbol::new()
+                resolved.name = sym_name
+                resolved.address = sym.st_value
+                resolved.size = sym.st_size
+                resolved.is_resolved = sym.st_value != 0
+                resolved.is_weak = sym.bind() == STB_WEAK
+                self.symbols.push(resolved);
+                self.num_symbols = self.num_symbols + 1
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Load Segments into Memory
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-LOAD-001 through PROC-ELF-LOAD-030
+
+    pub fn load_segments(self: ref mut, data: ref Byte[],
+                          load_base: u64)
+        -> Result<u64, ProcessError>
+        effects: [deterministic, io]
+    {
+        let base: u64 = load_base
+        self.base_addr = base
+        // loop: bounds[BOUND_SMALL] — bounded by num_segments
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_segments {
+            let seg: ref LoadedSegment = self.segments.get(i)
+            if !seg.is_loadable {
+                continue
+            }
+            let load_addr: u64 = base + seg.vaddr
+            let file_data_size: u64 = seg.filesz
+            // Zero-fill memory for BSS (memsz - filesz)
+            // trust: copy segment from file to memory at load address
+            trusted("load segment: copy file data and zero-fill BSS") {
+                if file_data_size > 0 {
+                    __builtin_copy_from_buffer(load_addr, data, seg.file_offset, file_data_size)
+                }
+                if seg.memsz > file_data_size {
+                    let bss_addr: u64 = load_addr + file_data_size
+                    let bss_size: u64 = seg.memsz - file_data_size
+                    __builtin_memzero(bss_addr, bss_size)
+                }
+            }
+        }
+        self.record_load_residual(base, self.num_segments)
+        Result::Ok(base + self.header.e_entry)
+    }
+
+    // ──────────────────────────────────────────────
+    // Apply Relocations
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-RELOC-001 through PROC-ELF-RELOC-035
+
+    pub fn apply_relocations(self: ref mut, data: ref Byte[], load_base: u64)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.dl_info.rela_size == 0 {
+            return Result::Ok(())
+        }
+        let num_relas: u32 = if self.dl_info.rela_ent > 0 {
+            (self.dl_info.rela_size / self.dl_info.rela_ent) as u32
+        } else {
+            0
+        }
+        if num_relas > ELF_MAX_RELOCATIONS {
+            return Result::Err(proc_error(
+                DIAG_ELF_RELOC_ERROR,
+                FixedString[128]::from_slice("Too many relocations")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_relas
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_relas {
+            let offset: u64 = self.dl_info.rela_addr + (i as u64) * self.dl_info.rela_ent
+            let rela: Elf64Rela = trusted("parse relocation entry") {
+                let mut r: Elf64Rela = Elf64Rela::new()
+                r.r_offset = __builtin_read_u64(data, offset)
+                r.r_info = __builtin_read_u64(data, offset + 8)
+                r.r_addend = __builtin_read_i64(data, offset + 16)
+                r
+            }
+            let reloc_type: u32 = rela.r_type()
+            let reloc_addr: u64 = load_base + rela.r_offset
+            // trust: apply relocation at computed address
+            trusted("apply relocation") {
+                match reloc_type {
+                    R_X86_64_RELATIVE => {
+                        let value: u64 = load_base + (rela.r_addend as u64)
+                        __builtin_write_u64(reloc_addr, value)
+                    },
+                    R_X86_64_64 => {
+                        let sym: u32 = rela.r_sym()
+                        let sym_addr: u64 = self.resolve_symbol_address(sym, load_base)
+                        __builtin_write_u64(reloc_addr, sym_addr + (rela.r_addend as u64))
+                    },
+                    R_X86_64_PC32 => {
+                        let sym: u32 = rela.r_sym()
+                        let sym_addr: u64 = self.resolve_symbol_address(sym, load_base)
+                        let value: u32 = (sym_addr + (rela.r_addend as u64) - reloc_addr) as u32
+                        __builtin_write_u32(reloc_addr, value)
+                    },
+                    R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                        let sym: u32 = rela.r_sym()
+                        let sym_addr: u64 = self.resolve_symbol_address(sym, load_base)
+                        __builtin_write_u64(reloc_addr, sym_addr)
+                    },
+                    R_X86_64_32 | R_X86_64_32S => {
+                        let sym: u32 = rela.r_sym()
+                        let sym_addr: u64 = self.resolve_symbol_address(sym, load_base)
+                        let value: u32 = (sym_addr + (rela.r_addend as u64)) as u32
+                        __builtin_write_u32(reloc_addr, value)
+                    },
+                    _ => {
+                        // Unsupported relocation type
+                    },
+                }
+            }
+        }
+        self.record_reloc_residual(num_relas)
+        Result::Ok(())
+    }
+
+    fn resolve_symbol_address(self, sym_index: u32, load_base: u64) -> u64
+        effects: [deterministic]
+    {
+        if sym_index < self.num_symbols {
+            let sym: ref ResolvedSymbol = self.symbols.get(sym_index)
+            if sym.is_resolved {
+                return sym.address
+            }
+        }
+        // Symbol not found: return 0 (will cause runtime error)
+        0
+    }
+
+    // ──────────────────────────────────────────────
+    // Read String from ELF string table
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-STR-001 through PROC-ELF-STR-010
+
+    fn read_string(self, data: ref Byte[], str_offset: u64)
+        -> FixedString[64]
+        effects: [deterministic]
+    {
+        let mut result: FixedString[64] = FixedString::new()
+        // loop: bounds[BOUND_SMALL] — bounded by string length
+        loop: bounds[BOUND_SMALL] for i in 0..64 {
+            let offset: u64 = str_offset + (i as u64)
+            if offset >= data.len() as u64 {
+                break
+            }
+            let c: u8 = data.get(offset as u32)
+            if c == 0 {
+                break
+            }
+            result.push_char(c as char)
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────────
+    // Resolve Symbols from symbol table
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-SYMRES-001 through PROC-ELF-SYMRES-015
+
+    pub fn resolve_all_symbols(self: ref mut, other_loader: ref ElfLoader)
+        -> Result<u32, ProcessError>
+        effects: [deterministic]
+    {
+        let mut resolved_count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_symbols
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_symbols {
+            let sym: ref ResolvedSymbol = self.symbols.get(i)
+            if sym.is_resolved {
+                resolved_count = resolved_count + 1
+                continue
+            }
+            // Look up in other loader's symbols
+            // loop: bounds[BOUND_MEDIUM] — bounded by other_loader.num_symbols
+            loop: bounds[BOUND_MEDIUM] for j in 0..other_loader.num_symbols {
+                let other_sym: ref ResolvedSymbol = other_loader.symbols.get(j)
+                if !sym.is_weak && other_sym.name == sym.name && other_sym.is_resolved {
+                    let mut sym_mut: ref mut ResolvedSymbol = self.symbols.get_mut(i)
+                    sym_mut.address = other_sym.address
+                    sym_mut.is_resolved = true
+                    resolved_count = resolved_count + 1
+                    break
+                }
+            }
+        }
+        self.record_symbol_resolve_residual(resolved_count)
+        Result::Ok(resolved_count)
+    }
+
+    // ──────────────────────────────────────────────
+    // Get Entry Point
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-ENTRY-001 through PROC-ELF-ENTRY-005
+
+    pub fn get_entry_point(self) -> u64
+        effects: [deterministic]
+    {
+        self.base_addr + self.entry_point
+    }
+
+    pub fn get_interp(self) -> FixedString[64]
+        effects: [deterministic]
+    {
+        self.interp_path
+    }
+
+    pub fn get_base(self) -> u64
+        effects: [deterministic]
+    {
+        self.base_addr
+    }
+
+    pub fn get_needed_libs(self) -> FixedArray[ELF_MAX_NEEDED_LIBS, FixedString[64]]
+        effects: [deterministic]
+    {
+        self.needed_libs
+    }
+
+    pub fn num_needed_libs(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_needed
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-ELF-RESID-001 through PROC-ELF-RESID-015
+
+    fn record_parse_residual(self)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "ELF header parsed",
+            code: DIAG_ELF_OK,
+            data: (self.header.e_entry, self.header.e_phnum),
+        )
+    }
+
+    fn record_phdr_parse_residual(self, phnum: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "ELF program headers parsed",
+            code: DIAG_ELF_OK,
+            data: phnum,
+        )
+    }
+
+    fn record_load_residual(self, base: u64, num_seg: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "ELF segments loaded",
+            code: DIAG_ELF_OK,
+            data: (base, num_seg),
+        )
+    }
+
+    fn record_reloc_residual(self, num_relocs: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "ELF relocations applied",
+            code: DIAG_ELF_OK,
+            data: num_relocs,
+        )
+    }
+
+    fn record_symbol_resolve_residual(self, count: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "ELF symbols resolved",
+            code: DIAG_ELF_OK,
+            data: count,
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Convenience Load Function
+// ──────────────────────────────────────────────
+// Evidence path: PROC-ELF-LOAD-FN-001 through PROC-ELF-LOAD-FN-015
+
+pub fn load_elf_binary(data: ref Byte[], data_size: u64, load_base: u64)
+    -> Result[ElfLoader, ProcessError>
+    effects: [deterministic, io]
+{
+    let mut loader: ElfLoader = ElfLoader::new()
+    loader.parse_header(data, data_size)?;
+    loader.parse_program_headers(data)?;
+    loader.parse_section_headers(data)?;
+    let entry: u64 = loader.load_segments(data, load_base)?;
+    loader.apply_relocations(data, load_base)?;
+    Result::Ok(loader)
+}
+
+pub fn load_phor_container(data: ref Byte[], data_size: u64)
+    -> Result[ElfLoader, ProcessError>
+    effects: [deterministic, io]
+{
+    // Phorensic container format embeds an ELF binary with additional
+    // metadata sections. For now, we load it as a standard ELF.
+    let load_base: u64 = 0x400000  // Default base address
+    load_elf_binary(data, data_size, load_base)
+}
+
+pub fn check_elf_signature(data: ref Byte[]) -> bool
+    effects: [deterministic]
+{
+    if data.len() < 4 {
+        return false
+    }
+    let magic: u32 = __builtin_read_u32(data, 0)
+    magic == ELF_MAGIC
+}

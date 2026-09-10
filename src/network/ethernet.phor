@@ -1,0 +1,1862 @@
+// ethernet.phor — Ethernet frame parsing, MAC addressing, frame types, CRC checking, NIC interface
+// Implements IEEE 802.3 Ethernet II framing with full residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/ethernet.phor
+// Court: ethernet:v1
+
+package network.ethernet;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// Network diagnostic range: 0xE000 - 0xEFFF
+// Ethernet sub-range: 0xE000 - 0xE0FF
+
+type EthernetError = enum {
+    EthInvalidFrame         = 0xE000,  // NE000: Frame shorter than minimum length
+    EthInvalidPreamble      = 0xE001,  // NE001: Invalid preamble pattern
+    EthCrcMismatch          = 0xE002,  // NE002: CRC check failed
+    EthUnsupportedType      = 0xE003,  // NE003: Unsupported EtherType
+    EthBufferOverflow       = 0xE004,  // NE004: Buffer capacity exceeded for frame
+    EthNidNotFound          = 0xE005,  // NE005: NIC not found in registry
+    EthNidNotReady          = 0xE006,  // NE006: NIC not initialized
+    EthTxTimeout            = 0xE007,  // NE007: Transmit timeout on NIC
+    EthRxTimeout            = 0xE008,  // NE008: Receive timeout on NIC
+    EthCapabilityError      = 0xE009,  // NE009: Insufficient capability for Ethernet operation
+    EthMacInvalid           = 0xE00A,  // NE00A: Invalid MAC address (multicast bit collision)
+    EthLenFieldMismatch     = 0xE00B,  // NE00B: Length field does not match payload
+    EthAlignmentError       = 0xE00C,  // NE00C: Frame alignment error (non-octet alignment)
+    EthJumboFrame           = 0xE00D,  // NE00D: Jumbo frame exceeds max MTU
+    EthVlanTagged           = 0xE00E,  // NE00E: VLAN tagged frame not supported in this context
+    EthInterruptNotRegistered = 0xE00F, // NE00F: Interrupt handler not registered
+    EthDescriptorCorrupt    = 0xE010,  // NE010: DMA descriptor chain corrupted
+    EthRingFull             = 0xE011,  // NE011: Descriptor ring is full
+    EthRingEmpty            = 0xE012,  // NE012: Descriptor ring is empty
+    EthTruncatedPacket      = 0xE013,  // NE013: Packet truncated during DMA
+    EthLinkDown             = 0xE014,  // NE014: Link is down
+    EthFlowControlPause     = 0xE015,  // NE015: Flow control pause frame received
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const ETH_ADDR_LEN         : u64 = 6;
+const ETH_PREAMBLE_LEN     : u64 = 7;
+const ETH_SFD              : u8   = 0xD5;
+const ETH_FRAME_MIN_LEN    : u64 = 64;
+const ETH_FRAME_MAX_LEN    : u64 = 1518;
+const ETH_FRAME_MAX_MTU    : u64 = 1500;
+const ETH_JUMBO_FRAME_MAX  : u64 = 9000;
+const ETH_CRC_LEN          : u64 = 4;
+const ETH_HEADER_LEN       : u64 = 14;
+const ETH_VLAN_HEADER_LEN  : u64 = 18;
+const ETH_MAX_BURST        : u64 = 64;
+const ETH_DEFAULT_SPEED_MB : u64 = 1000;
+const ETH_MAX_DESCRIPTORS  : u64 = 1024;
+const ETH_INITIAL_GEN      : u64 = 1;
+
+// ─────────────────────────────────────────────────────────────
+// EtherType Constants (IEEE 802.3)
+// ─────────────────────────────────────────────────────────────
+
+type EtherType = enum {
+    Ipv4         = 0x0800,
+    Arp          = 0x0806,
+    Ipv6         = 0x86DD,
+    WakeOnLan    = 0x0842,
+    VlanTag      = 0x8100,
+    ProvNet      = 0x88B5,
+    Lldp         = 0x88CC,
+    MacSec       = 0x88E5,
+    Pbb          = 0x88E7,
+    Fcoe         = 0x8906,
+    Fip          = 0x8914,
+    Roce         = 0x8915,
+    Ctb          = 0x8929,
+    HsrPrp       = 0x892F,
+    Ipv6Frag     = 0x86DD,
+    QinQ         = 0x88A8,
+    MplsUni      = 0x8847,
+    MplsMulti    = 0x8848,
+    PppoeDisc    = 0x8863,
+    PppoeSess    = 0x8864,
+    Loopback     = 0x9000,
+    Custom       = 0xFFFF,
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAC Address
+// ─────────────────────────────────────────────────────────────
+
+struct MacAddress {
+    octets: Array(u8, ETH_ADDR_LEN),
+    generation: u64,
+}
+
+impl MacAddress {
+    fn broadcast() -> MacAddress
+        effect [deterministic]
+        court "mac_broadcast:v1"
+    {
+        let mut addr: MacAddress = MacAddress {
+            octets: Array::zeroed(),
+            generation: 0,
+        };
+        loop bound ETH_ADDR_LEN {
+            addr.octets[0] = 0xFF;
+            addr.octets[1] = 0xFF;
+            addr.octets[2] = 0xFF;
+            addr.octets[3] = 0xFF;
+            addr.octets[4] = 0xFF;
+            addr.octets[5] = 0xFF;
+            break;
+        };
+        addr.generation = ETH_INITIAL_GEN;
+        return addr;
+    }
+
+    fn zero() -> MacAddress
+        effect [deterministic]
+    {
+        return MacAddress {
+            octets: Array::zeroed(),
+            generation: ETH_INITIAL_GEN,
+        };
+    }
+
+    fn from_bytes(bytes: Array(u8, ETH_ADDR_LEN)) -> MacAddress
+        effect [deterministic]
+    {
+        return MacAddress {
+            octets: bytes,
+            generation: ETH_INITIAL_GEN,
+        };
+    }
+
+    fn from_slice(data: Array(u8, ETH_FRAME_MAX_LEN), offset: u64) -> Result(MacAddress, EthernetError)
+        effect [deterministic]
+        court "mac_from_slice:v1"
+    {
+        if (offset + ETH_ADDR_LEN) > ETH_FRAME_MAX_LEN {
+            return Result::Err(EthernetError::EthInvalidFrame);
+        };
+        let mut octets: Array(u8, ETH_ADDR_LEN) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            octets[i] = data[offset + i];
+        };
+        return Result::Ok(MacAddress {
+            octets: octets,
+            generation: ETH_INITIAL_GEN,
+        });
+    }
+
+    fn is_broadcast(self) -> bool
+        effect [deterministic]
+    {
+        loop bound ETH_ADDR_LEN {
+            if self.octets[i] != 0xFF {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_multicast(self) -> bool
+        effect [deterministic]
+    {
+        return (self.octets[0] & 0x01) == 0x01;
+    }
+
+    fn is_unicast(self) -> bool
+        effect [deterministic]
+    {
+        return (self.octets[0] & 0x01) == 0x00;
+    }
+
+    fn is_local_administered(self) -> bool
+        effect [deterministic]
+    {
+        return (self.octets[0] & 0x02) == 0x02;
+    }
+
+    fn is_universal_administered(self) -> bool
+        effect [deterministic]
+    {
+        return (self.octets[0] & 0x02) == 0x00;
+    }
+
+    fn eq(self, other: MacAddress) -> bool
+        effect [deterministic]
+    {
+        loop bound ETH_ADDR_LEN {
+            if self.octets[i] != other.octets[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn to_array(self) -> Array(u8, ETH_ADDR_LEN)
+        effect [deterministic]
+    {
+        return self.octets;
+    }
+
+    fn write_to_buf(self, buf: ref mut Array(u8, ETH_FRAME_MAX_LEN), offset: u64) -> Result(void, EthernetError)
+        effect [deterministic]
+    {
+        if (offset + ETH_ADDR_LEN) > ETH_FRAME_MAX_LEN {
+            return Result::Err(EthernetError::EthBufferOverflow);
+        };
+        loop bound ETH_ADDR_LEN {
+            buf[offset + i] = self.octets[i];
+        };
+        return Result::Ok(void);
+    }
+
+    fn to_string(self) -> Array(u8, 18)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, 18) = Array::zeroed();
+        let hex: Array(u8, 16) = Array::from_literal("0123456789ABCDEF");
+        loop bound 6 {
+            let idx: u64 = i * 3;
+            let byte_val: u8 = self.octets[i];
+            buf[idx] = hex[(byte_val >> 4) as u64];
+            buf[idx + 1] = hex[(byte_val & 0x0F) as u64];
+            if i < 5 {
+                buf[idx + 2] = ':';
+            };
+        };
+        return buf;
+    }
+
+    fn from_string(s: Array(u8, 18), len: u64) -> Result(MacAddress, EthernetError)
+        effect [deterministic]
+    {
+        if len < 17 {
+            return Result::Err(EthernetError::EthMacInvalid);
+        };
+        let mut octets: Array(u8, ETH_ADDR_LEN) = Array::zeroed();
+        let hex_val: u8;
+        loop bound 6 {
+            let idx: u64 = i * 3;
+            let hi: u8 = self.hex_char_to_u8(s[idx]);
+            let lo: u8 = self.hex_char_to_u8(s[idx + 1]);
+            if hi == 0xFF || lo == 0xFF {
+                return Result::Err(EthernetError::EthMacInvalid);
+            };
+            octets[i] = (hi << 4) | lo;
+        };
+        return Result::Ok(MacAddress {
+            octets: octets,
+            generation: ETH_INITIAL_GEN,
+        });
+    }
+
+    fn hex_char_to_u8(c: u8) -> u8
+        effect [deterministic]
+    {
+        if c >= '0' && c <= '9' {
+            return c - '0';
+        } else if c >= 'A' && c <= 'F' {
+            return c - 'A' + 10;
+        } else if c >= 'a' && c <= 'f' {
+            return c - 'a' + 10;
+        } else {
+            return 0xFF;
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Ethernet Header
+// ─────────────────────────────────────────────────────────────
+
+struct EthernetHeader {
+    destination: MacAddress,
+    source: MacAddress,
+    ether_type: u16,
+    vlan_tag: Option(u32),
+    generation: u64,
+}
+
+impl EthernetHeader {
+    fn new(dst: MacAddress, src: MacAddress, etype: u16) -> EthernetHeader
+        effect [deterministic]
+    {
+        return EthernetHeader {
+            destination: dst,
+            source: src,
+            ether_type: etype,
+            vlan_tag: Option::None,
+            generation: ETH_INITIAL_GEN,
+        };
+    }
+
+    fn with_vlan(dst: MacAddress, src: MacAddress, etype: u16, vlan: u32) -> EthernetHeader
+        effect [deterministic]
+    {
+        return EthernetHeader {
+            destination: dst,
+            source: src,
+            ether_type: etype,
+            vlan_tag: Option::Some(vlan),
+            generation: ETH_INITIAL_GEN,
+        };
+    }
+
+    fn parse(data: Array(u8, ETH_FRAME_MAX_LEN), len: u64) -> Result(EthernetHeader, EthernetError)
+        effect [deterministic]
+        court "eth_header_parse:v1"
+    {
+        if len < ETH_HEADER_LEN {
+            return Result::Err(EthernetError::EthInvalidFrame);
+        };
+        let dst_res: Result(MacAddress, EthernetError) = MacAddress::from_slice(data, 0);
+        if dst_res.is_err() {
+            return Result::Err(dst_res.unwrap_err());
+        };
+        let src_res: Result(MacAddress, EthernetError) = MacAddress::from_slice(data, 6);
+        if src_res.is_err() {
+            return Result::Err(src_res.unwrap_err());
+        };
+        let dst: MacAddress = dst_res.unwrap();
+        let src: MacAddress = src_res.unwrap();
+        let etype_raw: u16 = ((data[12] as u16) << 8) | (data[13] as u16);
+        let mut vlan_tag: Option(u32) = Option::None;
+        let mut ether_type: u16 = etype_raw;
+        // Check for 802.1Q VLAN tag
+        if etype_raw == 0x8100 {
+            if len < ETH_VLAN_HEADER_LEN {
+                return Result::Err(EthernetError::EthVlanTagged);
+            };
+            let vlan_raw: u32 = ((data[14] as u32) << 8) | (data[15] as u32) | ((data[16] as u32) << 24) | ((data[17] as u32) << 16);
+            vlan_tag = Option::Some(vlan_raw);
+            ether_type = ((data[16] as u16) << 8) | (data[17] as u16);
+        };
+        return Result::Ok(EthernetHeader {
+            destination: dst,
+            source: src,
+            ether_type: ether_type,
+            vlan_tag: vlan_tag,
+            generation: ETH_INITIAL_GEN,
+        });
+    }
+
+    fn serialize(self, buf: ref mut Array(u8, ETH_FRAME_MAX_LEN)) -> Result(u64, EthernetError)
+        effect [deterministic]
+    {
+        let mut offset: u64 = 0;
+        // Write destination MAC
+        let dst_res: Result(void, EthernetError) = self.destination.write_to_buf(buf, 0);
+        if dst_res.is_err() {
+            return Result::Err(dst_res.unwrap_err());
+        };
+        offset = 6;
+        // Write source MAC
+        let src_res: Result(void, EthernetError) = self.source.write_to_buf(buf, offset);
+        if src_res.is_err() {
+            return Result::Err(src_res.unwrap_err());
+        };
+        offset = 12;
+        // Write EtherType
+        buf[offset] = ((self.ether_type >> 8) & 0xFF) as u8;
+        buf[offset + 1] = (self.ether_type & 0xFF) as u8;
+        offset = 14;
+        // Write VLAN tag if present
+        if self.vlan_tag.is_some() {
+            let vlan: u32 = self.vlan_tag.unwrap();
+            buf[12] = 0x81;
+            buf[13] = 0x00;
+            buf[14] = ((vlan >> 8) & 0xFF) as u8;
+            buf[15] = (vlan & 0xFF) as u8;
+            buf[16] = ((self.ether_type >> 8) & 0xFF) as u8;
+            buf[17] = (self.ether_type & 0xFF) as u8;
+            offset = 18;
+        };
+        return Result::Ok(offset);
+    }
+
+    fn header_length(self) -> u64
+        effect [deterministic]
+    {
+        if self.vlan_tag.is_some() {
+            return ETH_VLAN_HEADER_LEN;
+        } else {
+            return ETH_HEADER_LEN;
+        };
+    }
+
+    fn is_ipv4(self) -> bool
+        effect [deterministic]
+    {
+        return self.ether_type == 0x0800;
+    }
+
+    fn is_ipv6(self) -> bool
+        effect [deterministic]
+    {
+        return self.ether_type == 0x86DD;
+    }
+
+    fn is_arp(self) -> bool
+        effect [deterministic]
+    {
+        return self.ether_type == 0x0806;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// CRC-32 (IEEE 802.3) Calculation
+// ─────────────────────────────────────────────────────────────
+
+struct Crc32 {
+    crc_table: Array(u32, 256),
+    table_initialized: bool,
+}
+
+impl Crc32 {
+    fn new_and_init() -> Crc32
+        effect [deterministic]
+        court "crc32_init:v1"
+    {
+        let mut crc: Crc32 = Crc32 {
+            crc_table: Array::zeroed(),
+            table_initialized: false,
+        };
+        crc.init_table();
+        return crc;
+    }
+
+    fn init_table(self: ref mut)
+        effect [deterministic]
+    {
+        if self.table_initialized {
+            return;
+        };
+        let polynomial: u32 = 0xEDB88320;
+        loop bound 256 {
+            let mut crc_val: u32 = i as u32;
+            loop bound 8 {
+                if (crc_val & 1) != 0 {
+                    crc_val = (crc_val >> 1) ^ polynomial;
+                } else {
+                    crc_val = crc_val >> 1;
+                };
+            };
+            self.crc_table[i] = crc_val;
+        };
+        self.table_initialized = true;
+    }
+
+    fn compute(self, data: Array(u8, ETH_FRAME_MAX_LEN), len: u64) -> u32
+        effect [deterministic]
+        court "crc32_compute:v1"
+    {
+        let mut crc_val: u32 = 0xFFFFFFFF;
+        loop bound ETH_FRAME_MAX_LEN {
+            if i >= len {
+                break;
+            };
+            let index: u64 = ((crc_val ^ (data[i] as u32)) & 0xFF) as u64;
+            crc_val = (crc_val >> 8) ^ self.crc_table[index];
+        };
+        return crc_val ^ 0xFFFFFFFF;
+    }
+
+    fn verify(self, data: Array(u8, ETH_FRAME_MAX_LEN), len: u64) -> bool
+        effect [deterministic]
+    {
+        if len < 4 {
+            return false;
+        };
+        let crc_val: u32 = self.compute(data, len - 4);
+        let stored_crc: u32 = ((data[len - 4] as u32)) |
+                              ((data[len - 3] as u32) << 8) |
+                              ((data[len - 2] as u32) << 16) |
+                              ((data[len - 1] as u32) << 24);
+        return crc_val == stored_crc;
+    }
+
+    fn append_crc(self, data: ref mut Array(u8, ETH_FRAME_MAX_LEN), len: ref mut u64) -> Result(void, EthernetError)
+        effect [deterministic]
+    {
+        if (*len + 4) > ETH_FRAME_MAX_LEN {
+            return Result::Err(EthernetError::EthBufferOverflow);
+        };
+        let crc_val: u32 = self.compute(data, *len);
+        data[*len] = (crc_val & 0xFF) as u8;
+        data[*len + 1] = ((crc_val >> 8) & 0xFF) as u8;
+        data[*len + 2] = ((crc_val >> 16) & 0xFF) as u8;
+        data[*len + 3] = ((crc_val >> 24) & 0xFF) as u8;
+        *len = *len + 4;
+        return Result::Ok(void);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Capability
+// ─────────────────────────────────────────────────────────────
+
+struct NicCapability {
+    object_id: Identity,
+    generation: u64,
+    can_send: bool,
+    can_receive: bool,
+    can_configure: bool,
+    can_set_promisc: bool,
+    can_set_multicast: bool,
+    can_set_mac: bool,
+    can_reset: bool,
+    max_frame_size: u64,
+    max_descriptors: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Link Status
+// ─────────────────────────────────────────────────────────────
+
+type NicLinkStatus = enum {
+    LinkDown        = 0,
+    LinkUp          = 1,
+    LinkAutoNeg     = 2,
+    LinkUnknown     = 3,
+    LinkError       = 4,
+}
+
+type NicDuplexMode = enum {
+    HalfDuplex      = 0,
+    FullDuplex      = 1,
+    AutoNegotiate   = 2,
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Hardware Registers (Abstract Interface)
+// ─────────────────────────────────────────────────────────────
+
+struct NicRegisters {
+    mmio_base: u64,
+    io_port_base: u64,
+    mmio: bool,
+}
+
+impl NicRegisters {
+    fn read32(self, offset: u64) -> u32
+        effect [memory:mmio, machine:ioport]
+    {
+        return trusted reason "NIC MMIO/IO register read at verified address, PCI spec §3" {
+            if self.mmio {
+                let ptr: *(u32) = (self.mmio_base + offset) as *(u32);
+                return *ptr;
+            } else {
+                // ioread32(self.io_port_base + offset)
+                return 0;
+            };
+        };
+    }
+
+    fn write32(self, offset: u64, value: u32)
+        effect [memory:mmio, machine:ioport]
+    {
+        trusted reason "NIC MMIO/IO register write at verified address, PCI spec §3" {
+            if self.mmio {
+                let ptr: *(u32) = (self.mmio_base + offset) as *(u32);
+                *ptr = value;
+            } else {
+                // iowrite32(self.io_port_base + offset, value)
+            };
+        };
+    }
+
+    fn read16(self, offset: u64) -> u16
+        effect [memory:mmio, machine:ioport]
+    {
+        return trusted reason "NIC 16-bit register read" {
+            if self.mmio {
+                let ptr: *(u16) = (self.mmio_base + offset) as *(u16);
+                return *ptr;
+            } else {
+                return 0;
+            };
+        };
+    }
+
+    fn write16(self, offset: u64, value: u16)
+        effect [memory:mmio, machine:ioport]
+    {
+        trusted reason "NIC 16-bit register write" {
+            if self.mmio {
+                let ptr: *(u16) = (self.mmio_base + offset) as *(u16);
+                *ptr = value;
+            } else {
+            };
+        };
+    }
+
+    fn read8(self, offset: u64) -> u8
+        effect [memory:mmio, machine:ioport]
+    {
+        return trusted reason "NIC 8-bit register read" {
+            if self.mmio {
+                let ptr: *(u8) = (self.mmio_base + offset) as *(u8);
+                return *ptr;
+            } else {
+                return 0;
+            };
+        };
+    }
+
+    fn write8(self, offset: u64, value: u8)
+        effect [memory:mmio, machine:ioport]
+    {
+        trusted reason "NIC 8-bit register write" {
+            if self.mmio {
+                let ptr: *(u8) = (self.mmio_base + offset) as *(u8);
+                *ptr = value;
+            } else {
+            };
+        };
+    }
+
+    fn or32(self, offset: u64, mask: u32)
+        effect [memory:mmio, machine:ioport]
+    {
+        let val: u32 = self.read32(offset);
+        self.write32(offset, val | mask);
+    }
+
+    fn and32(self, offset: u64, mask: u32)
+        effect [memory:mmio, machine:ioport]
+    {
+        let val: u32 = self.read32(offset);
+        self.write32(offset, val & mask);
+    }
+
+    fn set_bits(self, offset: u64, mask: u32, value: bool)
+        effect [memory:mmio, machine:ioport]
+    {
+        if value {
+            self.or32(offset, mask);
+        } else {
+            let inv_mask: u32 = !mask;
+            self.and32(offset, inv_mask);
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DMA Descriptor for Packet Buffers
+// ─────────────────────────────────────────────────────────────
+
+struct DmaDescriptor {
+    physical_addr: u64,
+    length: u32,
+    flags: u16,
+    generation: u16,
+    next_index: u32,
+    status: DmaDescriptorStatus,
+}
+
+type DmaDescriptorStatus = enum {
+    DescriptorFree      = 0,
+    DescriptorOwned     = 1,
+    DescriptorComplete  = 2,
+    DescriptorError     = 3,
+    DescriptorCanceled  = 4,
+}
+
+struct DmaDescriptorRing {
+    descriptors: Array(DmaDescriptor, ETH_MAX_DESCRIPTORS),
+    count: u64,
+    head_index: u64,
+    tail_index: u64,
+    generation: u64,
+}
+
+impl DmaDescriptorRing {
+    fn new(count: u64) -> Result(DmaDescriptorRing, EthernetError)
+        effect [deterministic]
+    {
+        if count == 0 || count > ETH_MAX_DESCRIPTORS {
+            return Result::Err(EthernetError::EthInvalidFrame);
+        };
+        return Result::Ok(DmaDescriptorRing {
+            descriptors: Array::zeroed(),
+            count: count,
+            head_index: 0,
+            tail_index: 0,
+            generation: ETH_INITIAL_GEN,
+        });
+    }
+
+    fn is_full(self) -> bool
+        effect [deterministic]
+    {
+        let next: u64 = (self.head_index + 1) % self.count;
+        return next == self.tail_index;
+    }
+
+    fn is_empty(self) -> bool
+        effect [deterministic]
+    {
+        return self.head_index == self.tail_index;
+    }
+
+    fn enqueue(self: ref mut, desc: DmaDescriptor) -> Result(void, EthernetError)
+        effect [deterministic]
+    {
+        if self.is_full() {
+            return Result::Err(EthernetError::EthRingFull);
+        };
+        self.descriptors[self.head_index] = desc;
+        self.head_index = (self.head_index + 1) % self.count;
+        return Result::Ok(void);
+    }
+
+    fn dequeue(self: ref mut) -> Result(DmaDescriptor, EthernetError)
+        effect [deterministic]
+    {
+        if self.is_empty() {
+            return Result::Err(EthernetError::EthRingEmpty);
+        };
+        let desc: DmaDescriptor = self.descriptors[self.tail_index];
+        self.tail_index = (self.tail_index + 1) % self.count;
+        return Result::Ok(desc);
+    }
+
+    fn peek(self) -> Result(DmaDescriptor, EthernetError)
+        effect [deterministic]
+    {
+        if self.is_empty() {
+            return Result::Err(EthernetError::EthRingEmpty);
+        };
+        return Result::Ok(self.descriptors[self.tail_index]);
+    }
+
+    fn available_entries(self) -> u64
+        effect [deterministic]
+    {
+        if self.head_index >= self.tail_index {
+            return (self.count - self.head_index + self.tail_index) - 1;
+        } else {
+            return (self.tail_index - self.head_index) - 1;
+        };
+    }
+
+    fn used_entries(self) -> u64
+        effect [deterministic]
+    {
+        if self.head_index >= self.tail_index {
+            return self.head_index - self.tail_index;
+        } else {
+            return self.count - (self.tail_index - self.head_index);
+        };
+    }
+
+    fn reset(self: ref mut)
+        effect [deterministic]
+    {
+        self.head_index = 0;
+        self.tail_index = 0;
+        self.generation = self.generation + 1;
+    }
+
+    fn iterate_used(self, callback: fn(DmaDescriptor) -> void effect [deterministic])
+        effect [deterministic]
+    {
+        let mut idx: u64 = self.tail_index;
+        loop bound ETH_MAX_DESCRIPTORS {
+            if idx == self.head_index {
+                break;
+            };
+            callback(self.descriptors[idx]);
+            idx = (idx + 1) % self.count;
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Statistics
+// ─────────────────────────────────────────────────────────────
+
+struct NicStatistics {
+    tx_packets: u64,
+    tx_bytes: u64,
+    tx_errors: u64,
+    tx_dropped: u64,
+    tx_collisions: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    rx_errors: u64,
+    rx_dropped: u64,
+    rx_overruns: u64,
+    rx_crc_errors: u64,
+    rx_frame_errors: u64,
+    rx_fifo_errors: u64,
+    rx_missed: u64,
+    interrupts: u64,
+    link_up_count: u64,
+    link_down_count: u64,
+    reset_count: u64,
+    last_activity_timestamp: u64,
+}
+
+impl NicStatistics {
+    fn new() -> NicStatistics
+        effect [deterministic]
+    {
+        return NicStatistics {
+            tx_packets: 0,
+            tx_bytes: 0,
+            tx_errors: 0,
+            tx_dropped: 0,
+            tx_collisions: 0,
+            rx_packets: 0,
+            rx_bytes: 0,
+            rx_errors: 0,
+            rx_dropped: 0,
+            rx_overruns: 0,
+            rx_crc_errors: 0,
+            rx_frame_errors: 0,
+            rx_fifo_errors: 0,
+            rx_missed: 0,
+            interrupts: 0,
+            link_up_count: 0,
+            link_down_count: 0,
+            reset_count: 0,
+            last_activity_timestamp: 0,
+        };
+    }
+
+    fn record_tx(self: ref mut, bytes: u64)
+        effect [deterministic]
+    {
+        self.tx_packets = self.tx_packets + 1;
+        self.tx_bytes = self.tx_bytes + bytes;
+        self.last_activity_timestamp = self.now();
+    }
+
+    fn record_rx(self: ref mut, bytes: u64)
+        effect [deterministic]
+    {
+        self.rx_packets = self.rx_packets + 1;
+        self.rx_bytes = self.rx_bytes + bytes;
+        self.last_activity_timestamp = self.now();
+    }
+
+    fn record_tx_error(self: ref mut)
+        effect [deterministic]
+    {
+        self.tx_errors = self.tx_errors + 1;
+    }
+
+    fn record_rx_error(self: ref mut)
+        effect [deterministic]
+    {
+        self.rx_errors = self.rx_errors + 1;
+    }
+
+    fn record_crc_error(self: ref mut)
+        effect [deterministic]
+    {
+        self.rx_crc_errors = self.rx_crc_errors + 1;
+        self.rx_errors = self.rx_errors + 1;
+    }
+
+    fn record_link_up(self: ref mut)
+        effect [deterministic]
+    {
+        self.link_up_count = self.link_up_count + 1;
+    }
+
+    fn record_link_down(self: ref mut)
+        effect [deterministic]
+    {
+        self.link_down_count = self.link_down_count + 1;
+    }
+
+    fn now(self) -> u64
+        effect [deterministic]
+    {
+        // Placeholder: in real implementation, read system timestamp
+        return 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Configuration
+// ─────────────────────────────────────────────────────────────
+
+struct NicConfig {
+    mac_address: MacAddress,
+    desired_speed_mb: u64,
+    duplex_mode: NicDuplexMode,
+    auto_negotiate: bool,
+    promiscuous: bool,
+    multicast_enabled: bool,
+    rx_interrupts: bool,
+    tx_interrupts: bool,
+    rx_ring_size: u64,
+    tx_ring_size: u64,
+    max_frame_size: u64,
+    jumbo_frames: bool,
+    flow_control: bool,
+    wol_enabled: bool,
+    checksum_offload: bool,
+    tso_enabled: bool,
+    rss_enabled: bool,
+    vlan_filtering: bool,
+    generation: u64,
+}
+
+impl NicConfig {
+    fn default(mac: MacAddress) -> NicConfig
+        effect [deterministic]
+    {
+        return NicConfig {
+            mac_address: mac,
+            desired_speed_mb: ETH_DEFAULT_SPEED_MB,
+            duplex_mode: NicDuplexMode::AutoNegotiate,
+            auto_negotiate: true,
+            promiscuous: false,
+            multicast_enabled: false,
+            rx_interrupts: true,
+            tx_interrupts: true,
+            rx_ring_size: 256,
+            tx_ring_size: 256,
+            max_frame_size: ETH_FRAME_MAX_LEN,
+            jumbo_frames: false,
+            flow_control: true,
+            wol_enabled: false,
+            checksum_offload: true,
+            tso_enabled: false,
+            rss_enabled: false,
+            vlan_filtering: false,
+            generation: ETH_INITIAL_GEN,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Interface - The core abstraction for a Network Interface Controller
+// ─────────────────────────────────────────────────────────────
+
+struct NicInterface {
+    identity: Identity,
+    regs: NicRegisters,
+    config: NicConfig,
+    rx_ring: DmaDescriptorRing,
+    tx_ring: DmaDescriptorRing,
+    rx_buffer: Array(u8, ETH_FRAME_MAX_LEN * 16),
+    rx_buffer_count: u64,
+    tx_next_buffer: u64,
+    capability: Cap(NicCapability),
+    status: NicLinkStatus,
+    statistics: NicStatistics,
+    crc_accel: Crc32,
+    interrupt_handler: Option(Handle),
+    initialized: bool,
+    power_state: NicPowerState,
+    residual_log: RingBuf(ResidualRecord, 256),
+    driver_private: Array(u8, 256),
+    driver_private_len: u64,
+    speed_mb: u64,
+    duplex: NicDuplexMode,
+    generation: u64,
+}
+
+type NicPowerState = enum {
+    PowerFull     = 0,
+    PowerLow      = 1,
+    PowerSleep    = 2,
+    PowerOff      = 3,
+}
+
+impl NicInterface {
+    fn new(
+        identity: Identity,
+        mmio_base: u64,
+        io_base: u64,
+        mmio: bool,
+        config: NicConfig,
+        cap: Cap(NicCapability),
+        rx_desc_count: u64,
+        tx_desc_count: u64,
+    ) -> Result(NicInterface, EthernetError)
+        effect [deterministic]
+        court "nic_interface_new:v1"
+    {
+        let rx_ring_res: Result(DmaDescriptorRing, EthernetError) = DmaDescriptorRing::new(rx_desc_count);
+        if rx_ring_res.is_err() {
+            return Result::Err(rx_ring_res.unwrap_err());
+        };
+        let tx_ring_res: Result(DmaDescriptorRing, EthernetError) = DmaDescriptorRing::new(tx_desc_count);
+        if tx_ring_res.is_err() {
+            return Result::Err(tx_ring_res.unwrap_err());
+        };
+        return Result::Ok(NicInterface {
+            identity: identity,
+            regs: NicRegisters {
+                mmio_base: mmio_base,
+                io_port_base: io_base,
+                mmio: mmio,
+            },
+            config: config,
+            rx_ring: rx_ring_res.unwrap(),
+            tx_ring: tx_ring_res.unwrap(),
+            rx_buffer: Array::zeroed(),
+            rx_buffer_count: 0,
+            tx_next_buffer: 0,
+            capability: cap,
+            status: NicLinkStatus::LinkDown,
+            statistics: NicStatistics::new(),
+            crc_accel: Crc32::new_and_init(),
+            interrupt_handler: Option::None,
+            initialized: false,
+            power_state: NicPowerState::PowerFull,
+            residual_log: RingBuf::new(),
+            driver_private: Array::zeroed(),
+            driver_private_len: 0,
+            speed_mb: config.desired_speed_mb,
+            duplex: config.duplex_mode,
+            generation: ETH_INITIAL_GEN,
+        });
+    }
+
+    fn initialize(self: ref mut, timestamp: u64) -> Result(void, EthernetError)
+        effect [memory:mmio, machine:ioport, deterministic]
+        court "nic_initialize:v1"
+    {
+        if !self.capability.can_configure {
+            return Result::Err(EthernetError::EthCapabilityError);
+        };
+        // Reset NIC
+        self.regs.write32(0x000, 1); // Reset bit
+        self.reset_wait();
+        // Configure MAC address
+        loop bound ETH_ADDR_LEN {
+            self.regs.write8(0x100 + i, self.config.mac_address.octets[i]);
+        };
+        // Set RX/TX ring base addresses
+        self.regs.write32(0x200, 0x1000);
+        self.regs.write32(0x204, 0x2000);
+        // Configure interrupt moderation
+        if self.config.rx_interrupts {
+            self.regs.or32(0x300, 0x01);
+        };
+        if self.config.tx_interrupts {
+            self.regs.or32(0x300, 0x02);
+        };
+        // Set max frame size
+        self.regs.write32(0x400, self.config.max_frame_size as u32);
+        // Configure flow control
+        if self.config.flow_control {
+            self.regs.or32(0x500, 0x01);
+        };
+        // Enable promiscuous mode if requested
+        if self.config.promiscuous {
+            self.regs.or32(0x600, 0x01);
+        };
+        // Enable multicast if requested
+        if self.config.multicast_enabled {
+            self.regs.or32(0x700, 0x01);
+        };
+        // Enable checksum offload
+        if self.config.checksum_offload {
+            self.regs.or32(0x800, 0x01);
+        };
+        // Enable TSO if supported
+        if self.config.tso_enabled {
+            self.regs.or32(0x900, 0x01);
+        };
+        // Enable RSS if supported
+        if self.config.rss_enabled {
+            self.regs.or32(0xA00, 0x01);
+        };
+        // Start the NIC
+        self.regs.write32(0x000, 0x02); // Enable bit
+        self.initialized = true;
+        self.generation = self.generation + 1;
+        self.config.generation = self.config.generation + 1;
+
+        residual emit {
+            op: "nic.initialize",
+            identity: self.identity.id_hash,
+            timestamp: timestamp,
+            mac: self.config.mac_address.to_array(),
+            speed: self.speed_mb,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn reset_wait(self)
+        effect [memory:mmio, machine:ioport, deterministic]
+    {
+        loop bound 10000 {
+            let status: u32 = self.regs.read32(0x000);
+            if (status & 1) == 0 {
+                break;
+            };
+        };
+    }
+
+    fn send_frame(
+        self: ref mut,
+        frame_data: Array(u8, ETH_FRAME_MAX_LEN),
+        frame_len: u64,
+        timestamp: u64,
+    ) -> Result(void, EthernetError)
+        effect [deterministic, memory:mmio, machine:ioport]
+        court "nic_send_frame:v1"
+    {
+        if !self.capability.can_send {
+            return Result::Err(EthernetError::EthCapabilityError);
+        };
+        if !self.initialized {
+            return Result::Err(EthernetError::EthNidNotReady);
+        };
+        if self.status != NicLinkStatus::LinkUp {
+            return Result::Err(EthernetError::EthLinkDown);
+        };
+        if frame_len < ETH_FRAME_MIN_LEN {
+            return Result::Err(EthernetError::EthInvalidFrame);
+        };
+        if frame_len > self.config.max_frame_size {
+            return Result::Err(EthernetError::EthJumboFrame);
+        };
+        if self.tx_ring.is_full() {
+            return Result::Err(EthernetError::EthRingFull);
+        };
+        // Pad frame to minimum length
+        let mut padded_len: u64 = frame_len;
+        if padded_len < ETH_FRAME_MIN_LEN {
+            padded_len = ETH_FRAME_MIN_LEN;
+        };
+        // Append CRC
+        let crc_res: Result(void, EthernetError) = self.crc_accel.append_crc(frame_data, padded_len);
+        if crc_res.is_err() {
+            return Result::Err(crc_res.unwrap_err());
+        };
+        // Copy to TX buffer
+        let buffer_offset: u64 = self.tx_next_buffer * ETH_FRAME_MAX_LEN;
+        if (buffer_offset + padded_len) > (ETH_FRAME_MAX_LEN * 16) {
+            return Result::Err(EthernetError::EthBufferOverflow);
+        };
+        loop bound ETH_FRAME_MAX_LEN {
+            if i >= padded_len {
+                break;
+            };
+            self.rx_buffer[buffer_offset + i] = frame_data[i];
+        };
+        // Build DMA descriptor
+        let desc: DmaDescriptor = DmaDescriptor {
+            physical_addr: buffer_offset,
+            length: padded_len as u32,
+            flags: 0x01, // Interrupt on completion
+            generation: self.tx_ring.generation as u16,
+            next_index: 0,
+            status: DmaDescriptorStatus::DescriptorOwned,
+        };
+        // Enqueue to TX ring
+        let enq_res: Result(void, EthernetError) = self.tx_ring.enqueue(desc);
+        if enq_res.is_err() {
+            return Result::Err(enq_res.unwrap_err());
+        };
+        // Notify NIC of new TX descriptor
+        self.regs.write32(0x210, self.tx_ring.head_index as u32);
+        self.tx_next_buffer = (self.tx_next_buffer + 1) % 16;
+        // Record statistics
+        self.statistics.record_tx(padded_len);
+
+        residual emit {
+            op: "nic.send",
+            timestamp: timestamp,
+            frame_len: padded_len,
+            tx_ring_used: self.tx_ring.used_entries(),
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn recv_frame(
+        self: ref mut,
+        frame_data: ref mut Array(u8, ETH_FRAME_MAX_LEN),
+        frame_len: ref mut u64,
+        timestamp: u64,
+    ) -> Result(void, EthernetError)
+        effect [deterministic, memory:mmio, machine:ioport]
+        court "nic_recv_frame:v1"
+    {
+        if !self.capability.can_receive {
+            return Result::Err(EthernetError::EthCapabilityError);
+        };
+        if !self.initialized {
+            return Result::Err(EthernetError::EthNidNotReady);
+        };
+        if self.rx_ring.is_empty() {
+            return Result::Err(EthernetError::EthRingEmpty);
+        };
+        // Dequeue descriptor
+        let desc_res: Result(DmaDescriptor, EthernetError) = self.rx_ring.dequeue();
+        if desc_res.is_err() {
+            return Result::Err(desc_res.unwrap_err());
+        };
+        let desc: DmaDescriptor = desc_res.unwrap();
+        if desc.status == DmaDescriptorStatus::DescriptorError {
+            self.statistics.record_rx_error();
+            return Result::Err(EthernetError::EthDescriptorCorrupt);
+        };
+        // Copy frame from RX buffer
+        let buffer_offset: u64 = desc.physical_addr;
+        let pkt_len: u64 = desc.length as u64;
+        if pkt_len > ETH_FRAME_MAX_LEN {
+            self.statistics.record_rx_error();
+            return Result::Err(EthernetError::EthTruncatedPacket);
+        };
+        loop bound ETH_FRAME_MAX_LEN {
+            if i >= pkt_len {
+                break;
+            };
+            frame_data[i] = self.rx_buffer[buffer_offset + i];
+        };
+        *frame_len = pkt_len;
+        // Verify CRC
+        let crc_ok: bool = self.crc_accel.verify(frame_data, pkt_len);
+        if !crc_ok {
+            self.statistics.record_crc_error();
+            return Result::Err(EthernetError::EthCrcMismatch);
+        };
+        // Record statistics
+        self.statistics.record_rx(pkt_len);
+
+        residual emit {
+            op: "nic.recv",
+            timestamp: timestamp,
+            frame_len: pkt_len,
+            rx_ring_used: self.rx_ring.used_entries(),
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn poll_link_status(self: ref mut) -> NicLinkStatus
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let link_reg: u32 = self.regs.read32(0x010);
+        if (link_reg & 0x01) != 0 {
+            let old: NicLinkStatus = self.status;
+            self.status = NicLinkStatus::LinkUp;
+            if old != NicLinkStatus::LinkUp {
+                self.statistics.record_link_up();
+                self.speed_mb = ((link_reg >> 8) & 0xFF) as u64;
+                self.duplex = if (link_reg & 0x100) != 0 {
+                    NicDuplexMode::FullDuplex
+                } else {
+                    NicDuplexMode::HalfDuplex
+                };
+            };
+        } else {
+            let old: NicLinkStatus = self.status;
+            self.status = NicLinkStatus::LinkDown;
+            if old != NicLinkStatus::LinkDown {
+                self.statistics.record_link_down();
+            };
+        };
+        return self.status;
+    }
+
+    fn set_power_state(self: ref mut, state: NicPowerState)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        let old: NicPowerState = self.power_state;
+        self.power_state = state;
+        self.regs.write32(0x030, state as u32);
+
+        residual emit {
+            op: "nic.power_state",
+            old_state: old as u64,
+            new_state: state as u64,
+        };
+    }
+
+    fn update_mac_address(self: ref mut, new_mac: MacAddress)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        self.config.mac_address = new_mac;
+        loop bound ETH_ADDR_LEN {
+            self.regs.write8(0x100 + i, new_mac.octets[i]);
+        };
+        self.generation = self.generation + 1;
+    }
+
+    fn set_promiscuous(self: ref mut, enabled: bool)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        self.config.promiscuous = enabled;
+        if enabled {
+            self.regs.or32(0x600, 0x01);
+        } else {
+            let mask: u32 = !0x01u32;
+            self.regs.and32(0x600, mask);
+        };
+    }
+
+    fn register_interrupt_handler(self: ref mut, handler: Handle)
+        effect [deterministic]
+    {
+        self.interrupt_handler = Option::Some(handler);
+    }
+
+    fn handle_interrupt(self: ref mut, timestamp: u64) -> Result(void, EthernetError)
+        effect [deterministic, memory:mmio, machine:ioport]
+    {
+        self.statistics.interrupts = self.statistics.interrupts + 1;
+        let status_reg: u32 = self.regs.read32(0x020);
+        // Handle TX completion interrupt
+        if (status_reg & 0x01) != 0 {
+            self.regs.write32(0x020, 0x01); // Clear TX interrupt
+            // Process completed TX descriptors
+            loop bound ETH_MAX_DESCRIPTORS {
+                if self.tx_ring.is_empty() {
+                    break;
+                };
+                let peek_res: Result(DmaDescriptor, EthernetError) = self.tx_ring.peek();
+                if peek_res.is_err() {
+                    break;
+                };
+                let desc: DmaDescriptor = peek_res.unwrap();
+                if desc.status != DmaDescriptorStatus::DescriptorComplete {
+                    break;
+                };
+                self.tx_ring.dequeue();
+            };
+        };
+        // Handle RX completion interrupt
+        if (status_reg & 0x02) != 0 {
+            self.regs.write32(0x020, 0x02); // Clear RX interrupt
+        };
+        // Handle link status change
+        if (status_reg & 0x04) != 0 {
+            self.regs.write32(0x020, 0x04); // Clear link change interrupt
+            self.poll_link_status();
+        };
+        // Handle error interrupt
+        if (status_reg & 0x08) != 0 {
+            self.regs.write32(0x020, 0x08); // Clear error interrupt
+            self.statistics.record_tx_error();
+        };
+
+        residual emit {
+            op: "nic.interrupt",
+            timestamp: timestamp,
+            status: status_reg,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn reset(self: ref mut, timestamp: u64) -> Result(void, EthernetError)
+        effect [deterministic, memory:mmio, machine:ioport]
+        court "nic_reset:v1"
+    {
+        self.regs.write32(0x000, 1);
+        self.reset_wait();
+        self.rx_ring.reset();
+        self.tx_ring.reset();
+        self.statistics.reset_count = self.statistics.reset_count + 1;
+        self.generation = self.generation + 1;
+
+        residual emit {
+            op: "nic.reset",
+            timestamp: timestamp,
+            generation: self.generation,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn get_stats(self) -> NicStatistics
+        effect [deterministic]
+    {
+        return self.statistics;
+    }
+
+    fn is_initialized(self) -> bool
+        effect [deterministic]
+    {
+        return self.initialized;
+    }
+
+    fn link_status(self) -> NicLinkStatus
+        effect [deterministic]
+    {
+        return self.status;
+    }
+
+    fn current_config(self) -> NicConfig
+        effect [deterministic]
+    {
+        return self.config;
+    }
+
+    fn device_identity(self) -> Identity
+        effect [deterministic]
+    {
+        return self.identity;
+    }
+
+    fn mac_address(self) -> MacAddress
+        effect [deterministic]
+    {
+        return self.config.mac_address;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Ethernet Frame: Complete frame representation
+// ─────────────────────────────────────────────────────────────
+
+struct EthernetFrame {
+    header: EthernetHeader,
+    payload: Array(u8, ETH_FRAME_MAX_LEN),
+    payload_length: u64,
+    crc: u32,
+    generation: u64,
+}
+
+impl EthernetFrame {
+    fn new(
+        dst: MacAddress,
+        src: MacAddress,
+        etype: u16,
+        payload_data: Array(u8, ETH_FRAME_MAX_LEN),
+        payload_len: u64,
+    ) -> EthernetFrame
+        effect [deterministic]
+    {
+        return EthernetFrame {
+            header: EthernetHeader::new(dst, src, etype),
+            payload: payload_data,
+            payload_length: payload_len,
+            crc: 0,
+            generation: ETH_INITIAL_GEN,
+        };
+    }
+
+    fn parse(raw: Array(u8, ETH_FRAME_MAX_LEN), len: u64) -> Result(EthernetFrame, EthernetError)
+        effect [deterministic]
+        court "eth_frame_parse:v1"
+    {
+        if len < ETH_HEADER_LEN {
+            return Result::Err(EthernetError::EthInvalidFrame);
+        };
+        if len > ETH_FRAME_MAX_LEN {
+            return Result::Err(EthernetError::EthJumboFrame);
+        };
+        let header_res: Result(EthernetHeader, EthernetError) = EthernetHeader::parse(raw, len);
+        if header_res.is_err() {
+            return Result::Err(header_res.unwrap_err());
+        };
+        let header: EthernetHeader = header_res.unwrap();
+        let hdr_len: u64 = header.header_length();
+        let payload_len: u64 = len - hdr_len - ETH_CRC_LEN;
+        let mut payload: Array(u8, ETH_FRAME_MAX_LEN) = Array::zeroed();
+        loop bound ETH_FRAME_MAX_LEN {
+            if i >= payload_len {
+                break;
+            };
+            payload[i] = raw[hdr_len + i];
+        };
+        let crc_raw: u32 = ((raw[len - 4] as u32)) |
+                           ((raw[len - 3] as u32) << 8) |
+                           ((raw[len - 2] as u32) << 16) |
+                           ((raw[len - 1] as u32) << 24);
+        return Result::Ok(EthernetFrame {
+            header: header,
+            payload: payload,
+            payload_length: payload_len,
+            crc: crc_raw,
+            generation: ETH_INITIAL_GEN,
+        });
+    }
+
+    fn serialize(self, crc_accel: Crc32) -> Result(Array(u8, ETH_FRAME_MAX_LEN), EthernetError)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, ETH_FRAME_MAX_LEN) = Array::zeroed();
+        let hdr_len_res: Result(u64, EthernetError) = self.header.serialize(buf);
+        if hdr_len_res.is_err() {
+            return Result::Err(hdr_len_res.unwrap_err());
+        };
+        let hdr_len: u64 = hdr_len_res.unwrap();
+        let mut total_len: u64 = hdr_len + self.payload_length;
+        // Copy payload
+        loop bound ETH_FRAME_MAX_LEN {
+            if i >= self.payload_length {
+                break;
+            };
+            buf[hdr_len + i] = self.payload[i];
+        };
+        // Pad to minimum frame size
+        if total_len < ETH_FRAME_MIN_LEN {
+            loop bound ETH_FRAME_MAX_LEN {
+                let idx: u64 = total_len;
+                if idx >= ETH_FRAME_MIN_LEN {
+                    break;
+                };
+                buf[idx] = 0;
+                total_len = total_len + 1;
+            };
+        };
+        // Append CRC
+        let crc_res: Result(void, EthernetError) = crc_accel.append_crc(buf, total_len);
+        if crc_res.is_err() {
+            return Result::Err(crc_res.unwrap_err());
+        };
+        return Result::Ok(buf);
+    }
+
+    fn validate(self, crc_accel: Crc32) -> bool
+        effect [deterministic]
+    {
+        let ser_res: Result(Array(u8, ETH_FRAME_MAX_LEN), EthernetError) = self.serialize(crc_accel);
+        if ser_res.is_err() {
+            return false;
+        };
+        let buf: Array(u8, ETH_FRAME_MAX_LEN) = ser_res.unwrap();
+        let total_len: u64 = self.header.header_length() + self.payload_length;
+        let frame_len: u64 = if total_len < ETH_FRAME_MIN_LEN {
+            ETH_FRAME_MIN_LEN + ETH_CRC_LEN
+        } else {
+            total_len + ETH_CRC_LEN
+        };
+        return crc_accel.verify(buf, frame_len);
+    }
+
+    fn frame_type(self) -> u16
+        effect [deterministic]
+    {
+        return self.header.ether_type;
+    }
+
+    fn destination_mac(self) -> MacAddress
+        effect [deterministic]
+    {
+        return self.header.destination;
+    }
+
+    fn source_mac(self) -> MacAddress
+        effect [deterministic]
+    {
+        return self.header.source;
+    }
+
+    fn payload_slice(self) -> (Array(u8, ETH_FRAME_MAX_LEN), u64)
+        effect [deterministic]
+    {
+        return (self.payload, self.payload_length);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// NIC Registry
+// ─────────────────────────────────────────────────────────────
+
+const MAX_NICS: u64 = 16;
+
+type NicRegistrationEntry = struct {
+    nic: Option(NicInterface),
+    name: Array(u8, 64),
+    name_len: u64,
+    pci_bus: u16,
+    pci_device: u16,
+    pci_function: u16,
+    irq_line: u8,
+    registered: bool,
+    registration_timestamp: u64,
+    generation: u64,
+}
+
+impl NicRegistrationEntry {
+    fn empty() -> NicRegistrationEntry
+        effect [deterministic]
+    {
+        return NicRegistrationEntry {
+            nic: Option::None,
+            name: Array::zeroed(),
+            name_len: 0,
+            pci_bus: 0,
+            pci_device: 0,
+            pci_function: 0,
+            irq_line: 0,
+            registered: false,
+            registration_timestamp: 0,
+            generation: 0,
+        };
+    }
+}
+
+struct NicRegistry {
+    entries: Array(NicRegistrationEntry, MAX_NICS),
+    entry_count: u64,
+    next_generation: u64,
+}
+
+impl NicRegistry {
+    fn new() -> NicRegistry
+        effect [deterministic]
+    {
+        return NicRegistry {
+            entries: Array::zeroed(),
+            entry_count: 0,
+            next_generation: ETH_INITIAL_GEN,
+        };
+    }
+
+    fn register(
+        self: ref mut,
+        nic: NicInterface,
+        name: Array(u8, 64),
+        name_len: u64,
+        pci_bus: u16,
+        pci_device: u16,
+        pci_function: u16,
+        irq_line: u8,
+        timestamp: u64,
+    ) -> Result(u64, EthernetError)
+        effect [deterministic]
+    {
+        if self.entry_count >= MAX_NICS {
+            return Result::Err(EthernetError::EthRingFull);
+        };
+        let idx: u64 = self.entry_count;
+        self.entries[idx] = NicRegistrationEntry {
+            nic: Option::Some(nic),
+            name: name,
+            name_len: name_len,
+            pci_bus: pci_bus,
+            pci_device: pci_device,
+            pci_function: pci_function,
+            irq_line: irq_line,
+            registered: true,
+            registration_timestamp: timestamp,
+            generation: self.next_generation,
+        };
+        self.entry_count = self.entry_count + 1;
+        let gen: u64 = self.next_generation;
+        self.next_generation = self.next_generation + 1;
+
+        residual emit {
+            op: "nic_registry.register",
+            index: idx,
+            timestamp: timestamp,
+            name: name,
+            generation: gen,
+        };
+
+        return Result::Ok(idx);
+    }
+
+    fn unregister(self: ref mut, index: u64) -> Result(void, EthernetError)
+        effect [deterministic]
+    {
+        if index >= self.entry_count {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        self.entries[index] = NicRegistrationEntry::empty();
+        // Compact if last entry
+        if index == self.entry_count - 1 {
+            self.entry_count = self.entry_count - 1;
+        };
+
+        residual emit {
+            op: "nic_registry.unregister",
+            index: index,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn get(self, index: u64) -> Result(ref NicInterface, EthernetError)
+        effect [deterministic]
+    {
+        if index >= self.entry_count {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        if !self.entries[index].registered {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        if self.entries[index].nic.is_none() {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        let nic: ref NicInterface = self.entries[index].nic.as_ref().unwrap();
+        return Result::Ok(nic);
+    }
+
+    fn get_mut(self: ref mut, index: u64) -> Result(ref mut NicInterface, EthernetError)
+        effect [deterministic]
+    {
+        if index >= self.entry_count {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        if !self.entries[index].registered {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        if self.entries[index].nic.is_none() {
+            return Result::Err(EthernetError::EthNidNotFound);
+        };
+        let nic: ref mut NicInterface = self.entries[index].nic.as_mut().unwrap();
+        return Result::Ok(nic);
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+
+    fn find_by_name(self, name: Array(u8, 64), name_len: u64) -> Result(u64, EthernetError)
+        effect [deterministic]
+    {
+        loop bound MAX_NICS {
+            if i >= self.entry_count {
+                break;
+            };
+            if !self.entries[i].registered {
+                continue;
+            };
+            if self.entries[i].name_len != name_len {
+                continue;
+            };
+            let mut match_found: bool = true;
+            loop bound 64 {
+                if j >= name_len {
+                    break;
+                };
+                if self.entries[i].name[j] != name[j] {
+                    match_found = false;
+                    break;
+                };
+            };
+            if match_found {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(EthernetError::EthNidNotFound);
+    }
+
+    fn find_by_mac(self, mac: MacAddress) -> Result(u64, EthernetError)
+        effect [deterministic]
+    {
+        loop bound MAX_NICS {
+            if i >= self.entry_count {
+                break;
+            };
+            if !self.entries[i].registered {
+                continue;
+            };
+            let nic: ref NicInterface = self.entries[i].nic.as_ref().unwrap();
+            if nic.mac_address().eq(mac) {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(EthernetError::EthNidNotFound);
+    }
+
+    fn for_each(self, callback: fn(u64, ref NicRegistrationEntry) -> void effect [deterministic])
+        effect [deterministic]
+    {
+        loop bound MAX_NICS {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].registered {
+                callback(i, self.entries[i]);
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization and Helper Functions
+// ─────────────────────────────────────────────────────────────
+
+fn eth_init() -> Result(void, EthernetError)
+    effect [deterministic]
+    court "eth_init:v1"
+{
+    residual emit {
+        op: "ethernet.init",
+        status: "ready",
+    };
+    return Result::Ok(void);
+}
+
+fn eth_min_frame_size() -> u64
+    effect [deterministic]
+{
+    return ETH_FRAME_MIN_LEN;
+}
+
+fn eth_max_frame_size() -> u64
+    effect [deterministic]
+{
+    return ETH_FRAME_MAX_LEN;
+}
+
+fn eth_header_overhead() -> u64
+    effect [deterministic]
+{
+    return ETH_HEADER_LEN + ETH_CRC_LEN;
+}
+
+fn eth_is_valid_ethertype(etype: u16) -> bool
+    effect [deterministic]
+{
+    // Values 0x0600 and above are EtherType; below are length
+    return etype >= 0x0600;
+}
+
+fn eth_is_broadcast_addr(addr: Array(u8, ETH_ADDR_LEN)) -> bool
+    effect [deterministic]
+{
+    loop bound ETH_ADDR_LEN {
+        if addr[i] != 0xFF {
+            return false;
+        };
+    };
+    return true;
+}
+
+fn eth_is_multicast_addr(addr: Array(u8, ETH_ADDR_LEN)) -> bool
+    effect [deterministic]
+{
+    return (addr[0] & 0x01) != 0;
+}
+
+fn eth_compute_padding(payload_len: u64) -> u64
+    effect [deterministic]
+{
+    let total: u64 = ETH_HEADER_LEN + payload_len + ETH_CRC_LEN;
+    if total < ETH_FRAME_MIN_LEN {
+        return ETH_FRAME_MIN_LEN - total;
+    } else {
+        return 0;
+    };
+}

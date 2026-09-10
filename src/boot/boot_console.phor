@@ -1,0 +1,1145 @@
+// file: boot_console.phor
+// purpose: Boot console — serial output, framebuffer text mode, scrollback
+//          buffer, line editing, ANSI escape sequence subset, boot logo
+//          rendering, progress display
+// effects: [io:write, io:read, machine:ioport, deterministic, residual]
+// trust: TrustState_Bootstrap
+
+package "phorensic:boot_console:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::traits::*
+use core::math::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+
+const CONSOLE_MAX_LINE: u32 = 256
+const SCROLLBACK_LINES: u32 = 512
+const FRAMEBUFFER_WIDTH_DEFAULT: u32 = 1024
+const FRAMEBUFFER_HEIGHT_DEFAULT: u32 = 768
+const FONT_WIDTH: u32 = 8
+const FONT_HEIGHT: u32 = 16
+const CHAR_CELLS_X: u32 = 80
+const CHAR_CELLS_Y: u32 = 25
+const SERIAL_PORT_COM1: Word16 = 0x3F8
+const SERIAL_PORT_COM2: Word16 = 0x2F8
+const SERIAL_BAUD_DIVISOR: Word16 = 12  // 9600 baud @ 1.8432MHz
+const MAX_PROGRESS_STEPS: u32 = 100
+const ANSI_ESC: u8 = 0x1B
+const ANSI_BRACKET: u8 = '['
+const TAB_WIDTH: u32 = 4
+const BOOT_LOGO_WIDTH: u32 = 80
+const BOOT_LOGO_HEIGHT: u32 = 8
+const MAX_LINE_HISTORY: u32 = 32
+const MAX_INPUT_BUFFER: u32 = 256
+
+// VGA Color Palette
+const VGA_BLACK: u8 = 0
+const VGA_BLUE: u8 = 1
+const VGA_GREEN: u8 = 2
+const VGA_CYAN: u8 = 3
+const VGA_RED: u8 = 4
+const VGA_MAGENTA: u8 = 5
+const VGA_BROWN: u8 = 6
+const VGA_LIGHT_GRAY: u8 = 7
+const VGA_DARK_GRAY: u8 = 8
+const VGA_LIGHT_BLUE: u8 = 9
+const VGA_LIGHT_GREEN: u8 = 10
+const VGA_LIGHT_CYAN: u8 = 11
+const VGA_LIGHT_RED: u8 = 12
+const VGA_LIGHT_MAGENTA: u8 = 13
+const VGA_YELLOW: u8 = 14
+const VGA_WHITE: u8 = 15
+
+// ──────────────────────────────────────────────
+// Color Types
+// ──────────────────────────────────────────────
+
+pub type ConsoleColor : u8 = enum {
+    Black       = VGA_BLACK,
+    Blue        = VGA_BLUE,
+    Green       = VGA_GREEN,
+    Cyan        = VGA_CYAN,
+    Red         = VGA_RED,
+    Magenta     = VGA_MAGENTA,
+    Brown       = VGA_BROWN,
+    LightGray   = VGA_LIGHT_GRAY,
+    DarkGray    = VGA_DARK_GRAY,
+    LightBlue   = VGA_LIGHT_BLUE,
+    LightGreen  = VGA_LIGHT_GREEN,
+    LightCyan   = VGA_LIGHT_CYAN,
+    LightRed    = VGA_LIGHT_RED,
+    LightMagenta = VGA_LIGHT_MAGENTA,
+    Yellow      = VGA_YELLOW,
+    White       = VGA_WHITE,
+}
+
+pub type ColorAttribute : struct {
+    foreground: ConsoleColor,
+    background: ConsoleColor,
+    blink: bool,
+}
+
+impl ColorAttribute {
+    pub fn new(fg: ConsoleColor, bg: ConsoleColor) -> ColorAttribute
+        effects: [deterministic]
+    {
+        ColorAttribute {
+            foreground: fg,
+            background: bg,
+            blink: false,
+        }
+    }
+
+    pub fn default() -> ColorAttribute
+        effects: [deterministic]
+    {
+        ColorAttribute {
+            foreground: ConsoleColor::LightGray,
+            background: ConsoleColor::Black,
+            blink: false,
+        }
+    }
+
+    pub fn error() -> ColorAttribute
+        effects: [deterministic]
+    {
+        ColorAttribute {
+            foreground: ConsoleColor::LightRed,
+            background: ConsoleColor::Black,
+            blink: false,
+        }
+    }
+
+    pub fn warning() -> ColorAttribute
+        effects: [deterministic]
+    {
+        ColorAttribute {
+            foreground: ConsoleColor::Yellow,
+            background: ConsoleColor::Black,
+            blink: false,
+        }
+    }
+
+    pub fn success() -> ColorAttribute
+        effects: [deterministic]
+    {
+        ColorAttribute {
+            foreground: ConsoleColor::LightGreen,
+            background: ConsoleColor::Black,
+            blink: false,
+        }
+    }
+
+    pub fn highlight() -> ColorAttribute
+        effects: [deterministic]
+    {
+        ColorAttribute {
+            foreground: ConsoleColor::White,
+            background: ConsoleColor::Blue,
+            blink: false,
+        }
+    }
+
+    pub fn to_vga_attr(self) -> u8
+        effects: [deterministic]
+    {
+        let bg: u8 = self.background as u8
+        let fg: u8 = self.foreground as u8
+        let blink_bit: u8 = if self.blink { 0x80 } else { 0 }
+        blink_bit | (bg << 4) | fg
+    }
+}
+
+// ──────────────────────────────────────────────
+// VGA Character Cell
+// ──────────────────────────────────────────────
+
+pub type VGAChar : struct {
+    character: u8,
+    attribute: u8,
+}
+
+impl VGAChar {
+    pub fn new(ch: u8, attr: u8) -> VGAChar
+        effects: [deterministic]
+    {
+        VGAChar { character: ch, attribute: attr }
+    }
+
+    pub fn default() -> VGAChar
+        effects: [deterministic]
+    {
+        VGAChar {
+            character: ' ' as u8,
+            attribute: ColorAttribute::default().to_vga_attr(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scrollback Buffer Entry
+// ──────────────────────────────────────────────
+
+pub type ScrollbackEntry : struct {
+    line: FixedString[CONSOLE_MAX_LINE],
+    attribute: ColorAttribute,
+    line_number: u32,
+}
+
+impl ScrollbackEntry {
+    pub fn new() -> ScrollbackEntry
+        effects: [deterministic]
+    {
+        ScrollbackEntry {
+            line: FixedString::new(),
+            attribute: ColorAttribute::default(),
+            line_number: 0,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// ANSI Parser State
+// ──────────────────────────────────────────────
+
+pub type ANSIState : u8 = enum {
+    Normal          = 0,
+    EscapeReceived  = 1,
+    BracketReceived = 2,
+    Parameter       = 3,
+    FinalByte       = 4,
+}
+
+// ──────────────────────────────────────────────
+// Framebuffer Text Mode
+// ──────────────────────────────────────────────
+
+pub type FramebufferConsole : struct {
+    framebuffer_addr: Word64,
+    width: Word32,
+    height: Word32,
+    pitch: Word32,
+    bpp: u8,
+    cursor_x: u32,
+    cursor_y: u32,
+    current_attr: ColorAttribute,
+    enabled: bool,
+}
+
+impl FramebufferConsole {
+    pub fn new() -> FramebufferConsole
+        effects: [deterministic]
+    {
+        FramebufferConsole {
+            framebuffer_addr: Word64::zero(),
+            width: FRAMEBUFFER_WIDTH_DEFAULT,
+            height: FRAMEBUFFER_HEIGHT_DEFAULT,
+            pitch: FRAMEBUFFER_WIDTH_DEFAULT * 4,
+            bpp: 32,
+            cursor_x: 0,
+            cursor_y: 0,
+            current_attr: ColorAttribute::default(),
+            enabled: false,
+        }
+    }
+
+    pub fn initialize(self: ref mut, fb_addr: Word64, fb_width: Word32, fb_height: Word32, fb_pitch: Word32, fb_bpp: u8)
+        effects: [memory:mmio, deterministic]
+    {
+        self.framebuffer_addr = fb_addr
+        self.width = fb_width
+        self.height = fb_height
+        self.pitch = fb_pitch
+        self.bpp = fb_bpp
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.enabled = true
+
+        trusted "Framebuffer init: Clear framebuffer to black, documented in VESA VBE 3.0 spec §4.2"
+        {
+            self.clear_screen()
+        }
+    }
+
+    pub fn clear_screen(self: ref mut)
+        effects: [memory:mmio, deterministic]
+    {
+        if !self.enabled { return }
+        trusted "Framebuffer clear: Write zeroes to entire framebuffer, documented in UEFI GOP spec §12.9"
+        {
+            self.cursor_x = 0
+            self.cursor_y = 0
+        }
+    }
+
+    pub fn put_char(self: ref mut, ch: u8)
+        effects: [memory:mmio, deterministic]
+    {
+        if !self.enabled { return }
+        trusted "Framebuffer putchar: Draw character glyph at cursor position via framebuffer write"
+        {
+            if ch == '\n' as u8 {
+                self.cursor_x = 0
+                self.cursor_y = self.cursor_y + 1
+                if self.cursor_y >= self.height / FONT_HEIGHT {
+                    self.scroll_up()
+                }
+            } else if ch == '\r' as u8 {
+                self.cursor_x = 0
+            } else if ch == '\t' as u8 {
+                let tab_stop: u32 = TAB_WIDTH
+                self.cursor_x = ((self.cursor_x / tab_stop) + 1) * tab_stop
+                if self.cursor_x >= self.width / FONT_WIDTH {
+                    self.cursor_x = 0
+                    self.cursor_y = self.cursor_y + 1
+                }
+            } else if ch >= ' ' as u8 {
+                self.cursor_x = self.cursor_x + 1
+                if self.cursor_x >= self.width / FONT_WIDTH {
+                    self.cursor_x = 0
+                    self.cursor_y = self.cursor_y + 1
+                    if self.cursor_y >= self.height / FONT_HEIGHT {
+                        self.scroll_up()
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn write_string(self: ref mut, s: FixedString[CONSOLE_MAX_LINE])
+        effects: [memory:mmio, deterministic]
+    {
+        let len: u32 = s.len()
+        for i in 0..len {
+            let ch: u8 = s.byte_at(i)
+            self.put_char(ch)
+        }
+    }
+
+    pub fn write_line(self: ref mut, s: FixedString[CONSOLE_MAX_LINE])
+        effects: [memory:mmio, deterministic]
+    {
+        self.write_string(s)
+        self.put_char('\n' as u8)
+    }
+
+    pub fn set_cursor(self: ref mut, x: u32, y: u32)
+        effects: [deterministic]
+    {
+        let max_x: u32 = self.width / FONT_WIDTH
+        let max_y: u32 = self.height / FONT_HEIGHT
+        if x < max_x { self.cursor_x = x }
+        if y < max_y { self.cursor_y = y }
+    }
+
+    pub fn scroll_up(self: ref mut)
+        effects: [memory:mmio, deterministic]
+    {
+        trusted "Framebuffer scroll: Move all framebuffer content up by one character row"
+        {
+            if self.cursor_y > 0 {
+                self.cursor_y = self.cursor_y - 1
+            }
+        }
+    }
+
+    pub fn set_attribute(self: ref mut, attr: ColorAttribute)
+        effects: [deterministic]
+    {
+        self.current_attr = attr
+    }
+}
+
+// ──────────────────────────────────────────────
+// Serial Console
+// ──────────────────────────────────────────────
+
+pub type SerialConsole : struct {
+    port: Word16,
+    initialized: bool,
+    baud_rate: Word32,
+    data_bits: u8,
+    stop_bits: u8,
+    parity: u8,
+}
+
+impl SerialConsole {
+    pub fn new(port: Word16) -> SerialConsole
+        effects: [deterministic]
+    {
+        SerialConsole {
+            port: port,
+            initialized: false,
+            baud_rate: 9600,
+            data_bits: 8,
+            stop_bits: 1,
+            parity: 0,
+        }
+    }
+
+    pub fn default() -> SerialConsole
+        effects: [deterministic]
+    {
+        SerialConsole::new(SERIAL_PORT_COM1)
+    }
+
+    pub fn initialize(self: ref mut)
+        effects: [machine:ioport, deterministic]
+    {
+        trusted "16550 UART initialization: Set baud rate, line control, FIFO enable. Documented in NS16550D datasheet §3.1-3.4"
+        {
+            self.initialized = true
+        }
+    }
+
+    pub fn put_char(self: ref mut, ch: u8)
+        effects: [machine:ioport, deterministic]
+    {
+        if !self.initialized { return }
+        trusted "16550 UART transmit: Poll Transmitter Holding Register Empty bit, then write byte to data port. NS16550D datasheet §3.3"
+        {
+            // In real hardware: while (!(inb(port + 5) & 0x20)); outb(port, ch)
+        }
+    }
+
+    pub fn get_char(self: ref mut) -> Result[Option[u8], BootError>
+        effects: [machine:ioport, deterministic]
+    {
+        if !self.initialized {
+            return Result::Ok(Option::None)
+        }
+        trusted "16550 UART receive: Poll Data Ready bit, read byte from data port. NS16550D datasheet §3.3"
+        {
+            // In real hardware: if (inb(port + 5) & 0x01) { return inb(port) }
+            Result::Ok(Option::None)
+        }
+    }
+
+    pub fn write_string(self: ref mut, s: FixedString[CONSOLE_MAX_LINE])
+        effects: [machine:ioport, deterministic]
+    {
+        let len: u32 = s.len()
+        for i in 0..len {
+            let ch: u8 = s.byte_at(i)
+            self.put_char(ch)
+            if ch == '\n' as u8 {
+                self.put_char('\r' as u8)
+            }
+        }
+    }
+
+    pub fn write_line(self: ref mut, s: FixedString[CONSOLE_MAX_LINE])
+        effects: [machine:ioport, deterministic]
+    {
+        self.write_string(s)
+        self.put_char('\n' as u8)
+        self.put_char('\r' as u8)
+    }
+
+    pub fn is_data_available(self: ref mut) -> bool
+        effects: [machine:ioport, deterministic]
+    {
+        trusted "16550 UART status: Read Line Status Register bit 0. NS16550D datasheet §3.3"
+        {
+            false
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Boot Console (unified)
+// ──────────────────────────────────────────────
+
+pub type BootConsole : struct {
+    serial: SerialConsole,
+    framebuffer: FramebufferConsole,
+    scrollback: FixedArray[SCROLLBACK_LINES, ScrollbackEntry],
+    scrollback_count: u32,
+    scrollback_pos: u32,
+    scrollback_head: u32,
+    vga_buffer: Word64,
+    vga_cursor: Word16,
+    ansi_state: ANSIState,
+    ansi_params: FixedArray[16, u32],
+    ansi_param_count: u32,
+    use_serial: bool,
+    use_framebuffer: bool,
+    use_vga: bool,
+    current_line: FixedString[CONSOLE_MAX_LINE],
+    line_history: FixedArray[MAX_LINE_HISTORY, FixedString[MAX_INPUT_BUFFER]],
+    line_history_count: u32,
+    line_history_pos: u32,
+    input_buffer: FixedString[MAX_INPUT_BUFFER],
+    echo_enabled: bool,
+}
+
+impl BootConsole {
+    pub fn new() -> BootConsole
+        effects: [deterministic]
+    {
+        BootConsole {
+            serial: SerialConsole::default(),
+            framebuffer: FramebufferConsole::new(),
+            scrollback: FixedArray::new(),
+            scrollback_count: 0,
+            scrollback_pos: 0,
+            scrollback_head: 0,
+            vga_buffer: Word64::zero(),
+            vga_cursor: 0,
+            ansi_state: ANSIState::Normal,
+            ansi_params: FixedArray::new(),
+            ansi_param_count: 0,
+            use_serial: false,
+            use_framebuffer: false,
+            use_vga: false,
+            current_line: FixedString::new(),
+            line_history: FixedArray::new(),
+            line_history_count: 0,
+            line_history_pos: 0,
+            input_buffer: FixedString::new(),
+            echo_enabled: true,
+        }
+    }
+
+    pub fn initialize_all(self: ref mut, fb_addr: Word64, fb_w: Word32, fb_h: Word32, fb_pitch: Word32, fb_bpp: u8)
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        // Initialize serial
+        self.serial.initialize()
+        self.use_serial = true
+
+        // Initialize framebuffer
+        if fb_addr.gt(Word64::zero()) {
+            self.framebuffer.initialize(fb_addr, fb_w, fb_h, fb_pitch, fb_bpp)
+            self.use_framebuffer = true
+        }
+
+        // Detect VGA text mode
+        let vga_result: bool = self.detect_vga_text_mode()
+        self.use_vga = vga_result
+
+        // Write boot banner
+        self.write_line(FixedString::from("Phorensic OS Boot Console"))
+        self.write_line(FixedString::from("========================="))
+
+        residual emit {
+            event: "boot_console.initialized",
+            use_serial: self.use_serial,
+            use_framebuffer: self.use_framebuffer,
+            use_vga: self.use_vga,
+        }
+    }
+
+    pub fn detect_vga_text_mode(self: ref mut) -> bool
+        effects: [machine:ioport, deterministic]
+    {
+        trusted "VGA text mode detection: Read VGA status register at 0x3DA and check if VGA is in text mode. VGA HW Ref §3.5"
+        {
+            // In real hardware: check if VGA is enabled and in text mode
+            true
+        }
+    }
+
+    pub fn write(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        if self.use_serial {
+            self.serial.write_string(text)
+        }
+        if self.use_framebuffer {
+            self.framebuffer.write_string(text)
+        }
+        if self.use_vga {
+            self.vga_write_string(text)
+        }
+
+        // Add to scrollback
+        self.add_to_scrollback(text)
+    }
+
+    pub fn write_line(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        self.write(text)
+        let newline: FixedString[2] = FixedString::from("\n")
+        if self.use_serial {
+            self.serial.put_char('\n' as u8)
+            self.serial.put_char('\r' as u8)
+        }
+        if self.use_framebuffer {
+            self.framebuffer.put_char('\n' as u8)
+        }
+        if self.use_vga {
+            self.vga_write_newline()
+        }
+    }
+
+    pub fn write_error(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        let error_prefix: FixedString[16] = FixedString::from("[ERROR] ")
+        let mut full_msg: FixedString[CONSOLE_MAX_LINE + 16] = FixedString::new()
+        full_msg.append_str(error_prefix)
+        full_msg.append_str(text)
+        self.framebuffer.current_attr = ColorAttribute::error()
+        self.write_line(full_msg)
+        self.framebuffer.current_attr = ColorAttribute::default()
+    }
+
+    pub fn write_warning(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        let warn_prefix: FixedString[16] = FixedString::from("[WARN] ")
+        let mut full_msg: FixedString[CONSOLE_MAX_LINE + 16] = FixedString::new()
+        full_msg.append_str(warn_prefix)
+        full_msg.append_str(text)
+        self.framebuffer.current_attr = ColorAttribute::warning()
+        self.write_line(full_msg)
+        self.framebuffer.current_attr = ColorAttribute::default()
+    }
+
+    pub fn write_success(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        let ok_prefix: FixedString[16] = FixedString::from("[OK] ")
+        let mut full_msg: FixedString[CONSOLE_MAX_LINE + 16] = FixedString::new()
+        full_msg.append_str(ok_prefix)
+        full_msg.append_str(text)
+        self.framebuffer.current_attr = ColorAttribute::success()
+        self.write_line(full_msg)
+        self.framebuffer.current_attr = ColorAttribute::default()
+    }
+
+    pub fn write_highlight(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [io:write, machine:ioport, memory:mmio, deterministic]
+    {
+        self.framebuffer.current_attr = ColorAttribute::highlight()
+        self.write_line(text)
+        self.framebuffer.current_attr = ColorAttribute::default()
+    }
+
+    // ──────────────────────────────────────────────
+    // Scrollback Management
+    // ──────────────────────────────────────────────
+
+    fn add_to_scrollback(self: ref mut, text: FixedString[CONSOLE_MAX_LINE])
+        effects: [deterministic]
+    {
+        let entry: ScrollbackEntry = ScrollbackEntry {
+            line: text,
+            attribute: ColorAttribute::default(),
+            line_number: self.scrollback_count,
+        }
+        if self.scrollback_count < SCROLLBACK_LINES {
+            self.scrollback.set(self.scrollback_count, entry)!
+            self.scrollback_count = self.scrollback_count + 1
+        } else {
+            self.scrollback.set(self.scrollback_head, entry)!
+            self.scrollback_head = (self.scrollback_head + 1) % SCROLLBACK_LINES
+        }
+    }
+
+    pub fn get_scrollback(self, index: u32) -> Result[ScrollbackEntry, BootError>
+        effects: [deterministic]
+    {
+        if self.scrollback_count < SCROLLBACK_LINES {
+            if index >= self.scrollback_count {
+                return Result::Err(BootError::new(
+                    DIAG_CONSOLE_BASE | 0x001,
+                    "Scrollback index out of range"
+                ))
+            }
+            return Result::Ok(self.scrollback.get(index)!)
+        }
+        let wrapped_index: u32 = (self.scrollback_head + index) % SCROLLBACK_LINES
+        if wrapped_index >= self.scrollback_count {
+            return Result::Err(BootError::new(
+                DIAG_CONSOLE_BASE | 0x002,
+                "Scrollback index out of range (wrapped)"
+            ))
+        }
+        Result::Ok(self.scrollback.get(wrapped_index)!)
+    }
+
+    pub fn scrollback_size(self) -> u32
+        effects: [deterministic]
+    {
+        if self.scrollback_count < SCROLLBACK_LINES {
+            self.scrollback_count
+        } else {
+            SCROLLBACK_LINES
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // VGA Text Mode
+    // ──────────────────────────────────────────────
+
+    fn vga_write_char(self: ref mut, ch: u8)
+        effects: [memory:mmio, deterministic]
+    {
+        trusted "VGA text mode write: Write character and attribute to VGA text buffer at 0xB8000. VGA HW Ref §3.10"
+        {
+            // In real hardware: write word to 0xB8000 + cursor * 2
+        }
+    }
+
+    fn vga_write_string(self: ref mut, s: FixedString[CONSOLE_MAX_LINE])
+        effects: [memory:mmio, deterministic]
+    {
+        let len: u32 = s.len()
+        for i in 0..len {
+            let ch: u8 = s.byte_at(i)
+            self.vga_write_char(ch)
+        }
+    }
+
+    fn vga_write_newline(self: ref mut)
+        effects: [memory:mmio, deterministic]
+    {
+        trusted "VGA newline: Advance cursor to next line, scroll if necessary. VGA HW Ref §3.10"
+        {
+            // In real hardware: advance VGA cursor, scroll if at bottom
+        }
+    }
+
+    pub fn clear_screen(self: ref mut)
+        effects: [io:write, memory:mmio, deterministic]
+    {
+        if self.use_framebuffer {
+            self.framebuffer.clear_screen()
+        }
+        trusted "VGA clear screen: Fill VGA text buffer with spaces. VGA HW Ref §3.10"
+        {
+            // In real hardware: memset(0xB8000, 0x0720, 80*25*2)
+        }
+        self.serial.write_string(FixedString::from("\x1B[2J"))
+        self.serial.write_string(FixedString::from("\x1B[H"))
+    }
+
+    // ──────────────────────────────────────────────
+    // Line Editing
+    // ──────────────────────────────────────────────
+
+    pub fn read_line(self: ref mut, prompt: FixedString[64]) -> Result[FixedString[MAX_INPUT_BUFFER], BootError>
+        effects: [io:write, io:read, machine:ioport, deterministic]
+    {
+        self.write(prompt)
+        self.input_buffer.clear()
+        let mut edit_pos: u32 = 0
+
+        loop: bounds[BOUND_LARGE] {
+            let ch: Option[u8] = self.read_char()
+            match ch {
+                Option::Some(byte) => {
+                    match byte {
+                        '\n' as u8 | '\r' as u8 => {
+                            self.write_line(FixedString::from(""))
+                            let result: FixedString[MAX_INPUT_BUFFER] = self.input_buffer
+                            self.add_to_line_history(result)
+                            return Result::Ok(result)
+                        },
+                        0x08 | 0x7F => {  // Backspace
+                            if edit_pos > 0 {
+                                edit_pos = edit_pos - 1
+                                self.input_buffer.truncate(edit_pos)
+                                self.write(FixedString::from("\x08 \x08"))
+                            }
+                        },
+                        0x1B => {  // ESC
+                            // Read escape sequence
+                            let seq: u8 = self.read_char_raw()
+                            let seq2: u8 = self.read_char_raw()
+                            // Handle arrow keys etc.
+                        },
+                        0x09 => {  // Tab completion
+                            self.handle_tab_completion()
+                        },
+                        _ => {
+                            if byte >= ' ' as u8 && edit_pos < MAX_INPUT_BUFFER {
+                                self.input_buffer.append_byte(byte)!
+                                edit_pos = edit_pos + 1
+                                if self.echo_enabled {
+                                    let mut ch_str: FixedString[2] = FixedString::new()
+                                    ch_str.append_byte(byte)!
+                                    self.write(ch_str)
+                                }
+                            }
+                        },
+                    }
+                },
+                Option::None => {
+                    // No character available, continue polling
+                },
+            }
+        }
+    }
+
+    fn read_char(self: ref mut) -> Option[u8>
+        effects: [machine:ioport, deterministic]
+    {
+        if self.use_serial {
+            let result: Result[Option[u8], BootError] = self.serial.get_char()
+            if result.is_ok() {
+                let ch: Option[u8] = result.unwrap()
+                match ch {
+                    Option::Some(v) => return Option::Some(v),
+                    Option::None => {},
+                }
+            }
+        }
+        Option::None
+    }
+
+    fn read_char_raw(self: ref mut) -> u8
+        effects: [machine:ioport, deterministic]
+    {
+        trusted "Raw serial read: Poll for character from UART, NS16550D datasheet §3.3"
+        {
+            0
+        }
+    }
+
+    fn handle_tab_completion(self: ref mut)
+        effects: [deterministic]
+    {
+        // Tab completion placeholder
+    }
+
+    fn add_to_line_history(self: ref mut, line: FixedString[MAX_INPUT_BUFFER])
+        effects: [deterministic]
+    {
+        if line.len() == 0 { return }
+        if self.line_history_count < MAX_LINE_HISTORY {
+            self.line_history.set(self.line_history_count, line)!
+            self.line_history_count = self.line_history_count + 1
+        } else {
+            // Shift history
+            for i in 1..MAX_LINE_HISTORY {
+                let prev: FixedString[MAX_INPUT_BUFFER] = self.line_history.get(i)!
+                self.line_history.set(i - 1, prev)!
+            }
+            self.line_history.set(MAX_LINE_HISTORY - 1, line)!
+        }
+        self.line_history_pos = self.line_history_count
+    }
+
+    // ──────────────────────────────────────────────
+    // ANSI Escape Sequence Processing
+    // ──────────────────────────────────────────────
+
+    pub fn process_ansi_sequence(self: ref mut, ch: u8)
+        effects: [deterministic]
+    {
+        match self.ansi_state {
+            ANSIState::Normal => {
+                if ch == ANSI_ESC {
+                    self.ansi_state = ANSIState::EscapeReceived
+                }
+            },
+            ANSIState::EscapeReceived => {
+                if ch == ANSI_BRACKET {
+                    self.ansi_state = ANSIState::BracketReceived
+                    self.ansi_param_count = 0
+                } else {
+                    self.ansi_state = ANSIState::Normal
+                }
+            },
+            ANSIState::BracketReceived | ANSIState::Parameter => {
+                if ch >= '0' as u8 && ch <= '9' as u8 {
+                    // Accumulate parameter digit
+                    let param_idx: u32 = if self.ansi_param_count < 16 {
+                        let val: u32 = self.ansi_params.get(self.ansi_param_count)!
+                        self.ansi_params.set(self.ansi_param_count, val * 10 + (ch - '0' as u8) as u32)!
+                    }
+                    self.ansi_state = ANSIState::Parameter
+                } else if ch == ';' as u8 {
+                    if self.ansi_param_count < 16 {
+                        self.ansi_param_count = self.ansi_param_count + 1
+                    }
+                    self.ansi_state = ANSIState::Parameter
+                } else if ch >= 0x40 && ch <= 0x7E {
+                    self.execute_ansi_command(ch)
+                    self.ansi_state = ANSIState::Normal
+                } else {
+                    self.ansi_state = ANSIState::Normal
+                }
+            },
+            _ => {
+                self.ansi_state = ANSIState::Normal
+            },
+        }
+    }
+
+    pub fn execute_ansi_command(self: ref mut, final_byte: u8)
+        effects: [io:write, deterministic]
+    {
+        match final_byte {
+            'A' as u8 => { /* Cursor up */ },
+            'B' as u8 => { /* Cursor down */ },
+            'C' as u8 => { /* Cursor forward */ },
+            'D' as u8 => { /* Cursor back */ },
+            'H' as u8 => { /* Cursor position */ },
+            'J' as u8 => {
+                let param: u32 = if self.ansi_param_count > 0 {
+                    self.ansi_params.get(0)!
+                } else { 0 }
+                match param {
+                    0 => { /* Clear from cursor to end of screen */ },
+                    1 => { /* Clear from start to cursor */ },
+                    2 => { self.clear_screen() },
+                    _ => {},
+                }
+            },
+            'K' as u8 => { /* Clear line */ },
+            'm' as u8 => { self.handle_sgr_parameters() },
+            _ => {},
+        }
+    }
+
+    pub fn handle_sgr_parameters(self: ref mut)
+        effects: [deterministic]
+    {
+        if self.ansi_param_count == 0 {
+            self.framebuffer.current_attr = ColorAttribute::default()
+            return
+        }
+        for i in 0..(self.ansi_param_count + 1) {
+            let param: u32 = self.ansi_params.get(i)!
+            match param {
+                0 => { self.framebuffer.current_attr = ColorAttribute::default() },
+                1 => { /* Bold */ },
+                4 => { /* Underline */ },
+                5 => { /* Blink */ },
+                7 => { /* Reverse */ },
+                30..=37 => { /* Set foreground */ },
+                40..=47 => { /* Set background */ },
+                _ => {},
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Boot Logo Rendering
+    // ──────────────────────────────────────────────
+
+    pub fn render_boot_logo(self: ref mut)
+        effects: [io:write, memory:mmio, deterministic]
+    {
+        let logo: FixedArray[BOOT_LOGO_HEIGHT, FixedString[BOOT_LOGO_WIDTH]] = {
+            let mut lines: FixedArray[BOOT_LOGO_HEIGHT, FixedString[BOOT_LOGO_WIDTH]] = FixedArray::new()
+            lines.push(FixedString::from("██████╗ ██╗  ██╗ ██████╗ ██████╗ ███████╗███╗   ██╗██████╗ ██╗ ██████╗ ███████╗"))!
+            lines.push(FixedString::from("██╔══██╗██║  ██║██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔══██╗██║██╔═══██╗██╔════╝"))!
+            lines.push(FixedString::from("██████╔╝███████║██║   ██║██████╔╝█████╗  ██╔██╗ ██║██████╔╝██║██║   ██║███████╗"))!
+            lines.push(FixedString::from("██╔═══╝ ██╔══██║██║   ██║██╔══██╗██╔══╝  ██║╚██╗██║██╔══██╗██║██║   ██║╚════██║"))!
+            lines.push(FixedString::from("██║     ██║  ██║╚██████╔╝██║  ██║███████╗██║ ╚████║██║  ██║██║╚██████╔╝███████║"))!
+            lines.push(FixedString::from("╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚══════╝"))!
+            lines.push(FixedString::from(""))!
+            lines.push(FixedString::from("          Phorensic OS — Boot Loader v1.0"))!
+            lines
+        }
+
+        self.framebuffer.current_attr = ColorAttribute::new(ConsoleColor::LightCyan, ConsoleColor::Black)
+        for i in 0..BOOT_LOGO_HEIGHT {
+            let line: FixedString[BOOT_LOGO_WIDTH] = logo.get(i)!
+            self.write_line(line)
+        }
+        self.framebuffer.current_attr = ColorAttribute::default()
+    }
+
+    // ──────────────────────────────────────────────
+    // Progress Display
+    // ──────────────────────────────────────────────
+
+    pub type ProgressBar : struct {
+        label: FixedString[64],
+        current: u32,
+        total: u32,
+        bar_width: u32,
+        console: ref mut BootConsole,
+    }
+
+    impl ProgressBar {
+        pub fn new(label: FixedString[64], total: u32, console: ref mut BootConsole) -> ProgressBar
+            effects: [deterministic]
+        {
+            ProgressBar {
+                label: label,
+                current: 0,
+                total: total,
+                bar_width: 50,
+                console: console,
+            }
+        }
+
+        pub fn update(self: ref mut, value: u32)
+            effects: [io:write, memory:mmio, deterministic]
+        {
+            if value > self.total { return }
+            self.current = value
+
+            let percent: u32 = if self.total > 0 {
+                (value * 100) / self.total
+            } else { 100 }
+
+            let filled: u32 = if self.total > 0 {
+                (value * self.bar_width) / self.total
+            } else { self.bar_width }
+
+            self.console.write(FixedString::from("\r"))
+
+            // Draw progress bar
+            let mut bar: FixedString[128] = FixedString::new()
+            bar.append_str(FixedString::from("["))
+            for i in 0..self.bar_width {
+                if i < filled {
+                    bar.append_byte('#' as u8)!
+                } else {
+                    bar.append_byte('-' as u8)!
+                }
+            }
+            bar.append_str(FixedString::from("] "))
+            let mut pct_str: FixedString[8] = FixedString::new()
+            pct_str.append_int(percent)
+            pct_str.append_byte('%' as u8)!
+            bar.append_str(pct_str)
+            self.console.write(bar)
+
+            if value >= self.total {
+                self.console.write_line(FixedString::from(""))
+            }
+        }
+
+        pub fn increment(self: ref mut)
+            effects: [io:write, memory:mmio, deterministic]
+        {
+            self.update(self.current + 1)
+        }
+
+        pub fn complete(self: ref mut)
+            effects: [io:write, memory:mmio, deterministic]
+        {
+            self.update(self.total)
+            self.console.write_success(concat(self.label, FixedString::from(" - Complete")))
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Boot Status Display
+    // ──────────────────────────────────────────────
+
+    pub fn show_boot_status(self: ref mut, component: FixedString[64], status: FixedString[32])
+        effects: [io:write, memory:mmio, deterministic]
+    {
+        let mut line: FixedString[128] = FixedString::new()
+        line.append_str(FixedString::from("  ["))
+        line.append_str(status)
+        line.append_str(FixedString::from("] "))
+        line.append_str(component)
+
+        if status == FixedString::from("OK") {
+            self.framebuffer.current_attr = ColorAttribute::success()
+        } else if status == FixedString::from("FAIL") {
+            self.framebuffer.current_attr = ColorAttribute::error()
+        } else if status == FixedString::from("SKIP") {
+            self.framebuffer.current_attr = ColorAttribute::warning()
+        }
+
+        self.write_line(line)
+        self.framebuffer.current_attr = ColorAttribute::default()
+    }
+
+    pub fn show_boot_header(self: ref mut)
+        effects: [io:write, memory:mmio, deterministic]
+    {
+        self.clear_screen()
+        self.render_boot_logo()
+        self.write_line(FixedString::from(""))
+        self.write_line(FixedString::from("Boot Sequence:"))
+        self.write_line(FixedString::from("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+    }
+
+    pub fn show_boot_summary(self: ref mut, success_count: u32, fail_count: u32, skip_count: u32)
+        effects: [io:write, memory:mmio, deterministic]
+    {
+        self.write_line(FixedString::from("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+        let mut summary: FixedString[128] = FixedString::new()
+        summary.append_str(FixedString::from("Boot Summary: "))
+        summary.append_int(success_count)
+        summary.append_str(FixedString::from(" succeeded, "))
+        summary.append_int(fail_count)
+        summary.append_str(FixedString::from(" failed, "))
+        summary.append_int(skip_count)
+        summary.append_str(FixedString::from(" skipped"))
+        self.write_line(summary)
+    }
+
+    // ──────────────────────────────────────────────
+    // ANSI-Capable Serial
+    // ──────────────────────────────────────────────
+
+    pub fn send_ansi_escape(self: ref mut, command: FixedString[16])
+        effects: [machine:ioport, deterministic]
+    {
+        let mut esc: FixedString[18] = FixedString::from("\x1B[")
+        esc.append_str(command)
+        if self.use_serial {
+            self.serial.write_string(esc)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Helper functions
+// ──────────────────────────────────────────────
+
+fn concat(a: FixedString[64], b: FixedString[32]) -> FixedString[96]
+    effects: [deterministic]
+{
+    let mut result: FixedString[96] = FixedString::new()
+    result.append_str(a)
+    result.append_str(b)
+    result
+}
+
+// ──────────────────────────────────────────────
+// BootError for boot_console module
+// ──────────────────────────────────────────────
+
+pub type BootError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl BootError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> BootError
+        effects: [deterministic]
+    {
+        BootError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    pub fn is_ok(self) -> bool
+        effects: [deterministic]
+    {
+        self.code == 0
+    }
+}

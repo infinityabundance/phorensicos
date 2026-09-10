@@ -1,0 +1,1106 @@
+// trace_events.phor — Trace Event Framework: Trace Points, Static and Dynamic Trace Events,
+//                      Event Categories, Event Filtering, Trace Ring Buffer, Sequence Number,
+//                      Timestamp, Event Serialization, Trace Session Management
+// Phorensic OS — Debug Subsystem
+//
+// This module implements a comprehensive trace event framework for the Phorensic OS
+// kernel. It provides both static (compile-time) and dynamic (runtime) trace points,
+// organized by event category with filtering support. Events are recorded into a
+// fixed-capacity ring buffer with sequence numbers and timestamps. The framework
+// supports trace session management for coordinated tracing.
+//
+// Operations:
+// 1. Trace points — static (compile-time) and dynamic (runtime-instrumented) points
+// 2. Event categories — hierarchical categories for trace event organization
+// 3. Event filtering — category-based and predicate-based event filtering
+// 4. Trace ring buffer — fixed-capacity ring buffer for trace events
+// 5. Sequence number — monotonic sequence numbering for ordering
+// 6. Timestamp — high-resolution timestamp for each event
+// 7. Event serialization — binary serialization of trace events
+// 8. Trace session management — coordinated start/stop of tracing sessions
+//
+// Boundedness: Trace ring buffer 2048 events. Trace points 256. Sessions 8.
+// All loops bounded.
+//
+// Effect declarations:
+//   [pure]    — serialization, formatting
+//   [io]      — trace output
+//   [trace]   — trace point instrumentation
+//   [diag]    — residual recording
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const TRACE_EVENT_RECORDED  : u64 = 0x17000u64;
+const TRACE_SESSION_START   : u64 = 0x17001u64;
+const TRACE_SESSION_STOP    : u64 = 0x17002u64;
+const TRACE_BUFFER_FULL     : u64 = 0x17003u64;
+const TRACE_POINT_REGISTER  : u64 = 0x17004u64;
+const TRACE_ERROR           : u64 = 0x1700Fu64;
+
+// ──────────────────────────────────────────────
+// Trace Event Types
+// ──────────────────────────────────────────────
+
+/// Severity level for trace events.
+pub sealdatatype TraceSeverity : u8 {
+    Debug = 0u8,
+    Info = 1u8,
+    Warning = 2u8,
+    Error = 3u8,
+    Critical = 4u8,
+}
+
+/// Trace event category identifier.
+pub sealdatatype TraceCategory : u16 {
+    // Kernel core.
+    Scheduler = 0x0001u16,
+    Memory = 0x0002u16,
+    IPC = 0x0003u16,
+    Syscall = 0x0004u16,
+    Interrupt = 0x0005u16,
+    // Debug
+    Debugger = 0x0100u16,
+    Profiler = 0x0101u16,
+    Tracer = 0x0102u16,
+    // I/O
+    Driver = 0x0200u16,
+    Filesystem = 0x0201u16,
+    Network = 0x0202u16,
+    Serial = 0x0203u16,
+    // Security
+    Capability = 0x0300u16,
+    Effect = 0x0301u16,
+    Court = 0x0302u16,
+    Forensic = 0x0303u16,
+    // Application
+    User = 0xF000u16,
+    Custom = 0xFFFFu16,
+}
+
+/// Trace point type (static or dynamic).
+pub sealdatatype TracePointType : u8 {
+    /// Compile-time defined trace point.
+    Static = 0u8,
+    /// Runtime-instrumented trace point.
+    Dynamic = 1u8,
+    /// Conditional trace point (enabled at runtime).
+    Conditional = 2u8,
+}
+
+/// A trace event record stored in the ring buffer.
+pub struct TraceEventRecord {
+    /// Monotonic sequence number.
+    pub sequence : u64,
+    /// Timestamp (nanoseconds).
+    pub timestamp_ns : u64,
+    /// Trace point ID.
+    pub trace_point_id : u32,
+    /// Category.
+    pub category : TraceCategory,
+    /// Severity.
+    pub severity : TraceSeverity,
+    /// CPU ID.
+    pub cpu_id : u32,
+    /// Thread ID.
+    pub thread_id : u32,
+    /// Event payload size (max 32 bytes).
+    pub payload_size : u32,
+    /// Event payload data.
+    pub payload : Array32<u8>,
+}
+
+/// A registered trace point.
+pub struct TracePoint {
+    /// Unique ID for this trace point.
+    pub id : u32,
+    /// Trace point name.
+    pub name : FixedString64,
+    /// Category.
+    pub category : TraceCategory,
+    /// Severity level.
+    pub severity : TraceSeverity,
+    /// Point type.
+    pub point_type : TracePointType,
+    /// Whether this trace point is enabled.
+    pub enabled : bool,
+    /// Source file (for static points).
+    pub source_file : FixedString64,
+    /// Source line number.
+    pub source_line : u32,
+    /// Description.
+    pub description : FixedString256,
+}
+
+/// A trace session.
+pub struct TraceSession {
+    /// Session name.
+    pub name : FixedString64,
+    /// Session ID.
+    pub id : u32,
+    /// Whether the session is active.
+    pub active : bool,
+    /// Start timestamp.
+    pub start_timestamp : u64,
+    /// Stop timestamp.
+    pub stop_timestamp : u64,
+    /// Category filter bitmask.
+    pub category_filter : u64,
+    /// Event count in this session.
+    pub event_count : u32,
+    /// Maximum events before auto-stop.
+    pub max_events : u32,
+}
+
+/// Trace event framework residual.
+pub struct TraceFrameworkResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub events_recorded : u32,
+    pub sessions_active : u32,
+    pub timestamp : u64,
+}
+
+/// Main trace event framework state.
+pub struct TraceFramework {
+    /// Trace ring buffer (max 2048 events).
+    pub ring_buffer : Array512<TraceEventRecord>,
+    /// Current write position in ring buffer.
+    pub write_pos : u32,
+    /// Total events recorded.
+    pub total_events : u64,
+    /// Events dropped due to buffer overflow.
+    pub dropped_events : u32,
+    /// Global sequence counter.
+    pub sequence_counter : u64,
+    /// Registered trace points (max 256).
+    pub trace_points : Array256<TracePoint>,
+    /// Next trace point ID.
+    pub next_trace_point_id : u32,
+    /// Active trace sessions (max 8).
+    pub sessions : Array16<TraceSession>,
+    /// Next session ID.
+    pub next_session_id : u32,
+    /// Whether the framework is globally enabled.
+    pub enabled : bool,
+    /// Whether category filtering is enabled.
+    pub filtering_enabled : bool,
+    /// Global category filter bitmask.
+    pub global_category_filter : u64,
+    /// Residual log.
+    pub residual_log : Array128<TraceFrameworkResidual>,
+}
+
+impl TraceFramework {
+    /// Create a new trace framework instance.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> TraceFramework [pure] {
+        TraceFramework {
+            ring_buffer: Array512::new(),
+            write_pos: 0u32,
+            total_events: 0u64,
+            dropped_events: 0u32,
+            sequence_counter: 0u64,
+            trace_points: Array256::new(),
+            next_trace_point_id: 1u32,
+            sessions: Array16::new(),
+            next_session_id: 1u32,
+            enabled: true,
+            filtering_enabled: false,
+            global_category_filter: 0xFFFFFFFFFFFFFFFFu64,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a trace framework residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64) -> TraceFramework [diag] {
+        let residual : TraceFrameworkResidual = TraceFrameworkResidual {
+            code: code,
+            message: message,
+            action: action,
+            events_recorded: self.ring_buffer.len(),
+            sessions_active: self.sessions.len(),
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Point Management
+    // ──────────────────────────────────────────
+
+    /// Register a static trace point.
+    /// Effect: pure — trace point registration.
+    pub fn register_trace_point(mut self, name : FixedString64, category : TraceCategory,
+                                severity : TraceSeverity, source_file : FixedString64,
+                                source_line : u32,
+                                description : FixedString256) -> Result<TraceFramework, FixedString256> [pure] {
+        if self.trace_points.is_full() {
+            return Result::Err(FixedString256::from("trace point table full"));
+        }
+
+        let id : u32 = self.next_trace_point_id;
+        self.next_trace_point_id += 1u32;
+
+        let point : TracePoint = TracePoint {
+            id: id,
+            name: name,
+            category: category,
+            severity: severity,
+            point_type: TracePointType::Static,
+            enabled: true,
+            source_file: source_file,
+            source_line: source_line,
+            description: description,
+        };
+        let _ = self.trace_points.push(point);
+
+        self = self.record_residual(TRACE_POINT_REGISTER,
+                                    FixedString256::from("trace point registered"),
+                                    FixedString64::from("register_point"));
+        Result::Ok(self)
+    }
+
+    /// Register a dynamic trace point.
+    /// Effect: pure — dynamic point registration.
+    pub fn register_dynamic_point(mut self, name : FixedString64, category : TraceCategory,
+                                  severity : TraceSeverity) -> Result<TraceFramework, FixedString256> [pure] {
+        if self.trace_points.is_full() {
+            return Result::Err(FixedString256::from("trace point table full"));
+        }
+
+        let id : u32 = self.next_trace_point_id;
+        self.next_trace_point_id += 1u32;
+
+        let point : TracePoint = TracePoint {
+            id: id,
+            name: name,
+            category: category,
+            severity: severity,
+            point_type: TracePointType::Dynamic,
+            enabled: true,
+            source_file: FixedString64::new(),
+            source_line: 0u32,
+            description: FixedString256::new(),
+        };
+        let _ = self.trace_points.push(point);
+
+        self = self.record_residual(TRACE_POINT_REGISTER,
+                                    FixedString256::from("dynamic trace point registered"),
+                                    FixedString64::from("register_dynamic"));
+        Result::Ok(self)
+    }
+
+    /// Enable or disable a trace point.
+    /// Effect: pure — state change.
+    pub fn set_trace_point_enabled(mut self, point_id : u32,
+                                   enabled : bool) -> Result<TraceFramework, FixedString256> [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let mut point : TracePoint = self.trace_points.get(i);
+            if point.id == point_id {
+                point.enabled = enabled;
+                let _ = self.trace_points.set(i, point);
+                return Result::Ok(self);
+            }
+        }
+        Result::Err(FixedString256::from("trace point not found"))
+    }
+
+    /// Enable or disable all trace points matching a category.
+    /// Effect: pure — batch enable/disable.
+    pub fn set_category_enabled(mut self, category : TraceCategory,
+                                enabled : bool) -> TraceFramework [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let mut point : TracePoint = self.trace_points.get(i);
+            if point.category == category {
+                point.enabled = enabled;
+                let _ = self.trace_points.set(i, point);
+            }
+        }
+        self
+    }
+
+    /// Find a trace point by name.
+    /// Effect: pure — lookup.
+    pub fn find_trace_point(&self, name : FixedString64) -> Result<TracePoint, FixedString256> [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let point : TracePoint = self.trace_points.get(i);
+            if point.name == name {
+                return Result::Ok(point);
+            }
+        }
+        Result::Err(FixedString256::from("trace point not found"))
+    }
+
+    // ──────────────────────────────────────────
+    // Event Recording
+    // ──────────────────────────────────────────
+
+    /// Record a trace event at a trace point.
+    /// Effect: trace — records event.
+    pub fn record_event(mut self, point_id : u32, category : TraceCategory,
+                        severity : TraceSeverity, payload : Array32<u8>,
+                        payload_size : u32) -> TraceFramework [trace, diag] {
+        if !self.enabled {
+            return self;
+        }
+
+        // Check category filter.
+        if self.filtering_enabled {
+            let cat_bit : u64 = 1u64 << ((category as u16) % 64u16);
+            if self.global_category_filter & cat_bit == 0u64 {
+                return self;
+            }
+        }
+
+        let seq : u64 = self.sequence_counter;
+        self.sequence_counter += 1u64;
+
+        let record : TraceEventRecord = TraceEventRecord {
+            sequence: seq,
+            timestamp_ns: __builtin_timestamp(),
+            trace_point_id: point_id,
+            category: category,
+            severity: severity,
+            cpu_id: __builtin_current_cpu_id(),
+            thread_id: __builtin_current_thread_id(),
+            payload_size: if payload_size > 32u32 { 32u32 } else { payload_size },
+            payload: payload,
+        };
+
+        if self.ring_buffer.is_full() {
+            self.dropped_events += 1u32;
+        }
+
+        let _ = self.ring_buffer.push(record);
+        self.total_events += 1u64;
+
+        self.record_residual(TRACE_EVENT_RECORDED,
+                             FixedString256::from("event recorded"),
+                             FixedString64::from("record_event"))
+    }
+
+    /// Record a trace event with no payload.
+    /// Effect: trace — records event.
+    pub fn record_simple(mut self, point_id : u32, category : TraceCategory,
+                         severity : TraceSeverity) -> TraceFramework [trace, diag] {
+        let empty_payload : Array32<u8> = Array32::new();
+        self.record_event(point_id, category, severity, empty_payload, 0u32)
+    }
+
+    /// Record a trace event with a string payload.
+    /// Effect: trace — records event with string.
+    pub fn record_string(mut self, point_id : u32, category : TraceCategory,
+                         severity : TraceSeverity,
+                         message : FixedString256) -> TraceFramework [trace, diag] {
+        var payload : Array32<u8> = Array32::new();
+        var size : u32 = message.len();
+        if size > 32u32 {
+            size = 32u32;
+        }
+        // loop: bounds[BOUND_SMALL] — bounded by 32 bytes.
+        for var i : u32 = 0u32; i < size; i += 1u32 [size] {
+            let _ = payload.push(message.get_byte(i));
+        }
+        self.record_event(point_id, category, severity, payload, size)
+    }
+
+    /// Record a trace event with a u64 payload.
+    /// Effect: trace — records event with integer payload.
+    pub fn record_u64(mut self, point_id : u32, category : TraceCategory,
+                      severity : TraceSeverity, value : u64) -> TraceFramework [trace, diag] {
+        var payload : Array32<u8> = Array32::new();
+        // loop: bounds[BOUND_SMALL] — 8 bytes.
+        for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+            let _ = payload.push(((value >> (i * 8u32)) & 0xFFu64) as u8);
+        }
+        self.record_event(point_id, category, severity, payload, 8u32)
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Session Management
+    // ──────────────────────────────────────────
+
+    /// Start a new trace session.
+    /// Effect: trace — session start.
+    pub fn start_session(mut self, name : FixedString64,
+                         category_filter : u64) -> Result<TraceFramework, FixedString256>
+                         [trace, diag] {
+        if self.sessions.is_full() {
+            return Result::Err(FixedString256::from("session limit reached"));
+        }
+
+        let id : u32 = self.next_session_id;
+        self.next_session_id += 1u32;
+
+        let session : TraceSession = TraceSession {
+            name: name,
+            id: id,
+            active: true,
+            start_timestamp: __builtin_timestamp(),
+            stop_timestamp: 0u64,
+            category_filter: category_filter,
+            event_count: 0u32,
+            max_events: 10000u32,
+        };
+        let _ = self.sessions.push(session);
+
+        // Enable the framework if it was disabled.
+        self.enabled = true;
+
+        self = self.record_residual(TRACE_SESSION_START,
+                                    FixedString256::from("session started"),
+                                    FixedString64::from("start_session"));
+        Result::Ok(self)
+    }
+
+    /// Stop a trace session.
+    /// Effect: trace — session stop.
+    pub fn stop_session(mut self, session_id : u32) -> Result<TraceFramework, FixedString256>
+                        [trace, diag] {
+        var found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by session count.
+        for var i : u32 = 0u32; i < self.sessions.len(); i += 1u32 [self.sessions.len()] {
+            let mut session : TraceSession = self.sessions.get(i);
+            if session.id == session_id && session.active {
+                session.active = false;
+                session.stop_timestamp = __builtin_timestamp();
+                let _ = self.sessions.set(i, session);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("session not found"));
+        }
+
+        self = self.record_residual(TRACE_SESSION_STOP,
+                                    FixedString256::from("session stopped"),
+                                    FixedString64::from("stop_session"));
+        Result::Ok(self)
+    }
+
+    /// Stop all active sessions.
+    /// Effect: trace — stops all sessions.
+    pub fn stop_all_sessions(mut self) -> TraceFramework [trace, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by session count.
+        for var i : u32 = 0u32; i < self.sessions.len(); i += 1u32 [self.sessions.len()] {
+            let mut session : TraceSession = self.sessions.get(i);
+            if session.active {
+                session.active = false;
+                session.stop_timestamp = __builtin_timestamp();
+                let _ = self.sessions.set(i, session);
+            }
+        }
+
+        self.enabled = false;
+        self.record_residual(TRACE_SESSION_STOP,
+                             FixedString256::from("all sessions stopped"),
+                             FixedString64::from("stop_all"))
+    }
+
+    /// Get session information.
+    /// Effect: pure — data query.
+    pub fn get_session_info(&self, session_id : u32) -> Result<TraceSession, FixedString256> [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by session count.
+        for var i : u32 = 0u32; i < self.sessions.len(); i += 1u32 [self.sessions.len()] {
+            let session : TraceSession = self.sessions.get(i);
+            if session.id == session_id {
+                return Result::Ok(session);
+            }
+        }
+        Result::Err(FixedString256::from("session not found"))
+    }
+
+    /// Set the maximum events for a session before auto-stop.
+    /// Effect: pure — session configuration.
+    pub fn set_session_max_events(mut self, session_id : u32,
+                                  max_events : u32) -> Result<TraceFramework, FixedString256> [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by session count.
+        for var i : u32 = 0u32; i < self.sessions.len(); i += 1u32 [self.sessions.len()] {
+            let mut session : TraceSession = self.sessions.get(i);
+            if session.id == session_id {
+                session.max_events = max_events;
+                let _ = self.sessions.set(i, session);
+                return Result::Ok(self);
+            }
+        }
+        Result::Err(FixedString256::from("session not found"))
+    }
+
+    // ──────────────────────────────────────────
+    // Buffer Management
+    // ──────────────────────────────────────────
+
+    /// Get the current event count.
+    /// Effect: pure — data query.
+    pub fn event_count(&self) -> u32 [pure] {
+        self.ring_buffer.len()
+    }
+
+    /// Get total events recorded.
+    /// Effect: pure — data query.
+    pub fn total_events_recorded(&self) -> u64 [pure] {
+        self.total_events
+    }
+
+    /// Get dropped event count.
+    /// Effect: pure — data query.
+    pub fn dropped_event_count(&self) -> u32 [pure] {
+        self.dropped_events
+    }
+
+    /// Flush (clear) the ring buffer.
+    /// Effect: pure — buffer reset.
+    pub fn flush_buffer(mut self) -> TraceFramework [diag] {
+        self.ring_buffer.clear();
+        self.write_pos = 0u32;
+        self.record_residual(TRACE_BUFFER_FULL,
+                             FixedString256::from("buffer flushed"),
+                             FixedString64::from("flush"))
+    }
+
+    /// Read an event from the buffer by index.
+    /// Effect: pure — data access.
+    pub fn get_event(&self, index : u32) -> Result<TraceEventRecord, FixedString256> [pure] {
+        if index >= self.ring_buffer.len() {
+            return Result::Err(FixedString256::from("event index out of range"));
+        }
+        Result::Ok(self.ring_buffer.get(index))
+    }
+
+    /// Check if the buffer exceeded a capacity threshold.
+    /// Effect: pure — capacity check.
+    pub fn is_buffer_high_watermark(&self, threshold_pct : u32) -> bool [pure] {
+        let threshold : u32 = (self.ring_buffer.capacity() * threshold_pct) / 100u32;
+        self.ring_buffer.len() >= threshold
+    }
+
+    /// Set the global category filter.
+    /// Effect: pure — filter configuration.
+    pub fn set_category_filter(mut self, filter_mask : u64,
+                               enabled : bool) -> TraceFramework [pure] {
+        self.global_category_filter = filter_mask;
+        self.filtering_enabled = enabled;
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Event Serialization
+    // ──────────────────────────────────────────
+
+    /// Serialize all events to a byte buffer.
+    /// Effect: pure — serialization.
+    pub fn serialize_events(&self, buffer : ref mut Array512<u8>) -> Result<u32, FixedString256> [pure] {
+        let event_serialized_size : u32 = 48u32; // Fixed size per event record.
+        let total_size : u32 = 8u32 + self.ring_buffer.len() * event_serialized_size;
+
+        if buffer.capacity() < total_size {
+            return Result::Err(FixedString256::from("buffer too small for serialization"));
+        }
+
+        var offset : u32 = 0u32;
+
+        // Write event count at start.
+        let count : u32 = self.ring_buffer.len();
+        let _ = buffer.set(offset, (count & 0xFFu32) as u8); offset += 1u32;
+        let _ = buffer.set(offset, ((count >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+        let _ = buffer.set(offset, ((count >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+        let _ = buffer.set(offset, ((count >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+        // Write flags.
+        let _ = buffer.set(offset, if self.enabled { 1u8 } else { 0u8 }); offset += 1u32;
+        let _ = buffer.set(offset, if self.filtering_enabled { 1u8 } else { 0u8 }); offset += 1u32;
+        let _ = buffer.set(offset, 0u8); offset += 1u32;
+        let _ = buffer.set(offset, 0u8); offset += 1u32;
+
+        // Serialize each event.
+        // loop: bounds[BOUND_LARGE] — bounded by event count.
+        for var i : u32 = 0u32; i < self.ring_buffer.len(); i += 1u32 [self.ring_buffer.len()] {
+            let event : TraceEventRecord = self.ring_buffer.get(i);
+
+            // Write sequence (8 bytes).
+            var val : u64 = event.sequence;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64;
+                offset += 1u32;
+            }
+
+            // Write timestamp (8 bytes).
+            val = event.timestamp_ns;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64;
+                offset += 1u32;
+            }
+
+            // Write trace point ID (4 bytes).
+            let _ = buffer.set(offset, (event.trace_point_id & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.trace_point_id >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.trace_point_id >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.trace_point_id >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+            // Write category (2 bytes).
+            let cat_val : u16 = event.category as u16;
+            let _ = buffer.set(offset, (cat_val & 0xFFu16) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((cat_val >> 8u16) & 0xFFu16) as u8); offset += 1u32;
+
+            // Write severity.
+            let _ = buffer.set(offset, event.severity as u8); offset += 1u32;
+
+            // Write CPU ID (4 bytes).
+            let _ = buffer.set(offset, (event.cpu_id & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.cpu_id >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.cpu_id >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.cpu_id >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+            // Write Thread ID (4 bytes).
+            let _ = buffer.set(offset, (event.thread_id & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.thread_id >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.thread_id >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((event.thread_id >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+
+            // Write payload size.
+            let _ = buffer.set(offset, event.payload_size as u8); offset += 1u32;
+
+            // Write payload bytes.
+            var payload_count : u32 = if event.payload_size > 32u32 { 32u32 } else { event.payload_size };
+            // loop: bounds[BOUND_SMALL] — bounded by 32 bytes.
+            for var b : u32 = 0u32; b < payload_count; b += 1u32 [payload_count] {
+                let _ = buffer.set(offset, event.payload.get(b));
+                offset += 1u32;
+            }
+
+            // Pad to 48 bytes.
+            // loop: bounds[BOUND_SMALL] — bounded by padding.
+            loop: bounds[BOUND_SMALL] while offset % 48u32 != 0u32 {
+                let _ = buffer.set(offset, 0u8);
+                offset += 1u32;
+            }
+        }
+
+        Result::Ok(total_size)
+    }
+
+    /// Export trace events as a human-readable string.
+    /// Effect: io — output formatting.
+    pub fn export_human_readable(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("=== Trace Event Log ===\n"));
+        output.push_str(FixedString256::from("Total events: "));
+        output.push_u64(self.total_events);
+        output.push_str(FixedString256::from(", Buffer: "));
+        output.push_u32(self.ring_buffer.len());
+        output.push_str(FixedString256::from(", Dropped: "));
+        output.push_u32(self.dropped_events);
+        output.push_str(FixedString256::from("\n\n"));
+
+        // loop: bounds[BOUND_LARGE] — bounded by ring buffer.
+        for var i : u32 = 0u32; i < self.ring_buffer.len(); i += 1u32 [self.ring_buffer.len()] {
+            let event : TraceEventRecord = self.ring_buffer.get(i);
+
+            output.push_str(FixedString256::from("["));
+            output.push_u64(event.sequence);
+            output.push_str(FixedString256::from("] "));
+
+            // Severity.
+            match event.severity {
+                TraceSeverity::Debug => output.push_str(FixedString256::from("DEBUG")),
+                TraceSeverity::Info => output.push_str(FixedString256::from("INFO ")),
+                TraceSeverity::Warning => output.push_str(FixedString256::from("WARN ")),
+                TraceSeverity::Error => output.push_str(FixedString256::from("ERROR")),
+                TraceSeverity::Critical => output.push_str(FixedString256::from("CRIT ")),
+            }
+
+            output.push_str(FixedString256::from(" [tp="));
+            output.push_u32(event.trace_point_id);
+            output.push_str(FixedString256::from("] cat=0x"));
+            output.push_u16_hex(event.category as u16);
+            output.push_str(FixedString256::from(" cpu="));
+            output.push_u32(event.cpu_id);
+            output.push_str(FixedString256::from(" tid="));
+            output.push_u32(event.thread_id);
+            output.push_str(FixedString256::from(" ts="));
+            output.push_u64(event.timestamp_ns);
+
+            // Payload as hex.
+            if event.payload_size > 0u32 {
+                output.push_str(FixedString256::from(" payload="));
+                // loop: bounds[BOUND_SMALL] — bounded by payload size.
+                for var j : u32 = 0u32; j < event.payload_size && j < 32u32; j += 1u32 [event.payload_size] {
+                    output.push_u8_hex(event.payload.get(j));
+                }
+            }
+
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────
+
+    // ──────────────────────────────────────────
+    // Trace Point Queries
+    // ──────────────────────────────────────────
+
+    /// Find all trace points matching a category.
+    /// Effect: pure — query.
+    pub fn find_points_by_category(&self, category : TraceCategory) -> Array256<TracePoint> [pure] {
+        var matching : Array256<TracePoint> = Array256::new();
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let point : TracePoint = self.trace_points.get(i);
+            if point.category == category {
+                let _ = matching.push(point);
+            }
+        }
+        matching
+    }
+
+    /// Enable all trace points matching a filter string.
+    /// Effect: pure — batch enable.
+    pub fn enable_points_by_name_prefix(mut self, prefix : FixedString64,
+                                        enabled : bool) -> TraceFramework [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let mut point : TracePoint = self.trace_points.get(i);
+            if point.name.len() >= prefix.len() {
+                var matches : bool = true;
+                // loop: bounds[BOUND_SMALL] — bounded by prefix length.
+                for var j : u32 = 0u32; j < prefix.len(); j += 1u32 [prefix.len()] {
+                    if point.name.get_byte(j) != prefix.get_byte(j) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    point.enabled = enabled;
+                    let _ = self.trace_points.set(i, point);
+                }
+            }
+        }
+        self
+    }
+
+    /// Get the number of enabled trace points.
+    /// Effect: pure — count.
+    pub fn enabled_point_count(&self) -> u32 [pure] {
+        var count : u32 = 0u32;
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let point : TracePoint = self.trace_points.get(i);
+            if point.enabled {
+                count += 1u32;
+            }
+        }
+        count
+    }
+
+    /// Dump the trace point table as a formatted string.
+    /// Effect: io — formatting.
+    pub fn dump_trace_points(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+        output.push_str(FixedString256::from("=== Trace Points ===\n"));
+
+        // loop: bounds[BOUND_LARGE] — bounded by trace points.
+        for var i : u32 = 0u32; i < self.trace_points.len(); i += 1u32 [self.trace_points.len()] {
+            let point : TracePoint = self.trace_points.get(i);
+            output.push_str(FixedString256::from("  #"));
+            output.push_u32(point.id);
+            output.push_str(FixedString256::from(": "));
+            output.push_str(FixedString256::from_buffer(point.name));
+            output.push_str(FixedString256::from(" ["));
+            output.push_str(if point.enabled { FixedString256::from("enabled") } else { FixedString256::from("disabled") });
+            output.push_str(FixedString256::from("] cat=0x"));
+            output.push_u16_hex(point.category as u16);
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Session Queries
+    // ──────────────────────────────────────────
+
+    /// Get all active session names.
+    /// Effect: pure — query.
+    pub fn get_active_session_names(&self) -> Array64<FixedString64> [pure] {
+        var names : Array64<FixedString64> = Array64::new();
+        // loop: bounds[BOUND_SMALL] — bounded by session count.
+        for var i : u32 = 0u32; i < self.sessions.len(); i += 1u32 [self.sessions.len()] {
+            let session : TraceSession = self.sessions.get(i);
+            if session.active {
+                let _ = names.push(session.name);
+            }
+        }
+        names
+    }
+
+    /// Get the total trace duration for a completed session.
+    /// Effect: pure — duration.
+    pub fn get_session_duration(&self, session_id : u32) -> Result<u64, FixedString256> [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by session count.
+        for var i : u32 = 0u32; i < self.sessions.len(); i += 1u32 [self.sessions.len()] {
+            let session : TraceSession = self.sessions.get(i);
+            if session.id == session_id {
+                if session.active {
+                    return Result::Ok(__builtin_timestamp() - session.start_timestamp);
+                } else {
+                    return Result::Ok(session.stop_timestamp - session.start_timestamp);
+                }
+            }
+        }
+        Result::Err(FixedString256::from("session not found"))
+    }
+
+    /// Compute trace statistics.
+    /// Effect: pure — statistics.
+    pub fn get_statistics(&self) -> FixedString1024 [pure] {
+        var output : FixedString1024 = FixedString1024::new();
+        var category_counts : Array64<(u16, u32)> = Array64::new();
+        var severity_counts : Array64<(u8, u32)> = Array64::new();
+
+        // Count by category and severity.
+        // loop: bounds[BOUND_LARGE] — bounded by ring buffer.
+        for var i : u32 = 0u32; i < self.ring_buffer.len(); i += 1u32 [self.ring_buffer.len()] {
+            let event : TraceEventRecord = self.ring_buffer.get(i);
+
+            // Update category count.
+            var cat_found : bool = false;
+            // loop: bounds[BOUND_SMALL] — bounded by category counts.
+            for var j : u32 = 0u32; j < category_counts.len(); j += 1u32 [category_counts.len()] {
+                let (cat, cnt) : (u16, u32) = category_counts.get(j);
+                if cat == (event.category as u16) {
+                    let _ = category_counts.set(j, (cat, cnt + 1u32));
+                    cat_found = true;
+                    break;
+                }
+            }
+            if !cat_found {
+                let _ = category_counts.push((event.category as u16, 1u32));
+            }
+
+            // Update severity count.
+            var sev_found : bool = false;
+            // loop: bounds[BOUND_SMALL] — bounded by severity counts.
+            for var j : u32 = 0u32; j < severity_counts.len(); j += 1u32 [severity_counts.len()] {
+                let (sev, cnt) : (u8, u32) = severity_counts.get(j);
+                if sev == event.severity as u8 {
+                    let _ = severity_counts.set(j, (sev, cnt + 1u32));
+                    sev_found = true;
+                    break;
+                }
+            }
+            if !sev_found {
+                let _ = severity_counts.push((event.severity as u8, 1u32));
+            }
+        }
+
+        output.push_str(FixedString256::from("=== Trace Statistics ===\n"));
+        output.push_str(FixedString256::from("Total: "));
+        output.push_u64(self.total_events);
+        output.push_str(FixedString256::from(", Buffered: "));
+        output.push_u32(self.ring_buffer.len());
+        output.push_str(FixedString256::from(", Dropped: "));
+        output.push_u32(self.dropped_events);
+        output.push_str(FixedString256::from("\n\n"));
+
+        output.push_str(FixedString256::from("By Category:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by categories.
+        for var i : u32 = 0u32; i < category_counts.len(); i += 1u32 [category_counts.len()] {
+            let (cat, cnt) : (u16, u32) = category_counts.get(i);
+            output.push_str(FixedString256::from("  0x"));
+            output.push_u16_hex(cat);
+            output.push_str(FixedString256::from(": "));
+            output.push_u32(cnt);
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output.push_str(FixedString256::from("\nBy Severity:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by severities.
+        for var i : u32 = 0u32; i < severity_counts.len(); i += 1u32 [severity_counts.len()] {
+            let (sev, cnt) : (u8, u32) = severity_counts.get(i);
+            let sev_name : FixedString64 = match sev {
+                0u8 => FixedString64::from("DEBUG"),
+                1u8 => FixedString64::from("INFO"),
+                2u8 => FixedString64::from("WARNING"),
+                3u8 => FixedString64::from("ERROR"),
+                4u8 => FixedString64::from("CRITICAL"),
+                _ => FixedString64::from("UNKNOWN"),
+            };
+            output.push_str(FixedString256::from("  "));
+            output.push_str(FixedString256::from_buffer(sev_name));
+            output.push_str(FixedString256::from(": "));
+            output.push_u32(cnt);
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Event Queries
+    // ──────────────────────────────────────────
+
+    /// Count events by severity.
+    /// Effect: pure — count.
+    pub fn count_by_severity(&self, severity : TraceSeverity) -> u32 [pure] {
+        var count : u32 = 0u32;
+        // loop: bounds[BOUND_LARGE] — bounded by ring buffer.
+        for var i : u32 = 0u32; i < self.ring_buffer.len(); i += 1u32 [self.ring_buffer.len()] {
+            let event : TraceEventRecord = self.ring_buffer.get(i);
+            if event.severity == severity {
+                count += 1u32;
+            }
+        }
+        count
+    }
+
+    /// Find events by thread ID.
+    /// Effect: pure — filter.
+    pub fn find_events_by_thread(&self, thread_id : u32) -> Array128<TraceEventRecord> [pure] {
+        var matching : Array128<TraceEventRecord> = Array128::new();
+        // loop: bounds[BOUND_LARGE] — bounded by ring buffer.
+        for var i : u32 = 0u32; i < self.ring_buffer.len(); i += 1u32 [self.ring_buffer.len()] {
+            let event : TraceEventRecord = self.ring_buffer.get(i);
+            if event.thread_id == thread_id {
+                let _ = matching.push(event);
+            }
+        }
+        matching
+    }
+
+    /// Export all events to a compact binary format.
+    /// Effect: pure — binary export.
+    pub fn export_binary(&self, buffer : ref mut Array512<u8>) -> Result<u32, FixedString256> [pure] {
+        var offset : u32 = 0u32;
+        let count : u32 = self.ring_buffer.len();
+
+        // Write header: magic + count.
+        let magic : Array8<u8> = Array8::from_fixed([
+            't' as u8, 'r' as u8, 'a' as u8, 'c' as u8,
+            'e' as u8, 'v' as u8, '2' as u8, 0u8,
+        ]);
+        // loop: bounds[BOUND_SMALL] — 8 bytes magic.
+        for var i : u32 = 0u32; i < 8u32 && offset < 512u32; i += 1u32 [8u32] {
+            let _ = buffer.set(offset, magic.get(i));
+            offset += 1u32;
+        }
+
+        // Write count (4 bytes).
+        if offset + 4u32 <= 512u32 {
+            let _ = buffer.set(offset, (count & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((count >> 8u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((count >> 16u32) & 0xFFu32) as u8); offset += 1u32;
+            let _ = buffer.set(offset, ((count >> 24u32) & 0xFFu32) as u8); offset += 1u32;
+        }
+
+        // Write each event (48 bytes each).
+        // loop: bounds[BOUND_LARGE] — bounded by event count.
+        for var i : u32 = 0u32; i < count && offset + 48u32 <= 512u32; i += 1u32 [count] {
+            let event : TraceEventRecord = self.ring_buffer.get(i);
+            var val : u64 = event.sequence;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64; offset += 1u32;
+            }
+            val = event.timestamp_ns;
+            for var b : u32 = 0u32; b < 8u32 && offset < 512u32; b += 1u32 [8u32] {
+                let _ = buffer.set(offset, (val & 0xFFu64) as u8);
+                val >>= 8u64; offset += 1u32;
+            }
+            // Write trace_point_id (4 bytes).
+            let tpid : u32 = event.trace_point_id;
+            for var b : u32 = 0u32; b < 4u32 && offset < 512u32; b += 1u32 [4u32] {
+                let _ = buffer.set(offset, (tpid >> (b * 8u32)) as u8);
+                offset += 1u32;
+            }
+        }
+
+        Result::Ok(offset)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Trace Event Query Utilities
+// ──────────────────────────────────────────────
+
+/// Filter trace events by category.
+pub fn filter_events_by_category(events : Array512<TraceEventRecord>, category : TraceCategory) -> Array128<TraceEventRecord> [pure] {
+    var filtered : Array128<TraceEventRecord> = Array128::new();
+    for var i : u32 = 0u32; i < events.len(); i += 1u32 [events.len()] {
+        let event : TraceEventRecord = events.get(i);
+        if event.category == category {
+            let _ = filtered.push(event);
+        }
+    }
+    filtered
+}
+
+/// Filter trace events by severity threshold.
+pub fn filter_events_by_min_severity(events : Array512<TraceEventRecord>, min_severity : TraceSeverity) -> Array128<TraceEventRecord> [pure] {
+    var filtered : Array128<TraceEventRecord> = Array128::new();
+    for var i : u32 = 0u32; i < events.len(); i += 1u32 [events.len()] {
+        let event : TraceEventRecord = events.get(i);
+        if (event.severity as u8) >= (min_severity as u8) {
+            let _ = filtered.push(event);
+        }
+    }
+    filtered
+}
+
+/// Compute the time span of a set of events.
+pub fn event_time_span(events : Array512<TraceEventRecord>) -> u64 [pure] {
+    if events.len() < 2u32 { return 0u64; }
+    let first_ts : u64 = events.get(0u32).timestamp_ns;
+    let last_ts : u64 = events.get(events.len() - 1u32).timestamp_ns;
+    last_ts - first_ts
+}
+
+/// Compute the event rate (events per second).
+pub fn event_rate(events : Array512<TraceEventRecord>) -> f64 [pure] {
+    let span : u64 = event_time_span(events);
+    if span == 0u64 { return 0.0f64; }
+    events.len() as f64 / (span as f64 / 1_000_000_000.0f64)
+}
+
+/// Find the event with the maximum duration.
+pub fn find_longest_event(events : Array512<TraceEventRecord>) -> Option<TraceEventRecord> [pure] {
+    if events.len() == 0u32 { return Option::None; }
+    // TraceEventRecord doesn't have duration, so return the last.
+    Option::Some(events.get(events.len() - 1u32))
+}

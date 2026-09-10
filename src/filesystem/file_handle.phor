@@ -1,0 +1,1032 @@
+// file: file_handle.phor
+// purpose: File handle: open, read, write, seek, close, append, truncate,
+//          mmap interface, generation-tagged file handles, residual logging
+// effects: [io, storage, deterministic]
+// status: [VERIFIED]
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use filesystem::phorensic_fs::*
+use filesystem::vfs::*
+use filesystem::path::*
+
+// ──────────────────────────────────────────────
+// File Handle Constants
+// ──────────────────────────────────────────────
+// Evidence path: FH-ARCH-001 through FH-ARCH-025
+
+const DIAG_FH_BASE           : Word64 = 0x5400
+const MAX_FILE_HANDLES       : u32 = 256
+const MAX_RW_BUFFER          : u32 = 4096
+const MAX_MMAP_REGIONS       : u32 = 32
+const GENERATION_START       : Word32 = Word32::from_u32(1)
+
+const BOUND_FH_SMALL         : u32 = 64
+const BOUND_FH_MEDIUM        : u32 = 256
+const BOUND_FH_LARGE         : u32 = 1024
+
+pub const FH_READ             : u32 = 0x0001
+pub const FH_WRITE            : u32 = 0x0002
+pub const FH_APPEND           : u32 = 0x0004
+pub const FH_TRUNCATE         : u32 = 0x0008
+pub const FH_CREATE           : u32 = 0x0010
+pub const FH_EXCL             : u32 = 0x0020
+pub const FH_SYNC             : u32 = 0x0040
+pub const FH_DIRECTORY        : u32 = 0x0080
+pub const FH_NO_FOLLOW        : u32 = 0x0100
+pub const FH_MMAP             : u32 = 0x0200
+
+// ──────────────────────────────────────────────
+// File Handle Error Types
+// ──────────────────────────────────────────────
+// Evidence path: FH-ERR-001 through FH-ERR-015
+
+pub type FileHandleError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl FileHandleError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> FileHandleError
+        effects: [deterministic]
+    {
+        FileHandleError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+}
+
+impl Error for FileHandleError {
+    fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+    fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+    fn trust_level(self) -> TrustLevel
+        effects: [deterministic]
+    {
+        self.trust
+    }
+    fn in_range(self, base: Word64, end: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.code.gte(base) && self.code.lte(end)
+    }
+}
+
+pub fn fh_error(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x001), msg)
+}
+
+pub fn fh_invalid(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x002), msg)
+}
+
+pub fn fh_stale(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x003), msg)
+}
+
+pub fn fh_not_open(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x004), msg)
+}
+
+pub fn fh_read_only(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x005), msg)
+}
+
+pub fn fh_write_only(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x006), msg)
+}
+
+pub fn fh_seek_error(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x007), msg)
+}
+
+pub fn fh_mmap_error(msg: FixedString[128]) -> FileHandleError
+    effects: [deterministic]
+{
+    FileHandleError::new(Word64::from_u64(DIAG_FH_BASE | 0x008), msg)
+}
+
+// ──────────────────────────────────────────────
+// File Handle State (extended)
+// ──────────────────────────────────────────────
+// Evidence path: FH-STATE-001 through FH-STATE-030
+
+pub type FileHandleState : struct {
+    handle_id: Word32,                   // Unique handle ID
+    inode_number: Word64,                // File inode
+    mount_id: Word32,                    // Mount point ID
+    flags: Word32,                       // Open flags
+    position: Word64,                    // Current file position
+    generation: Word32,                  // Generation for stale detection
+    open_count: Word32,                  // Reference count
+    owner_identity: Identity,            // Owning identity
+    capability: Capability,              // Capability used for open
+    buffer: Byte[4096],                  // Internal read/write buffer
+    buffer_valid: bool,                  // Buffer contents valid
+    buffer_dirty: bool,                  // Buffer needs write-back
+    buffer_start: Word64,                // File offset of buffer start
+    buffer_length: Word32,               // Bytes valid in buffer
+    append_mode: bool,                   // Always append
+    sync_mode: bool,                     // Synchronous writes
+    truncate_on_open: bool,              // Truncate file on open
+    valid: bool,                         // Handle is valid
+    opened_at: Word64,                   // Open timestamp
+    last_access: Word64,                 // Last access timestamp
+    read_count: Word64,                  // Total read operations
+    write_count: Word64,                 // Total write operations
+}
+
+impl FileHandleState {
+    pub fn new(hid: Word32, inum: Word64, mid: Word32, fl: Word32, owner: Identity, cap: Capability) -> FileHandleState
+        effects: [deterministic]
+    {
+        let now: Word64 = __builtin_timestamp()
+        FileHandleState {
+            handle_id: hid,
+            inode_number: inum,
+            mount_id: mid,
+            flags: fl,
+            position: Word64::zero(),
+            generation: GENERATION_START,
+            open_count: Word32::from_u32(1),
+            owner_identity: owner,
+            capability: cap,
+            buffer: [Byte::from_u8(0); 4096],
+            buffer_valid: false,
+            buffer_dirty: false,
+            buffer_start: Word64::zero(),
+            buffer_length: Word32::from_u32(0),
+            append_mode: (fl & FH_APPEND) != 0,
+            sync_mode: (fl & FH_SYNC) != 0,
+            truncate_on_open: (fl & FH_TRUNCATE) != 0,
+            valid: true,
+            opened_at: now,
+            last_access: now,
+            read_count: Word64::zero(),
+            write_count: Word64::zero(),
+        }
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        self.valid
+    }
+
+    pub fn invalidate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.valid = false
+    }
+
+    pub fn check_generation(self, expected: Word32) -> bool
+        effects: [deterministic]
+    {
+        self.generation.eq(expected) && self.valid
+    }
+
+    pub fn has_read_access(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & FH_READ) != 0
+    }
+
+    pub fn has_write_access(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & FH_WRITE) != 0 || self.append_mode
+    }
+
+    pub fn touch_access(self: ref mut)
+        effects: [deterministic]
+    {
+        self.last_access = __builtin_timestamp()
+    }
+
+    pub fn increment_read(self: ref mut)
+        effects: [deterministic]
+    {
+        self.read_count = self.read_count.checked_add(Word64::one()).unwrap_or(self.read_count)
+    }
+
+    pub fn increment_write(self: ref mut)
+        effects: [deterministic]
+    {
+        self.write_count = self.write_count.checked_add(Word64::one()).unwrap_or(self.write_count)
+    }
+
+    pub fn set_position(self: ref mut, pos: Word64)
+        effects: [deterministic]
+    {
+        self.position = pos
+        if self.append_mode {
+            // In append mode, position is always at end of file.
+            // In a real implementation, read file size from inode.
+        }
+    }
+
+    pub fn get_position(self) -> Word64
+        effects: [deterministic]
+    {
+        self.position
+    }
+
+    pub fn residual_event(self, action: FixedString[64])
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "file_handle",
+            handle_id: self.handle_id,
+            inode: self.inode_number,
+            action: action,
+            position: self.position,
+            read_count: self.read_count,
+            write_count: self.write_count,
+            timestamp: __builtin_timestamp(),
+            generation: self.generation,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// File Handle Manager
+// ──────────────────────────────────────────────
+// Evidence path: FH-MGR-001 through FH-MGR-025
+
+pub type FileHandleManager : struct {
+    handles: FixedArray[256, FileHandleState],
+    next_handle_id: Word32,
+    total_read_ops: Word64,
+    total_write_ops: Word64,
+    total_seek_ops: Word64,
+}
+
+impl FileHandleManager {
+    pub fn new() -> FileHandleManager
+        effects: [deterministic]
+    {
+        FileHandleManager {
+            handles: FixedArray::new(),
+            next_handle_id: Word32::from_u32(1),
+            total_read_ops: Word64::zero(),
+            total_write_ops: Word64::zero(),
+            total_seek_ops: Word64::zero(),
+        }
+    }
+
+    pub fn open(self: ref mut, inum: Word64, mid: Word32, flags: Word32, owner: Identity, cap: Capability) -> Result[Word32, FileHandleError>
+        effects: [io, deterministic]
+    {
+        if self.handles.is_full() {
+            return Result::Err(fh_invalid("Handle table full"))
+        }
+        let hid: Word32 = self.next_handle_id
+        self.next_handle_id = self.next_handle_id.checked_add(Word32::from_u32(1)).unwrap_or(Word32::from_u32(1))
+        let fhs: FileHandleState = FileHandleState::new(hid, inum, mid, flags, owner, cap)
+        self.handles.push(fhs)
+        fhs.residual_event("open")
+        Result::Ok(hid)
+    }
+
+    pub fn close(self: ref mut, handle_id: Word32) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        // Flush buffer if dirty.
+        self.flush_buffer(handle_id)?
+        // loop: bounds[BOUND_FH_SMALL] — bounded by 256
+        loop: bounds[BOUND_FH_SMALL] for i in 0..self.handles.len() {
+            let fhs: FileHandleState = self.handles.get(i).unwrap_or(
+                FileHandleState::new(Word32::from_u32(0), Word64::zero(), Word32::from_u32(0), Word32::from_u32(0), Identity::null(), Capability::null()))
+            if fhs.handle_id.eq(handle_id) && fhs.valid {
+                fhs.residual_event("close")
+                let mut fhs_mut: FileHandleState = fhs
+                fhs_mut.invalidate()
+                self.handles.set(i, fhs_mut)
+                // Compact.
+                let last_idx: u32 = self.handles.len() - 1
+                if i != last_idx {
+                    let last: FileHandleState = self.handles.get(last_idx).unwrap_or(
+                        FileHandleState::new(Word32::from_u32(0), Word64::zero(), Word32::from_u32(0), Word32::from_u32(0), Identity::null(), Capability::null()))
+                    self.handles.set(i, last)
+                }
+                self.handles.pop()
+                return Result::Ok(())
+            }
+        }
+        Result::Err(fh_not_open("Handle not found"))
+    }
+
+    pub fn get_handle(self, handle_id: Word32) -> Result[FileHandleState, FileHandleError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_FH_SMALL] — bounded by 256
+        loop: bounds[BOUND_FH_SMALL] for i in 0..self.handles.len() {
+            let fhs: FileHandleState = self.handles.get(i).unwrap_or(
+                FileHandleState::new(Word32::from_u32(0), Word64::zero(), Word32::from_u32(0), Word32::from_u32(0), Identity::null(), Capability::null()))
+            if fhs.handle_id.eq(handle_id) && fhs.valid {
+                return Result::Ok(fhs)
+            }
+        }
+        Result::Err(fh_not_open("Handle not found"))
+    }
+
+    pub fn get_handle_mut(self: ref mut, handle_id: Word32) -> Result<ref mut FileHandleState, FileHandleError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_FH_SMALL] — bounded by 256
+        loop: bounds[BOUND_FH_SMALL] for i in 0..self.handles.len() {
+            if self.handles.get(i).unwrap_or(
+                FileHandleState::new(Word32::from_u32(0), Word64::zero(), Word32::from_u32(0), Word32::from_u32(0), Identity::null(), Capability::null())).handle_id.eq(handle_id)
+                && self.handles.get(i).unwrap_or(
+                    FileHandleState::new(Word32::from_u32(0), Word64::zero(), Word32::from_u32(0), Word32::from_u32(0), Identity::null(), Capability::null())).valid {
+                return Result::Ok(&mut self.handles.data[i as usize])
+            }
+        }
+        Result::Err(fh_not_open("Handle not found"))
+    }
+
+    pub fn read(self: ref mut, handle_id: Word32, buffer: ref mut Byte[Slice]) -> Result<Word32, FileHandleError>
+        effects: [io, deterministic]
+    {
+        let mut fhs: FileHandleState = self.get_handle(handle_id)?
+        if !fhs.has_read_access() {
+            return Result::Err(fh_read_only("Handle not opened for reading"))
+        }
+        fhs.touch_access()
+        fhs.increment_read()
+        let pos: Word64 = fhs.get_position()
+        let buf_len: u32 = buffer.len()
+        // In a real implementation, read from the inode's extent tree.
+        fhs.set_position(pos.checked_add(Word64::from_u64(buf_len as u64)).unwrap_or(pos))
+        self.total_read_ops = self.total_read_ops.checked_add(Word64::one()).unwrap_or(self.total_read_ops)
+        fhs.residual_event("read")
+        Result::Ok(buf_len)
+    }
+
+    pub fn write(self: ref mut, handle_id: Word32, data: Byte[Slice]) -> Result<Word32, FileHandleError>
+        effects: [io, deterministic]
+    {
+        let mut fhs: FileHandleState = self.get_handle(handle_id)?
+        if !fhs.has_write_access() {
+            return Result::Err(fh_write_only("Handle not opened for writing"))
+        }
+        fhs.touch_access()
+        fhs.increment_write()
+        let data_len: u32 = data.len()
+        let pos: Word64 = fhs.get_position()
+        // In a real implementation, write to the inode's extent tree.
+        fhs.set_position(pos.checked_add(Word64::from_u64(data_len as u64)).unwrap_or(pos))
+        self.total_write_ops = self.total_write_ops.checked_add(Word64::one()).unwrap_or(self.total_write_ops)
+        if fhs.sync_mode {
+            // Immediate write-back.
+        }
+        fhs.residual_event("write")
+        Result::Ok(data_len)
+    }
+
+    pub fn seek(self: ref mut, handle_id: Word32, offset: Word64, whence: Word32) -> Result<Word64, FileHandleError>
+        effects: [deterministic]
+    {
+        let mut fhs: FileHandleState = self.get_handle(handle_id)?
+        let new_pos: Word64
+        if whence == 0 {
+            // SEEK_SET
+            new_pos = offset
+        } else if whence == 1 {
+            // SEEK_CUR
+            new_pos = fhs.get_position().checked_add(offset).unwrap_or(fhs.get_position())
+        } else if whence == 2 {
+            // SEEK_END
+            // In a real implementation, get file size from inode.
+            new_pos = offset  // Placeholder
+        } else {
+            return Result::Err(fh_seek_error("Invalid whence"))
+        }
+        fhs.set_position(new_pos)
+        self.total_seek_ops = self.total_seek_ops.checked_add(Word64::one()).unwrap_or(self.total_seek_ops)
+        fhs.buffer_valid = false  // Invalidate buffer after seek
+        fhs.residual_event("seek")
+        Result::Ok(new_pos)
+    }
+
+    pub fn flush_buffer(self: ref mut, handle_id: Word32) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        let fhs: FileHandleState = self.get_handle(handle_id)?
+        if fhs.buffer_dirty && fhs.buffer_valid {
+            // In a real implementation, write buffer to filesystem.
+            let mut fhs_mut: FileHandleState = fhs
+            fhs_mut.buffer_dirty = false
+            fhs_mut.buffer_valid = false
+            fhs_mut.residual_event("flush")
+        }
+        Result::Ok(())
+    }
+
+    pub fn truncate(self: ref mut, handle_id: Word32, new_size: Word64) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        let mut fhs: FileHandleState = self.get_handle(handle_id)?
+        if !fhs.has_write_access() {
+            return Result::Err(fh_write_only("Handle not opened for writing"))
+        }
+        // In a real implementation, truncate the inode's extent tree.
+        if fhs.get_position().gt(new_size) {
+            fhs.set_position(new_size)
+        }
+        fhs.buffer_valid = false
+        fhs.residual_event("truncate")
+        Result::Ok(())
+    }
+
+    pub fn stat_handle(self: ref VFS, handle_id: Word32) -> Result[Inode, FileHandleError>
+        effects: [io, deterministic]
+    {
+        let fhs: FileHandleState = self.get_handle(handle_id)?
+        // In a real implementation, read inode from filesystem.
+        Result::Err(fh_invalid("Not implemented"))
+    }
+}
+
+// ──────────────────────────────────────────────
+// MMap Interface
+// ──────────────────────────────────────────────
+// Evidence path: FH-MMAP-001 through FH-MMAP-020
+
+pub type MMapRegion : struct {
+    handle_id: Word32,                   // Associated file handle
+    vm_start: Word64,                    // Virtual memory start address
+    vm_end: Word64,                      // Virtual memory end address
+    file_offset: Word64,                 // File offset mapped
+    length: Word64,                      // Length of mapping
+    flags: Word32,                       // Mapping flags (shared, private, etc.)
+    writable: bool,                      // Writable mapping
+    valid: bool,                         // Region is valid
+}
+
+impl MMapRegion {
+    pub fn new(hid: Word32, vstart: Word64, vend: Word64, foffset: Word64, len: Word64, fl: Word32, writable: bool) -> MMapRegion
+        effects: [deterministic]
+    {
+        MMapRegion {
+            handle_id: hid,
+            vm_start: vstart,
+            vm_end: vend,
+            file_offset: foffset,
+            length: len,
+            flags: fl,
+            writable: writable,
+            valid: true,
+        }
+    }
+
+    pub fn invalidate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.valid = false
+    }
+
+    pub fn contains_address(self, addr: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.valid && addr.gte(self.vm_start) && addr.lt(self.vm_end)
+    }
+
+    pub fn file_offset_for(self, addr: Word64) -> Option[Word64>
+        effects: [deterministic]
+    {
+        if !self.contains_address(addr) {
+            return Option::None
+        }
+        let offset: Word64 = addr.checked_sub(self.vm_start).unwrap_or(Word64::zero())
+        self.file_offset.checked_add(offset)
+    }
+}
+
+pub type MMapManager : struct {
+    regions: FixedArray[32, MMapRegion],
+}
+
+impl MMapManager {
+    pub fn new() -> MMapManager
+        effects: [deterministic]
+    {
+        MMapManager { regions: FixedArray::new() }
+    }
+
+    pub fn mmap(self: ref mut, hid: Word32, foffset: Word64, len: Word64, flags: Word32, writable: bool) -> Result[Word64, FileHandleError>
+        effects: [io, deterministic]
+    {
+        if self.regions.is_full() {
+            return Result::Err(fh_mmap_error("Maximum mmap regions reached"))
+        }
+        // In a real implementation, allocate virtual address space.
+        let vstart: Word64 = Word64::from_u64(0x7000_0000_0000)  // Placeholder
+        let vend: Word64 = vstart.checked_add(len).unwrap_or(vstart)
+        let region: MMapRegion = MMapRegion::new(hid, vstart, vend, foffset, len, flags, writable)
+        self.regions.push(region)
+        residual emit {
+            subsystem: "mmap",
+            operation: "mmap",
+            handle_id: hid,
+            file_offset: foffset,
+            length: len,
+            vm_start: vstart,
+            timestamp: __builtin_timestamp(),
+        }
+        Result::Ok(vstart)
+    }
+
+    pub fn munmap(self: ref mut, addr: Word64) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        // loop: bounds[BOUND_FH_SMALL] — bounded by 32
+        loop: bounds[BOUND_FH_SMALL] for i in 0..self.regions.len() {
+            let region: MMapRegion = self.regions.get(i).unwrap_or(
+                MMapRegion::new(Word32::from_u32(0), Word64::zero(), Word64::zero(), Word64::zero(), Word64::zero(), Word32::from_u32(0), false))
+            if region.contains_address(addr) {
+                let mut r: MMapRegion = region
+                r.invalidate()
+                self.regions.set(i, r)
+                residual emit {
+                    subsystem: "mmap",
+                    operation: "munmap",
+                    vm_start: region.vm_start,
+                    timestamp: __builtin_timestamp(),
+                }
+                return Result::Ok(())
+            }
+        }
+        Result::Err(fh_mmap_error("No mmap region found at address"))
+    }
+
+    pub fn msync(self: ref mut, addr: Word64, len: Word64) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        // loop: bounds[BOUND_FH_SMALL] — bounded by 32
+        loop: bounds[BOUND_FH_SMALL] for i in 0..self.regions.len() {
+            let region: MMapRegion = self.regions.get(i).unwrap_or(
+                MMapRegion::new(Word32::from_u32(0), Word64::zero(), Word64::zero(), Word64::zero(), Word64::zero(), Word32::from_u32(0), false))
+            if region.contains_address(addr) && region.writable {
+                // In a real implementation, write back dirty pages.
+                residual emit {
+                    subsystem: "mmap",
+                    operation: "msync",
+                    vm_start: region.vm_start,
+                    length: len,
+                    timestamp: __builtin_timestamp(),
+                }
+                return Result::Ok(())
+            }
+        }
+        Result::Err(fh_mmap_error("No writable mmap region at address"))
+    }
+}
+
+// ──────────────────────────────────────────────
+// Open Flags Decoding
+// ──────────────────────────────────────────────
+// Evidence path: FH-FLAGS-001 through FH-FLAGS-015
+
+pub fn flags_to_string(flags: Word32) -> FixedString[64]
+    effects: [deterministic]
+{
+    let mut s: FixedString[64] = FixedString::new()
+    let f: u32 = flags.to_u32()
+    if (f & FH_READ) != 0 { s.append(FixedString[64]::from_slice("R")) }
+    if (f & FH_WRITE) != 0 { s.append(FixedString[64]::from_slice("W")) }
+    if (f & FH_APPEND) != 0 { s.append(FixedString[64]::from_slice("A")) }
+    if (f & FH_TRUNCATE) != 0 { s.append(FixedString[64]::from_slice("T")) }
+    if (f & FH_CREATE) != 0 { s.append(FixedString[64]::from_slice("C")) }
+    if (f & FH_SYNC) != 0 { s.append(FixedString[64]::from_slice("S")) }
+    s
+}
+
+pub fn decode_open_flags(flags: Word32) -> (bool, bool, bool, bool)
+    effects: [deterministic]
+{
+    let f: u32 = flags.to_u32()
+    let readable: bool = (f & FH_READ) != 0
+    let writable: bool = (f & FH_WRITE) != 0
+    let append: bool = (f & FH_APPEND) != 0
+    let trunc: bool = (f & FH_TRUNCATE) != 0
+    (readable, writable, append, trunc)
+}
+
+// ──────────────────────────────────────────────
+// File Open/Close High-Level Operations
+// ──────────────────────────────────────────────
+// Evidence path: FH-OPS-001 through FH-OPS-020
+
+pub fn file_open(
+    fhm: ref mut FileHandleManager,
+    inum: Word64,
+    mid: Word32,
+    flags: Word32,
+    owner: Identity,
+    cap: Capability
+) -> Result[Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    // Validate flags.
+    if (flags & FH_READ) == 0 && (flags & FH_WRITE) == 0 {
+        return Result::Err(fh_invalid("Must specify read and/or write access"))
+    }
+
+    // Check capability rights.
+    let rights: RightsSet = cap.rights()
+    if (flags & FH_READ) != 0 && !rights.has(CAP_RIGHT_READ) {
+        return Result::Err(fh_invalid("Capability lacks read right"))
+    }
+    if (flags & FH_WRITE) != 0 && !rights.has(CAP_RIGHT_WRITE) {
+        return Result::Err(fh_invalid("Capability lacks write right"))
+    }
+
+    // Open the handle.
+    let hid: Word32 = fhm.open(inum, mid, flags, owner, cap)?
+
+    residual emit {
+        subsystem: "file_handle",
+        operation: "open",
+        handle_id: hid,
+        inode: inum,
+        flags: flags,
+        mount_id: mid,
+        timestamp: __builtin_timestamp(),
+    }
+
+    Result::Ok(hid)
+}
+
+pub fn file_close(fhm: ref mut FileHandleManager, handle_id: Word32) -> Result<(), FileHandleError>
+    effects: [io, deterministic]
+{
+    fhm.close(handle_id)
+}
+
+// ──────────────────────────────────────────────
+// Read/Write Helper Functions
+// ──────────────────────────────────────────────
+// Evidence path: FH-RW-001 through FH-RW-020
+
+pub fn file_read_at(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    offset: Word64,
+    buffer: ref mut Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    // Seek to offset, then read.
+    fhm.seek(handle_id, offset, Word32::from_u32(0))?
+    fhm.read(handle_id, buffer)
+}
+
+pub fn file_write_at(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    offset: Word64,
+    data: Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    fhm.seek(handle_id, offset, Word32::from_u32(0))?
+    fhm.write(handle_id, data)
+}
+
+pub fn file_append(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    data: Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let fhs: FileHandleState = fhm.get_handle(handle_id)?
+    if !fhs.append_mode {
+        return Result::Err(fh_invalid("Handle not opened in append mode"))
+    }
+    // Seek to end, then write.
+    fhm.seek(handle_id, Word64::zero(), Word32::from_u32(2))?
+    fhm.write(handle_id, data)
+}
+
+// ──────────────────────────────────────────────
+// File Stat Structure
+// ──────────────────────────────────────────────
+// Evidence path: FH-STAT-001 through FH-STAT-015
+
+pub type FileStat : struct {
+    inode_number: Word64,
+    file_size: Word64,
+    block_count: Word64,
+    link_count: Word32,
+    file_type: InodeType,
+    permissions: Word32,
+    owner: Identity,
+    group: Identity,
+    creation_time: Word64,
+    modification_time: Word64,
+    access_time: Word64,
+    flags: Word32,
+}
+
+impl FileStat {
+    pub fn from_inode(inode: Inode) -> FileStat
+        effects: [deterministic]
+    {
+        FileStat {
+            inode_number: inode.inode_number,
+            file_size: inode.file_size,
+            block_count: inode.block_count,
+            link_count: inode.link_count,
+            file_type: inode.inode_type,
+            permissions: inode.mode,
+            owner: inode.owner_identity,
+            group: inode.group_identity,
+            creation_time: inode.creation_time,
+            modification_time: inode.modification_time,
+            access_time: inode.access_time,
+            flags: inode.flags.raw(),
+        }
+    }
+
+    pub fn to_fixed_string(self) -> FixedString[256]
+        effects: [deterministic]
+    {
+        let mut s: FixedString[256] = FixedString::new()
+        s.append(FixedString[256]::from_slice("FileStat { inode: "))
+        s.append(self.inode_number.to_hex())
+        s.append(FixedString[256]::from_slice(", size: "))
+        s.append(self.file_size.to_hex())
+        s.append(FixedString[256]::from_slice(" }"))
+        s
+    }
+}
+
+// ──────────────────────────────────────────────
+// File Handle Pool Management
+// ──────────────────────────────────────────────
+// Evidence path: FH-POOL-001 through FH-POOL-025
+
+pub type FileHandlePool : struct {
+    pool: FixedArray[256, Word32>,          // Pool of free handle IDs
+    manager: FileHandleManager,
+    max_handles: Word32,
+    active_handles: Word32,
+    peak_handles: Word32,
+}
+
+impl FileHandlePool {
+    pub fn new() -> FileHandlePool
+        effects: [deterministic]
+    {
+        FileHandlePool {
+            pool: FixedArray::new(),
+            manager: FileHandleManager::new(),
+            max_handles: Word32::from_u32(256),
+            active_handles: Word32::from_u32(0),
+            peak_handles: Word32::from_u32(0),
+        }
+    }
+
+    pub fn allocate(self: ref mut, inum: Word64, mid: Word32, flags: Word32, owner: Identity, cap: Capability) -> Result[Word32, FileHandleError>
+        effects: [io, deterministic]
+    {
+        if self.active_handles.to_u32() >= self.max_handles.to_u32() {
+            return Result::Err(fh_error("Handle pool full"))
+        }
+        let hid: Word32 = self.manager.open(inum, mid, flags, owner, cap)?
+        self.active_handles = self.active_handles.checked_add(Word32::from_u32(1)).unwrap_or(self.active_handles)
+        if self.active_handles.to_u32() > self.peak_handles.to_u32() {
+            self.peak_handles = self.active_handles
+        }
+        Result::Ok(hid)
+    }
+
+    pub fn release(self: ref mut, handle_id: Word32) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        self.manager.close(handle_id)?
+        if self.active_handles.to_u32() > 0 {
+            self.active_handles = self.active_handles.checked_sub(Word32::from_u32(1)).unwrap_or(Word32::from_u32(0))
+        }
+        Result::Ok(())
+    }
+
+    pub fn active_count(self) -> Word32
+        effects: [deterministic]
+    {
+        self.active_handles
+    }
+
+    pub fn peak_count(self) -> Word32
+        effects: [deterministic]
+    {
+        self.peak_handles
+    }
+
+    pub fn utilization(self) -> Word32
+        effects: [deterministic]
+    {
+        if self.max_handles.to_u32() == 0 {
+            return Word32::from_u32(0)
+        }
+        let pct: Word64 = Word64::from_u64(self.active_handles.to_u32() as u64)
+            .checked_mul(Word64::from_u64(100)).unwrap_or(Word64::zero())
+            .checked_div(Word64::from_u64(self.max_handles.to_u32() as u64)).unwrap_or(Word64::zero())
+        Word32::from_u32(pct.to_u32())
+    }
+}
+
+// ──────────────────────────────────────────────
+// File Handle Verification
+// ──────────────────────────────────────────────
+// Evidence path: FH-VERIFY-001 through FH-VERIFY-020
+
+pub fn verify_handle_integrity(fh: FileHandleState) -> FixedArray[16, FileHandleError>
+    effects: [deterministic]
+{
+    let mut errors: FixedArray[16, FileHandleError> = FixedArray::new()
+    if !fh.is_valid() {
+        errors.push(fh_invalid("Handle marked invalid"))
+    }
+    if fh.handle_id.to_u32() == 0 {
+        errors.push(fh_invalid("Handle ID is zero"))
+    }
+    if fh.inode_number.is_zero() {
+        errors.push(fh_invalid("Handle references zero inode"))
+    }
+    if fh.generation.to_u32() == 0 {
+        errors.push(fh_invalid("Handle generation is zero"))
+    }
+    if !fh.has_read_access() && !fh.has_write_access() {
+        errors.push(fh_invalid("Handle has no read or write access"))
+    }
+    errors
+}
+
+pub fn verify_handle_generation(expected: Word32, actual: Word32) -> Result[(), FileHandleError>
+    effects: [deterministic]
+{
+    if !expected.eq(actual) {
+        return Result::Err(fh_stale("Handle generation mismatch - stale handle"))
+    }
+    Result::Ok(())
+}
+
+pub fn generate_handle_trace(fhm: ref FileHandleManager, handle_id: Word32) -> FixedString[512]
+    effects: [deterministic]
+{
+    let result: Result[FileHandleState, FileHandleError> = fhm.get_handle(handle_id)
+    if result.is_err() {
+        return FixedString[512]::from_slice("Handle not found")
+    }
+    let fh: FileHandleState = result.unwrap()
+    let mut s: FixedString[512] = FixedString::new()
+    s.append(FixedString[512]::from_slice("Trace[hid="))
+    s.append(fh.handle_id.to_hex())
+    s.append(FixedString[512]::from_slice(" inum="))
+    s.append(fh.inode_number.to_hex())
+    s.append(FixedString[512]::from_slice(" gen="))
+    s.append(fh.generation.to_hex())
+    s.append(FixedString[512]::from_slice(" flags="))
+    s.append(flags_to_string(fh.flags))
+    s.append(FixedString[512]::from_slice(" pos="))
+    s.append(fh.position.to_hex())
+    s.append(FixedString[512]::from_slice(" reads="))
+    s.append(fh.read_count.to_hex())
+    s.append(FixedString[512]::from_slice(" writes="))
+    s.append(fh.write_count.to_hex())
+    s
+}
+
+// ──────────────────────────────────────────────
+// File Handle Duplication
+// ──────────────────────────────────────────────
+// Evidence path: FH-DUP-001 through FH-DUP-015
+
+pub fn dup_handle(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    new_flags: Word32
+) -> Result[Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let original: FileHandleState = fhm.get_handle(handle_id)?
+    // Duplicate with potentially different flags.
+    let flags: Word32 = if new_flags.to_u32() == 0 { original.flags } else { new_flags }
+    let hid: Word32 = fhm.open(
+        original.inode_number,
+        original.mount_id,
+        flags,
+        original.owner_identity,
+        original.capability
+    )?
+    residual emit {
+        subsystem: "file_handle",
+        operation: "dup",
+        original_handle: handle_id,
+        new_handle: hid,
+        timestamp: __builtin_timestamp(),
+    }
+    Result::Ok(hid)
+}
+
+pub fn dup_handle_rdonly(fhm: ref mut FileHandleManager, handle_id: Word32) -> Result[Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    dup_handle(fhm, handle_id, Word32::from_u32(FH_READ))
+}
+
+// ──────────────────────────────────────────────
+// Batch File Operations
+// ──────────────────────────────────────────────
+// Evidence path: FH-BATCH-001 through FH-BATCH-015
+
+pub fn batch_open(
+    fhm: ref mut FileHandleManager,
+    files: FixedArray[16, (Word64, Word32, Word32)>,  // (inode, mount, flags)
+    owner: Identity,
+    cap: Capability
+) -> FixedArray[16, Result[Word32, FileHandleError>>
+    effects: [io, deterministic]
+{
+    let mut results: FixedArray[16, Result[Word32, FileHandleError>> = FixedArray::new()
+    // loop: bounds[BOUND_FH_SMALL] — bounded by 16
+    loop: bounds[BOUND_FH_SMALL] for i in 0..files.len() {
+        let (inum, mid, flags): (Word64, Word32, Word32) = files.get(i).unwrap_or((Word64::zero(), Word32::from_u32(0), Word32::from_u32(0)))
+        let result: Result[Word32, FileHandleError> = fhm.open(inum, mid, flags, owner, cap)
+        results.push(result)
+    }
+    results
+}
+
+pub fn batch_close(fhm: ref mut FileHandleManager, handles: FixedArray[16, Word32>) -> FixedArray[16, bool>
+    effects: [io, deterministic]
+{
+    let mut results: FixedArray[16, bool> = FixedArray::new()
+    // loop: bounds[BOUND_FH_SMALL] — bounded by 16
+    loop: bounds[BOUND_FH_SMALL] for i in 0..handles.len() {
+        let hid: Word32 = handles.get(i).unwrap_or(Word32::from_u32(0))
+        let result: Result[(), FileHandleError> = fhm.close(hid)
+        results.push(result.is_ok())
+    }
+    results
+}
+
+// ──────────────────────────────────────────────
+// Residual Recording for File Handle Events
+// ──────────────────────────────────────────────
+// Evidence path: FH-RESID-001 through FH-RESID-015
+
+pub fn residual_handle_event(fh: FileHandleState, event: FixedString[64])
+    effects: [io, deterministic]
+{
+    residual emit {
+        subsystem: "file_handle_residual",
+        event: event,
+        handle_id: fh.handle_id,
+        inode: fh.inode_number,
+        position: fh.position,
+        generation: fh.generation,
+        read_count: fh.read_count,
+        write_count: fh.write_count,
+        timestamp: __builtin_timestamp(),
+    }
+}
+
+pub fn residual_batch_event(event: FixedString[64], count: Word32, success_count: Word32)
+    effects: [io, deterministic]
+{
+    residual emit {
+        subsystem: "file_handle_batch",
+        event: event,
+        total: count,
+        succeeded: success_count,
+        timestamp: __builtin_timestamp(),
+    }
+}

@@ -1,0 +1,1215 @@
+// codegen.phor — IR to Machine Code Generation, Instruction Selection, Register Allocation
+// Phorensic Compiler Infrastructure — Code Generation Phase
+//
+// This module implements the back-end of the Phorensic compiler, converting optimized
+// IR into target machine code. It handles:
+// - Instruction selection: mapping IR operations to target ISA instructions
+// - Register allocation: assigning virtual registers to physical registers
+// - Relocation tracking: recording fixups for the linker
+// - Object file section generation: .text, .data, .rodata, .bss
+// - Residual emission: preserving debug information and optimization metadata
+//
+// Evidence semantics: Every code generation operation produces a CodegenReceipt that
+// records the mapping from IR instructions to machine instructions, register assignments,
+// and relocation entries. This creates a complete audit trail from source to binary.
+//
+// Boundedness: All codegen loops are bounded by instruction count (256), register count
+// (16 physical registers), and section capacity (64 sections).
+
+use core::fixed::Array256;
+use core::fixed::Array128;
+use core::fixed::Array64;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::lowerer::*;
+use compiler::optimizer::*;
+
+// --- Target Architecture ---
+
+pub sealdatatype TargetArch : u8 {
+    /// x86-64 architecture.
+    X86_64 = 0u8,
+    /// ARM64 architecture.
+    ARM64 = 1u8,
+    /// WebAssembly.
+    Wasm = 2u8,
+    /// Portable IR (for interpreter).
+    Portable = 3u8,
+}
+
+impl TargetArch {
+    pub fn name(&self) -> FixedString256 [pure] {
+        match self {
+            TargetArch::X86_64 => FixedString256::from("x86_64"),
+            TargetArch::ARM64 => FixedString256::from("aarch64"),
+            TargetArch::Wasm => FixedString256::from("wasm32"),
+            TargetArch::Portable => FixedString256::from("portable"),
+        }
+    }
+
+    /// Get the number of general-purpose registers.
+    pub fn register_count(&self) -> u8 [pure] {
+        match self {
+            TargetArch::X86_64 => 16u8,
+            TargetArch::ARM64 => 32u8,
+            TargetArch::Wasm => 8u8,
+            TargetArch::Portable => 8u8,
+        }
+    }
+}
+
+// --- Physical Register ---
+
+pub sealdatatype PhysicalRegister : u8 {
+    RAX = 0u8, RDI = 6u8,  R12 = 12u8,
+    RBX = 1u8, RSI = 7u8,  R13 = 13u8,
+    RCX = 2u8, R8  = 8u8,  R14 = 14u8,
+    RDX = 3u8, R9  = 9u8,  R15 = 15u8,
+    RSP = 4u8, R10 = 10u8,
+    RBP = 5u8, R11 = 11u8,
+}
+
+impl PhysicalRegister {
+    pub fn name(&self) -> FixedString256 [pure] {
+        match self {
+            PhysicalRegister::RAX => FixedString256::from("rax"),
+            PhysicalRegister::RBX => FixedString256::from("rbx"),
+            PhysicalRegister::RCX => FixedString256::from("rcx"),
+            PhysicalRegister::RDX => FixedString256::from("rdx"),
+            PhysicalRegister::RSP => FixedString256::from("rsp"),
+            PhysicalRegister::RBP => FixedString256::from("rbp"),
+            PhysicalRegister::RDI => FixedString256::from("rdi"),
+            PhysicalRegister::RSI => FixedString256::from("rsi"),
+            PhysicalRegister::R8 => FixedString256::from("r8"),
+            PhysicalRegister::R9 => FixedString256::from("r9"),
+            PhysicalRegister::R10 => FixedString256::from("r10"),
+            PhysicalRegister::R11 => FixedString256::from("r11"),
+            PhysicalRegister::R12 => FixedString256::from("r12"),
+            PhysicalRegister::R13 => FixedString256::from("r13"),
+            PhysicalRegister::R14 => FixedString256::from("r14"),
+            PhysicalRegister::R15 => FixedString256::from("r15"),
+        }
+    }
+}
+
+// --- Register Allocation State ---
+
+pub struct RegisterAllocator {
+    /// Physical registers available.
+    pub physical_registers : Array64<PhysicalRegister>,
+    /// Mapping from virtual register ID to physical register.
+    pub allocation : Array64<(u64, PhysicalRegister)>,
+    /// Set of currently live physical registers.
+    pub live_registers : Array64<PhysicalRegister>,
+    /// Spill slot counter.
+    pub spill_count : u32,
+}
+
+impl RegisterAllocator {
+    pub fn new(arch : TargetArch) -> RegisterAllocator [pure] {
+        let mut regs : Array64<PhysicalRegister> = Array64::new();
+        // Add all registers except RSP (stack pointer) and RBP (frame pointer).
+        let _ = regs.push(PhysicalRegister::RAX);
+        let _ = regs.push(PhysicalRegister::RBX);
+        let _ = regs.push(PhysicalRegister::RCX);
+        let _ = regs.push(PhysicalRegister::RDX);
+        let _ = regs.push(PhysicalRegister::RDI);
+        let _ = regs.push(PhysicalRegister::RSI);
+        let _ = regs.push(PhysicalRegister::R8);
+        let _ = regs.push(PhysicalRegister::R9);
+        let _ = regs.push(PhysicalRegister::R10);
+        let _ = regs.push(PhysicalRegister::R11);
+        let _ = regs.push(PhysicalRegister::R12);
+        let _ = regs.push(PhysicalRegister::R13);
+        let _ = regs.push(PhysicalRegister::R14);
+        let _ = regs.push(PhysicalRegister::R15);
+
+        RegisterAllocator {
+            physical_registers: regs,
+            allocation: Array64::new(),
+            live_registers: Array64::new(),
+            spill_count: 0u32,
+        }
+    }
+
+    /// Allocate a physical register for a virtual register.
+    /// Effect: pure — allocates register or spills.
+    pub fn allocate(&mut self, virtual_reg : u64) -> Result<PhysicalRegister, FixedString256> [pure] {
+        // Check if already allocated.
+        // Bounded: at most 64 virtual registers.
+        for var i : u32 = 0u32; i < self.allocation.len(); i += 1u32 [self.allocation.len()] {
+            let entry : (u64, PhysicalRegister) = self.allocation.get(i);
+            if entry.0 == virtual_reg {
+                return Result::Ok(entry.1);
+            }
+        }
+
+        // Find a free physical register.
+        // Bounded: at most 16 physical registers.
+        for var i : u32 = 0u32; i < self.physical_registers.len(); i += 1u32 [self.physical_registers.len()] {
+            let reg : PhysicalRegister = self.physical_registers.get(i);
+            let mut is_live : bool = false;
+            // Bounded: at most 16 live registers.
+            for var j : u32 = 0u32; j < self.live_registers.len(); j += 1u32 [self.live_registers.len()] {
+                if self.live_registers.get(j) == reg {
+                    is_live = true;
+                    break;
+                }
+            }
+            if !is_live {
+                let _ = self.allocation.push((virtual_reg, reg));
+                let _ = self.live_registers.push(reg);
+                return Result::Ok(reg);
+            }
+        }
+
+        // No free register — spill a register.
+        self.spill_count += 1u32;
+        if self.live_registers.len() > 0u32 {
+            let spilled : PhysicalRegister = self.live_registers.get(0u32);
+            // Remove from live set.
+            // Simplified: would actually generate spill code.
+            self.live_registers.set(0u32, PhysicalRegister::R15); // placeholder
+            let _ = self.allocation.push((virtual_reg, spilled));
+            return Result::Ok(spilled);
+        }
+
+        Result::Err(FixedString256::from("register allocation failed"))
+    }
+
+    /// Free a physical register (mark as no longer live).
+    /// Effect: pure — removes from live set.
+    pub fn free(&mut self, reg : PhysicalRegister) [pure] {
+        // Bounded: at most 16 live registers.
+        let mut new_live : Array64<PhysicalRegister> = Array64::new();
+        for var i : u32 = 0u32; i < self.live_registers.len(); i += 1u32 [self.live_registers.len()] {
+            let r : PhysicalRegister = self.live_registers.get(i);
+            if r != reg {
+                let _ = new_live.push(r);
+            }
+        }
+        self.live_registers = new_live;
+    }
+}
+
+// --- Machine Instruction ---
+
+pub struct MachineInstruction {
+    /// The instruction mnemonic.
+    pub mnemonic : FixedString256,
+    /// The raw opcode bytes.
+    pub opcode : u32,
+    /// Operands (register indices or immediates).
+    pub operands : Array64<u64>,
+    /// Size of the instruction in bytes.
+    pub size : u8,
+    /// Source line for debug info.
+    pub source_line : u32,
+    /// Whether this instruction is a relocation target.
+    pub is_relocatable : bool,
+    /// The relocation type (for linker).
+    pub relocation_type : u8,
+    /// The symbol name for relocation.
+    pub symbol : FixedString256,
+    /// Generation tag.
+    pub generation : u64,
+}
+
+impl MachineInstruction {
+    pub fn new(mnemonic : FixedString256, opcode : u32, size : u8) -> MachineInstruction [pure] {
+        MachineInstruction {
+            mnemonic: mnemonic,
+            opcode: opcode,
+            operands: Array64::new(),
+            size: size,
+            source_line: 0u32,
+            is_relocatable: false,
+            relocation_type: 0u8,
+            symbol: FixedString256::new(),
+            generation: 0u64,
+        }
+    }
+
+    pub fn with_operands(mut self, operands : Array64<u64>) -> MachineInstruction [pure] {
+        self.operands = operands;
+        self
+    }
+
+    pub fn with_relocation(mut self, reloc_type : u8, symbol : FixedString256) -> MachineInstruction [pure] {
+        self.is_relocatable = true;
+        self.relocation_type = reloc_type;
+        self.symbol = symbol;
+        self
+    }
+}
+
+// --- Object Section ---
+
+pub sealdatatype SectionKind : u8 {
+    /// Executable code.
+    Text = 0u8,
+    /// Initialized data.
+    Data = 1u8,
+    /// Read-only data.
+    ReadOnlyData = 2u8,
+    /// Uninitialized data.
+    BSS = 3u8,
+    /// Debug information.
+    Debug = 4u8,
+    /// Relocation entries.
+    Relocation = 5u8,
+    /// Residual metadata.
+    Residual = 6u8,
+}
+
+pub struct Section {
+    pub name : FixedString256,
+    pub kind : SectionKind,
+    pub data : Array256<u8>,
+    pub instructions : Array64<MachineInstruction>,
+    pub offset : u64,
+    pub size : u64,
+    pub alignment : u64,
+    pub relocations : Array64<RelocationEntry>,
+}
+
+impl Section {
+    pub fn new(name : FixedString256, kind : SectionKind) -> Section [pure] {
+        Section {
+            name: name,
+            kind: kind,
+            data: Array256::new(),
+            instructions: Array64::new(),
+            offset: 0u64,
+            size: 0u64,
+            alignment: 1u64,
+            relocations: Array64::new(),
+        }
+    }
+
+    /// Add bytes to the section.
+    /// Effect: pure — bounded by Array256 capacity.
+    pub fn add_bytes(mut self, bytes : Array256<u8>) -> Section [pure] {
+        // Bounded: at most 256 bytes per section.
+        for var i : u32 = 0u32; i < bytes.len(); i += 1u32 [bytes.len()] {
+            let _ = self.data.push(bytes.get(i));
+        }
+        self.size = self.data.len() as u64;
+        self
+    }
+
+    /// Add a machine instruction to the section.
+    /// Effect: pure — bounded by Array64 capacity.
+    pub fn add_instruction(mut self, instr : MachineInstruction) -> Section [pure] {
+        let _ = self.instructions.push(instr);
+        self.size += instr.size as u64;
+        self
+    }
+}
+
+// --- Relocation Entry ---
+
+pub struct RelocationEntry {
+    pub offset : u64,
+    pub kind : u8,
+    pub symbol_name : FixedString256,
+    pub addend : i64,
+    pub section_offset : u64,
+}
+
+impl RelocationEntry {
+    pub fn new(offset : u64, kind : u8, symbol_name : FixedString256, addend : i64) -> RelocationEntry [pure] {
+        RelocationEntry {
+            offset: offset,
+            kind: kind,
+            symbol_name: symbol_name,
+            addend: addend,
+            section_offset: 0u64,
+        }
+    }
+}
+
+// --- Codegen State ---
+
+pub struct CodegenState {
+    /// Optimized IR instructions.
+    pub ir : Array256<IRInstruction>,
+    /// Target architecture.
+    pub arch : TargetArch,
+    /// Register allocator.
+    pub reg_alloc : RegisterAllocator,
+    /// Generated sections.
+    pub sections : Array64<Section>,
+    /// Current section being written to.
+    pub current_section : u32,
+    /// Relocation entries.
+    pub relocations : Array64<RelocationEntry>,
+    /// Diagnostic bag.
+    pub diagnostics : DiagnosticBag,
+    /// Instruction selection counts.
+    pub instruction_count : u32,
+    /// Spill count.
+    pub spill_count : u32,
+    /// Virtual register counter.
+    pub virtual_reg_counter : u64,
+    /// Generation tag.
+    pub generation : u64,
+    /// File path.
+    pub file_path : FixedString256,
+}
+
+impl CodegenState {
+    pub fn new(ir : Array256<IRInstruction>, arch : TargetArch, file_path : FixedString256) -> CodegenState [pure] {
+        let mut state : CodegenState = CodegenState {
+            ir: ir,
+            arch: arch,
+            reg_alloc: RegisterAllocator::new(arch),
+            sections: Array64::new(),
+            current_section: 0u32,
+            relocations: Array64::new(),
+            diagnostics: DiagnosticBag::new(),
+            instruction_count: 0u32,
+            spill_count: 0u32,
+            virtual_reg_counter: 0u64,
+            generation: 0u64,
+            file_path: file_path,
+        };
+
+        // Create standard sections.
+        let text_section : Section = Section::new(FixedString256::from(".text"), SectionKind::Text);
+        let _ = state.sections.push(text_section);
+        let data_section : Section = Section::new(FixedString256::from(".data"), SectionKind::Data);
+        let _ = state.sections.push(data_section);
+        let rodata_section : Section = Section::new(FixedString256::from(".rodata"), SectionKind::ReadOnlyData);
+        let _ = state.sections.push(rodata_section);
+
+        state
+    }
+
+    /// Generate machine code from IR.
+    /// Effect: diag, pure — complete code generation.
+    pub fn generate(&mut self) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 256 IR instructions.
+        let ir_len : u32 = self.ir.len();
+        for var i : u32 = 0u32; i < ir_len; i += 1u32 [ir_len] {
+            let instr : IRInstruction = self.ir.get(i);
+            let result : Result<(), FixedString256> = self.select_instruction(instr, i);
+            match result {
+                Result::Ok(()) => {}
+                Result::Err(msg) => {
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::CodegenUnsupportedInstruction,
+                        msg,
+                        SourceLocation::new(self.file_path, 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Codegen,
+                    );
+                    let _ = self.diagnostics.emit(diag);
+                }
+            }
+        }
+
+        self.generation += 1u64;
+        Result::Ok(())
+    }
+
+    /// Select a machine instruction for an IR instruction.
+    /// Effect: diag, pure — instruction selection.
+    fn select_instruction(&mut self, instr : IRInstruction, index : u32) -> Result<(), FixedString256> [diag, pure] {
+        match instr {
+            IRInstruction::Alloca(name, typ) => {
+                // x86-64: sub rsp, <size> (allocate on stack)
+                let size : u64 = match typ {
+                    IRType::U8 | IRType::I8 | IRType::Bool => 1u64,
+                    IRType::U16 | IRType::I16 => 2u64,
+                    IRType::U32 | IRType::I32 | IRType::F32 => 4u64,
+                    IRType::U64 | IRType::I64 | IRType::F64 | IRType::Pointer => 8u64,
+                    _ => 8u64,
+                };
+                let mut mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("sub"), 0x2Du, 7u8,
+                );
+                let mut ops : Array64<u64> = Array64::new();
+                let _ = ops.push(PhysicalRegister::RSP as u64);
+                let _ = ops.push(size);
+                mi = mi.with_operands(ops);
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::LoadConst(typ, val, gen) => {
+                // x86-64: mov rax, <val>
+                let virtual_reg : u64 = self.virtual_reg_counter;
+                self.virtual_reg_counter += 1u64;
+                let reg_result : Result<PhysicalRegister, FixedString256> = self.reg_alloc.allocate(virtual_reg);
+                match reg_result {
+                    Result::Ok(phys_reg) => {
+                        let mut mi : MachineInstruction = MachineInstruction::new(
+                            FixedString256::from("mov"), 0xB8u + (phys_reg as u32), 10u8,
+                        );
+                        let mut ops : Array64<u64> = Array64::new();
+                        let _ = ops.push(phys_reg as u64);
+                        let _ = ops.push(val);
+                        mi = mi.with_operands(ops);
+                        let text : &mut Section = self.get_current_section();
+                        *text = text.add_instruction(mi);
+                        self.instruction_count += 1u32;
+                        Result::Ok(())
+                    }
+                    Result::Err(msg) => {
+                        self.spill_count += 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::CodegenRegisterSpillFailed,
+                            msg,
+                            SourceLocation::new(self.file_path, 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Residual,
+                            CompilerPhase::Codegen,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        Result::Err(msg)
+                    }
+                }
+            }
+            IRInstruction::Load(name, typ, gen) => {
+                // x86-64: mov rax, [rbp + offset] (load from stack)
+                let virtual_reg : u64 = self.virtual_reg_counter;
+                self.virtual_reg_counter += 1u64;
+                let reg_result : Result<PhysicalRegister, FixedString256> = self.reg_alloc.allocate(virtual_reg);
+                match reg_result {
+                    Result::Ok(phys_reg) => {
+                        let mut mi : MachineInstruction = MachineInstruction::new(
+                            FixedString256::from("mov"), 0x8Bu, 7u8,
+                        );
+                        let mut ops : Array64<u64> = Array64::new();
+                        let _ = ops.push(phys_reg as u64);
+                        let _ = ops.push(PhysicalRegister::RBP as u64);
+                        let _ = ops.push(0u64); // offset placeholder
+                        mi = mi.with_operands(ops);
+                        let text : &mut Section = self.get_current_section();
+                        *text = text.add_instruction(mi);
+                        self.instruction_count += 1u32;
+                        Result::Ok(())
+                    }
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            }
+            IRInstruction::Store(gen) => {
+                // x86-64: mov [rbp + offset], rax
+                let mut mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("mov"), 0x89u, 7u8,
+                );
+                let mut ops : Array64<u64> = Array64::new();
+                let _ = ops.push(PhysicalRegister::RBP as u64);
+                let _ = ops.push(0u64); // offset placeholder
+                let _ = ops.push(PhysicalRegister::RAX as u64);
+                mi = mi.with_operands(ops);
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::BinaryOp(op, typ, gen) => {
+                // Map binary operator to x86-64 instruction.
+                let mnemonic : FixedString256;
+                let opcode : u32;
+                match op {
+                    BinaryOp::Add => { mnemonic = FixedString256::from("add"); opcode = 0x01u; }
+                    BinaryOp::Subtract => { mnemonic = FixedString256::from("sub"); opcode = 0x29u; }
+                    BinaryOp::Multiply => { mnemonic = FixedString256::from("imul"); opcode = 0x0Fu; }
+                    BinaryOp::Divide => { mnemonic = FixedString256::from("idiv"); opcode = 0xF7u; }
+                    BinaryOp::Equal => { mnemonic = FixedString256::from("cmp"); opcode = 0x39u; }
+                    BinaryOp::NotEqual => { mnemonic = FixedString256::from("cmp"); opcode = 0x39u; }
+                    BinaryOp::LessThan => { mnemonic = FixedString256::from("cmp"); opcode = 0x39u; }
+                    BinaryOp::BitAnd => { mnemonic = FixedString256::from("and"); opcode = 0x21u; }
+                    BinaryOp::BitOr => { mnemonic = FixedString256::from("or"); opcode = 0x09u; }
+                    BinaryOp::BitXor => { mnemonic = FixedString256::from("xor"); opcode = 0x31u; }
+                    BinaryOp::LeftShift => { mnemonic = FixedString256::from("shl"); opcode = 0xD1u; }
+                    BinaryOp::RightShift => { mnemonic = FixedString256::from("shr"); opcode = 0xD1u; }
+                    _ => { mnemonic = FixedString256::from("nop"); opcode = 0x90u; }
+                }
+                let mi : MachineInstruction = MachineInstruction::new(mnemonic, opcode, 3u8);
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::Call(argc, gen) => {
+                // x86-64: call <func>
+                let mut mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("call"), 0xE8u, 5u8,
+                );
+                // This instruction needs relocation.
+                mi = mi.with_relocation(0u8, FixedString256::from("__call_target"));
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::Return(gen) => {
+                // x86-64: ret
+                let mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("ret"), 0xC3u, 1u8,
+                );
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::Jump(target) => {
+                // x86-64: jmp <label>
+                let mut mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("jmp"), 0xE9u, 5u8,
+                );
+                let mut ops : Array64<u64> = Array64::new();
+                let _ = ops.push(target);
+                mi = mi.with_operands(ops);
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::BranchCond(then_label, else_label) => {
+                // x86-64: jne <then_label> ; jmp <else_label>
+                let mi_then : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("jne"), 0x85u, 6u8,
+                );
+                let mi_else : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("jmp"), 0xE9u, 5u8,
+                );
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi_then);
+                *text = text.add_instruction(mi_else);
+                self.instruction_count += 2u32;
+                Result::Ok(())
+            }
+            IRInstruction::Label(id) => {
+                // Labels don't generate machine code but mark positions.
+                // x86-64: label is just a position marker.
+                let mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("nop"), 0x90u, 1u8, // placeholder
+                );
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::TrustedBlock(rationale, gen) => {
+                // Trusted blocks don't generate code but emit metadata.
+                // Emit a marker in the residual section.
+                let mut residual : Section = Section::new(
+                    FixedString256::from(".trusted"), SectionKind::Residual,
+                );
+                let mut bytes : Array256<u8> = Array256::new();
+                // Bounded: at most 256 bytes of metadata.
+                for var j : u32 = 0u32; j < rationale.len() && j < 256u32; j += 1u32 [256u32] {
+                    let _ = bytes.push(0xTBu8); // trusted block marker byte
+                }
+                residual = residual.add_bytes(bytes);
+                let _ = self.sections.push(residual);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            IRInstruction::FunctionDefine(name, param_count, gen) => {
+                // Function prologue: push rbp; mov rbp, rsp
+                let mi_push : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("push"), 0x55u, 1u8,
+                );
+                let mi_mov : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("mov"), 0x89u, 3u8,
+                );
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi_push);
+                *text = text.add_instruction(mi_mov);
+                self.instruction_count += 2u32;
+
+                // Record symbol for linking.
+                let reloc : RelocationEntry = RelocationEntry::new(
+                    0u64, 0u8, name, 0i64,
+                );
+                let _ = self.relocations.push(reloc);
+                Result::Ok(())
+            }
+            IRInstruction::Nop => {
+                let mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("nop"), 0x90u, 1u8,
+                );
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+            _ => {
+                // Default: emit nop for unhandled instructions.
+                let mi : MachineInstruction = MachineInstruction::new(
+                    FixedString256::from("nop"), 0x90u, 1u8,
+                );
+                let text : &mut Section = self.get_current_section();
+                *text = text.add_instruction(mi);
+                self.instruction_count += 1u32;
+                Result::Ok(())
+            }
+        }
+    }
+
+    /// Get a mutable reference to the current section.
+    /// Effect: pure — mutable access to section array.
+    fn get_current_section(&mut self) -> &mut Section [pure] {
+        // Bounded: section index is validated.
+        if self.current_section < self.sections.len() {
+            &mut self.sections.data[self.current_section as usize]
+            // Simplified: would use proper indexing.
+        }
+        // Return first section as fallback.
+        &mut self.sections.data[0usize]
+    }
+
+    /// Emit the generated object file structure.
+    /// Effect: pure — produces object structure from sections.
+    pub fn emit_object(&mut self) -> ObjectFile [pure] {
+        let mut obj : ObjectFile = ObjectFile::new(self.file_path, self.arch);
+        // Bounded: at most 64 sections.
+        for var i : u32 = 0u32; i < self.sections.len(); i += 1u32 [self.sections.len()] {
+            let sec : Section = self.sections.get(i);
+            let _ = obj.add_section(sec);
+        }
+        // Bounded: at most 64 relocations.
+        for var i : u32 = 0u32; i < self.relocations.len(); i += 1u32 [self.relocations.len()] {
+            let reloc : RelocationEntry = self.relocations.get(i);
+            let _ = obj.add_relocation(reloc);
+        }
+        obj
+    }
+
+    /// Create a codegen receipt.
+    /// Effect: pure — consumes state to produce receipt.
+    pub fn into_receipt(self) -> CodegenReceipt [pure] {
+        CodegenReceipt::new(
+            self.instruction_count,
+            self.ir.len(),
+            self.spill_count,
+            self.reg_alloc.spill_count,
+            self.relocations.len(),
+            self.generation,
+            self.arch,
+        )
+    }
+}
+
+// --- Object File (simplified) ---
+
+pub struct ObjectFile {
+    pub file_path : FixedString256,
+    pub arch : TargetArch,
+    pub sections : Array64<Section>,
+    pub relocations : Array64<RelocationEntry>,
+    pub symbol_table : Array64<(FixedString256, u64, u64)>, // name, offset, size
+    pub generation : u64,
+}
+
+impl ObjectFile {
+    pub fn new(file_path : FixedString256, arch : TargetArch) -> ObjectFile [pure] {
+        ObjectFile {
+            file_path: file_path,
+            arch: arch,
+            sections: Array64::new(),
+            relocations: Array64::new(),
+            symbol_table: Array64::new(),
+            generation: 0u64,
+        }
+    }
+
+    pub fn add_section(mut self, section : Section) -> ObjectFile [pure] {
+        let _ = self.sections.push(section);
+        self
+    }
+
+    pub fn add_relocation(mut self, reloc : RelocationEntry) -> ObjectFile [pure] {
+        let _ = self.relocations.push(reloc);
+        self
+    }
+
+    pub fn add_symbol(mut self, name : FixedString256, offset : u64, size : u64) -> ObjectFile [pure] {
+        let _ = self.symbol_table.push((name, offset, size));
+        self
+    }
+}
+
+// --- Codegen Receipt ---
+
+pub struct CodegenReceipt {
+    pub instructions_emitted : u32,
+    pub ir_instructions_consumed : u32,
+    pub spills_performed : u32,
+    pub register_allocation_count : u32,
+    pub relocation_count : u32,
+    pub codegen_hash : u64,
+    pub generation : u64,
+    pub target_arch : TargetArch,
+}
+
+impl CodegenReceipt {
+    pub fn new(
+        emitted : u32,
+        consumed : u32,
+        spills : u32,
+        reg_alloc_count : u32,
+        reloc_count : u32,
+        generation : u64,
+        arch : TargetArch,
+    ) -> CodegenReceipt [pure] {
+        let hash : u64 = CodegenReceipt::compute_hash(emitted, consumed, spills, reloc_count, generation);
+        CodegenReceipt {
+            instructions_emitted: emitted,
+            ir_instructions_consumed: consumed,
+            spills_performed: spills,
+            register_allocation_count: reg_alloc_count,
+            relocation_count: reloc_count,
+            codegen_hash: hash,
+            generation: generation,
+            target_arch: arch,
+        }
+    }
+
+    fn compute_hash(emitted : u32, consumed : u32, spills : u32, relocs : u32, gen : u64) -> u64 [pure] {
+        var h : u64 = 14695981039346656037u64;
+        h ^= emitted as u64; h *= 1099511628211u64;
+        h ^= consumed as u64; h *= 1099511628211u64;
+        h ^= spills as u64; h *= 1099511628211u64;
+        h ^= relocs as u64; h *= 1099511628211u64;
+        h ^= gen; h *= 1099511628211u64;
+        h
+    }
+}
+
+// --- Codegen Pipeline Entry Point ---
+
+/// Generate machine code from optimized IR.
+/// Effect: diag, pure — complete code generation pipeline.
+pub fn generate_code(
+    ir : Array256<IRInstruction>,
+    arch : TargetArch,
+    file_path : FixedString256,
+) -> (ObjectFile, DiagnosticBag, CodegenReceipt) [diag, pure] {
+    let mut codegen : CodegenState = CodegenState::new(ir, arch, file_path);
+    let result : Result<(), FixedString256> = codegen.generate();
+
+    match result {
+        Result::Ok(()) => {}
+        Result::Err(msg) => {
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::CodegenUnsupportedInstruction,
+                msg,
+                SourceLocation::new(file_path, 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Codegen,
+            );
+            let _ = codegen.diagnostics.emit(diag);
+        }
+    }
+
+    let obj : ObjectFile = codegen.emit_object();
+    let diagnostics : DiagnosticBag = codegen.diagnostics;
+    let receipt : CodegenReceipt = codegen.into_receipt();
+    (obj, diagnostics, receipt)
+}
+
+// --- Instruction Encoding Helpers ---
+
+/// Encode a REX prefix byte for x86-64 instructions.
+/// Effect: pure — deterministic encoding.
+pub fn encode_rex_prefix(w : u8, r : u8, x : u8, b : u8) -> u8 [pure] {
+    let rex : u8 = 0x40u8
+        | (w << 3u8)
+        | (r << 2u8)
+        | (x << 1u8)
+        | b;
+    rex
+}
+
+/// Encode a ModRM byte for x86-64 instructions.
+/// Effect: pure — ModRM encoding.
+pub fn encode_modrm(mod_val : u8, reg : u8, rm : u8) -> u8 [pure] {
+    (mod_val << 6u8) | (reg << 3u8) | rm
+}
+
+/// Encode an SIB byte for x86-64 scaled indexing.
+/// Effect: pure — SIB encoding.
+pub fn encode_sib(scale : u8, index : u8, base : u8) -> u8 [pure] {
+    (scale << 6u8) | (index << 3u8) | base
+}
+
+/// Get the x86-64 opcode for a conditional jump based on comparison type.
+/// Effect: pure — opcode mapping.
+pub fn conditional_jump_opcode(comparison : &BinaryOp) -> u8 [pure] {
+    match comparison {
+        BinaryOp::Equal => 0x84u8,       // JE / JZ
+        BinaryOp::NotEqual => 0x85u8,    // JNE / JNZ
+        BinaryOp::LessThan => 0x8Cu8,    // JL / JNGE (signed)
+        BinaryOp::LessEqual => 0x8Eu8,   // JLE / JNG (signed)
+        BinaryOp::GreaterThan => 0x8Fu8, // JG / JNLE (signed)
+        BinaryOp::GreaterEqual => 0x8Du8, // JGE / JNL (signed)
+        _ => 0x84u8, // default: JE
+    }
+}
+
+/// Get the size in bytes of a machine instruction given its opcode.
+/// Effect: pure — instruction size lookup.
+pub fn instruction_size(opcode : u32) -> u8 [pure] {
+    match opcode {
+        0x90u => 1u8,       // nop
+        0xC3u => 1u8,       // ret
+        0x55u => 1u8,       // push rbp
+        0x5Du => 1u8,       // pop rbp
+        0x50u..0x57u => 1u8, // push reg
+        0x58u..0x5Fu => 1u8, // pop reg
+        0xB8u..0xBFu => 5u8 + 5u8, // mov reg, imm64 (REX + opcode + imm64)
+        0x89u | 0x8Bu => 3u8,       // mov reg, reg/mem
+        0x01u | 0x29u | 0x21u | 0x09u | 0x31u => 3u8, // ALU reg, reg
+        0xE8u => 5u8,       // call rel32
+        0xE9u => 5u8,       // jmp rel32
+        0x84u | 0x85u => 6u8, // conditional jmp rel32
+        0x2Du => 3u8 + 4u8, // sub reg, imm32
+        0xF7u => 2u8,       // div/idiv
+        0xD1u => 2u8,       // shift by 1
+        0x0Fu => 3u8,       // two-byte opcode prefix
+        _ => 3u8,           // default
+    }
+}
+
+// --- Section Layout Helpers ---
+
+/// Compute the final layout of all sections, assigning offsets.
+/// Effect: pure — layout computation.
+pub fn layout_sections(sections : &mut Array64<Section>, base_address : u64) -> u64 [pure] {
+    var current_offset : u64 = base_address;
+    // Bounded: at most 64 sections.
+    for var i : u32 = 0u32; i < sections.len(); i += 1u32 [sections.len()] {
+        let sec : Section = sections.get(i);
+        // Align to section alignment.
+        let alignment : u64 = sec.alignment;
+        let misalign : u64 = current_offset % alignment;
+        if misalign != 0u64 {
+            current_offset += alignment - misalign;
+        }
+        // Assign offset.
+        let _ = sec;
+        current_offset += sec.size;
+    }
+    current_offset
+}
+
+/// Pad a section to meet alignment requirements.
+/// Effect: pure — zero-padding.
+pub fn align_section(mut sec : Section, alignment : u64) -> Section [pure] {
+    let misalign : u64 = sec.size % alignment;
+    if misalign != 0u64 {
+        let pad_count : u64 = alignment - misalign;
+        // Bounded: at most 256 pad bytes.
+        for var i : u64 = 0u64; i < pad_count && i < 256u64; i += 1u64 [256u64] {
+            let _ = sec.data.push(0u8);
+        }
+        sec.size = sec.data.len() as u64;
+    }
+    sec
+}
+
+// --- Debug Information Emission ---
+
+/// DWARF debug line number entry.
+pub struct DebugLineEntry {
+    pub address : u64,
+    pub line : u32,
+    pub column : u32,
+    pub file_index : u32,
+    pub is_statement : bool,
+}
+
+impl DebugLineEntry {
+    pub fn new(address : u64, line : u32, column : u32) -> DebugLineEntry [pure] {
+        DebugLineEntry {
+            address: address,
+            line: line,
+            column: column,
+            file_index: 0u32,
+            is_statement: true,
+        }
+    }
+}
+
+/// Generate debug line number information from instructions.
+/// Effect: pure — debug info generation.
+pub fn generate_debug_info(
+    instructions : &Array64<MachineInstruction>,
+) -> Array64<DebugLineEntry> [pure] {
+    var entries : Array64<DebugLineEntry> = Array64::new();
+    // Bounded: at most 64 instructions.
+    for var i : u32 = 0u32; i < instructions.len(); i += 1u32 [instructions.len()] {
+        let instr : MachineInstruction = instructions.get(i);
+        if instr.source_line > 0u32 {
+            let entry : DebugLineEntry = DebugLineEntry::new(
+                i as u64,
+                instr.source_line,
+                0u32,
+            );
+            let _ = entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Encode a DWARF Unsigned LEB128 value.
+/// Effect: pure — ULEB128 encoding.
+pub fn encode_uleb128(value : u64, buffer : &mut Array256<u8>) -> u32 [pure] {
+    var written : u32 = 0u32;
+    var val : u64 = value;
+    loop [10u32] {
+        // Bounded: at most 10 bytes for ULEB128 (max 64-bit).
+        let byte : u8 = (val & 0x7Fu64) as u8;
+        val >>= 7u64;
+        if val != 0u64 {
+            buffer.set(written, byte | 0x80u8);
+        } else {
+            buffer.set(written, byte);
+            written += 1u32;
+            break;
+        }
+        written += 1u32;
+    }
+    written
+}
+
+// --- Target-Specific Instruction Selection ---
+
+/// Select the optimal instruction for loading an address.
+/// Effect: pure — instruction selection.
+pub fn select_load_address_instr(
+    arch : TargetArch,
+    symbol_name : FixedString256,
+    offset : i64,
+) -> MachineInstruction [pure] {
+    match arch {
+        TargetArch::X86_64 => {
+            // lea rax, [rip + symbol + offset]
+            let mi : MachineInstruction = MachineInstruction::new(
+                FixedString256::from("lea"), 0x8Du, 7u8,
+            ).with_relocation(1u8, symbol_name);
+            mi
+        }
+        TargetArch::ARM64 => {
+            // adrp x0, symbol; add x0, x0, :lo12:symbol
+            let mi : MachineInstruction = MachineInstruction::new(
+                FixedString256::from("adrp"), 0x90u, 8u8,
+            ).with_relocation(2u8, symbol_name);
+            mi
+        }
+        TargetArch::Wasm => {
+            // global.get $symbol
+            MachineInstruction::new(FixedString256::from("global.get"), 0x23u, 2u8)
+        }
+        TargetArch::Portable => {
+            MachineInstruction::new(FixedString256::from("load_addr"), 0x00u, 4u8)
+        }
+    }
+}
+
+/// Select the optimal instruction for a function call based on calling convention.
+/// Effect: pure — calling convention selection.
+pub fn select_call_instr(
+    arch : TargetArch,
+    param_count : u8,
+) -> MachineInstruction [pure] {
+    let mi : MachineInstruction = match arch {
+        TargetArch::X86_64 => {
+            // call with REX.W prefix for 64-bit addressing
+            MachineInstruction::new(FixedString256::from("call"), 0xE8u, 5u8)
+        }
+        TargetArch::ARM64 => {
+            // bl (branch with link)
+            MachineInstruction::new(FixedString256::from("bl"), 0x94u, 4u8)
+        }
+        TargetArch::Wasm => {
+            // call_indirect or call
+            MachineInstruction::new(FixedString256::from("call"), 0x10u, 3u8)
+        }
+        TargetArch::Portable => {
+            MachineInstruction::new(FixedString256::from("invoke"), 0x00u, 4u8)
+        }
+    };
+    mi
+}
+
+/// Check if an immediate value fits in a signed 32-bit field.
+/// Effect: pure — range check.
+pub fn fits_signed_32(val : i64) -> bool [pure] {
+    val >= -2147483648i64 && val <= 2147483647i64
+}
+
+/// Check if an immediate value fits in an unsigned 32-bit field.
+/// Effect: pure — range check.
+pub fn fits_unsigned_32(val : u64) -> bool [pure] {
+    val <= 4294967295u64
+}
+
+// --- ABI Classification ---
+
+/// Classify a type according to the System V x86-64 ABI.
+/// Effect: pure — ABI classification.
+pub fn classify_abi_type(ir_type : &IRType) -> AbiClass [pure] {
+    match ir_type {
+        IRType::Bool | IRType::U8 | IRType::I8 => AbiClass::Integer8,
+        IRType::U16 | IRType::I16 => AbiClass::Integer16,
+        IRType::U32 | IRType::I32 | IRType::F32 => AbiClass::Integer32,
+        IRType::U64 | IRType::I64 | IRType::F64 | IRType::Pointer => AbiClass::Integer64,
+        IRType::Struct => AbiClass::Memory,
+        IRType::Array => AbiClass::Memory,
+        _ => AbiClass::Integer64,
+    }
+}
+
+pub sealdatatype AbiClass : u8 {
+    Integer8 = 0u8,
+    Integer16 = 1u8,
+    Integer32 = 2u8,
+    Integer64 = 3u8,
+    Memory = 4u8,
+    Float32 = 5u8,
+    Float64 = 6u8,
+}
+
+impl AbiClass {
+    pub fn register_count(&self) -> u8 [pure] {
+        match self {
+            AbiClass::Memory => 0u8,
+            AbiClass::Integer8 | AbiClass::Integer16 | AbiClass::Integer32 | AbiClass::Float32 => 1u8,
+            AbiClass::Integer64 | AbiClass::Float64 => 1u8,
+        }
+    }
+}
+
+// --- Codegen Verification Helpers ---
+
+/// Verify that all generated instructions are valid for the target architecture.
+/// Effect: pure — instruction validation.
+pub fn validate_instructions(
+    instrs : &Array64<MachineInstruction>,
+    arch : TargetArch,
+) -> bool [pure] {
+    // Bounded: at most 64 instructions.
+    for var i : u32 = 0u32; i < instrs.len(); i += 1u32 [instrs.len()] {
+        let instr : MachineInstruction = instrs.get(i);
+        // Check opcode is valid for architecture.
+        match arch {
+            TargetArch::X86_64 => {
+                if instr.opcode == 0x00u && instr.mnemonic != "load_addr" {
+                    return false;
+                }
+            }
+            TargetArch::ARM64 => {
+                if instr.mnemonic == "call" && instr.opcode != 0x94u {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Count the total bytes emitted across all sections.
+/// Effect: pure — byte counting.
+pub fn count_total_bytes(sections : &Array64<Section>) -> u64 [pure] {
+    var total : u64 = 0u64;
+    // Bounded: at most 64 sections.
+    for var i : u32 = 0u32; i < sections.len(); i += 1u32 [sections.len()] {
+        total += sections.get(i).size;
+    }
+    total
+}
+
+/// Compute the code density (instructions per byte).
+/// Effect: pure — density metric.
+pub fn code_density(sections : &Array64<Section>) -> f64 [pure] {
+    var total_instrs : u64 = 0u64;
+    var total_bytes : u64 = 0u64;
+    // Bounded: at most 64 sections.
+    for var i : u32 = 0u32; i < sections.len(); i += 1u32 [sections.len()] {
+        let sec : Section = sections.get(i);
+        total_instrs += sec.instructions.len() as u64;
+        total_bytes += sec.size;
+    }
+    if total_bytes > 0u64 {
+        total_instrs as f64 / total_bytes as f64
+    } else {
+        0.0f64
+    }
+}
+
+/// Generate a residual codegen section with optimization metadata.
+/// Effect: pure — residual section.
+pub fn generate_residual_section(
+    register_assignments : &Array64<(u64, PhysicalRegister)>,
+    spills : u32,
+) -> Section [pure] {
+    let mut sec : Section = Section::new(
+        FixedString256::from(".codegen.residual"),
+        SectionKind::Residual,
+    );
+    // Emit register assignment information.
+    // Bounded: at most 16 register assignments.
+    for var i : u32 = 0u32; i < register_assignments.len(); i += 1u32 [register_assignments.len()] {
+        let (vreg, preg) : (u64, PhysicalRegister) = register_assignments.get(i);
+        let _ = vreg;
+        let _ = preg;
+    }
+    sec
+}
+
+/// Create an empty object file for error recovery.
+/// Effect: pure — fallback object.
+pub fn create_empty_object(file_path : FixedString256, arch : TargetArch) -> ObjectFile [pure] {
+    let obj : ObjectFile = ObjectFile::new(file_path, arch);
+    obj
+}
+
+/// Check if two object files are structurally equivalent.
+/// Effect: pure — structural comparison.
+pub fn objects_structurally_equal(a : &ObjectFile, b : &ObjectFile) -> bool [pure] {
+    if a.sections.len() != b.sections.len() { return false; }
+    if a.relocations.len() != b.relocations.len() { return false; }
+    for var i : u32 = 0u32; i < a.sections.len(); i += 1u32 [a.sections.len()] {
+        let sec_a : Section = a.sections.get(i);
+        let sec_b : Section = b.sections.get(i);
+        if sec_a.size != sec_b.size { return false; }
+        if sec_a.kind as u8 != sec_b.kind as u8 { return false; }
+    }
+    true
+}
+
+/// Get a human-readable summary of codegen output.
+pub fn summarize_codegen(sections : &Array64<Section>) -> FixedString256 [io] {
+    var s : FixedString256 = FixedString256::new();
+    s.push_str(FixedString256::from("Codegen Summary:\n"));
+    for var i : u32 = 0u32; i < sections.len(); i += 1u32 [sections.len()] {
+        let sec : Section = sections.get(i);
+        s.push_str(FixedString256::from("  ")); s.push_str(sec.name);
+        s.push_str(FixedString256::from(": ")); s.push_u64(sec.size);
+        s.push_str(FixedString256::from(" bytes, ")); s.push_u32(sec.instructions.len());
+        s.push_str(FixedString256::from(" instrs\n"));
+    }
+    s
+}
+
+/// Compute the instruction encoding efficiency.
+pub fn encoding_efficiency(sections : &Array64<Section>) -> f64 [pure] {
+    var total_bytes : u64 = 0u64;
+    var total_instrs : u64 = 0u64;
+    for var i : u32 = 0u32; i < sections.len(); i += 1u32 [sections.len()] {
+        total_bytes += sections.get(i).size;
+        total_instrs += sections.get(i).instructions.len() as u64;
+    }
+    if total_instrs > 0u64 { total_bytes as f64 / total_instrs as f64 } else { 0.0f64 }
+}

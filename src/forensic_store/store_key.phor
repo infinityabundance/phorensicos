@@ -1,0 +1,1183 @@
+// store_key.phor — StoreKey computation from semantic inputs, hash composition
+// Phorensic Forensic Store: content-addressed key derivation
+// Spec: FORENSIC_STORE.md — Store Key section
+// Grammar: PHORENSIC_GRAMMAR.md §43 Store Operation Grammar (production 191)
+
+package forensic_store.store_key;
+
+use forensic_store.store_object::{ Hash256, hash256_zero, hash256_equal, Identity, DialectProfile };
+
+// ============================================================================
+// StoreKey — The Content Address
+// ============================================================================
+
+/// A StoreKey is a 256-bit hash that uniquely identifies a store object.
+/// The key is computed from the complete semantic context:
+///
+///   StoreKey = hash(
+///     source_hash,
+///     dependencies_hash,
+///     dialect_profile_hash,
+///     compiler_version_hash,
+///     target_arch_hash,
+///     effect_profile_hash,
+///     expansion_receipts_hash,
+///     oracle_identities_hash,
+///     court_versions_hash,
+///     build_environment_capsule_hash
+///   )
+///
+/// This composite hash ensures that the same source compiled under different
+/// configurations produces different store keys, enabling safe coexistence.
+type StoreKey = Hash256;
+
+// ============================================================================
+// Semantic Input Types
+// ============================================================================
+
+/// Source snapshot reference — identifies a specific source tree state.
+struct SourceSnapshot
+    layout packed
+{
+    /// Hash of the complete source archive
+    source_hash: Hash256,
+    /// Number of files in the source tree
+    file_count: u32,
+    /// Manifest of (path_hash, size) pairs — bounded to 1024 files
+    manifest_hashes: Array[Hash256, 1024],
+    manifest_sizes: Array[u64, 1024],
+    manifest_count: u32,
+    /// Source format identifier
+    format: Array[u8, 32],
+    format_len: u32,
+}
+
+/// Dependency specification for key computation.
+struct KeyDependency
+    layout packed
+{
+    /// Package name
+    dep_name: Array[u8, 128],
+    dep_name_len: u32,
+    /// Version constraint
+    dep_version: Array[u8, 64],
+    dep_version_len: u32,
+    /// Store key of the resolved dependency
+    dep_store_key: StoreKey,
+}
+
+/// A set of dependencies (bounded) as input to key computation.
+struct KeyDependencySet
+    layout packed
+{
+    deps: Array[KeyDependency, 128],
+    dep_count: u32,
+}
+
+/// Compiler version information.
+struct CompilerVersion
+    layout packed
+{
+    /// Semantic version string
+    version: Array[u8, 64],
+    version_len: u32,
+    /// Hash of the compiler binary
+    compiler_hash: Hash256,
+    /// Store key of the compiler image
+    compiler_image_key: StoreKey,
+    /// Compiler build generation
+    compiler_gen: u64,
+}
+
+/// Target architecture specification.
+struct TargetArch
+    layout packed
+{
+    /// Architecture name (e.g., "x86_64", "aarch64")
+    arch_name: Array[u8, 32],
+    arch_name_len: u32,
+    /// Sub-architecture (e.g., "v3", "neon")
+    sub_arch: Array[u8, 32],
+    sub_arch_len: u32,
+    /// Feature flags
+    features: Array[Array[u8, 64], 32],
+    feature_lens: Array[u32, 32],
+    feature_count: u32,
+}
+
+/// Effect profile — declares the effect set required by the object.
+struct EffectProfile
+    layout packed
+{
+    /// Effect names (bounded to 32 effects)
+    effects: Array[Array[u8, 64], 32],
+    effect_lens: Array[u32, 32],
+    effect_count: u32,
+    /// Whether non-deterministic effects are allowed
+    allows_non_deterministic: bool,
+    /// Whether I/O effects are allowed
+    allows_io: bool,
+    /// Whether machine-specific effects are allowed
+    allows_machine: bool,
+}
+
+/// Oracle identity reference for key computation.
+struct KeyOracleRef
+    layout packed
+{
+    oracle_name: Array[u8, 64],
+    oracle_name_len: u32,
+    oracle_version: Array[u8, 32],
+    oracle_version_len: u32,
+    oracle_source_hash: Hash256,
+    oracle_binary_hash: Hash256,
+}
+
+/// Oracle identity set for key computation.
+struct OracleIdentitySet
+    layout packed
+{
+    oracles: Array[KeyOracleRef, 16],
+    oracle_count: u32,
+}
+
+/// Court version reference for key computation.
+struct CourtVersionRef
+    layout packed
+{
+    court_name: Array[u8, 64],
+    court_name_len: u32,
+    court_version: Array[u8, 32],
+    court_version_len: u32,
+    /// Store key of the court's own package
+    court_store_key: StoreKey,
+}
+
+/// Court version set for key computation.
+struct CourtVersionSet
+    layout packed
+{
+    courts: Array[CourtVersionRef, 16],
+    court_count: u32,
+}
+
+/// Environment capsule — fully specified for key reproducibility.
+struct KeyEnvironmentCapsule
+    layout packed
+{
+    cpu_feature_set: Array[u8, 256],
+    cpu_feature_set_len: u32,
+    memory_model: Array[u8, 64],
+    memory_model_len: u32,
+    device_identities: Array[Identity, 16],
+    device_count: u32,
+}
+
+// ============================================================================
+// StoreKeyInputs — All semantic inputs for key computation
+// ============================================================================
+
+/// Aggregate of all semantic inputs that determine a StoreKey.
+struct StoreKeyInputs
+    layout packed
+{
+    /// Source snapshot hash
+    source_hash: Hash256,
+    /// Dependency set hash
+    dependencies_hash: Hash256,
+    /// Dialect profile (full struct, used for hashing)
+    dialect_profile: DialectProfile,
+    /// Compiler version
+    compiler_version: CompilerVersion,
+    /// Target architecture
+    target_arch: TargetArch,
+    /// Effect profile
+    effect_profile: EffectProfile,
+    /// Expansion receipts hash (hash of all receipts)
+    expansion_receipts_hash: Hash256,
+    /// Oracle identities set hash
+    oracle_identities_hash: Hash256,
+    /// Court versions set hash
+    court_versions_hash: Hash256,
+    /// Environment capsule (serialized for hashing)
+    environment_capsule: KeyEnvironmentCapsule,
+    /// Deduplication salt — when set, identical inputs with different salts
+    /// produce different keys (for intentional store divergence)
+    dedup_salt: Array[u8, 32],
+    dedup_salt_len: u32,
+}
+
+// ============================================================================
+// Hash Composition — Internal Hash State Machine
+// ============================================================================
+
+/// Internal state for incremental hash computation.
+/// Uses a simple sponge-like construction over 256-bit state.
+struct HashComposer
+    layout packed
+{
+    /// Current 256-bit hash state
+    state: Hash256,
+    /// Number of bytes absorbed
+    absorbed: u64,
+    /// Whether the hash has been finalized
+    finalized: bool,
+}
+
+/// Create a new hash composer with zeroed state.
+fn hash_composer_new() -> HashComposer
+    effect [compute]
+{
+    return HashComposer {
+        state: hash256_zero(),
+        absorbed: 0,
+        finalized: false,
+    };
+}
+
+/// Absorb a byte into the hash state.
+fn hash_composer_absorb_byte(
+    composer: HashComposer,
+    byte: u8,
+) -> HashComposer
+    effect [compute]
+{
+    if composer.finalized {
+        return composer;
+    }
+    let new_state: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    // XOR the byte into the state at position (absorbed % 32), then rotate
+    let pos: u64 = composer.absorbed % 32;
+    for i in 0..32 {
+        let idx: u64 = (i + pos) % 32;
+        let b: u8 = byte;
+        if i == 0 {
+            new_state.bytes[idx] = composer.state.bytes[idx] ^ b;
+        } else {
+            new_state.bytes[idx] = composer.state.bytes[idx];
+        }
+    }
+    // Rotate all bytes by 1
+    for i in 0..32 {
+        let src: u64 = (i + 1) % 32;
+        new_state.bytes[i] = composer.state.bytes[src];
+    }
+    // XOR the byte into position 0
+    new_state.bytes[0] = new_state.bytes[0] ^ byte;
+
+    return HashComposer {
+        state: new_state,
+        absorbed: composer.absorbed + 1,
+        finalized: false,
+    };
+}
+
+/// Absorb a u64 value (8 bytes, little-endian).
+fn hash_composer_absorb_u64(
+    composer: HashComposer,
+    value: u64,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_byte(c, (value & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 8) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 16) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 24) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 32) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 40) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 48) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 56) & 0xFF) as u8);
+    return c;
+}
+
+/// Absorb a u32 value (4 bytes, little-endian).
+fn hash_composer_absorb_u32(
+    composer: HashComposer,
+    value: u32,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_byte(c, (value & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 8) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 16) & 0xFF) as u8);
+    let c: HashComposer = hash_composer_absorb_byte(c, ((value >> 24) & 0xFF) as u8);
+    return c;
+}
+
+/// Absorb a bool as a byte (0 or 1).
+fn hash_composer_absorb_bool(
+    composer: HashComposer,
+    value: bool,
+) -> HashComposer
+    effect [compute]
+{
+    if value {
+        return hash_composer_absorb_byte(composer, 1);
+    }
+    return hash_composer_absorb_byte(composer, 0);
+}
+
+/// Absorb a byte array (bounded to its length).
+fn hash_composer_absorb_bytes(
+    composer: HashComposer,
+    bytes: Array[u8, 65536],
+    len: u32,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    // Absorb length prefix
+    let c: HashComposer = hash_composer_absorb_u32(c, len);
+    // Bounded loop: at most 65536 bytes
+    for i in 0..len as u64 {
+        let c: HashComposer = hash_composer_absorb_byte(c, bytes[i]);
+    }
+    return c;
+}
+
+/// Absorb a hash256 value as 32 bytes.
+fn hash_composer_absorb_hash256(
+    composer: HashComposer,
+    hash: Hash256,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    for i in 0..32 {
+        let c: HashComposer = hash_composer_absorb_byte(c, hash.bytes[i]);
+    }
+    return c;
+}
+
+/// Absorb an identity's key fields.
+fn hash_composer_absorb_identity(
+    composer: HashComposer,
+    id: Identity,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_bytes(c, id.name, id.name_len);
+    let c: HashComposer = hash_composer_absorb_hash256(c, id.key_fingerprint);
+    let c: HashComposer = hash_composer_absorb_u32(c, id.version);
+    return c;
+}
+
+/// Finalize the hash — produce the final StoreKey.
+fn hash_composer_finalize(composer: HashComposer) -> StoreKey
+    effect [compute]
+{
+    if composer.finalized {
+        return composer.state;
+    }
+    // Absorb finalization marker
+    let c: HashComposer = hash_composer_absorb_byte(composer, 0xFF);
+    // Absorb total length for domain separation
+    let c: HashComposer = hash_composer_absorb_u64(c, composer.absorbed);
+    // Return the state as the final hash
+    return c.state;
+}
+
+// ============================================================================
+// DialectProfile Hashing
+// ============================================================================
+
+/// Compute a hash over a DialectProfile for key composition.
+fn hash_dialect_profile(
+    composer: HashComposer,
+    profile: DialectProfile,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_bytes(c, profile.name, profile.name_len);
+    let c: HashComposer = hash_composer_absorb_bytes(c, profile.version, profile.version_len);
+    let c: HashComposer = hash_composer_absorb_bytes(c, profile.language, profile.language_len);
+    let c: HashComposer = hash_composer_absorb_bytes(c, profile.abi, profile.abi_len);
+    // Absorb features
+    let c: HashComposer = hash_composer_absorb_u32(c, profile.feature_count);
+    for i in 0..profile.feature_count as u64 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, profile.features[i], profile.feature_lens[i]);
+    }
+    return c;
+}
+
+// ============================================================================
+// CompilerVersion Hashing
+// ============================================================================
+
+/// Compute a hash over a CompilerVersion for key composition.
+fn hash_compiler_version(
+    composer: HashComposer,
+    cv: CompilerVersion,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_bytes(c, cv.version, cv.version_len);
+    let c: HashComposer = hash_composer_absorb_hash256(c, cv.compiler_hash);
+    let c: HashComposer = hash_composer_absorb_u64(c, cv.compiler_gen);
+    return c;
+}
+
+// ============================================================================
+// TargetArch Hashing
+// ============================================================================
+
+/// Compute a hash over a TargetArch for key composition.
+fn hash_target_arch(
+    composer: HashComposer,
+    arch: TargetArch,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_bytes(c, arch.arch_name, arch.arch_name_len);
+    let c: HashComposer = hash_composer_absorb_bytes(c, arch.sub_arch, arch.sub_arch_len);
+    let c: HashComposer = hash_composer_absorb_u32(c, arch.feature_count);
+    for i in 0..arch.feature_count as u64 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, arch.features[i], arch.feature_lens[i]);
+    }
+    return c;
+}
+
+// ============================================================================
+// EffectProfile Hashing
+// ============================================================================
+
+/// Compute a hash over an EffectProfile for key composition.
+fn hash_effect_profile(
+    composer: HashComposer,
+    ep: EffectProfile,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_u32(c, ep.effect_count);
+    for i in 0..ep.effect_count as u64 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, ep.effects[i], ep.effect_lens[i]);
+    }
+    let c: HashComposer = hash_composer_absorb_bool(c, ep.allows_non_deterministic);
+    let c: HashComposer = hash_composer_absorb_bool(c, ep.allows_io);
+    let c: HashComposer = hash_composer_absorb_bool(c, ep.allows_machine);
+    return c;
+}
+
+// ============================================================================
+// Oracle Set Hashing
+// ============================================================================
+
+/// Compute a hash over an OracleIdentitySet for key composition.
+fn hash_oracle_set(
+    composer: HashComposer,
+    oracles: OracleIdentitySet,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = hash_composer_absorb_u32(composer, oracles.oracle_count);
+    for i in 0..oracles.oracle_count as u64 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, oracles.oracles[i].oracle_name, oracles.oracles[i].oracle_name_len);
+        let c: HashComposer = hash_composer_absorb_bytes(c, oracles.oracles[i].oracle_version, oracles.oracles[i].oracle_version_len);
+        let c: HashComposer = hash_composer_absorb_hash256(c, oracles.oracles[i].oracle_source_hash);
+        let c: HashComposer = hash_composer_absorb_hash256(c, oracles.oracles[i].oracle_binary_hash);
+    }
+    return c;
+}
+
+// ============================================================================
+// Court Set Hashing
+// ============================================================================
+
+/// Compute a hash over a CourtVersionSet for key composition.
+fn hash_court_set(
+    composer: HashComposer,
+    courts: CourtVersionSet,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = hash_composer_absorb_u32(composer, courts.court_count);
+    for i in 0..courts.court_count as u64 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, courts.courts[i].court_name, courts.courts[i].court_name_len);
+        let c: HashComposer = hash_composer_absorb_bytes(c, courts.courts[i].court_version, courts.courts[i].court_version_len);
+        let c: HashComposer = hash_composer_absorb_hash256(c, courts.courts[i].court_store_key);
+    }
+    return c;
+}
+
+// ============================================================================
+// Environment Capsule Hashing
+// ============================================================================
+
+/// Compute a hash over a KeyEnvironmentCapsule for key composition.
+fn hash_environment_capsule(
+    composer: HashComposer,
+    capsule: KeyEnvironmentCapsule,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = composer;
+    let c: HashComposer = hash_composer_absorb_bytes(c, capsule.cpu_feature_set, capsule.cpu_feature_set_len);
+    let c: HashComposer = hash_composer_absorb_bytes(c, capsule.memory_model, capsule.memory_model_len);
+    let c: HashComposer = hash_composer_absorb_u32(c, capsule.device_count);
+    for i in 0..capsule.device_count as u64 {
+        let c: HashComposer = hash_composer_absorb_identity(c, capsule.device_identities[i]);
+    }
+    return c;
+}
+
+// ============================================================================
+// Dependency Set Hashing
+// ============================================================================
+
+/// Compute a hash over a dependency set.
+fn hash_dependency_set(
+    composer: HashComposer,
+    deps: KeyDependencySet,
+) -> HashComposer
+    effect [compute]
+{
+    let c: HashComposer = hash_composer_absorb_u32(composer, deps.dep_count);
+    for i in 0..deps.dep_count as u64 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, deps.deps[i].dep_name, deps.deps[i].dep_name_len);
+        let c: HashComposer = hash_composer_absorb_bytes(c, deps.deps[i].dep_version, deps.deps[i].dep_version_len);
+        let c: HashComposer = hash_composer_absorb_hash256(c, deps.deps[i].dep_store_key);
+    }
+    return c;
+}
+
+// ============================================================================
+// StoreKey Computation — Main Entry Points
+// ============================================================================
+
+/// Compute a StoreKey from all semantic inputs.
+/// This is the primary key derivation function for the forensic store.
+///
+/// The composition order is:
+///   1. Domain separator "PHORENSIC_STORE_KEY_v1"
+///   2. source_hash
+///   3. dependencies_hash (hash of sorted dependency list)
+///   4. dialect_profile (full serialization)
+///   5. compiler_version (version string + compiler hash)
+///   6. target_arch (architecture name + features)
+///   7. effect_profile (effect set + flags)
+///   8. expansion_receipts_hash
+///   9. oracle_identities_hash
+///  10. court_versions_hash
+///  11. environment_capsule
+///  12. dedup_salt (if non-empty)
+fn compute_store_key(inputs: StoreKeyInputs) -> StoreKey
+    effect [compute, residual]
+{
+    let composer: HashComposer = hash_composer_new();
+
+    // Step 1: Domain separator
+    let sep: Array[u8, 21] = Array[u8, 21]::from_literal("PHORENSIC_STORE_KEY_v1");
+    let c: HashComposer = composer;
+    for i in 0..21 {
+        let c: HashComposer = hash_composer_absorb_byte(c, sep[i]);
+    }
+
+    // Step 2: Source hash
+    let c: HashComposer = hash_composer_absorb_hash256(c, inputs.source_hash);
+
+    // Step 3: Dependencies hash
+    let c: HashComposer = hash_composer_absorb_hash256(c, inputs.dependencies_hash);
+
+    // Step 4: Dialect profile
+    let c: HashComposer = hash_dialect_profile(c, inputs.dialect_profile);
+
+    // Step 5: Compiler version
+    let c: HashComposer = hash_compiler_version(c, inputs.compiler_version);
+
+    // Step 6: Target architecture
+    let c: HashComposer = hash_target_arch(c, inputs.target_arch);
+
+    // Step 7: Effect profile
+    let c: HashComposer = hash_effect_profile(c, inputs.effect_profile);
+
+    // Step 8: Expansion receipts hash
+    let c: HashComposer = hash_composer_absorb_hash256(c, inputs.expansion_receipts_hash);
+
+    // Step 9: Oracle identities hash
+    let c: HashComposer = hash_composer_absorb_hash256(c, inputs.oracle_identities_hash);
+
+    // Step 10: Court versions hash
+    let c: HashComposer = hash_composer_absorb_hash256(c, inputs.court_versions_hash);
+
+    // Step 11: Environment capsule
+    let c: HashComposer = hash_environment_capsule(c, inputs.environment_capsule);
+
+    // Step 12: Dedup salt (optional)
+    if inputs.dedup_salt_len > 0 {
+        let c: HashComposer = hash_composer_absorb_bytes(c, inputs.dedup_salt, inputs.dedup_salt_len);
+    }
+
+    let key: StoreKey = hash_composer_finalize(c);
+
+    residual emit {
+        op: "store_key.compute",
+        source_hash_prefix: inputs.source_hash.bytes[0] as u64,
+        key_prefix: key.bytes[0] as u64,
+        absorbed: c.absorbed,
+    };
+
+    return key;
+}
+
+/// Convenience: compute a StoreKey from raw content bytes using a hash of
+/// the content as the source_hash. This is used for objects that are their
+/// own source (e.g., receipts, residual records).
+fn compute_store_key_from_content(
+    content: Array[u8, 65536],
+    content_len: u32,
+    dialect: DialectProfile,
+) -> StoreKey
+    effect [compute, residual]
+{
+    // Compute content hash
+    let content_hash: Hash256 = hash256_zero();
+    let c_hash: Hash256 = hash256_zero();
+    // Simple content hash (placeholder)
+    let mut c_h: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    for i in 0..content_len as u64 {
+        c_h.bytes[i % 32] = c_h.bytes[i % 32] ^ content[i];
+    }
+
+    // Build minimal StoreKeyInputs
+    let zero_hash: Hash256 = hash256_zero();
+    let empty_cv: CompilerVersion = CompilerVersion {
+        version: Array[u8, 64]::zeroed(),
+        version_len: 0,
+        compiler_hash: zero_hash,
+        compiler_image_key: zero_hash,
+        compiler_gen: 0,
+    };
+    let empty_arch: TargetArch = TargetArch {
+        arch_name: Array[u8, 32]::zeroed(),
+        arch_name_len: 0,
+        sub_arch: Array[u8, 32]::zeroed(),
+        sub_arch_len: 0,
+        features: Array[Array[u8, 64], 32]::zeroed(),
+        feature_lens: Array[u32, 32]::zeroed(),
+        feature_count: 0,
+    };
+    let empty_ep: EffectProfile = EffectProfile {
+        effects: Array[Array[u8, 64], 32]::zeroed(),
+        effect_lens: Array[u32, 32]::zeroed(),
+        effect_count: 0,
+        allows_non_deterministic: false,
+        allows_io: false,
+        allows_machine: false,
+    };
+    let empty_capsule: KeyEnvironmentCapsule = KeyEnvironmentCapsule {
+        cpu_feature_set: Array[u8, 256]::zeroed(),
+        cpu_feature_set_len: 0,
+        memory_model: Array[u8, 64]::zeroed(),
+        memory_model_len: 0,
+        device_identities: Array[Identity, 16]::zeroed(),
+        device_count: 0,
+    };
+
+    let inputs: StoreKeyInputs = StoreKeyInputs {
+        source_hash: c_h,
+        dependencies_hash: zero_hash,
+        dialect_profile: dialect,
+        compiler_version: empty_cv,
+        target_arch: empty_arch,
+        effect_profile: empty_ep,
+        expansion_receipts_hash: zero_hash,
+        oracle_identities_hash: zero_hash,
+        court_versions_hash: zero_hash,
+        environment_capsule: empty_capsule,
+        dedup_salt: Array[u8, 32]::zeroed(),
+        dedup_salt_len: 0,
+    };
+
+    return compute_store_key(inputs);
+}
+
+// ============================================================================
+// StoreKey Comparison and Display
+// ============================================================================
+
+/// Compare two store keys for equality.
+fn store_key_equal(a: StoreKey, b: StoreKey) -> bool
+    effect [compute]
+{
+    return hash256_equal(a, b);
+}
+
+/// Check if a store key is zero (uninitialized).
+fn store_key_is_zero(key: StoreKey) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if key.bytes[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Create a zero store key.
+fn store_key_zero() -> StoreKey
+    effect [compute]
+{
+    return Hash256 { bytes: Array[u8, 32]::zeroed() };
+}
+
+/// Compute a human-readable prefix string for a store key (first 8 hex chars).
+fn store_key_short_string(key: StoreKey) -> Array[u8, 16]
+    effect [compute]
+{
+    let hex_chars: Array[u8, 16] = Array[u8, 16]::from_literal("0123456789abcdef");
+    let result: Array[u8, 16] = Array[u8, 16]::zeroed();
+    for i in 0..4 {
+        let b: u8 = key.bytes[i];
+        let hi: u8 = (b >> 4) & 0x0F;
+        let lo: u8 = b & 0x0F;
+        result[i * 2] = hex_chars[hi as u64];
+        result[i * 2 + 1] = hex_chars[lo as u64];
+    }
+    // Check remaining prefix
+    for i in 4..8 {
+        result[i] = 0;
+    }
+    return result;
+}
+
+// ============================================================================
+// StoreKey Validation
+// ============================================================================
+
+/// Validate that a StoreKeyInputs contains no obviously inconsistent data.
+fn validate_store_key_inputs(inputs: StoreKeyInputs) -> bool
+    effect [compute, residual]
+{
+    // Source hash must not be zero
+    if store_key_is_zero(inputs.source_hash) {
+        residual emit {
+            op: "store_key.validate.fail",
+            reason: "zero_source_hash",
+        };
+        return false;
+    }
+
+    // Dialect profile must have a name
+    if inputs.dialect_profile.name_len == 0 {
+        residual emit {
+            op: "store_key.validate.fail",
+            reason: "empty_dialect_profile_name",
+        };
+        return false;
+    }
+
+    // Compiler version must be non-empty
+    if inputs.compiler_version.version_len == 0 {
+        residual emit {
+            op: "store_key.validate.fail",
+            reason: "empty_compiler_version",
+        };
+        return false;
+    }
+
+    // Target architecture must be non-empty
+    if inputs.target_arch.arch_name_len == 0 {
+        residual emit {
+            op: "store_key.validate.fail",
+            reason: "empty_target_arch",
+        };
+        return false;
+    }
+
+    residual emit {
+        op: "store_key.validate.pass",
+        source_hash_prefix: inputs.source_hash.bytes[0] as u64,
+    };
+    return true;
+}
+
+// ============================================================================
+// StoreKey Index — Precomputed Partitioning
+// ============================================================================
+
+/// Partition identifier derived from the first byte of a StoreKey.
+/// Used for store layout partitioning (256 buckets).
+fn store_key_partition(key: StoreKey) -> u8
+    effect [compute]
+{
+    return key.bytes[0];
+}
+
+/// Derive a directory prefix string from the key for filesystem layout.
+/// Returns two hex characters representing the first byte.
+fn store_key_directory_prefix(key: StoreKey) -> Array[u8, 2]
+    effect [compute]
+{
+    let hex_chars: Array[u8, 16] = Array[u8, 16]::from_literal("0123456789abcdef");
+    let result: Array[u8, 2] = Array[u8, 2]::zeroed();
+    let b: u8 = key.bytes[0];
+    result[0] = hex_chars[(b >> 4) as u64];
+    result[1] = hex_chars[(b & 0x0F) as u64];
+    return result;
+}
+
+// ============================================================================
+// Store Key Serialization
+// ============================================================================
+
+/// Serialize a StoreKeyInputs struct into a byte array for hashing.
+fn serialize_key_inputs(
+    inputs: StoreKeyInputs,
+    output: Array[u8, 4096],
+) -> u32
+    effect [compute]
+{
+    let mut pos: u32 = 0;
+
+    // Write domain separator
+    let sep: Array[u8, 21] = Array[u8, 21]::from_literal("PHORENSIC_STORE_KEY_v1");
+    for i in 0..21 {
+        output[pos as u64] = sep[i];
+        pos = pos + 1;
+    }
+
+    // Write source hash (32 bytes)
+    for i in 0..32 {
+        output[pos as u64] = inputs.source_hash.bytes[i];
+        pos = pos + 1;
+    }
+
+    // Write dependencies hash (32 bytes)
+    for i in 0..32 {
+        output[pos as u64] = inputs.dependencies_hash.bytes[i];
+        pos = pos + 1;
+    }
+
+    // Write dialect profile name
+    output[pos as u64] = inputs.dialect_profile.name_len as u8;
+    pos = pos + 1;
+    for i in 0..inputs.dialect_profile.name_len as u64 {
+        output[pos as u64] = inputs.dialect_profile.name[i];
+        pos = pos + 1;
+    }
+
+    // Write compiler version
+    output[pos as u64] = inputs.compiler_version.version_len as u8;
+    pos = pos + 1;
+    for i in 0..inputs.compiler_version.version_len as u64 {
+        output[pos as u64] = inputs.compiler_version.version[i];
+        pos = pos + 1;
+    }
+
+    // Write target arch
+    output[pos as u64] = inputs.target_arch.arch_name_len as u8;
+    pos = pos + 1;
+    for i in 0..inputs.target_arch.arch_name_len as u64 {
+        output[pos as u64] = inputs.target_arch.arch_name[i];
+        pos = pos + 1;
+    }
+
+    // Write effect profile flags
+    output[pos as u64] = inputs.effect_profile.effect_count as u8;
+    pos = pos + 1;
+    if inputs.effect_profile.allows_non_deterministic {
+        output[pos as u64] = 1;
+    } else {
+        output[pos as u64] = 0;
+    }
+    pos = pos + 1;
+
+    // Write expansion receipts hash
+    for i in 0..32 {
+        output[pos as u64] = inputs.expansion_receipts_hash.bytes[i];
+        pos = pos + 1;
+    }
+
+    // Write oracle identities hash
+    for i in 0..32 {
+        output[pos as u64] = inputs.oracle_identities_hash.bytes[i];
+        pos = pos + 1;
+    }
+
+    // Write court versions hash
+    for i in 0..32 {
+        output[pos as u64] = inputs.court_versions_hash.bytes[i];
+        pos = pos + 1;
+    }
+
+    // Write dedup salt
+    output[pos as u64] = inputs.dedup_salt_len as u8;
+    pos = pos + 1;
+    for i in 0..inputs.dedup_salt_len as u64 {
+        output[pos as u64] = inputs.dedup_salt[i];
+        pos = pos + 1;
+    }
+
+    return pos;
+}
+
+// ============================================================================
+// Store Key Cache (Bounded LRU)
+// ============================================================================
+
+/// A cached mapping from StoreKeyInputsHash to StoreKey to avoid recomputation.
+/// Bounded to 64 entries with FIFO eviction.
+struct StoreKeyCache
+    layout packed
+{
+    /// Input hashes (keys)
+    input_hashes: Array[Hash256, 64],
+    /// Computed store keys (values)
+    store_keys: Array[StoreKey, 64],
+    /// Occupied slots
+    occupied: Array[bool, 64],
+    /// Number of occupied slots
+    count: u32,
+    /// Next insertion index (FIFO)
+    next_index: u32,
+    /// Number of cache hits
+    hits: u64,
+    /// Number of cache misses
+    misses: u64,
+}
+
+/// Create a new store key cache.
+fn store_key_cache_new() -> StoreKeyCache
+    effect [compute]
+{
+    return StoreKeyCache {
+        input_hashes: Array[Hash256, 64]::zeroed(),
+        store_keys: Array[StoreKey, 64]::zeroed(),
+        occupied: Array[bool, 64]::zeroed(),
+        count: 0,
+        next_index: 0,
+        hits: 0,
+        misses: 0,
+    };
+}
+
+/// Look up a StoreKey in the cache.
+fn store_key_cache_lookup(
+    cache: StoreKeyCache,
+    input_hash: Hash256,
+) -> Result[StoreKey, u32]
+    effect [compute]
+{
+    for i in 0..64 {
+        if cache.occupied[i] && hash256_equal(cache.input_hashes[i], input_hash) {
+            return Result[StoreKey, u32]::Ok(cache.store_keys[i]);
+        }
+    }
+    return Result[StoreKey, u32]::Err(0);
+}
+
+/// Insert a StoreKey into the cache (FIFO eviction).
+fn store_key_cache_insert(
+    cache: StoreKeyCache,
+    input_hash: Hash256,
+    key: StoreKey,
+) -> StoreKeyCache
+    effect [compute, residual]
+{
+    let mut new_cache: StoreKeyCache = cache;
+    let idx: u32 = new_cache.next_index;
+    new_cache.input_hashes[idx as u64] = input_hash;
+    new_cache.store_keys[idx as u64] = key;
+    new_cache.occupied[idx as u64] = true;
+    new_cache.next_index = (idx + 1) % 64;
+    if new_cache.count < 64 {
+        new_cache.count = new_cache.count + 1;
+    }
+
+    residual emit {
+        op: "store_key_cache.insert",
+        key_prefix: key.bytes[0] as u64,
+        cache_size: new_cache.count,
+    };
+
+    return new_cache;
+}
+
+/// Compute a StoreKey with caching.
+fn compute_store_key_cached(
+    inputs: StoreKeyInputs,
+    cache: StoreKeyCache,
+) -> StoreKey
+    effect [compute, residual]
+{
+    // Compute input hash from serialized inputs
+    let serialized: Array[u8, 4096] = Array[u8, 4096]::zeroed();
+    let serialized_len: u32 = serialize_key_inputs(inputs, serialized);
+    let input_hash: Hash256 = hash256_zero();
+    for i in 0..serialized_len as u64 {
+        input_hash.bytes[i % 32] = input_hash.bytes[i % 32] ^ serialized[i];
+    }
+
+    // Check cache
+    let lookup: Result[StoreKey, u32] = store_key_cache_lookup(cache, input_hash);
+    match lookup {
+        Result::Ok(key) => {
+            residual emit {
+                op: "store_key.cache_hit",
+                key_prefix: key.bytes[0] as u64,
+            };
+            return key;
+        },
+        Result::Err(_) => {
+            let key: StoreKey = compute_store_key(inputs);
+            residual emit {
+                op: "store_key.cache_miss",
+                key_prefix: key.bytes[0] as u64,
+            };
+            return key;
+        },
+    }
+}
+
+// ============================================================================
+// Store Key Derivation for Specific Object Roles
+// ============================================================================
+
+/// Derive a StoreKey for a Source object.
+fn derive_source_object_key(
+    source_hash: Hash256,
+    dialect: DialectProfile,
+    compiler_version: CompilerVersion,
+    target_arch: TargetArch,
+) -> StoreKey
+    effect [compute, residual]
+{
+    let zero_hash: Hash256 = hash256_zero();
+    let inputs: StoreKeyInputs = StoreKeyInputs {
+        source_hash: source_hash,
+        dependencies_hash: zero_hash,
+        dialect_profile: dialect,
+        compiler_version: compiler_version,
+        target_arch: target_arch,
+        effect_profile: EffectProfile {
+            effects: Array[Array[u8, 64], 32]::zeroed(),
+            effect_lens: Array[u32, 32]::zeroed(),
+            effect_count: 0,
+            allows_non_deterministic: false,
+            allows_io: false,
+            allows_machine: false,
+        },
+        expansion_receipts_hash: zero_hash,
+        oracle_identities_hash: zero_hash,
+        court_versions_hash: zero_hash,
+        environment_capsule: KeyEnvironmentCapsule {
+            cpu_feature_set: Array[u8, 256]::zeroed(),
+            cpu_feature_set_len: 0,
+            memory_model: Array[u8, 64]::zeroed(),
+            memory_model_len: 0,
+            device_identities: Array[Identity, 16]::zeroed(),
+            device_count: 0,
+        },
+        dedup_salt: Array[u8, 32]::zeroed(),
+        dedup_salt_len: 0,
+    };
+    return compute_store_key(inputs);
+}
+
+/// Derive a StoreKey for a Binary object (includes dependency and receipt hashes).
+fn derive_binary_object_key(
+    source_hash: Hash256,
+    dependencies_hash: Hash256,
+    dialect: DialectProfile,
+    compiler_version: CompilerVersion,
+    target_arch: TargetArch,
+    expansion_receipts_hash: Hash256,
+    oracles_hash: Hash256,
+    courts_hash: Hash256,
+) -> StoreKey
+    effect [compute, residual]
+{
+    let zero_hash: Hash256 = hash256_zero();
+    let inputs: StoreKeyInputs = StoreKeyInputs {
+        source_hash: source_hash,
+        dependencies_hash: dependencies_hash,
+        dialect_profile: dialect,
+        compiler_version: compiler_version,
+        target_arch: target_arch,
+        effect_profile: EffectProfile {
+            effects: Array[Array[u8, 64], 32]::zeroed(),
+            effect_lens: Array[u32, 32]::zeroed(),
+            effect_count: 0,
+            allows_non_deterministic: false,
+            allows_io: false,
+            allows_machine: false,
+        },
+        expansion_receipts_hash: expansion_receipts_hash,
+        oracle_identities_hash: oracles_hash,
+        court_versions_hash: courts_hash,
+        environment_capsule: KeyEnvironmentCapsule {
+            cpu_feature_set: Array[u8, 256]::zeroed(),
+            cpu_feature_set_len: 0,
+            memory_model: Array[u8, 64]::zeroed(),
+            memory_model_len: 0,
+            device_identities: Array[Identity, 16]::zeroed(),
+            device_count: 0,
+        },
+        dedup_salt: Array[u8, 32]::zeroed(),
+        dedup_salt_len: 0,
+    };
+    return compute_store_key(inputs);
+}
+
+/// Derive a StoreKey for a PackageContainer object.
+fn derive_package_container_key(
+    source_hash: Hash256,
+    binary_hash: Hash256,
+    compiler_version: CompilerVersion,
+    dialect: DialectProfile,
+) -> StoreKey
+    effect [compute, residual]
+{
+    // Package container key blends source and binary hashes
+    let mut blended_hash: Hash256 = hash256_zero();
+    for i in 0..32 {
+        blended_hash.bytes[i] = source_hash.bytes[i] ^ binary_hash.bytes[i];
+    }
+
+    let zero_hash: Hash256 = hash256_zero();
+    let inputs: StoreKeyInputs = StoreKeyInputs {
+        source_hash: blended_hash,
+        dependencies_hash: zero_hash,
+        dialect_profile: dialect,
+        compiler_version: compiler_version,
+        target_arch: TargetArch {
+            arch_name: Array[u8, 32]::zeroed(),
+            arch_name_len: 0,
+            sub_arch: Array[u8, 32]::zeroed(),
+            sub_arch_len: 0,
+            features: Array[Array[u8, 64], 32]::zeroed(),
+            feature_lens: Array[u32, 32]::zeroed(),
+            feature_count: 0,
+        },
+        effect_profile: EffectProfile {
+            effects: Array[Array[u8, 64], 32]::zeroed(),
+            effect_lens: Array[u32, 32]::zeroed(),
+            effect_count: 0,
+            allows_non_deterministic: false,
+            allows_io: false,
+            allows_machine: false,
+        },
+        expansion_receipts_hash: zero_hash,
+        oracle_identities_hash: zero_hash,
+        court_versions_hash: zero_hash,
+        environment_capsule: KeyEnvironmentCapsule {
+            cpu_feature_set: Array[u8, 256]::zeroed(),
+            cpu_feature_set_len: 0,
+            memory_model: Array[u8, 64]::zeroed(),
+            memory_model_len: 0,
+            device_identities: Array[Identity, 16]::zeroed(),
+            device_count: 0,
+        },
+        dedup_salt: Array[u8, 32]::zeroed(),
+        dedup_salt_len: 0,
+    };
+    return compute_store_key(inputs);
+}

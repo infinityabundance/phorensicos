@@ -1,0 +1,918 @@
+// pwm_driver.phor — PWM driver
+// PWM chip abstraction, duty cycle/frequency control, polarity,
+// enable/disable, capture, PWM subsystem orchestration,
+// backlight control, fan speed control.
+//
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/pwm_driver.phor
+// Court: pwm_driver:v2
+
+package drivers.pwm_driver;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type PwmError = enum {
+    PwmNotInitialized          = 0x1200,
+    PwmChipNotFound            = 0x1201,
+    PwmChannelInvalid          = 0x1202,
+    PwmChannelAlreadyEnabled   = 0x1203,
+    PwmChannelNotEnabled       = 0x1204,
+    PwmDutyCycleError          = 0x1205,
+    PwmFrequencyError          = 0x1206,
+    PwmPolarityError           = 0x1207,
+    PwmCapabilityError         = 0x1208,
+    PwmCaptureError            = 0x1209,
+    PwmBacklightError          = 0x120A,
+    PwmFanSpeedError           = 0x120B,
+    PwmMaxChannelsExceeded     = 0x120C,
+    PwmResidualStoreFull       = 0x120D,
+    PwmPeriodExceedLimit       = 0x120E,
+    PwmPulseWidthError         = 0x120F,
+    PwmOrchestrationError      = 0x1210,
+    PwmNotCalibrated           = 0x1211,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Full Capability
+// ─────────────────────────────────────────────────────────────
+
+struct PwmCapability {
+    object_id: Identity,
+    generation: u64,
+    can_control: bool,
+    can_capture: bool,
+    can_backlight: bool,
+    can_fan: bool,
+    can_polarity: bool,
+    can_orchestrate: bool,
+    max_channels: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Polarity
+// ─────────────────────────────────────────────────────────────
+
+type PwmPolarity = enum {
+    Normal   = 0,
+    Inverted = 1,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Channel State
+// ─────────────────────────────────────────────────────────────
+
+struct PwmChannel {
+    channel_id: u8,
+    period_ns: u64,
+    duty_cycle_ns: u64,
+    polarity: PwmPolarity,
+    enabled: bool,
+    requested: bool,
+    capture_mode: bool,
+    scale_percent: u16,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Chip
+// ─────────────────────────────────────────────────────────────
+
+struct PwmChip {
+    chip_identity: Identity,
+    chip_id: u8,
+    channels: Array(PwmChannel, 8),
+    channel_count: u8,
+    mmio_base: u64,
+    reg_period: u64,
+    reg_duty: u64,
+    reg_control: u64,
+    reg_capture: u64,
+    clk_rate_hz: u64,
+    min_period_ns: u64,
+    max_period_ns: u64,
+    initialized: bool,
+    residual_log: RingBuf(ResidualRecord, 32),
+}
+
+// ─────────────────────────────────────────────────────────────
+// Backlight Control
+// ─────────────────────────────────────────────────────────────
+
+struct PwmBacklight {
+    chip_id: u8,
+    channel: u8,
+    current_brightness: u16,
+    max_brightness: u16,
+    enabled: bool,
+    pwm_period_ns: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fan Speed Control
+// ─────────────────────────────────────────────────────────────
+
+struct PwmFanControl {
+    chip_id: u8,
+    channel: u8,
+    target_rpm: u32,
+    current_duty: u16,
+    min_duty: u16,
+    max_duty: u16,
+    enabled: bool,
+    temperature_source: u8,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Subsystem Orchestrator
+// ─────────────────────────────────────────────────────────────
+
+struct PwmOrchestrator {
+    backlights: Array(PwmBacklight, 4),
+    backlight_count: u8,
+    fans: Array(PwmFanControl, 4),
+    fan_count: u8,
+    orchestration_enabled: bool,
+    update_interval_ms: u32,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Controller State
+// ─────────────────────────────────────────────────────────────
+
+struct PwmController {
+    controller_identity: Identity,
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    mmio_base: u64,
+    chips: Array(PwmChip, 4),
+    chip_count: u8,
+    orchestrator: PwmOrchestrator,
+    initialized: bool,
+    residual_log: RingBuf(ResidualRecord, 64),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct PwmDriverState {
+    driver_identity: Identity,
+    controllers: Array(PwmController, 4),
+    controller_count: u64,
+    initialized: bool,
+    initialization_timestamp: u64,
+    total_ops: u64,
+    total_errors: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM MMIO Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_mmio_read32(base: u64, offset: u64) -> u32
+    effect [memory:mmio]
+{
+    return trusted reason "PWM MMIO register read" {
+        let ptr: *(u32) = (base + offset) as *(u32);
+        return *ptr;
+    };
+}
+
+fn pwm_mmio_write32(base: u64, offset: u64, value: u32) -> void
+    effect [memory:mmio]
+{
+    trusted reason "PWM MMIO register write" {
+        let ptr: *(u32) = (base + offset) as *(u32);
+        *ptr = value;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Configure PWM Channel (period + duty cycle)
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_configure(
+    chip: Handle(PwmChip),
+    channel: u8,
+    period_ns: u64,
+    duty_cycle_ns: u64,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_configure:v1"
+{
+    if !cap.can_control {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    if (channel as u64) >= (chip.channel_count as u64) {
+        return Result::Err(PwmError::PwmChannelInvalid);
+    };
+
+    if period_ns < chip.min_period_ns || period_ns > chip.max_period_ns {
+        return Result::Err(PwmError::PwmPeriodExceedLimit);
+    };
+
+    if duty_cycle_ns > period_ns {
+        return Result::Err(PwmError::PwmDutyCycleError);
+    };
+
+    let ch: Handle(PwmChannel) = Handle(PwmChannel)::from_ptr(&chip.channels[channel as u64]);
+    ch.period_ns = period_ns;
+    ch.duty_cycle_ns = duty_cycle_ns;
+
+    if duty_cycle_ns > 0 {
+        ch.scale_percent = ((duty_cycle_ns * 100) / period_ns) as u16;
+    } else {
+        ch.scale_percent = 0;
+    };
+
+    let reg_base: u64 = chip.mmio_base + (channel as u64) * 0x10;
+
+    let period_cycles: u32 = ((period_ns * chip.clk_rate_hz) / 1000000000) as u32;
+    let duty_cycles: u32 = ((duty_cycle_ns * chip.clk_rate_hz) / 1000000000) as u32;
+
+    pwm_mmio_write32(chip.mmio_base, chip.reg_period + (channel as u64) * 4, period_cycles);
+    pwm_mmio_write32(chip.mmio_base, chip.reg_duty + (channel as u64) * 4, duty_cycles);
+
+    residual emit {
+        op: "pwm.configure",
+        chip_id: chip.chip_id as u64,
+        channel: channel as u64,
+        period_ns: period_ns,
+        duty_ns: duty_cycle_ns,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable / Disable PWM Channel
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_enable(
+    chip: Handle(PwmChip),
+    channel: u8,
+    enable: bool,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_enable:v1"
+{
+    if (channel as u64) >= (chip.channel_count as u64) {
+        return Result::Err(PwmError::PwmChannelInvalid);
+    };
+
+    let ch: Handle(PwmChannel) = Handle(PwmChannel)::from_ptr(&chip.channels[channel as u64]);
+
+    let ctrl_reg: u32 = pwm_mmio_read32(chip.mmio_base, chip.reg_control);
+    let bit: u32 = 1 << channel;
+
+    if enable {
+        pwm_mmio_write32(chip.mmio_base, chip.reg_control, ctrl_reg | bit);
+        ch.enabled = true;
+    } else {
+        pwm_mmio_write32(chip.mmio_base, chip.reg_control, ctrl_reg & !bit);
+        ch.enabled = false;
+    };
+
+    residual emit {
+        op: "pwm.enable",
+        chip_id: chip.chip_id as u64,
+        channel: channel as u64,
+        enabled: enable,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Polarity
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_set_polarity(
+    chip: Handle(PwmChip),
+    channel: u8,
+    polarity: PwmPolarity,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_set_polarity:v1"
+{
+    if !cap.can_polarity {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    if (channel as u64) >= (chip.channel_count as u64) {
+        return Result::Err(PwmError::PwmChannelInvalid);
+    };
+
+    let ch: Handle(PwmChannel) = Handle(PwmChannel)::from_ptr(&chip.channels[channel as u64]);
+    ch.polarity = polarity;
+
+    let ctrl_reg: u32 = pwm_mmio_read32(chip.mmio_base, chip.reg_control);
+    let pol_bit: u32 = 1 << (8 + channel);
+
+    if polarity == PwmPolarity::Inverted {
+        pwm_mmio_write32(chip.mmio_base, chip.reg_control, ctrl_reg | pol_bit);
+    } else {
+        pwm_mmio_write32(chip.mmio_base, chip.reg_control, ctrl_reg & !pol_bit);
+    };
+
+    residual emit {
+        op: "pwm.set_polarity",
+        chip_id: chip.chip_id as u64,
+        channel: channel as u64,
+        polarity: polarity as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capture PWM Input Signal
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_capture(
+    chip: Handle(PwmChip),
+    channel: u8,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(PwmChannel, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_capture:v1"
+{
+    if !cap.can_capture {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    if (channel as u64) >= (chip.channel_count as u64) {
+        return Result::Err(PwmError::PwmChannelInvalid);
+    };
+
+    let ch: Handle(PwmChannel) = Handle(PwmChannel)::from_ptr(&chip.channels[channel as u64]);
+
+    let cap_reg: u32 = pwm_mmio_read32(chip.mmio_base, chip.reg_capture + (channel as u64) * 4);
+    let captured_period_ns: u64 = ((cap_reg as u64) * 1000000000) / chip.clk_rate_hz;
+
+    ch.period_ns = captured_period_ns;
+    ch.capture_mode = true;
+
+    residual emit {
+        op: "pwm.capture",
+        chip_id: chip.chip_id as u64,
+        channel: channel as u64,
+        captured_period_ns: captured_period_ns,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(ch);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Backlight: Set Brightness
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_backlight_set_brightness(
+    bl: Handle(PwmBacklight),
+    chip: Handle(PwmChip),
+    brightness: u16,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_backlight_set_brightness:v1"
+{
+    if !cap.can_backlight {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    let duty: u16;
+    if brightness > bl.max_brightness {
+        duty = bl.max_brightness;
+    } else {
+        duty = brightness;
+    };
+
+    bl.current_brightness = duty;
+
+    let duty_ns: u64 = (bl.pwm_period_ns * (duty as u64)) / (bl.max_brightness as u64);
+    let result: Result(void, PwmError) = pwm_configure(chip, bl.channel, bl.pwm_period_ns, duty_ns, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            residual emit {
+                op: "pwm.backlight_set_brightness",
+                brightness: duty as u64,
+                max: bl.max_brightness as u64,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Backlight: Enable / Disable
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_backlight_enable(
+    bl: Handle(PwmBacklight),
+    chip: Handle(PwmChip),
+    enable: bool,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_backlight_enable:v1"
+{
+    let result: Result(void, PwmError) = pwm_enable(chip, bl.channel, enable, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            bl.enabled = enable;
+            residual emit {
+                op: "pwm.backlight_enable",
+                enabled: enable,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fan: Set Speed (RPM Target -> Duty Cycle)
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_fan_set_speed(
+    fan: Handle(PwmFanControl),
+    chip: Handle(PwmChip),
+    target_rpm: u32,
+    max_rpm: u32,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_fan_set_speed:v1"
+{
+    if !cap.can_fan {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    let duty: u16;
+    if target_rpm >= max_rpm {
+        duty = fan.max_duty;
+    } else if target_rpm == 0 {
+        duty = 0;
+    } else {
+        duty = fan.min_duty + (((target_rpm as u32) * ((fan.max_duty - fan.min_duty) as u32) / max_rpm) as u16);
+    };
+
+    fan.target_rpm = target_rpm;
+    fan.current_duty = duty;
+
+    let period_ns: u64 = 10000000;
+    let duty_ns: u64 = (period_ns * (duty as u64)) / (fan.max_duty as u64);
+    let result: Result(void, PwmError) = pwm_configure(chip, fan.channel, period_ns, duty_ns, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            residual emit {
+                op: "pwm.fan_set_speed",
+                target_rpm: target_rpm as u64,
+                duty: duty as u64,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fan: Enable / Disable
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_fan_enable(
+    fan: Handle(PwmFanControl),
+    chip: Handle(PwmChip),
+    enable: bool,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_fan_enable:v1"
+{
+    let result: Result(void, PwmError) = pwm_enable(chip, fan.channel, enable, cap, timestamp);
+    match result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {
+            fan.enabled = enable;
+            residual emit {
+                op: "pwm.fan_enable",
+                enabled: enable,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Orchestration: Update All Backlights and Fans
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_orchestrate_update(
+    orchestrator: Handle(PwmOrchestrator),
+    chip: Handle(PwmChip),
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_orchestrate_update:v1"
+{
+    if !cap.can_orchestrate {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    loop bound 4 {
+        let mut i: u64 = 0;
+        if i >= (orchestrator.backlight_count as u64) {
+            break;
+        };
+        let bl: Handle(PwmBacklight) = Handle(PwmBacklight)::from_ptr(&orchestrator.backlights[i]);
+        if bl.enabled {
+            let _: Result(void, PwmError) = pwm_backlight_set_brightness(bl, chip, bl.current_brightness, cap, timestamp);
+        };
+        i = i + 1;
+    };
+
+    loop bound 4 {
+        let mut j: u64 = 0;
+        if j >= (orchestrator.fan_count as u64) {
+            break;
+        };
+        let fan: Handle(PwmFanControl) = Handle(PwmFanControl)::from_ptr(&orchestrator.fans[j]);
+        if fan.enabled {
+            let _: Result(void, PwmError) = pwm_fan_set_speed(fan, chip, fan.target_rpm, 10000, cap, timestamp);
+        };
+        j = j + 1;
+    };
+
+    residual emit {
+        op: "pwm.orchestrate_update",
+        backlight_count: orchestrator.backlight_count as u64,
+        fan_count: orchestrator.fan_count as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Chip Init
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_chip_init(
+    chip: Handle(PwmChip),
+    chip_id: u8,
+    mmio_base: u64,
+    channel_count: u8,
+    clk_rate_hz: u64,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_chip_init:v1"
+{
+    chip.chip_id = chip_id;
+    chip.mmio_base = mmio_base;
+    chip.channel_count = channel_count;
+    chip.clk_rate_hz = clk_rate_hz;
+    chip.reg_period = 0x00;
+    chip.reg_duty = 0x20;
+    chip.reg_control = 0x40;
+    chip.reg_capture = 0x50;
+    chip.min_period_ns = 1000;
+    chip.max_period_ns = 100000000;
+
+    pwm_mmio_write32(mmio_base, chip.reg_control, 0x00);
+    chip.initialized = true;
+
+    residual emit {
+        op: "pwm.chip_init",
+        chip_id: chip_id as u64,
+        channels: channel_count as u64,
+        clk_hz: clk_rate_hz,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_driver_init(
+    driver_identity: Identity,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> PwmDriverState
+    effect [deterministic, residual]
+    court "pwm_driver_init:v1"
+{
+    let state: PwmDriverState = PwmDriverState {
+        driver_identity: driver_identity,
+        controllers: Array::zeroed(),
+        controller_count: 0,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        total_ops: 0,
+        total_errors: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "pwm.driver_init",
+        driver_identity: driver_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add PWM Chip to Controller
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_add_chip(
+    controller: Handle(PwmController),
+    chip_id: u8,
+    mmio_base: u64,
+    channel_count: u8,
+    clk_rate_hz: u64,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(u8, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_add_chip:v1"
+{
+    if (controller.chip_count as u64) >= 4 {
+        return Result::Err(PwmError::PwmMaxChannelsExceeded);
+    };
+
+    let idx: u64 = controller.chip_count as u64;
+    let chip: Handle(PwmChip) = Handle(PwmChip)::from_ptr(&controller.chips[idx]);
+
+    let init_result: Result(void, PwmError) = pwm_chip_init(chip, chip_id, mmio_base, channel_count, clk_rate_hz, cap, timestamp);
+    match init_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    controller.chip_count = controller.chip_count + 1;
+
+    residual emit {
+        op: "pwm.add_chip",
+        chip_id: chip_id as u64,
+        channels: channel_count as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx as u8);
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Register Backlight
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_register_backlight(
+    orchestrator: Handle(PwmOrchestrator),
+    chip_id: u8,
+    channel: u8,
+    max_brightness: u16,
+    period_ns: u64,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(u8, PwmError)
+    effect [deterministic, residual]
+    court "pwm_register_backlight:v1"
+{
+    if !cap.can_backlight {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    if (orchestrator.backlight_count as u64) >= 4 {
+        return Result::Err(PwmError::PwmMaxChannelsExceeded);
+    };
+
+    let idx: u64 = orchestrator.backlight_count as u64;
+    orchestrator.backlights[idx] = PwmBacklight {
+        chip_id: chip_id,
+        channel: channel,
+        current_brightness: 0,
+        max_brightness: max_brightness,
+        enabled: false,
+        pwm_period_ns: period_ns,
+    };
+    orchestrator.backlight_count = orchestrator.backlight_count + 1;
+
+    residual emit {
+        op: "pwm.register_backlight",
+        chip_id: chip_id as u64,
+        channel: channel as u64,
+        max_brightness: max_brightness as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx as u8);
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Register Fan
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_register_fan(
+    orchestrator: Handle(PwmOrchestrator),
+    chip_id: u8,
+    channel: u8,
+    min_duty: u16,
+    max_duty: u16,
+    temperature_source: u8,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(u8, PwmError)
+    effect [deterministic, residual]
+    court "pwm_register_fan:v1"
+{
+    if !cap.can_fan {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    if (orchestrator.fan_count as u64) >= 4 {
+        return Result::Err(PwmError::PwmMaxChannelsExceeded);
+    };
+
+    let idx: u64 = orchestrator.fan_count as u64;
+    orchestrator.fans[idx] = PwmFanControl {
+        chip_id: chip_id,
+        channel: channel,
+        target_rpm: 0,
+        current_duty: 0,
+        min_duty: min_duty,
+        max_duty: max_duty,
+        enabled: false,
+        temperature_source: temperature_source,
+    };
+    orchestrator.fan_count = orchestrator.fan_count + 1;
+
+    residual emit {
+        op: "pwm.register_fan",
+        chip_id: chip_id as u64,
+        channel: channel as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx as u8);
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Enable Orchestration
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_enable_orchestration(
+    orchestrator: Handle(PwmOrchestrator),
+    interval_ms: u32,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [deterministic, residual]
+    court "pwm_enable_orchestration:v1"
+{
+    if !cap.can_orchestrate {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    orchestrator.orchestration_enabled = true;
+    orchestrator.update_interval_ms = interval_ms;
+
+    residual emit {
+        op: "pwm.enable_orchestration",
+        interval_ms: interval_ms,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// PWM Set Duty Cycle by Percent
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_set_duty_percent(
+    chip: Handle(PwmChip),
+    channel: u8,
+    percent: u16,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(void, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_set_duty_percent:v1"
+{
+    if !cap.can_control {
+        return Result::Err(PwmError::PwmCapabilityError);
+    };
+
+    if (channel as u64) >= (chip.channel_count as u64) {
+        return Result::Err(PwmError::PwmChannelInvalid);
+    };
+
+    if percent > 100 {
+        return Result::Err(PwmError::PwmDutyCycleError);
+    };
+
+    let ch: Handle(PwmChannel) = Handle(PwmChannel)::from_ptr(&chip.channels[channel as u64]);
+    ch.scale_percent = percent;
+
+    let duty_ns: u64 = (ch.period_ns * (percent as u64)) / 100;
+    return pwm_configure(chip, channel, ch.period_ns, duty_ns, cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add PWM Controller from PCI Discovery
+// ─────────────────────────────────────────────────────────────
+
+fn pwm_add_controller(
+    state: Handle(PwmDriverState),
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    mmio_base: u64,
+    mmio_size: u64,
+    cap: PwmCapability,
+    timestamp: u64,
+) -> Result(u64, PwmError)
+    effect [memory:mmio, deterministic, residual]
+    court "pwm_add_controller:v1"
+{
+    if state.controller_count >= 4 {
+        return Result::Err(PwmError::PwmMaxChannelsExceeded);
+    };
+
+    let idx: u64 = state.controller_count;
+    let ctrl_identity: Identity = identity_new(0x50574D, timestamp, idx, pci_bus as u64);
+
+    let ctrl: PwmController = PwmController {
+        controller_identity: ctrl_identity,
+        pci_bus: pci_bus,
+        pci_device: pci_device,
+        pci_func: pci_func,
+        mmio_base: mmio_base,
+        chips: Array::zeroed(),
+        chip_count: 0,
+        orchestrator: PwmOrchestrator {
+            backlights: Array::zeroed(),
+            backlight_count: 0,
+            fans: Array::zeroed(),
+            fan_count: 0,
+            orchestration_enabled: false,
+            update_interval_ms: 100,
+        },
+        initialized: true,
+        residual_log: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    state.controllers[idx] = ctrl;
+    state.controller_count = state.controller_count + 1;
+
+    residual emit {
+        op: "pwm.add_controller",
+        controller_idx: idx,
+        mmio_base: mmio_base,
+        pci_bus: pci_bus as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx);
+}

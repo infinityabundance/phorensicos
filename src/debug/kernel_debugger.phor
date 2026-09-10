@@ -1,0 +1,1976 @@
+// kernel_debugger.phor — Kernel Debugger: Breakpoint Management, Single-Stepping,
+//                          Register/Memory Inspection, Stack Trace, Symbol Lookup,
+//                          Disassembly Interface, Conditional Breakpoints,
+//                          Watchpoints, Crash Dump Analysis
+// Phorensic OS — Debug Subsystem
+//
+// This module implements the kernel-mode debugger for Phorensic OS. It provides
+// the foundation for interactive and scripted debugging of kernel code, processes,
+// and system state. All operations are capability-gated and produce forensic
+// residuals for audit trail integrity.
+//
+// Operations:
+// 1. Breakpoint management — insert, remove, enable, disable, list breakpoints
+// 2. Single-stepping — instruction-level stepping with trap flag management
+// 3. Register/memory inspection — read/write CPU registers and memory regions
+// 4. Stack trace — frame pointer and DWARF-based stack unwinding
+// 5. Symbol lookup — address-to-symbol and symbol-to-address resolution
+// 6. Disassembly interface — instruction decode and disassembly output
+// 7. Conditional breakpoints — breakpoints with predicate expressions
+// 8. Watchpoints — memory access watchpoints (read, write, execute)
+// 9. Crash dump analysis — post-mortem dump parsing and inspection
+//
+// Boundedness: Breakpoint table holds 32 entries. Watchpoints 16. Stack frames
+// 64 max. All loops bounded by fixed capacities. Fixed-capacity collections
+// throughout.
+//
+// Effect declarations:
+//   [pure]    — deterministic data queries
+//   [io]      — formatted output, serial communication
+//   [debug]   — hardware debug register access, trap handling
+//   [diag]    — diagnostic emission, residual recording
+//   [memory]  — memory read/write operations
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+
+use debug::gdb_stub::*;
+use debug::tracer::*;
+use debug::fault_handler::*;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes for Kernel Debugger
+// ──────────────────────────────────────────────
+
+const DBG_BREAKPOINT_FULL    : u64 = 0x10000u64;
+const DBG_WATCHPOINT_FULL    : u64 = 0x10001u64;
+const DBG_STEP_COMPLETE      : u64 = 0x10002u64;
+const DBG_REGISTER_READ      : u64 = 0x10003u64;
+const DBG_REGISTER_WRITE     : u64 = 0x10004u64;
+const DBG_MEMORY_READ        : u64 = 0x10005u64;
+const DBG_MEMORY_WRITE       : u64 = 0x10006u64;
+const DBG_STACK_TRACE        : u64 = 0x10007u64;
+const DBG_SYMBOL_LOOKUP      : u64 = 0x10008u64;
+const DBG_DISASSEMBLY        : u64 = 0x10009u64;
+const DBG_CRASH_DUMP         : u64 = 0x1000Au64;
+const DBG_CONTINUE           : u64 = 0x1000Bu64;
+const DBG_INTERRUPT          : u64 = 0x1000Cu64;
+
+// ──────────────────────────────────────────────
+// Debugger State and Types
+// ──────────────────────────────────────────────
+
+/// Breakpoint type: software, hardware, or conditional.
+pub sealdatatype BreakpointType : u8 {
+    /// Software breakpoint: INT3 (0xCC) patch.
+    Software = 0u8,
+    /// Hardware breakpoint: DR0-DR3 debug registers.
+    Hardware = 1u8,
+    /// Conditional breakpoint: predicate evaluated at hit.
+    Conditional = 2u8,
+}
+
+/// Watchpoint type: read, write, or execute access.
+pub sealdatatype WatchpointType : u8 {
+    /// Read access watch.
+    Read = 0u8,
+    /// Write access watch.
+    Write = 1u8,
+    /// Execute access watch.
+    Execute = 2u8,
+    /// Read/Write access watch.
+    ReadWrite = 3u8,
+}
+
+/// Watchpoint size in bytes.
+pub sealdatatype WatchpointSize : u8 {
+    Size1 = 1u8,
+    Size2 = 2u8,
+    Size4 = 4u8,
+    Size8 = 8u8,
+}
+
+/// Breakpoint state.
+pub sealdatatype BreakpointState : u8 {
+    /// Breakpoint is active.
+    Active = 0u8,
+    /// Breakpoint is disabled.
+    Disabled = 1u8,
+    /// Breakpoint has been hit.
+    Hit = 2u8,
+    /// Breakpoint has a pending condition evaluation.
+    PendingCondition = 3u8,
+}
+
+/// CPU register identifier.
+pub sealdatatype RegisterId : u8 {
+    RAX = 0u8,  RBX = 1u8,  RCX = 2u8,  RDX = 3u8,
+    RSI = 4u8,  RDI = 5u8,  RBP = 6u8,  RSP = 7u8,
+    R8  = 8u8,  R9  = 9u8,  R10 = 10u8, R11 = 11u8,
+    R12 = 12u8, R13 = 13u8, R14 = 14u8, R15 = 15u8,
+    RIP = 16u8, RFLAGS = 17u8,
+    CS  = 18u8, SS  = 19u8, DS  = 20u8, ES  = 21u8,
+    FS  = 22u8, GS  = 23u8,
+    CR0 = 24u8, CR2 = 25u8, CR3 = 26u8, CR4 = 27u8,
+    DR0 = 28u8, DR1 = 29u8, DR2 = 30u8, DR3 = 31u8,
+    DR6 = 32u8, DR7 = 33u8,
+}
+
+/// A single breakpoint entry.
+pub struct BreakpointEntry {
+    /// Unique breakpoint identifier.
+    pub id : u32,
+    /// Address of the breakpoint.
+    pub address : u64,
+    /// Type of breakpoint.
+    pub bp_type : BreakpointType,
+    /// Current state.
+    pub state : BreakpointState,
+    /// Original byte at address (for software breakpoints).
+    pub original_byte : u8,
+    /// Hit count.
+    pub hit_count : u32,
+    /// Condition expression (empty if unconditional).
+    pub condition : FixedString256,
+    /// Condition evaluated result cache.
+    pub condition_met : bool,
+    /// Thread ID this breakpoint is specific to (0 = all threads).
+    pub thread_id : u32,
+    /// Whether this breakpoint is persistent across reboots.
+    pub persistent : bool,
+    /// Residual record for this breakpoint's creation.
+    pub creation_residual : DebugResidual,
+}
+
+/// A single watchpoint entry.
+pub struct WatchpointEntry {
+    /// Unique watchpoint identifier.
+    pub id : u32,
+    /// Start address of watched region.
+    pub address : u64,
+    /// Size of watched region in bytes.
+    pub size : u64,
+    /// Type of access to watch.
+    pub watch_type : WatchpointType,
+    /// Current state.
+    pub active : bool,
+    /// Hit count.
+    pub hit_count : u32,
+    /// Thread ID filter (0 = all threads).
+    pub thread_id : u32,
+}
+
+/// A single stack frame entry.
+pub struct StackFrameEntry {
+    /// Frame number (0 = current, ascending).
+    pub frame_number : u32,
+    /// Instruction pointer at this frame.
+    pub instruction_pointer : u64,
+    /// Stack pointer at this frame.
+    pub stack_pointer : u64,
+    /// Base pointer at this frame.
+    pub base_pointer : u64,
+    /// Return address from this frame.
+    pub return_address : u64,
+    /// Symbol name (empty if unknown).
+    pub symbol_name : FixedString256,
+    /// Source file name (empty if unknown).
+    pub source_file : FixedString256,
+    /// Source line number (0 if unknown).
+    pub source_line : u32,
+}
+
+/// A symbol table entry mapping address to name.
+pub struct SymbolEntry {
+    /// Symbol address.
+    pub address : u64,
+    /// Symbol name.
+    pub name : FixedString256,
+    /// Size of the symbol in bytes.
+    pub size : u64,
+    /// Section this symbol belongs to.
+    pub section : FixedString64,
+    /// Whether this is a function symbol.
+    pub is_function : bool,
+    /// Whether this is a global symbol.
+    pub is_global : bool,
+}
+
+/// A disassembled instruction.
+pub struct DisassembledInstruction {
+    /// Address of this instruction.
+    pub address : u64,
+    /// Raw instruction bytes.
+    pub raw_bytes : Array16<u8>,
+    /// Mnemonic string (e.g., "mov", "add", "call").
+    pub mnemonic : FixedString64,
+    /// Operands string.
+    pub operands : FixedString256,
+    /// Length in bytes.
+    pub length : u8,
+    /// Whether this is a branch instruction.
+    pub is_branch : bool,
+    /// Whether this is a call instruction.
+    pub is_call : bool,
+    /// Whether this is a return instruction.
+    pub is_return : bool,
+}
+
+/// CPU register file snapshot.
+pub struct RegisterFile {
+    /// General-purpose registers.
+    pub rax : u64, pub rbx : u64, pub rcx : u64, pub rdx : u64,
+    pub rsi : u64, pub rdi : u64, pub rbp : u64, pub rsp : u64,
+    pub r8  : u64, pub r9  : u64, pub r10 : u64, pub r11 : u64,
+    pub r12 : u64, pub r13 : u64, pub r14 : u64, pub r15 : u64,
+    /// Instruction pointer and flags.
+    pub rip : u64, pub rflags : u64,
+    /// Segment registers.
+    pub cs : u64, pub ss : u64, pub ds : u64, pub es : u64,
+    pub fs : u64, pub gs : u64,
+    /// Control registers.
+    pub cr0 : u64, pub cr2 : u64, pub cr3 : u64, pub cr4 : u64,
+    /// Debug registers.
+    pub dr0 : u64, pub dr1 : u64, pub dr2 : u64, pub dr3 : u64,
+    pub dr6 : u64, pub dr7 : u64,
+}
+
+impl RegisterFile {
+    /// Create a new, zeroed register file.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> RegisterFile [pure] {
+        RegisterFile {
+            rax: 0u64, rbx: 0u64, rcx: 0u64, rdx: 0u64,
+            rsi: 0u64, rdi: 0u64, rbp: 0u64, rsp: 0u64,
+            r8: 0u64, r9: 0u64, r10: 0u64, r11: 0u64,
+            r12: 0u64, r13: 0u64, r14: 0u64, r15: 0u64,
+            rip: 0u64, rflags: 0u64,
+            cs: 0u64, ss: 0u64, ds: 0u64, es: 0u64,
+            fs: 0u64, gs: 0u64,
+            cr0: 0u64, cr2: 0u64, cr3: 0u64, cr4: 0u64,
+            dr0: 0u64, dr1: 0u64, dr2: 0u64, dr3: 0u64,
+            dr6: 0u64, dr7: 0u64,
+        }
+    }
+
+    /// Read a register by id.
+    /// Effect: pure — deterministic data query.
+    pub fn read_register(&self, id : RegisterId) -> u64 [pure] {
+        match id {
+            RegisterId::RAX => self.rax,    RegisterId::RBX => self.rbx,
+            RegisterId::RCX => self.rcx,    RegisterId::RDX => self.rdx,
+            RegisterId::RSI => self.rsi,    RegisterId::RDI => self.rdi,
+            RegisterId::RBP => self.rbp,    RegisterId::RSP => self.rsp,
+            RegisterId::R8  => self.r8,     RegisterId::R9  => self.r9,
+            RegisterId::R10 => self.r10,    RegisterId::R11 => self.r11,
+            RegisterId::R12 => self.r12,    RegisterId::R13 => self.r13,
+            RegisterId::R14 => self.r14,    RegisterId::R15 => self.r15,
+            RegisterId::RIP => self.rip,    RegisterId::RFLAGS => self.rflags,
+            RegisterId::CS  => self.cs,     RegisterId::SS  => self.ss,
+            RegisterId::DS  => self.ds,     RegisterId::ES  => self.es,
+            RegisterId::FS  => self.fs,     RegisterId::GS  => self.gs,
+            RegisterId::CR0 => self.cr0,    RegisterId::CR2 => self.cr2,
+            RegisterId::CR3 => self.cr3,    RegisterId::CR4 => self.cr4,
+            RegisterId::DR0 => self.dr0,    RegisterId::DR1 => self.dr1,
+            RegisterId::DR2 => self.dr2,    RegisterId::DR3 => self.dr3,
+            RegisterId::DR6 => self.dr6,    RegisterId::DR7 => self.dr7,
+        }
+    }
+
+    /// Write a register by id.
+    /// Effect: pure — deterministic data mutation.
+    pub fn write_register(mut self, id : RegisterId, value : u64) -> RegisterFile [pure] {
+        match id {
+            RegisterId::RAX => self.rax = value,    RegisterId::RBX => self.rbx = value,
+            RegisterId::RCX => self.rcx = value,    RegisterId::RDX => self.rdx = value,
+            RegisterId::RSI => self.rsi = value,    RegisterId::RDI => self.rdi = value,
+            RegisterId::RBP => self.rbp = value,    RegisterId::RSP => self.rsp = value,
+            RegisterId::R8  => self.r8 = value,     RegisterId::R9  => self.r9 = value,
+            RegisterId::R10 => self.r10 = value,    RegisterId::R11 => self.r11 = value,
+            RegisterId::R12 => self.r12 = value,    RegisterId::R13 => self.r13 = value,
+            RegisterId::R14 => self.r14 = value,    RegisterId::R15 => self.r15 = value,
+            RegisterId::RIP => self.rip = value,    RegisterId::RFLAGS => self.rflags = value,
+            RegisterId::CS  => self.cs = value,     RegisterId::SS  => self.ss = value,
+            RegisterId::DS  => self.ds = value,     RegisterId::ES  => self.es = value,
+            RegisterId::FS  => self.fs = value,     RegisterId::GS  => self.gs = value,
+            RegisterId::CR0 => self.cr0 = value,    RegisterId::CR2 => self.cr2 = value,
+            RegisterId::CR3 => self.cr3 = value,    RegisterId::CR4 => self.cr4 = value,
+            RegisterId::DR0 => self.dr0 = value,    RegisterId::DR1 => self.dr1 = value,
+            RegisterId::DR2 => self.dr2 = value,    RegisterId::DR3 => self.dr3 = value,
+            RegisterId::DR6 => self.dr6 = value,    RegisterId::DR7 => self.dr7 = value,
+        }
+        self
+    }
+
+    /// Format the register file as a string.
+    /// Effect: io — string formatting for display.
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("RAX=0x"));
+        result.push_u64_hex(self.rax);
+        result.push_str(FixedString256::from(" RBX=0x"));
+        result.push_u64_hex(self.rbx);
+        result.push_str(FixedString256::from(" RCX=0x"));
+        result.push_u64_hex(self.rcx);
+        result.push_str(FixedString256::from(" RDX=0x"));
+        result.push_u64_hex(self.rdx);
+        result.push_str(FixedString256::from("\nRBP=0x"));
+        result.push_u64_hex(self.rbp);
+        result.push_str(FixedString256::from(" RSP=0x"));
+        result.push_u64_hex(self.rsp);
+        result.push_str(FixedString256::from(" RSI=0x"));
+        result.push_u64_hex(self.rsi);
+        result.push_str(FixedString256::from(" RDI=0x"));
+        result.push_u64_hex(self.rdi);
+        result.push_str(FixedString256::from("\nR8=0x"));
+        result.push_u64_hex(self.r8);
+        result.push_str(FixedString256::from(" R9=0x"));
+        result.push_u64_hex(self.r9);
+        result.push_str(FixedString256::from(" R10=0x"));
+        result.push_u64_hex(self.r10);
+        result.push_str(FixedString256::from(" R11=0x"));
+        result.push_u64_hex(self.r11);
+        result.push_str(FixedString256::from("\nR12=0x"));
+        result.push_u64_hex(self.r12);
+        result.push_str(FixedString256::from(" R13=0x"));
+        result.push_u64_hex(self.r13);
+        result.push_str(FixedString256::from(" R14=0x"));
+        result.push_u64_hex(self.r14);
+        result.push_str(FixedString256::from(" R15=0x"));
+        result.push_u64_hex(self.r15);
+        result.push_str(FixedString256::from("\nRIP=0x"));
+        result.push_u64_hex(self.rip);
+        result.push_str(FixedString256::from(" RFLAGS=0x"));
+        result.push_u64_hex(self.rflags);
+        result
+    }
+
+    /// Read a debug status register value.
+    /// Effect: debug — accesses hardware debug state.
+    pub fn read_dr6() -> u64 [debug] {
+        __builtin_read_dr6()
+    }
+
+    /// Write debug control register.
+    /// Effect: debug — modifies hardware debug state.
+    pub fn write_dr7(value : u64) [debug] {
+        __builtin_write_dr7(value);
+    }
+}
+
+/// Debug residual record for forensic analysis.
+pub struct DebugResidual {
+    /// Residual diagnostic code.
+    pub code : u64,
+    /// Human-readable message.
+    pub message : FixedString256,
+    /// Debug action that produced this residual.
+    pub action : FixedString64,
+    /// Address involved (if applicable).
+    pub address : u64,
+    /// Value involved (if applicable).
+    pub value : u64,
+    /// Timestamp of residual creation.
+    pub timestamp : u64,
+}
+
+/// Debugger operating mode.
+pub sealdatatype DebuggerMode : u8 {
+    /// Debugger is idle, no target stopped.
+    Idle = 0u8,
+    /// Target is stopped at a breakpoint.
+    StoppedBreakpoint = 1u8,
+    /// Target is stopped after single-step.
+    StoppedStep = 2u8,
+    /// Target is stopped at a watchpoint.
+    StoppedWatchpoint = 3u8,
+    /// Target is stopped due to a fault.
+    StoppedFault = 4u8,
+    /// Debugger is single-stepping.
+    Stepping = 5u8,
+    /// Target is running freely.
+    Running = 6u8,
+}
+
+/// Kernel debugger main state.
+pub struct KernelDebugger {
+    /// Operating mode.
+    pub mode : DebuggerMode,
+    /// Registered breakpoint table (max 32).
+    pub breakpoints : Array32<BreakpointEntry>,
+    /// Next breakpoint ID.
+    pub next_breakpoint_id : u32,
+    /// Registered watchpoints (max 16).
+    pub watchpoints : Array16<WatchpointEntry>,
+    /// Next watchpoint ID.
+    pub next_watchpoint_id : u32,
+    /// Current register file snapshot.
+    pub register_file : RegisterFile,
+    /// Symbol table (max 256 entries).
+    pub symbol_table : Array256<SymbolEntry>,
+    /// Current stack trace (max 64 frames).
+    pub stack_trace : Array64<StackFrameEntry>,
+    /// Disassembly buffer (max 64 instructions).
+    pub disassembly_buffer : Array64<DisassembledInstruction>,
+    /// Debug residual log (max 128 entries).
+    pub residual_log : Array128<DebugResidual>,
+    /// Current debug target process ID.
+    pub target_thread_id : u32,
+    /// Whether breakpoints are enabled globally.
+    pub breakpoints_enabled : bool,
+    /// Whether the debugger is in attached state.
+    pub attached : bool,
+}
+
+impl KernelDebugger {
+    /// Create a new kernel debugger instance.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> KernelDebugger [pure] {
+        KernelDebugger {
+            mode: DebuggerMode::Idle,
+            breakpoints: Array32::new(),
+            next_breakpoint_id: 1u32,
+            watchpoints: Array16::new(),
+            next_watchpoint_id: 1u32,
+            register_file: RegisterFile::new(),
+            symbol_table: Array256::new(),
+            stack_trace: Array64::new(),
+            disassembly_buffer: Array64::new(),
+            residual_log: Array128::new(),
+            target_thread_id: 0u32,
+            breakpoints_enabled: true,
+            attached: false,
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a debug residual for forensic analysis.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, address : u64, value : u64) -> KernelDebugger [diag] {
+        let residual : DebugResidual = DebugResidual {
+            code: code,
+            message: message,
+            action: action,
+            address: address,
+            value: value,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Breakpoint Management
+    // ──────────────────────────────────────────
+
+    /// Insert a software breakpoint at the given address.
+    /// Effect: debug, memory — modifies code memory and debug state.
+    pub fn insert_breakpoint(mut self, address : u64, bp_type : BreakpointType,
+                             condition : FixedString256) -> Result<KernelDebugger, FixedString256>
+                             [debug, memory, diag] {
+        // Bounded check: breakpoint table capacity.
+        if self.breakpoints.is_full() {
+            return Result::Err(FixedString256::from("breakpoint table full"));
+        }
+
+        // Check for duplicate.
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let existing : BreakpointEntry = self.breakpoints.get(i);
+            if existing.address == address && existing.state != BreakpointState::Disabled {
+                return Result::Err(FixedString256::from("breakpoint already exists at address"));
+            }
+        }
+
+        let original_byte : u8 = 0u8;
+        if bp_type == BreakpointType::Software {
+            // Read original byte at address.
+            original_byte = __builtin_read_byte(address);
+            // Write INT3 (0xCC) at address.
+            __builtin_write_byte(address, 0xCCu8);
+        }
+
+        let entry : BreakpointEntry = BreakpointEntry {
+            id: self.next_breakpoint_id,
+            address: address,
+            bp_type: bp_type,
+            state: BreakpointState::Active,
+            original_byte: original_byte,
+            hit_count: 0u32,
+            condition: condition,
+            condition_met: false,
+            thread_id: self.target_thread_id,
+            persistent: false,
+            creation_residual: DebugResidual {
+                code: DBG_BREAKPOINT_FULL,
+                message: FixedString256::from("breakpoint inserted"),
+                action: FixedString64::from("insert_bp"),
+                address: address,
+                value: self.next_breakpoint_id as u64,
+                timestamp: __builtin_timestamp(),
+            },
+        };
+
+        let id : u32 = self.next_breakpoint_id;
+        self.next_breakpoint_id += 1u32;
+        let _ = self.breakpoints.push(entry);
+
+        self = self.record_residual(
+            DBG_BREAKPOINT_FULL,
+            FixedString256::from("breakpoint inserted"),
+            FixedString64::from("insert_bp"),
+            address,
+            id as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Remove a breakpoint by ID.
+    /// Effect: debug, memory — restores original code and clears debug state.
+    pub fn remove_breakpoint(mut self, id : u32) -> Result<KernelDebugger, FixedString256>
+                             [debug, memory, diag] {
+        var found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let entry : BreakpointEntry = self.breakpoints.get(i);
+            if entry.id == id && entry.state != BreakpointState::Disabled {
+                // Restore original byte for software breakpoints.
+                if entry.bp_type == BreakpointType::Software {
+                    __builtin_write_byte(entry.address, entry.original_byte);
+                }
+                found = true;
+                let _ = self.breakpoints.remove(i);
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("breakpoint not found"));
+        }
+
+        self = self.record_residual(
+            DBG_BREAKPOINT_FULL,
+            FixedString256::from("breakpoint removed"),
+            FixedString64::from("remove_bp"),
+            0u64,
+            id as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Enable a breakpoint by ID.
+    /// Effect: debug, memory — re-patches software breakpoint.
+    pub fn enable_breakpoint(mut self, id : u32) -> Result<KernelDebugger, FixedString256>
+                             [debug, memory, diag] {
+        var found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let mut entry : BreakpointEntry = self.breakpoints.get(i);
+            if entry.id == id {
+                if entry.state == BreakpointType::Software {
+                    __builtin_write_byte(entry.address, 0xCCu8);
+                }
+                entry.state = BreakpointState::Active;
+                let _ = self.breakpoints.set(i, entry);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("breakpoint not found"));
+        }
+
+        self = self.record_residual(
+            DBG_BREAKPOINT_FULL,
+            FixedString256::from("breakpoint enabled"),
+            FixedString64::from("enable_bp"),
+            0u64,
+            id as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Disable a breakpoint by ID.
+    /// Effect: debug, memory — restores original byte.
+    pub fn disable_breakpoint(mut self, id : u32) -> Result<KernelDebugger, FixedString256>
+                              [debug, memory, diag] {
+        var found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let mut entry : BreakpointEntry = self.breakpoints.get(i);
+            if entry.id == id {
+                if entry.state == BreakpointState::Active {
+                    if entry.bp_type == BreakpointType::Software {
+                        __builtin_write_byte(entry.address, entry.original_byte);
+                    }
+                }
+                entry.state = BreakpointState::Disabled;
+                let _ = self.breakpoints.set(i, entry);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("breakpoint not found"));
+        }
+
+        self = self.record_residual(
+            DBG_BREAKPOINT_FULL,
+            FixedString256::from("breakpoint disabled"),
+            FixedString64::from("disable_bp"),
+            0u64,
+            id as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// List all breakpoints formatted as a string.
+    /// Effect: io — string formatting.
+    pub fn list_breakpoints(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("Breakpoints:\n"));
+        if self.breakpoints.is_empty() {
+            result.push_str(FixedString256::from("  (none)\n"));
+            return result;
+        }
+
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let bp : BreakpointEntry = self.breakpoints.get(i);
+            result.push_str(FixedString256::from("  #"));
+            result.push_u32(bp.id);
+            result.push_str(FixedString256::from(": "));
+            result.push_u64_hex(bp.address);
+            result.push_str(FixedString256::from(" ["));
+            result.push_str(bp.state.name());
+            result.push_str(FixedString256::from("] hits="));
+            result.push_u32(bp.hit_count);
+            result.push_str(FixedString256::from(" type="));
+            result.push_str(bp.bp_type.name());
+            if bp.condition.len() > 0u32 {
+                result.push_str(FixedString256::from(" if \""));
+                result.push_str(bp.condition);
+                result.push_str(FixedString256::from("\""));
+            }
+            result.push_str(FixedString256::from("\n"));
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Watchpoint Management
+    // ──────────────────────────────────────────
+
+    /// Insert a watchpoint on a memory region.
+    /// Effect: debug — configures hardware debug registers.
+    pub fn insert_watchpoint(mut self, address : u64, size : u64,
+                             watch_type : WatchpointType) -> Result<KernelDebugger, FixedString256>
+                             [debug, diag] {
+        if self.watchpoints.is_full() {
+            return Result::Err(FixedString256::from("watchpoint table full"));
+        }
+
+        // Check for overlapping watchpoints.
+        // loop: bounds[BOUND_SMALL] — bounded by 16 entries.
+        for var i : u32 = 0u32; i < self.watchpoints.len(); i += 1u32 [self.watchpoints.len()] {
+            let existing : WatchpointEntry = self.watchpoints.get(i);
+            if existing.address == address && existing.active {
+                return Result::Err(FixedString256::from("watchpoint already exists at address"));
+            }
+        }
+
+        let entry : WatchpointEntry = WatchpointEntry {
+            id: self.next_watchpoint_id,
+            address: address,
+            size: size,
+            watch_type: watch_type,
+            active: true,
+            hit_count: 0u32,
+            thread_id: self.target_thread_id,
+        };
+
+        let id : u32 = self.next_watchpoint_id;
+        self.next_watchpoint_id += 1u32;
+        let _ = self.watchpoints.push(entry);
+
+        // Configure hardware debug registers if using DR0-DR3.
+        self = self.configure_hardware_watchpoints();
+
+        self = self.record_residual(
+            DBG_WATCHPOINT_FULL,
+            FixedString256::from("watchpoint inserted"),
+            FixedString64::from("insert_wp"),
+            address,
+            id as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Remove a watchpoint by ID.
+    /// Effect: debug — clears hardware debug register.
+    pub fn remove_watchpoint(mut self, id : u32) -> Result<KernelDebugger, FixedString256>
+                             [debug, diag] {
+        var found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by 16 entries.
+        for var i : u32 = 0u32; i < self.watchpoints.len(); i += 1u32 [self.watchpoints.len()] {
+            let entry : WatchpointEntry = self.watchpoints.get(i);
+            if entry.id == id {
+                let _ = self.watchpoints.remove(i);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("watchpoint not found"));
+        }
+
+        self = self.configure_hardware_watchpoints();
+
+        self = self.record_residual(
+            DBG_WATCHPOINT_FULL,
+            FixedString256::from("watchpoint removed"),
+            FixedString64::from("remove_wp"),
+            0u64,
+            id as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Configure hardware debug registers (DR0-DR3, DR7) based on watchpoints.
+    /// Effect: debug — writes hardware debug registers.
+    fn configure_hardware_watchpoints(mut self) -> KernelDebugger [debug] {
+        var dr7 : u64 = 0u64;
+
+        // loop: bounds[BOUND_SMALL] — bounded by 16 entries, only first 4 used.
+        for var i : u32 = 0u32; i < self.watchpoints.len() && i < 4u32; i += 1u32 [4u32] {
+            let wp : WatchpointEntry = self.watchpoints.get(i);
+            if !wp.active {
+                continue;
+            }
+
+            // Set debug register for address.
+            match i {
+                0u32 => self.register_file.dr0 = wp.address,
+                1u32 => self.register_file.dr1 = wp.address,
+                2u32 => self.register_file.dr2 = wp.address,
+                3u32 => self.register_file.dr3 = wp.address,
+                _ => {},
+            }
+
+            // Set DR7 fields for this watchpoint.
+            let shift : u64 = i as u64 * 4u64 + 16u64; // LEN0, R/W0 start at bit 16
+            let rw : u64 = match wp.watch_type {
+                WatchpointType::Execute => 0u64,
+                WatchpointType::Write => 1u64,
+                WatchpointType::ReadWrite => 3u64,
+                WatchpointType::Read => 3u64,
+            };
+            let len_enc : u64 = match wp.size {
+                1u64 => 0u64,
+                2u64 => 1u64,
+                4u64 => 3u64,
+                8u64 => 2u64,
+                _ => 0u64,
+            };
+
+            dr7 |= 1u64 << (i as u64 * 2u64);         // L0/L1/L2/L3 enable
+            dr7 |= rw << shift;                         // R/W0-3
+            dr7 |= len_enc << (shift + 2u64);           // LEN0-3
+
+            let _ = self.watchpoints.set(i, wp);
+        }
+
+        self.register_file.dr7 = dr7;
+        RegisterFile::write_dr7(dr7);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Single-Stepping
+    // ──────────────────────────────────────────
+
+    /// Enable single-step mode by setting the trap flag.
+    /// Effect: debug — modifies RFLAGS.TF.
+    pub fn enable_single_step(mut self) -> KernelDebugger [debug, diag] {
+        self.register_file.rflags |= 0x100u64; // Set TF (trap flag)
+        self.mode = DebuggerMode::Stepping;
+
+        self = self.record_residual(
+            DBG_STEP_COMPLETE,
+            FixedString256::from("single-step enabled"),
+            FixedString64::from("step_enable"),
+            0u64,
+            self.register_file.rflags,
+        );
+        self
+    }
+
+    /// Disable single-step mode by clearing the trap flag.
+    /// Effect: debug — modifies RFLAGS.TF.
+    pub fn disable_single_step(mut self) -> KernelDebugger [debug, diag] {
+        self.register_file.rflags &= !0x100u64; // Clear TF
+        self.mode = DebuggerMode::Idle;
+
+        self = self.record_residual(
+            DBG_STEP_COMPLETE,
+            FixedString256::from("single-step disabled"),
+            FixedString64::from("step_disable"),
+            0u64,
+            self.register_file.rflags,
+        );
+        self
+    }
+
+    /// Perform a single step (one instruction) on the target.
+    /// Effect: debug — executes one instruction with trap flag.
+    pub fn single_step(mut self) -> Result<KernelDebugger, FixedString256>
+                       [debug, memory, diag] {
+        if !self.attached {
+            return Result::Err(FixedString256::from("debugger not attached to any target"));
+        }
+
+        self = self.enable_single_step();
+        // The actual step is performed by returning to the target with TF set.
+        // On the next debug trap, the debugger will be re-entered.
+        self.mode = DebuggerMode::Stopping;
+
+        self = self.record_residual(
+            DBG_STEP_COMPLETE,
+            FixedString256::from("single-step executed"),
+            FixedString64::from("step"),
+            self.register_file.rip,
+            0u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Continue execution from the current location.
+    /// Effect: debug — resumes target execution.
+    pub fn continue_execution(mut self) -> Result<KernelDebugger, FixedString256>
+                              [debug, diag] {
+        if !self.attached {
+            return Result::Err(FixedString256::from("debugger not attached to any target"));
+        }
+
+        self.mode = DebuggerMode::Running;
+
+        self = self.record_residual(
+            DBG_CONTINUE,
+            FixedString256::from("execution continued"),
+            FixedString64::from("continue"),
+            self.register_file.rip,
+            0u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Register Inspection
+    // ──────────────────────────────────────────
+
+    /// Read a register value by name.
+    /// Effect: pure — data query from register file.
+    pub fn read_register_by_name(&self, name : FixedString256) -> Result<u64, FixedString256> [pure] {
+        if name == FixedString256::from("rax") { return Result::Ok(self.register_file.rax); }
+        if name == FixedString256::from("rbx") { return Result::Ok(self.register_file.rbx); }
+        if name == FixedString256::from("rcx") { return Result::Ok(self.register_file.rcx); }
+        if name == FixedString256::from("rdx") { return Result::Ok(self.register_file.rdx); }
+        if name == FixedString256::from("rsi") { return Result::Ok(self.register_file.rsi); }
+        if name == FixedString256::from("rdi") { return Result::Ok(self.register_file.rdi); }
+        if name == FixedString256::from("rbp") { return Result::Ok(self.register_file.rbp); }
+        if name == FixedString256::from("rsp") { return Result::Ok(self.register_file.rsp); }
+        if name == FixedString256::from("r8")  { return Result::Ok(self.register_file.r8); }
+        if name == FixedString256::from("r9")  { return Result::Ok(self.register_file.r9); }
+        if name == FixedString256::from("r10") { return Result::Ok(self.register_file.r10); }
+        if name == FixedString256::from("r11") { return Result::Ok(self.register_file.r11); }
+        if name == FixedString256::from("r12") { return Result::Ok(self.register_file.r12); }
+        if name == FixedString256::from("r13") { return Result::Ok(self.register_file.r13); }
+        if name == FixedString256::from("r14") { return Result::Ok(self.register_file.r14); }
+        if name == FixedString256::from("r15") { return Result::Ok(self.register_file.r15); }
+        if name == FixedString256::from("rip") { return Result::Ok(self.register_file.rip); }
+        if name == FixedString256::from("rflags") { return Result::Ok(self.register_file.rflags); }
+        Result::Err(FixedString256::from("unknown register"))
+    }
+
+    /// Write a register value by name.
+    /// Effect: pure — data mutation in register file.
+    pub fn write_register_by_name(mut self, name : FixedString256,
+                                  value : u64) -> Result<KernelDebugger, FixedString256> [pure] {
+        if name == FixedString256::from("rax") { self.register_file.rax = value; }
+        else if name == FixedString256::from("rbx") { self.register_file.rbx = value; }
+        else if name == FixedString256::from("rcx") { self.register_file.rcx = value; }
+        else if name == FixedString256::from("rdx") { self.register_file.rdx = value; }
+        else if name == FixedString256::from("rsi") { self.register_file.rsi = value; }
+        else if name == FixedString256::from("rdi") { self.register_file.rdi = value; }
+        else if name == FixedString256::from("rbp") { self.register_file.rbp = value; }
+        else if name == FixedString256::from("rsp") { self.register_file.rsp = value; }
+        else if name == FixedString256::from("r8")  { self.register_file.r8 = value; }
+        else if name == FixedString256::from("r9")  { self.register_file.r9 = value; }
+        else if name == FixedString256::from("r10") { self.register_file.r10 = value; }
+        else if name == FixedString256::from("r11") { self.register_file.r11 = value; }
+        else if name == FixedString256::from("r12") { self.register_file.r12 = value; }
+        else if name == FixedString256::from("r13") { self.register_file.r13 = value; }
+        else if name == FixedString256::from("r14") { self.register_file.r14 = value; }
+        else if name == FixedString256::from("r15") { self.register_file.r15 = value; }
+        else if name == FixedString256::from("rip") { self.register_file.rip = value; }
+        else if name == FixedString256::from("rflags") { self.register_file.rflags = value; }
+        else {
+            return Result::Err(FixedString256::from("unknown register"));
+        }
+
+        self = self.record_residual(
+            DBG_REGISTER_WRITE,
+            FixedString256::from("register written"),
+            FixedString64::from("write_reg"),
+            0u64,
+            value,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Dump all registers as a formatted string.
+    /// Effect: io — string formatting.
+    pub fn dump_registers(&self) -> FixedString256 [io] {
+        self.register_file.format()
+    }
+
+    // ──────────────────────────────────────────
+    // Memory Inspection
+    // ──────────────────────────────────────────
+
+    /// Read memory at an address into a buffer.
+    /// Effect: memory — reads from target address space.
+    pub fn read_memory(mut self, address : u64, buffer : ref mut Array64<u8>,
+                       size : u32) -> Result<KernelDebugger, FixedString256> [memory, diag] {
+        if buffer.capacity() < size {
+            return Result::Err(FixedString256::from("buffer too small for requested size"));
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size parameter.
+        for var i : u32 = 0u32; i < size; i += 1u32 [size] {
+            let byte : u8 = __builtin_read_byte(address + i as u64);
+            let _ = buffer.push(byte);
+        }
+
+        self = self.record_residual(
+            DBG_MEMORY_READ,
+            FixedString256::from("memory read"),
+            FixedString64::from("read_mem"),
+            address,
+            size as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Write memory at an address from a buffer.
+    /// Effect: memory — writes to target address space.
+    pub fn write_memory(mut self, address : u64, data : Array64<u8>,
+                        size : u32) -> Result<KernelDebugger, FixedString256> [memory, diag] {
+        if data.len() < size {
+            return Result::Err(FixedString256::from("data buffer too small"));
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size parameter.
+        for var i : u32 = 0u32; i < size; i += 1u32 [size] {
+            let byte : u8 = data.get(i);
+            __builtin_write_byte(address + i as u64, byte);
+        }
+
+        self = self.record_residual(
+            DBG_MEMORY_READ,
+            FixedString256::from("memory written"),
+            FixedString64::from("write_mem"),
+            address,
+            size as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Format a hex dump of a memory region.
+    /// Effect: io, memory — reads memory and formats.
+    pub fn hex_dump(&self, address : u64, size : u32) -> FixedString256 [io, memory] {
+        var result : FixedString256 = FixedString256::new();
+        var offset : u32 = 0u32;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size parameter (max 256).
+        loop: bounds[BOUND_LARGE] while offset < size && offset < 256u32 {
+            // Print address prefix.
+            result.push_u64_hex(address + offset as u64);
+            result.push_str(FixedString256::from(": "));
+
+            // Print hex bytes.
+            var col : u32 = 0u32;
+            // loop: bounds[BOUND_SMALL] — 16 bytes per line.
+            loop: bounds[BOUND_SMALL] while col < 16u32 && (offset + col) < size {
+                let byte : u8 = __builtin_read_byte(address + (offset + col) as u64);
+                result.push_u8_hex(byte);
+                result.push_str(FixedString256::from(" "));
+                col += 1u32;
+            }
+
+            // Print ASCII representation.
+            result.push_str(FixedString256::from(" |"));
+            col = 0u32;
+            // loop: bounds[BOUND_SMALL] — 16 bytes per line.
+            loop: bounds[BOUND_SMALL] while col < 16u32 && (offset + col) < size {
+                let byte : u8 = __builtin_read_byte(address + (offset + col) as u64);
+                if byte >= 0x20u8 && byte <= 0x7Eu8 {
+                    result.push_byte(byte);
+                } else {
+                    result.push_str(FixedString256::from("."));
+                }
+                col += 1u32;
+            }
+            result.push_str(FixedString256::from("|\n"));
+
+            offset += 16u32;
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Stack Trace
+    // ──────────────────────────────────────────
+
+    /// Unwind the stack using frame pointers (RBP chain).
+    /// Effect: memory — reads stack and frame pointer values.
+    pub fn unwind_stack(mut self, max_frames : u32) -> Result<KernelDebugger, FixedString256>
+                        [memory, diag] {
+        var rbp : u64 = self.register_file.rbp;
+        var rsp : u64 = self.register_file.rsp;
+        var rip : u64 = self.register_file.rip;
+        var frame_count : u32 = 0u32;
+
+        self.stack_trace.clear();
+
+        // Capture the current frame.
+        let current_frame : StackFrameEntry = StackFrameEntry {
+            frame_number: 0u32,
+            instruction_pointer: rip,
+            stack_pointer: rsp,
+            base_pointer: rbp,
+            return_address: rip,
+            symbol_name: FixedString256::new(),
+            source_file: FixedString256::new(),
+            source_line: 0u32,
+        };
+        let _ = self.stack_trace.push(current_frame);
+        frame_count = 1u32;
+
+        // Resolve symbol for current frame.
+        let current_name : FixedString256 = self.lookup_symbol(rip);
+        if current_name.len() > 0u32 {
+            let mut frame : StackFrameEntry = self.stack_trace.get(0u32);
+            frame.symbol_name = current_name;
+            let _ = self.stack_trace.set(0u32, frame);
+        }
+
+        // Walk the RBP chain.
+        // loop: bounds[BOUND_MEDIUM] — bounded by max_frames (max 64).
+        loop: bounds[BOUND_MEDIUM] while rbp != 0u64 && frame_count < max_frames && frame_count < 64u32 {
+            // Read saved RBP (at [rbp+0]) and return address (at [rbp+8]).
+            let saved_rbp : u64 = __builtin_read_u64(rbp);
+            let return_addr : u64 = __builtin_read_u64(rbp + 8u64);
+
+            if return_addr == 0u64 {
+                break;
+            }
+
+            let sym_name : FixedString256 = self.lookup_symbol(return_addr);
+
+            let frame : StackFrameEntry = StackFrameEntry {
+                frame_number: frame_count,
+                instruction_pointer: return_addr,
+                stack_pointer: rbp + 16u64,
+                base_pointer: saved_rbp,
+                return_address: return_addr,
+                symbol_name: sym_name,
+                source_file: FixedString256::new(),
+                source_line: 0u32,
+            };
+            let _ = self.stack_trace.push(frame);
+
+            rbp = saved_rbp;
+            frame_count += 1u32;
+        }
+
+        self = self.record_residual(
+            DBG_STACK_TRACE,
+            FixedString256::from("stack unwind complete"),
+            FixedString64::from("unwind"),
+            rbp,
+            frame_count as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Format the stack trace as a string.
+    /// Effect: io — string formatting.
+    pub fn format_stack_trace(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("Stack Trace:\n"));
+
+        if self.stack_trace.is_empty() {
+            result.push_str(FixedString256::from("  (empty)\n"));
+            return result;
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by 64 frames.
+        for var i : u32 = 0u32; i < self.stack_trace.len(); i += 1u32 [self.stack_trace.len()] {
+            let frame : StackFrameEntry = self.stack_trace.get(i);
+            result.push_str(FixedString256::from("  #"));
+            result.push_u32(frame.frame_number);
+            result.push_str(FixedString256::from(": 0x"));
+            result.push_u64_hex(frame.instruction_pointer);
+            if frame.symbol_name.len() > 0u32 {
+                result.push_str(FixedString256::from(" "));
+                result.push_str(frame.symbol_name);
+            }
+            result.push_str(FixedString256::from("\n"));
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Symbol Lookup
+    // ──────────────────────────────────────────
+
+    /// Look up a symbol name for an address.
+    /// Effect: pure — table lookup.
+    pub fn lookup_symbol(&self, address : u64) -> FixedString256 [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by 256 entries.
+        for var i : u32 = 0u32; i < self.symbol_table.len(); i += 1u32 [self.symbol_table.len()] {
+            let sym : SymbolEntry = self.symbol_table.get(i);
+            if address >= sym.address && address < sym.address + sym.size {
+                return sym.name;
+            }
+        }
+        FixedString256::new()
+    }
+
+    /// Look up an address for a symbol name.
+    /// Effect: pure — table lookup.
+    pub fn lookup_address(&self, name : FixedString256) -> Result<u64, FixedString256> [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by 256 entries.
+        for var i : u32 = 0u32; i < self.symbol_table.len(); i += 1u32 [self.symbol_table.len()] {
+            let sym : SymbolEntry = self.symbol_table.get(i);
+            if sym.name == name {
+                return Result::Ok(sym.address);
+            }
+        }
+        Result::Err(FixedString256::from("symbol not found"))
+    }
+
+    /// Load a symbol table from an array of entries.
+    /// Effect: pure — populates symbol table.
+    pub fn load_symbol_table(mut self, entries : Array256<SymbolEntry>) -> KernelDebugger [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by 256 entries.
+        for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+            let entry : SymbolEntry = entries.get(i);
+            let _ = self.symbol_table.push(entry);
+        }
+        self
+    }
+
+    /// Add a single symbol to the table.
+    /// Effect: pure — appends to symbol table.
+    pub fn add_symbol(mut self, entry : SymbolEntry) -> Result<KernelDebugger, FixedString256> [pure] {
+        if self.symbol_table.is_full() {
+            return Result::Err(FixedString256::from("symbol table full"));
+        }
+        let _ = self.symbol_table.push(entry);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Disassembly Interface
+    // ──────────────────────────────────────────
+
+    /// Disassemble instructions at a given address.
+    /// Effect: memory, io — reads code memory and decodes.
+    pub fn disassemble(mut self, address : u64, count : u32) -> Result<KernelDebugger, FixedString256>
+                       [memory, io] {
+        self.disassembly_buffer.clear();
+        var current_address : u64 = address;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by count (max 64).
+        loop: bounds[BOUND_MEDIUM] while self.disassembly_buffer.len() < count
+                                     && self.disassembly_buffer.len() < 64u32 {
+            let decoded : Result<DisassembledInstruction, FixedString256> =
+                self.decode_instruction(current_address);
+
+            match decoded {
+                Result::Ok(inst) => {
+                    let _ = self.disassembly_buffer.push(inst);
+                    current_address += inst.length as u64;
+                },
+                Result::Err(msg) => {
+                    // Insert an invalid instruction marker.
+                    let invalid : DisassembledInstruction = DisassembledInstruction {
+                        address: current_address,
+                        raw_bytes: Array16::new(),
+                        mnemonic: FixedString64::from("???"),
+                        operands: FixedString256::new(),
+                        length: 1u8,
+                        is_branch: false,
+                        is_call: false,
+                        is_return: false,
+                    };
+                    let _ = self.disassembly_buffer.push(invalid);
+                    current_address += 1u64;
+                },
+            }
+        }
+
+        self = self.record_residual(
+            DBG_DISASSEMBLY,
+            FixedString256::from("disassembly complete"),
+            FixedString64::from("disasm"),
+            address,
+            self.disassembly_buffer.len() as u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Decode a single instruction at an address.
+    /// Effect: memory — reads instruction bytes.
+    fn decode_instruction(&self, address : u64) -> Result<DisassembledInstruction, FixedString256>
+                          [memory] {
+        // Read first byte to determine instruction length and type.
+        let first_byte : u8 = __builtin_read_byte(address);
+        var result : DisassembledInstruction = DisassembledInstruction {
+            address: address,
+            raw_bytes: Array16::new(),
+            mnemonic: FixedString64::new(),
+            operands: FixedString256::new(),
+            length: 1u8,
+            is_branch: false,
+            is_call: false,
+            is_return: false,
+        };
+
+        let _ = result.raw_bytes.push(first_byte);
+
+        // Basic x86-64 instruction decoding (simplified).
+        if first_byte == 0xCCu8 {
+            // INT3 (breakpoint).
+            result.mnemonic = FixedString64::from("int3");
+            result.length = 1u8;
+        } else if first_byte == 0xC3u8 {
+            // RET (near return).
+            result.mnemonic = FixedString64::from("ret");
+            result.is_return = true;
+            result.length = 1u8;
+        } else if first_byte == 0x90u8 {
+            // NOP.
+            result.mnemonic = FixedString64::from("nop");
+            result.length = 1u8;
+        } else if first_byte == 0xE8u8 {
+            // CALL rel32.
+            result.mnemonic = FixedString64::from("call");
+            result.is_call = true;
+            result.length = 5u8;
+            // Read the 32-bit offset.
+            let offset : u32 = __builtin_read_u32(address + 1u64);
+            let target : u64 = address + result.length as u64 + offset as u64;
+            result.operands = FixedString256::from("0x");
+            result.operands.push_u64_hex(target);
+        } else if first_byte == 0xEBu8 {
+            // JMP rel8 (short).
+            result.mnemonic = FixedString64::from("jmp");
+            result.is_branch = true;
+            result.length = 2u8;
+        } else if first_byte >= 0x70u8 && first_byte <= 0x7Fu8 {
+            // Conditional jumps Jcc rel8.
+            let cond_names : Array16<FixedString64> = Array16::from_fixed([
+                FixedString64::from("jo"),  FixedString64::from("jno"),
+                FixedString64::from("jb"),  FixedString64::from("jnb"),
+                FixedString64::from("jz"),  FixedString64::from("jnz"),
+                FixedString64::from("jbe"), FixedString64::from("ja"),
+                FixedString64::from("js"),  FixedString64::from("jns"),
+                FixedString64::from("jp"),  FixedString64::from("jnp"),
+                FixedString64::from("jl"),  FixedString64::from("jnl"),
+                FixedString64::from("jle"), FixedString64::from("jg"),
+            ]);
+            let index : u8 = first_byte - 0x70u8;
+            result.mnemonic = cond_names.get(index as u32);
+            result.is_branch = true;
+            result.length = 2u8;
+        } else if first_byte == 0x0Fu8 {
+            // Two-byte opcode.
+            let second_byte : u8 = __builtin_read_byte(address + 1u64);
+            let _ = result.raw_bytes.push(second_byte);
+            result.length = 2u8;
+
+            if second_byte >= 0x80u8 && second_byte <= 0x8Fu8 {
+                // Jcc rel32 (conditional jumps with 32-bit offset).
+                result.is_branch = true;
+                result.length = 6u8;
+            } else {
+                result.mnemonic = FixedString64::from("??");
+            }
+        } else if first_byte == 0x48u8 || first_byte == 0x66u8 {
+            // REX prefix or operand size override. Read next byte.
+            let second_byte : u8 = __builtin_read_byte(address + 1u64);
+            let _ = result.raw_bytes.push(second_byte);
+
+            if second_byte == 0x89u8 || second_byte == 0x8Bu8 {
+                // MOV reg, reg/mem or MOV reg/mem, reg
+                result.mnemonic = FixedString64::from("mov");
+                result.length = 3u8;
+            } else if second_byte == 0x01u8 {
+                // ADD
+                result.mnemonic = FixedString64::from("add");
+                result.length = 3u8;
+            } else if second_byte == 0x29u8 {
+                // SUB
+                result.mnemonic = FixedString64::from("sub");
+                result.length = 3u8;
+            } else {
+                result.mnemonic = FixedString64::from("??");
+                result.length = 2u8;
+            }
+        } else if first_byte == 0xB8u8 || first_byte == 0xB9u8 ||
+                  first_byte == 0xBAu8 || first_byte == 0xBBu8 {
+            // MOV eax/ecx/edx/ebx, imm32 (with REX: mov rax, imm64)
+            result.mnemonic = FixedString64::from("mov");
+            result.length = 5u8;
+        } else {
+            // Unknown/default handling.
+            result.mnemonic = FixedString64::from("db");
+            result.operands = FixedString256::from("0x");
+            result.operands.push_u8_hex(first_byte);
+        }
+
+        Result::Ok(result)
+    }
+
+    /// Format the disassembly buffer as a string.
+    /// Effect: io — string formatting.
+    pub fn format_disassembly(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+
+        if self.disassembly_buffer.is_empty() {
+            result.push_str(FixedString256::from("(no disassembly)\n"));
+            return result;
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by 64 entries.
+        for var i : u32 = 0u32; i < self.disassembly_buffer.len(); i += 1u32 [self.disassembly_buffer.len()] {
+            let inst : DisassembledInstruction = self.disassembly_buffer.get(i);
+            result.push_str(FixedString256::from("  0x"));
+            result.push_u64_hex(inst.address);
+            result.push_str(FixedString256::from(": "));
+            result.push_str(inst.mnemonic);
+            if inst.operands.len() > 0u32 {
+                result.push_str(FixedString256::from(" "));
+                result.push_str(inst.operands);
+            }
+            result.push_str(FixedString256::from("\n"));
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Conditional Breakpoints
+    // ──────────────────────────────────────────
+
+    /// Evaluate a condition expression against register state.
+    /// Effect: pure — deterministic expression evaluation.
+    pub fn evaluate_condition(&self, condition : FixedString256) -> Result<bool, FixedString256> [pure] {
+        // Simple condition evaluation. Supports:
+        //   rax == 0x1234, rbx > 100, rcx < rdx, rip == 0xABCD
+        if condition.len() == 0u32 {
+            return Result::Ok(true);
+        }
+
+        // Parse "REG == VALUE" or "REG > VALUE" or "REG < VALUE" patterns.
+        var space_pos : u32 = 0u32;
+        // loop: bounds[BOUND_SMALL] — bounded by condition string length.
+        loop: bounds[BOUND_MEDIUM] while space_pos < condition.len() {
+            if condition.get_byte(space_pos) == ' ' as u8 {
+                break;
+            }
+            space_pos += 1u32;
+        }
+
+        if space_pos == 0u32 || space_pos >= condition.len() {
+            return Result::Err(FixedString256::from("invalid condition format"));
+        }
+
+        let reg_name : FixedString256 = condition.substring(0u32, space_pos);
+        var op_pos : u32 = space_pos + 1u32;
+
+        // Skip spaces to find operator.
+        // loop: bounds[BOUND_SMALL] — bounded by condition length.
+        loop: bounds[BOUND_SMALL] while op_pos < condition.len() {
+            if condition.get_byte(op_pos) != ' ' as u8 {
+                break;
+            }
+            op_pos += 1u32;
+        }
+
+        if op_pos >= condition.len() {
+            return Result::Err(FixedString256::from("invalid condition format"));
+        }
+
+        // Extract operator (==, !=, >, <, >=, <=).
+        var operator : FixedString64 = FixedString64::new();
+        // loop: bounds[BOUND_SMALL] — at most 2 operator chars.
+        loop: bounds[BOUND_SMALL] while op_pos < condition.len() {
+            let ch : u8 = condition.get_byte(op_pos);
+            if ch == '=' as u8 || ch == '!' as u8 || ch == '>' as u8 || ch == '<' as u8 {
+                let _ = operator.push_byte(ch);
+                op_pos += 1u32;
+            } else {
+                break;
+            }
+        }
+
+        // Skip spaces to find value.
+        // loop: bounds[BOUND_SMALL] — bounded by condition length.
+        loop: bounds[BOUND_SMALL] while op_pos < condition.len() {
+            if condition.get_byte(op_pos) != ' ' as u8 {
+                break;
+            }
+            op_pos += 1u32;
+        }
+
+        let value_str : FixedString256 = condition.substring(op_pos, condition.len());
+
+        // Get register value.
+        let reg_val : Result<u64, FixedString256> = self.read_register_by_name(reg_name);
+        let reg_value : u64 = match reg_val {
+            Result::Ok(v) => v,
+            Result::Err(_) => return Result::Err(FixedString256::from("unknown register in condition")),
+        };
+
+        // Parse value (hex or decimal).
+        var cmp_value : u64 = 0u64;
+        var parse_success : bool = false;
+        if value_str.len() > 2u32 && value_str.get_byte(0u32) == '0' as u8
+                                   && value_str.get_byte(1u32) == 'x' as u8 {
+            cmp_value = __builtin_parse_hex_u64(value_str);
+            parse_success = true;
+        } else {
+            cmp_value = __builtin_parse_dec_u64(value_str);
+            parse_success = true;
+        }
+
+        if !parse_success {
+            return Result::Err(FixedString256::from("failed to parse condition value"));
+        }
+
+        // Evaluate the comparison.
+        if operator == FixedString64::from("==") {
+            Result::Ok(reg_value == cmp_value)
+        } else if operator == FixedString64::from("!=") {
+            Result::Ok(reg_value != cmp_value)
+        } else if operator == FixedString64::from(">") {
+            Result::Ok(reg_value > cmp_value)
+        } else if operator == FixedString64::from("<") {
+            Result::Ok(reg_value < cmp_value)
+        } else if operator == FixedString64::from(">=") {
+            Result::Ok(reg_value >= cmp_value)
+        } else if operator == FixedString64::from("<=") {
+            Result::Ok(reg_value <= cmp_value)
+        } else {
+            Result::Err(FixedString256::from("unknown operator in condition"))
+        }
+    }
+
+    /// Check if a breakpoint with a condition should fire.
+    /// Effect: pure — condition evaluation.
+    pub fn check_conditional_breakpoint(mut self, bp_id : u32) -> Result<KernelDebugger, FixedString256>
+                                        [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let mut bp : BreakpointEntry = self.breakpoints.get(i);
+            if bp.id == bp_id {
+                if bp.condition.len() > 0u32 {
+                    let cond_result : Result<bool, FixedString256> =
+                        self.evaluate_condition(bp.condition);
+                    match cond_result {
+                        Result::Ok(met) => {
+                            bp.condition_met = met;
+                            let _ = self.breakpoints.set(i, bp);
+                            if met {
+                                bp.state = BreakpointState::Hit;
+                            }
+                        },
+                        Result::Err(msg) => {
+                            // Condition evaluation failed; treat as unmet.
+                            bp.condition_met = false;
+                            let _ = self.breakpoints.set(i, bp);
+                        },
+                    }
+                } else {
+                    bp.condition_met = true;
+                    bp.hit_count += 1u32;
+                    bp.state = BreakpointState::Hit;
+                    let _ = self.breakpoints.set(i, bp);
+                }
+                break;
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Breakpoint Hit Handling
+    // ──────────────────────────────────────────
+
+    /// Called when a breakpoint trap is received. Finds and returns the matching breakpoint.
+    /// Effect: pure — table lookup.
+    pub fn handle_breakpoint_hit(mut self, fault_address : u64) -> Result<KernelDebugger, FixedString256>
+                                 [debug, diag] {
+        self.mode = DebuggerMode::StoppedBreakpoint;
+        self.register_file.rip = fault_address;
+
+        // Find matching breakpoint.
+        var found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let mut bp : BreakpointEntry = self.breakpoints.get(i);
+            if bp.address == fault_address && bp.state == BreakpointState::Active {
+                // Temporarily restore original byte so we can step past it.
+                if bp.bp_type == BreakpointType::Software {
+                    __builtin_write_byte(fault_address, bp.original_byte);
+                }
+                bp.hit_count += 1u32;
+                bp.state = BreakpointState::Hit;
+                let _ = self.breakpoints.set(i, bp);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("no matching breakpoint found"));
+        }
+
+        // Unwind stack for context.
+        self = self.unwind_stack(16u32);
+
+        self = self.record_residual(
+            DBG_INTERRUPT,
+            FixedString256::from("breakpoint hit"),
+            FixedString64::from("bp_hit"),
+            fault_address,
+            0u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Step past a breakpoint and re-enable it.
+    /// Effect: debug, memory — single step then re-patch.
+    pub fn step_past_breakpoint(mut self, bp_id : u32) -> Result<KernelDebugger, FixedString256>
+                                [debug, memory, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let mut bp : BreakpointEntry = self.breakpoints.get(i);
+            if bp.id == bp_id && bp.bp_type == BreakpointType::Software {
+                // Single step past the original instruction.
+                // The original byte is already restored; after step, re-patch.
+                self = self.single_step();
+                // Re-patch the breakpoint.
+                __builtin_write_byte(bp.address, 0xCCu8);
+                bp.state = BreakpointState::Active;
+                let _ = self.breakpoints.set(i, bp);
+                break;
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Crash Dump Analysis
+    // ──────────────────────────────────────────
+
+    /// Parse and analyze a crash dump.
+    /// Effect: io, memory — reads dump data and formats analysis.
+    pub fn analyze_crash_dump(mut self, dump_data : Array256<u8>) -> Result<KernelDebugger, FixedString256>
+                              [io, memory, diag] {
+        // Parse dump header.
+        if dump_data.len() < 64u32 {
+            return Result::Err(FixedString256::from("dump data too small"));
+        }
+
+        // Extract register state from dump (format: magic(8) + regs(272) + stack(1024) + ...).
+        self.register_file.rax = __builtin_read_u64_from_slice(dump_data, 8u32);
+        self.register_file.rbx = __builtin_read_u64_from_slice(dump_data, 16u32);
+        self.register_file.rcx = __builtin_read_u64_from_slice(dump_data, 24u32);
+        self.register_file.rdx = __builtin_read_u64_from_slice(dump_data, 32u32);
+        self.register_file.rsi = __builtin_read_u64_from_slice(dump_data, 40u32);
+        self.register_file.rdi = __builtin_read_u64_from_slice(dump_data, 48u32);
+        self.register_file.rbp = __builtin_read_u64_from_slice(dump_data, 56u32);
+        self.register_file.rsp = __builtin_read_u64_from_slice(dump_data, 64u32);
+        self.register_file.rip = __builtin_read_u64_from_slice(dump_data, 72u32);
+        self.register_file.rflags = __builtin_read_u64_from_slice(dump_data, 80u32);
+
+        // Attempt stack unwind.
+        self = self.unwind_stack(32u32);
+
+        self.mode = DebuggerMode::StoppedFault;
+
+        self = self.record_residual(
+            DBG_CRASH_DUMP,
+            FixedString256::from("crash dump analyzed"),
+            FixedString64::from("crash_analyze"),
+            self.register_file.rip,
+            0u64,
+        );
+
+        Result::Ok(self)
+    }
+
+    /// Generate a crash dump analysis report.
+    /// Effect: io — string formatting.
+    pub fn generate_crash_report(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("=== Crash Dump Analysis Report ===\n\n"));
+
+        result.push_str(FixedString256::from("Fault Address: 0x"));
+        result.push_u64_hex(self.register_file.rip);
+        result.push_str(FixedString256::from("\n\n"));
+
+        result.push_str(FixedString256::from("Register State:\n"));
+        result.push_str(self.register_file.format());
+        result.push_str(FixedString256::from("\n\n"));
+
+        result.push_str(self.format_stack_trace());
+
+        // Symbol lookup for fault address.
+        let sym : FixedString256 = self.lookup_symbol(self.register_file.rip);
+        if sym.len() > 0u32 {
+            result.push_str(FixedString256::from("\nFault in function: "));
+            result.push_str(sym);
+            result.push_str(FixedString256::from("\n"));
+        }
+
+        result.push_str(FixedString256::from("\n=== End of Report ===\n"));
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Debugger Lifecycle
+    // ──────────────────────────────────────────
+
+    /// Attach the debugger to a thread.
+    /// Effect: debug — enters debug mode.
+    pub fn attach(mut self, thread_id : u32) -> KernelDebugger [debug, diag] {
+        self.attached = true;
+        self.target_thread_id = thread_id;
+        self.mode = DebuggerMode::Idle;
+
+        self.record_residual(
+            DBG_INTERRUPT,
+            FixedString256::from("debugger attached"),
+            FixedString64::from("attach"),
+            thread_id as u64,
+            0u64,
+        )
+    }
+
+    /// Detach the debugger from the current target.
+    /// Effect: debug — leaves debug mode, restores breakpoints.
+    pub fn detach(mut self) -> KernelDebugger [debug, memory, diag] {
+        // Restore all software breakpoint original bytes.
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.breakpoints.len(); i += 1u32 [self.breakpoints.len()] {
+            let bp : BreakpointEntry = self.breakpoints.get(i);
+            if bp.bp_type == BreakpointType::Software && bp.state == BreakpointState::Active {
+                __builtin_write_byte(bp.address, bp.original_byte);
+            }
+        }
+
+        self.attached = false;
+        self.mode = DebuggerMode::Idle;
+
+        self.record_residual(
+            DBG_INTERRUPT,
+            FixedString256::from("debugger detached"),
+            FixedString64::from("detach"),
+            0u64,
+            0u64,
+        )
+    }
+
+    /// Check for pending debug events (e.g., single-step complete, watchpoint hit).
+    /// Effect: debug — inspects debug status registers.
+    pub fn check_debug_events(mut self) -> Result<KernelDebugger, FixedString256> [debug] {
+        let dr6 : u64 = RegisterFile::read_dr6();
+
+        // Check if a breakpoint condition was triggered.
+        if dr6 & 0xFu64 != 0u64 {
+            var bp_index : u32 = 0u32;
+            // loop: bounds[BOUND_SMALL] — bounded by 4 debug registers.
+            loop: bounds[BOUND_SMALL] while bp_index < 4u32 {
+                if dr6 & (1u64 << bp_index as u64) != 0u64 {
+                    self.mode = DebuggerMode::StoppedWatchpoint;
+                    break;
+                }
+                bp_index += 1u32;
+            }
+        }
+
+        // Check single-step event.
+        if dr6 & 0x4000u64 != 0u64 {
+            self.mode = DebuggerMode::StoppedStep;
+        }
+
+        self = self.record_residual(
+            DBG_STEP_COMPLETE,
+            FixedString256::from("debug events checked"),
+            FixedString64::from("check_events"),
+            dr6,
+            0u64,
+        );
+
+        Result::Ok(self)
+    }
+}
+
+/// Implementation of BreakpointState name method.
+impl BreakpointState {
+    /// Get the name of this state.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            BreakpointState::Active => FixedString64::from("active"),
+            BreakpointState::Disabled => FixedString64::from("disabled"),
+            BreakpointState::Hit => FixedString64::from("hit"),
+            BreakpointState::PendingCondition => FixedString64::from("pending"),
+        }
+    }
+}
+
+/// Implementation of BreakpointType name method.
+impl BreakpointType {
+    /// Get the name of this breakpoint type.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            BreakpointType::Software => FixedString64::from("software"),
+            BreakpointType::Hardware => FixedString64::from("hardware"),
+            BreakpointType::Conditional => FixedString64::from("conditional"),
+        }
+    }
+}
+
+/// Implementation of DebuggerMode name method.
+impl DebuggerMode {
+    /// Get the name of this debugger mode.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            DebuggerMode::Idle => FixedString64::from("idle"),
+            DebuggerMode::StoppedBreakpoint => FixedString64::from("stopped (bp)"),
+            DebuggerMode::StoppedStep => FixedString64::from("stopped (step)"),
+            DebuggerMode::StoppedWatchpoint => FixedString64::from("stopped (wp)"),
+            DebuggerMode::StoppedFault => FixedString64::from("stopped (fault)"),
+            DebuggerMode::Stepping => FixedString64::from("stepping"),
+            DebuggerMode::Running => FixedString64::from("running"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Kernel Debugger Utility Functions
+// ──────────────────────────────────────────────
+
+/// Search for a string in memory (simple scan).
+/// Effect: memory — reads memory.
+pub fn search_memory(start_addr : u64, size : u64, pattern : FixedString256) -> Array256<u64> [memory] {
+    var results : Array256<u64> = Array256::new();
+    if pattern.len() == 0u32 {
+        return results;
+    }
+    // loop: bounds[BOUND_LARGE] — bounded by size.
+    for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+        var match_found : bool = true;
+        // loop: bounds[BOUND_SMALL] — bounded by pattern length.
+        for var j : u32 = 0u32; j < pattern.len(); j += 1u32 [pattern.len()] {
+            let mem_byte : u8 = __builtin_read_byte(start_addr + i + j as u64);
+            if mem_byte != pattern.get_byte(j) {
+                match_found = false;
+                break;
+            }
+        }
+        if match_found {
+            let _ = results.push(start_addr + i);
+        }
+    }
+    results
+}
+
+/// Check if a memory address is readable (tries to read one byte).
+/// Effect: memory — probe read.
+pub fn is_memory_readable(addr : u64) -> bool [memory] {
+    // Try to read a byte; return false on fault.
+    let result : bool = __builtin_try_read_byte(addr);
+    result
+}
+
+/// Convert a register value to its assembly-style name.
+/// Effect: pure — register naming.
+pub fn register_value_to_name(reg : RegisterId) -> FixedString64 [pure] {
+    match reg {
+        RegisterId::RAX => FixedString64::from("rax"),
+        RegisterId::RBX => FixedString64::from("rbx"),
+        RegisterId::RCX => FixedString64::from("rcx"),
+        RegisterId::RDX => FixedString64::from("rdx"),
+        RegisterId::RSI => FixedString64::from("rsi"),
+        RegisterId::RDI => FixedString64::from("rdi"),
+        RegisterId::RBP => FixedString64::from("rbp"),
+        RegisterId::RSP => FixedString64::from("rsp"),
+        RegisterId::RIP => FixedString64::from("rip"),
+        RegisterId::RFLAGS => FixedString64::from("rflags"),
+        _ => FixedString64::from("unknown"),
+    }
+}
+
+/// Determine if a value is likely a valid code pointer.
+/// Effect: pure — heuristic check.
+pub fn is_valid_code_ptr(addr : u64) -> bool [pure] {
+    if addr == 0u64 { return false; }
+    if addr < 0x1000u64 { return false; }
+    if addr >= 0xFFFF800000000000u64 { return false; }
+    true
+}
+
+/// Determine if a value is likely a valid stack pointer.
+/// Effect: pure — heuristic check.
+pub fn is_valid_stack_ptr(addr : u64) -> bool [pure] {
+    if addr == 0u64 { return false; }
+    if addr < 0x1000u64 { return false; }
+    if addr >= 0xFFFFFFFFFFFFFFFFu64 { return false; }
+    true
+}
+
+/// Get a formatted string showing RFLAGS bits.
+/// Effect: pure — flag formatting.
+pub fn format_rflags(rflags : u64) -> FixedString256 [pure] {
+    var result : FixedString256 = FixedString256::new();
+    result.push_str(FixedString256::from("CF="));
+    result.push_u8(if rflags & 0x001u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" PF="));
+    result.push_u8(if rflags & 0x004u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" AF="));
+    result.push_u8(if rflags & 0x010u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" ZF="));
+    result.push_u8(if rflags & 0x040u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" SF="));
+    result.push_u8(if rflags & 0x080u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" TF="));
+    result.push_u8(if rflags & 0x100u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" IF="));
+    result.push_u8(if rflags & 0x200u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" DF="));
+    result.push_u8(if rflags & 0x400u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result.push_str(FixedString256::from(" OF="));
+    result.push_u8(if rflags & 0x800u64 != 0u64 { '1' as u8 } else { '0' as u8 });
+    result
+}
+
+/// Read a null-terminated string from memory.
+pub fn read_c_string(address : u64, max_len : u32) -> FixedString256 [memory] {
+    var result : FixedString256 = FixedString256::new();
+    for var i : u32 = 0u32; i < max_len; i += 1u32 [max_len] {
+        let byte : u8 = __builtin_read_byte(address + i as u64);
+        if byte == 0u8 { break; }
+        let _ = result.push_byte(byte);
+    }
+    result
+}
+
+/// Format a memory address as a string with optional symbol.
+pub fn format_address_with_symbol(address : u64, symbol_table : Array256<SymbolEntry>) -> FixedString256 [pure] {
+    var result : FixedString256 = FixedString256::new();
+    for var i : u32 = 0u32; i < symbol_table.len(); i += 1u32 [symbol_table.len()] {
+        let sym : SymbolEntry = symbol_table.get(i);
+        if address >= sym.address && address < sym.address + sym.size {
+            result.push_str(sym.name);
+            result.push_str(FixedString256::from("+0x"));
+            result.push_u64_hex(address - sym.address);
+            return result;
+        }
+    }
+    result.push_str(FixedString256::from("0x"));
+    result.push_u64_hex(address);
+    result
+}
+
+/// Compare two breakpoints by address.
+pub fn breakpoint_cmp(a : BreakpointEntry, b : BreakpointEntry) -> bool [pure] {
+    a.address < b.address
+}
+
+/// Sort breakpoints by address (simple bubble sort).
+pub fn sort_breakpoints(mut bps : Array32<BreakpointEntry>) -> Array32<BreakpointEntry> [pure] {
+    let n : u32 = bps.len();
+    for var i : u32 = 0u32; i < n; i += 1u32 [n] {
+        for var j : u32 = 0u32; j < n - 1u32 - i; j += 1u32 [n] {
+            let a : BreakpointEntry = bps.get(j);
+            let b : BreakpointEntry = bps.get(j + 1u32);
+            if a.address > b.address {
+                let _ = bps.set(j, b);
+                let _ = bps.set(j + 1u32, a);
+            }
+        }
+    }
+    bps
+}
+
+/// Filter active breakpoints only.
+pub fn active_breakpoints(bps : Array32<BreakpointEntry>) -> Array32<BreakpointEntry> [pure] {
+    var active : Array32<BreakpointEntry> = Array32::new();
+    for var i : u32 = 0u32; i < bps.len(); i += 1u32 [bps.len()] {
+        let bp : BreakpointEntry = bps.get(i);
+        if bp.state == BreakpointState::Active {
+            let _ = active.push(bp);
+        }
+    }
+    active
+}
+
+/// Check if an address has an active breakpoint.
+pub fn has_breakpoint_at(bps : Array32<BreakpointEntry>, address : u64) -> bool [pure] {
+    for var i : u32 = 0u32; i < bps.len(); i += 1u32 [bps.len()] {
+        let bp : BreakpointEntry = bps.get(i);
+        if bp.address == address && bp.state == BreakpointState::Active {
+            return true;
+        }
+    }
+    false
+}

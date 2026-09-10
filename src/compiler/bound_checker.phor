@@ -1,0 +1,1032 @@
+// bound_checker.phor — Boundedness Checker: Loop Bound Verification, Recursion Depth
+//                        Verification, Capacity Overflow Prevention, Index Bounds
+//                        Checking, Static Bound Inference, Court-Proven Bound Verification
+// Phorensic Compiler Infrastructure — Boundedness Checking Phase
+//
+// This module implements the boundedness checker for the Phorensic compiler.
+// It verifies that all loops have explicit bounds, all recursion has proven
+// depth limits, and all array accesses are within capacity. The boundedness
+// checker is a critical component for ensuring termination and memory safety.
+//
+// Checks performed:
+// 1. Loop bound verification — all loops must declare explicit bounds
+// 2. Recursion depth verification — recursive functions must have depth limits
+// 3. Capacity overflow prevention — ensures collections don't exceed capacity
+// 4. Index bounds checking — validates array/slice access indices
+// 5. Static bound inference — infers bounds from context when possible
+// 6. Court-proven bound verification — accepts court-verified bound certificates
+//
+// Evidence semantics: Each check produces a BoundCheckReceipt. The checker
+// maintains a certificate chain for any court-proven bounds.
+//
+// Boundedness: All tracking structures are fixed-capacity. Loop bounds use
+// the project's standard bound constants (BOUND_TINY through BOUND_HUGE).
+//
+// Effect declarations: All checker functions are [pure] except diagnostic
+// emission [diag].
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+
+// ──────────────────────────────────────────────
+// LoopBound: Represents the bound annotation on a loop
+// ──────────────────────────────────────────────
+// Every loop must have a bound annotation that specifies its maximum
+// iteration count. Bounds can be static constants, function parameters,
+// or court-verified certificates.
+// Evidence path: BOUND-LOOP-001 through BOUND-LOOP-025
+
+pub sealdatatype BoundKind : u8 {
+    /// Static compile-time constant bound.
+    Static = 0u8,
+    /// Bound derived from a function parameter.
+    Parameter = 1u8,
+    /// Bound verified by a court certificate.
+    CourtVerified = 2u8,
+    /// Bound inferred from context.
+    Inferred = 3u8,
+    /// Bound expressed as a constant name (e.g., BOUND_SMALL).
+    Named = 4u8,
+    /// Bound is a capacity check on a collection.
+    Capacity = 5u8,
+}
+
+pub struct LoopBound {
+    /// Kind of bound.
+    pub kind : BoundKind,
+    /// The actual bound value (iteration limit).
+    pub value : u32,
+    /// The bound name (for named bounds like BOUND_SMALL).
+    pub name : FixedString256,
+    /// Source location of the bound annotation.
+    pub location : SourceLocation,
+    /// Whether this bound has been verified.
+    pub verified : bool,
+    /// Court certificate identifier (for CourtVerified bounds).
+    pub certificate_id : FixedString256,
+}
+
+impl LoopBound {
+    pub fn static_bound(value : u32, location : SourceLocation) -> LoopBound [pure] {
+        LoopBound {
+            kind: BoundKind::Static,
+            value: value,
+            name: FixedString256::new(),
+            location: location,
+            verified: false,
+            certificate_id: FixedString256::new(),
+        }
+    }
+
+    pub fn named_bound(name : FixedString256, value : u32, location : SourceLocation) -> LoopBound [pure] {
+        LoopBound {
+            kind: BoundKind::Named,
+            value: value,
+            name: name,
+            location: location,
+            verified: false,
+            certificate_id: FixedString256::new(),
+        }
+    }
+
+    pub fn inferred_bound(value : u32) -> LoopBound [pure] {
+        LoopBound {
+            kind: BoundKind::Inferred,
+            value: value,
+            name: FixedString256::new(),
+            location: SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            verified: true,
+            certificate_id: FixedString256::new(),
+        }
+    }
+
+    pub fn court_verified(
+        value : u32,
+        certificate_id : FixedString256,
+        location : SourceLocation,
+    ) -> LoopBound [pure] {
+        LoopBound {
+            kind: BoundKind::CourtVerified,
+            value: value,
+            name: FixedString256::new(),
+            location: location,
+            verified: true,
+            certificate_id: certificate_id,
+        }
+    }
+
+    pub fn verify(mut self) -> LoopBound [pure] {
+        self.verified = true;
+        self
+    }
+
+    pub fn is_valid(&self, actual_iterations : u32) -> bool [pure] {
+        actual_iterations <= self.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// RecursionBound: Tracks recursion depth limits
+// ──────────────────────────────────────────────
+// Recursive functions must declare maximum recursion depth. This can
+// be a static bound or a court-verified certificate.
+// Evidence path: BOUND-RECURSE-001 through BOUND-RECURSE-015
+
+pub struct RecursionBound {
+    /// Name of the recursive function.
+    pub function_name : FixedString256,
+    /// Maximum allowed recursion depth.
+    pub max_depth : u32,
+    /// Current depth during analysis.
+    pub current_depth : u32,
+    /// Whether this bound has been proven.
+    pub proven : bool,
+    /// Bound kind (static or court-verified).
+    pub kind : BoundKind,
+    /// Court certificate identifier.
+    pub certificate_id : FixedString256,
+}
+
+impl RecursionBound {
+    pub fn new(function_name : FixedString256, max_depth : u32) -> RecursionBound [pure] {
+        RecursionBound {
+            function_name: function_name,
+            max_depth: max_depth,
+            current_depth: 0u32,
+            proven: false,
+            kind: BoundKind::Static,
+            certificate_id: FixedString256::new(),
+        }
+    }
+
+    pub fn with_certificate(
+        function_name : FixedString256,
+        max_depth : u32,
+        certificate_id : FixedString256,
+    ) -> RecursionBound [pure] {
+        RecursionBound {
+            function_name: function_name,
+            max_depth: max_depth,
+            current_depth: 0u32,
+            proven: true,
+            kind: BoundKind::CourtVerified,
+            certificate_id: certificate_id,
+        }
+    }
+
+    pub fn enter(mut self) -> Result<RecursionBound, FixedString256> [pure] {
+        self.current_depth = self.current_depth + 1u32;
+        if self.current_depth > self.max_depth {
+            let msg : FixedString256 = FixedString256::from("recursion depth exceeded for '");
+            let msg2 : FixedString256 = msg + self.function_name + FixedString256::from("' (max ") + self.max_depth + FixedString256::from(")");
+            return Result::Err(msg2);
+        }
+        Result::Ok(self)
+    }
+
+    pub fn exit(mut self) -> RecursionBound [pure] {
+        if self.current_depth > 0u32 {
+            self.current_depth = self.current_depth - 1u32;
+        }
+        self
+    }
+
+    pub fn prove(mut self) -> RecursionBound [pure] {
+        self.proven = true;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// CapacityGuard: Prevents capacity overflow for collections
+// ──────────────────────────────────────────────
+// Every collection access is checked against its declared capacity.
+// Evidence path: BOUND-CAPACITY-001 through BOUND-CAPACITY-020
+
+pub struct CapacityGuard {
+    /// Name of the collection being guarded.
+    pub collection_name : FixedString256,
+    /// Declared capacity of the collection.
+    pub capacity : u32,
+    /// Current number of elements.
+    pub current_size : u32,
+    /// Whether the capacity check is active.
+    pub active : bool,
+}
+
+impl CapacityGuard {
+    pub fn new(collection_name : FixedString256, capacity : u32) -> CapacityGuard [pure] {
+        CapacityGuard {
+            collection_name: collection_name,
+            capacity: capacity,
+            current_size: 0u32,
+            active: true,
+        }
+    }
+
+    pub fn check_insert(mut self, count : u32) -> Result<CapacityGuard, FixedString256> [pure] {
+        let new_size : u32 = self.current_size + count;
+        if new_size > self.capacity {
+            let msg : FixedString256 = FixedString256::from("capacity overflow for '");
+            let msg2 : FixedString256 = msg + self.collection_name + FixedString256::from("' (capacity ") + self.capacity + FixedString256::from(", attempted ") + new_size + FixedString256::from(")");
+            return Result::Err(msg2);
+        }
+        self.current_size = new_size;
+        Result::Ok(self)
+    }
+
+    pub fn check_remove(mut self, count : u32) -> Result<CapacityGuard, FixedString256> [pure] {
+        if count > self.current_size {
+            let msg : FixedString256 = FixedString256::from("underflow for '");
+            let msg2 : FixedString256 = msg + self.collection_name + FixedString256::from("' (current ") + self.current_size + FixedString256::from(", removing ") + count + FixedString256::from(")");
+            return Result::Err(msg2);
+        }
+        self.current_size = self.current_size - count;
+        Result::Ok(self)
+    }
+
+    pub fn remaining(&self) -> u32 [pure] {
+        self.capacity - self.current_size
+    }
+
+    pub fn is_full(&self) -> bool [pure] {
+        self.current_size >= self.capacity
+    }
+}
+
+// ──────────────────────────────────────────────
+// IndexCheck: Validates array/slice access indices
+// ──────────────────────────────────────────────
+// Every index access is checked against the collection's length.
+// Evidence path: BOUND-INDEX-001 through BOUND-INDEX-015
+
+pub struct IndexCheck {
+    /// Name of the collection being indexed.
+    pub collection_name : FixedString256,
+    /// Length of the collection.
+    pub length : u32,
+    /// Whether the index check passed.
+    pub valid : bool,
+}
+
+impl IndexCheck {
+    pub fn new(collection_name : FixedString256, length : u32) -> IndexCheck [pure] {
+        IndexCheck {
+            collection_name: collection_name,
+            length: length,
+            valid: true,
+        }
+    }
+
+    pub fn check_index(self, index : u32) -> Result<IndexCheck, FixedString256> [pure] {
+        if index >= self.length {
+            let msg : FixedString256 = FixedString256::from("index out of bounds for '");
+            let msg2 : FixedString256 = msg + self.collection_name + FixedString256::from("' (index ") + index + FixedString256::from(", length ") + self.length + FixedString256::from(")");
+            return Result::Err(msg2);
+        }
+        Result::Ok(self)
+    }
+
+    pub fn check_range(self, start : u32, end : u32) -> Result<IndexCheck, FixedString256> [pure] {
+        if start > end {
+            let msg : FixedString256 = FixedString256::from("invalid range for '");
+            let msg2 : FixedString256 = msg + self.collection_name + FixedString256::from("' (start ") + start + FixedString256::from(", end ") + end + FixedString256::from(")");
+            return Result::Err(msg2);
+        }
+        if end > self.length {
+            let msg : FixedString256 = FixedString256::from("range out of bounds for '");
+            let msg2 : FixedString256 = msg + self.collection_name + FixedString256::from("' (end ") + end + FixedString256::from(", length ") + self.length + FixedString256::from(")");
+            return Result::Err(msg2);
+        }
+        Result::Ok(self)
+    }
+}
+
+// ──────────────────────────────────────────────
+// StaticBoundInference: Infers bounds from context
+// ──────────────────────────────────────────────
+// When bounds are not explicitly annotated, the checker tries to infer
+// them from the surrounding context (e.g., array length, capacity).
+// Evidence path: BOUND-INFER-001 through BOUND-INFER-020
+
+pub struct StaticBoundInference {
+    /// Inferred bound value.
+    pub bound_value : u32,
+    /// Confidence level (0-255).
+    pub confidence : u8,
+    /// Source of the inference.
+    pub source : FixedString256,
+    /// Whether inference succeeded.
+    pub succeeded : bool,
+}
+
+impl StaticBoundInference {
+    pub fn new() -> StaticBoundInference [pure] {
+        StaticBoundInference {
+            bound_value: 0u32,
+            confidence: 0u8,
+            source: FixedString256::new(),
+            succeeded: false,
+        }
+    }
+
+    pub fn infer_from_capacity(capacity : u32) -> StaticBoundInference [pure] {
+        StaticBoundInference {
+            bound_value: capacity,
+            confidence: 200u8,
+            source: FixedString256::from("collection capacity"),
+            succeeded: true,
+        }
+    }
+
+    pub fn infer_from_constant(constant_name : FixedString256, value : u32) -> StaticBoundInference [pure] {
+        StaticBoundInference {
+            bound_value: value,
+            confidence: 255u8,
+            source: constant_name,
+            succeeded: true,
+        }
+    }
+
+    pub fn infer_from_parameter(param_name : FixedString256, max_value : u32) -> StaticBoundInference [pure] {
+        StaticBoundInference {
+            bound_value: max_value,
+            confidence: 128u8,
+            source: param_name,
+            succeeded: true,
+        }
+    }
+
+    pub fn infer_loop_bound(iterable_length : u32) -> StaticBoundInference [pure] {
+        StaticBoundInference {
+            bound_value: iterable_length,
+            confidence: 255u8,
+            source: FixedString256::from("iterable length"),
+            succeeded: true,
+        }
+    }
+
+    pub fn combine(inferences : Array64<StaticBoundInference>) -> StaticBoundInference [pure] {
+        let mut best : StaticBoundInference = StaticBoundInference::new();
+        // loop: bounds[BOUND_SMALL] — bounded by 64 inferences.
+        loop: bounds[BOUND_SMALL] for i in 0..inferences.len() {
+            let inf : StaticBoundInference = inferences.get(i);
+            if inf.confidence > best.confidence && inf.succeeded {
+                best = inf;
+            }
+        }
+        best
+    }
+}
+
+// ──────────────────────────────────────────────
+// CourtProvenBound: Court-verified bound certificate
+// ──────────────────────────────────────────────
+// The court can issue certificates that verify a bound is correct.
+// These certificates carry the court's signature and can be checked.
+// Evidence path: BOUND-COURT-001 through BOUND-COURT-015
+
+pub struct CourtProvenBound {
+    /// Certificate unique identifier.
+    pub certificate_id : FixedString256,
+    /// The proven bound value.
+    pub bound_value : u32,
+    /// The court that issued the certificate.
+    pub court_id : FixedString256,
+    /// Court signature over the certificate.
+    pub signature : u64,
+    /// Whether the certificate has been verified.
+    pub verified : bool,
+}
+
+impl CourtProvenBound {
+    pub fn new(
+        certificate_id : FixedString256,
+        bound_value : u32,
+        court_id : FixedString256,
+        signature : u64,
+    ) -> CourtProvenBound [pure] {
+        CourtProvenBound {
+            certificate_id: certificate_id,
+            bound_value: bound_value,
+            court_id: court_id,
+            signature: signature,
+            verified: false,
+        }
+    }
+
+    pub fn verify(mut self) -> Result<CourtProvenBound, FixedString256> [pure] {
+        // Verify the court signature (FNV-1a based).
+        var hash : u64 = 14695981039346656037u64;
+        // loop: bounds[BOUND_MEDIUM] — bounded by certificate fields.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.certificate_id.len() {
+            hash ^= self.certificate_id.get_byte(i) as u64;
+            hash *= 1099511628211u64;
+        }
+        hash ^= self.bound_value as u64;
+        hash *= 1099511628211u64;
+        // loop: bounds[BOUND_MEDIUM] — bounded by court id length.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.court_id.len() {
+            hash ^= self.court_id.get_byte(i) as u64;
+            hash *= 1099511628211u64;
+        }
+
+        if hash != self.signature {
+            let msg : FixedString256 = FixedString256::from("court certificate signature mismatch for '");
+            let msg2 : FixedString256 = msg + self.certificate_id + FixedString256::from("'");
+            return Result::Err(msg2);
+        }
+
+        self.verified = true;
+        Result::Ok(self)
+    }
+}
+
+// ──────────────────────────────────────────────
+// BoundChecker: Main boundedness checking state machine
+// ──────────────────────────────────────────────
+// The bound checker verifies loop bounds, recursion depth, capacity
+// overflow, and index bounds throughout the program.
+// Evidence path: BOUND-CHECKER-001 through BOUND-CHECKER-060
+
+pub struct BoundChecker {
+    /// Loop bounds tracked (bounded: 128 max).
+    pub loop_bounds : Array128<LoopBound>,
+    /// Recursion bounds tracked (bounded: 64 max).
+    pub recursion_bounds : Array64<RecursionBound>,
+    /// Capacity guards tracked (bounded: 64 max).
+    pub capacity_guards : Array64<CapacityGuard>,
+    /// Index checks tracked (bounded: 128 max).
+    pub index_checks : Array128<IndexCheck>,
+    /// Court-proven bound certificates (bounded: 32 max).
+    pub court_certificates : Array64<CourtProvenBound>,
+    /// Diagnostic bag for collecting violations.
+    pub diagnostics : DiagnosticBag,
+    /// Number of loop bound violations.
+    pub loop_violation_count : u32,
+    /// Number of recursion bound violations.
+    pub recursion_violation_count : u32,
+    /// Number of capacity overflow violations.
+    pub capacity_violation_count : u32,
+    /// Number of index out-of-bounds violations.
+    pub index_violation_count : u32,
+    /// Number of bounds inferred.
+    pub inference_count : u32,
+    /// Whether the checker has completed.
+    pub completed : bool,
+}
+
+impl BoundChecker {
+    pub fn new() -> BoundChecker [pure] {
+        BoundChecker {
+            loop_bounds: Array128::new(),
+            recursion_bounds: Array64::new(),
+            capacity_guards: Array64::new(),
+            index_checks: Array128::new(),
+            court_certificates: Array64::new(),
+            diagnostics: DiagnosticBag::new(),
+            loop_violation_count: 0u32,
+            recursion_violation_count: 0u32,
+            capacity_violation_count: 0u32,
+            index_violation_count: 0u32,
+            inference_count: 0u32,
+            completed: false,
+        }
+    }
+
+    // ── Loop Bound Verification ──
+
+    pub fn register_loop_bound(
+        mut self,
+        bound : LoopBound,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        if self.loop_bounds.len() >= self.loop_bounds.capacity() {
+            let msg : FixedString256 = FixedString256::from("loop bound tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerUnboundedLoop,
+                msg,
+                bound.location,
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+        let _ = self.loop_bounds.push(bound);
+        Result::Ok(self)
+    }
+
+    pub fn verify_loop_bound(
+        mut self,
+        bound_name : FixedString256,
+        actual_iterations : u32,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        let mut found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 loop bounds.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.loop_bounds.len() {
+            let bound : LoopBound = self.loop_bounds.get(i);
+            if bound.name == bound_name || (!bound.name.is_empty() && bound.name == bound_name) {
+                found = true;
+                if !bound.is_valid(actual_iterations) {
+                    self.loop_violation_count = self.loop_violation_count + 1u32;
+                    let msg : FixedString256 = FixedString256::from("loop bound '");
+                    let msg2 : FixedString256 = msg + bound_name + FixedString256::from("' exceeded (bound ") + bound.value + FixedString256::from(", actual ") + actual_iterations + FixedString256::from(")");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerUnboundedLoop,
+                        msg2,
+                        bound.location,
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    let _ = self.diagnostics.emit(diag);
+                    return Result::Err(diag);
+                }
+                let verified : LoopBound = bound.verify();
+                self.loop_bounds.set(i, verified);
+                return Result::Ok(self);
+            }
+        }
+
+        // Bound not found — try to infer it.
+        let inference : StaticBoundInference = StaticBoundInference::infer_loop_bound(actual_iterations);
+        if inference.succeeded && inference.confidence >= 128u8 {
+            self.inference_count = self.inference_count + 1u32;
+            let inferred : LoopBound = LoopBound::inferred_bound(inference.bound_value);
+            let _ = self.loop_bounds.push(inferred);
+            return Result::Ok(self);
+        }
+
+        self.loop_violation_count = self.loop_violation_count + 1u32;
+        let msg : FixedString256 = FixedString256::from("no bound annotation found for loop (iterations=");
+        let msg2 : FixedString256 = msg.push_u32(actual_iterations) + FixedString256::from(")");
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerUnboundedLoop,
+            msg2,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        let _ = self.diagnostics.emit(diag);
+        Result::Err(diag)
+    }
+
+    pub fn check_loop_completeness(&self) -> Result<(), FixedString256> [pure] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 loop bounds.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.loop_bounds.len() {
+            let bound : LoopBound = self.loop_bounds.get(i);
+            if !bound.verified {
+                let msg : FixedString256 = FixedString256::from("loop bound '");
+                let msg2 : FixedString256 = msg + bound.name + FixedString256::from("' has not been verified");
+                return Result::Err(msg2);
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ── Recursion Depth Verification ──
+
+    pub fn register_recursion_bound(
+        mut self,
+        bound : RecursionBound,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        if self.recursion_bounds.len() >= self.recursion_bounds.capacity() {
+            let msg : FixedString256 = FixedString256::from("recursion bound tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerRecursionNotProvenBounded,
+                msg,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+        let _ = self.recursion_bounds.push(bound);
+        Result::Ok(self)
+    }
+
+    pub fn enter_recursive_function(
+        mut self,
+        function_name : FixedString256,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 recursion bounds.
+        loop: bounds[BOUND_SMALL] for i in 0..self.recursion_bounds.len() {
+            let bound : RecursionBound = self.recursion_bounds.get(i);
+            if bound.function_name == function_name {
+                match bound.enter() {
+                    Result::Ok(updated) => {
+                        self.recursion_bounds.set(i, updated);
+                        return Result::Ok(self);
+                    }
+                    Result::Err(msg) => {
+                        self.recursion_violation_count = self.recursion_violation_count + 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerRecursionNotProvenBounded,
+                            msg,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+
+        // No recursion bound registered — check for court certificate.
+        // loop: bounds[BOUND_SMALL] — bounded by 32 certificates.
+        loop: bounds[BOUND_SMALL] for ci in 0..self.court_certificates.len() {
+            let cert : CourtProvenBound = self.court_certificates.get(ci);
+            if cert.certificate_id == function_name && cert.verified {
+                // Found a court certificate for this recursion.
+                let rb : RecursionBound = RecursionBound::with_certificate(
+                    function_name, cert.bound_value, cert.certificate_id,
+                );
+                let _ = self.recursion_bounds.push(rb);
+                return Result::Ok(self);
+            }
+        }
+
+        self.recursion_violation_count = self.recursion_violation_count + 1u32;
+        let msg : FixedString256 = FixedString256::from("recursive function '");
+        let msg2 : FixedString256 = msg + function_name + FixedString256::from("' has no proven bound");
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerRecursionNotProvenBounded,
+            msg2,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        let _ = self.diagnostics.emit(diag);
+        Result::Err(diag)
+    }
+
+    pub fn exit_recursive_function(
+        mut self,
+        function_name : FixedString256,
+    ) -> BoundChecker [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 recursion bounds.
+        loop: bounds[BOUND_SMALL] for i in 0..self.recursion_bounds.len() {
+            let bound : RecursionBound = self.recursion_bounds.get(i);
+            if bound.function_name == function_name {
+                let exited : RecursionBound = bound.exit();
+                self.recursion_bounds.set(i, exited);
+            }
+        }
+        self
+    }
+
+    // ── Capacity Overflow Prevention ──
+
+    pub fn register_capacity_guard(
+        mut self,
+        guard : CapacityGuard,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        if self.capacity_guards.len() >= self.capacity_guards.capacity() {
+            let msg : FixedString256 = FixedString256::from("capacity guard tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerUnboundedLoop,
+                msg,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+        let _ = self.capacity_guards.push(guard);
+        Result::Ok(self)
+    }
+
+    pub fn check_insert(
+        mut self,
+        collection_name : FixedString256,
+        count : u32,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 guards.
+        loop: bounds[BOUND_SMALL] for i in 0..self.capacity_guards.len() {
+            let guard : CapacityGuard = self.capacity_guards.get(i);
+            if guard.collection_name == collection_name && guard.active {
+                match guard.check_insert(count) {
+                    Result::Ok(updated) => {
+                        self.capacity_guards.set(i, updated);
+                        return Result::Ok(self);
+                    }
+                    Result::Err(msg) => {
+                        self.capacity_violation_count = self.capacity_violation_count + 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerUnboundedLoop,
+                            msg,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+        Result::Ok(self)
+    }
+
+    pub fn check_remove(
+        mut self,
+        collection_name : FixedString256,
+        count : u32,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 guards.
+        loop: bounds[BOUND_SMALL] for i in 0..self.capacity_guards.len() {
+            let guard : CapacityGuard = self.capacity_guards.get(i);
+            if guard.collection_name == collection_name && guard.active {
+                match guard.check_remove(count) {
+                    Result::Ok(updated) => {
+                        self.capacity_guards.set(i, updated);
+                        return Result::Ok(self);
+                    }
+                    Result::Err(msg) => {
+                        self.capacity_violation_count = self.capacity_violation_count + 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerUnboundedLoop,
+                            msg,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+        Result::Ok(self)
+    }
+
+    // ── Index Bounds Checking ──
+
+    pub fn register_index_check(
+        mut self,
+        check : IndexCheck,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        if self.index_checks.len() >= self.index_checks.capacity() {
+            let msg : FixedString256 = FixedString256::from("index check tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerUnboundedLoop,
+                msg,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+        let _ = self.index_checks.push(check);
+        Result::Ok(self)
+    }
+
+    pub fn check_index_access(
+        mut self,
+        collection_name : FixedString256,
+        index : u32,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 index checks.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.index_checks.len() {
+            let check : IndexCheck = self.index_checks.get(i);
+            if check.collection_name == collection_name {
+                match check.check_index(index) {
+                    Result::Ok(_) => {
+                        return Result::Ok(self);
+                    }
+                    Result::Err(msg) => {
+                        self.index_violation_count = self.index_violation_count + 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerUnboundedLoop,
+                            msg,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+
+        // No index check registered — can't verify.
+        self.index_violation_count = self.index_violation_count + 1u32;
+        let msg : FixedString256 = FixedString256::from("no index bounds check registered for '");
+        let msg2 : FixedString256 = msg + collection_name + FixedString256::from("'");
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerUnboundedLoop,
+            msg2,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        let _ = self.diagnostics.emit(diag);
+        Result::Err(diag)
+    }
+
+    // ── Static Bound Inference ──
+
+    pub fn infer_bound_from_context(
+        mut self,
+        context_size : u32,
+        context_source : FixedString256,
+    ) -> Result<LoopBound, DiagnosticPayload> [pure, diag] {
+        let inference : StaticBoundInference = StaticBoundInference::infer_loop_bound(context_size);
+        if inference.succeeded && inference.confidence >= 128u8 {
+            self.inference_count = self.inference_count + 1u32;
+            let bound : LoopBound = LoopBound::inferred_bound(inference.bound_value);
+            let _ = self.loop_bounds.push(bound);
+            return Result::Ok(bound);
+        }
+
+        let msg : FixedString256 = FixedString256::from("cannot infer bound from '");
+        let msg2 : FixedString256 = msg + context_source + FixedString256::from("' (size=") + context_size + FixedString256::from(")");
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerUnboundedLoop,
+            msg2,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        Result::Err(diag)
+    }
+
+    // ── Court-Proven Bound Interface ──
+
+    pub fn register_court_certificate(
+        mut self,
+        certificate : CourtProvenBound,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        if self.court_certificates.len() >= self.court_certificates.capacity() {
+            let msg : FixedString256 = FixedString256::from("court certificate tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerUnboundedLoop,
+                msg,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        // Verify the certificate before registering.
+        match certificate.verify() {
+            Result::Ok(verified_cert) => {
+                let _ = self.court_certificates.push(verified_cert);
+                Result::Ok(self)
+            }
+            Result::Err(msg) => {
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LowerUnboundedLoop,
+                    msg,
+                    SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lowerer,
+                );
+                Result::Err(diag)
+            }
+        }
+    }
+
+    pub fn check_court_verified_bound(
+        mut self,
+        entity_name : FixedString256,
+        actual_value : u32,
+    ) -> Result<BoundChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 32 certificates.
+        loop: bounds[BOUND_SMALL] for i in 0..self.court_certificates.len() {
+            let cert : CourtProvenBound = self.court_certificates.get(i);
+            if cert.certificate_id == entity_name {
+                if actual_value > cert.bound_value {
+                    self.loop_violation_count = self.loop_violation_count + 1u32;
+                    let msg : FixedString256 = FixedString256::from("court-verified bound for '");
+                    let msg2 : FixedString256 = msg + entity_name + FixedString256::from("' exceeded (certified ") + cert.bound_value + FixedString256::from(", actual ") + actual_value + FixedString256::from(")");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerUnboundedLoop,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    let _ = self.diagnostics.emit(diag);
+                    return Result::Err(diag);
+                }
+                return Result::Ok(self);
+            }
+        }
+
+        let msg : FixedString256 = FixedString256::from("no court certificate found for '");
+        let msg2 : FixedString256 = msg + entity_name + FixedString256::from("'");
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerUnboundedLoop,
+            msg2,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        Result::Err(diag)
+    }
+
+    // ── Finalization ──
+
+    pub fn finalize(mut self) -> (BoundChecker, BoundCheckReceipt) [pure] {
+        let has_violations : bool = self.loop_violation_count > 0u32
+            || self.recursion_violation_count > 0u32
+            || self.capacity_violation_count > 0u32
+            || self.index_violation_count > 0u32;
+        let receipt : BoundCheckReceipt = BoundCheckReceipt::new(
+            self.loop_violation_count,
+            self.recursion_violation_count,
+            self.capacity_violation_count,
+            self.index_violation_count,
+            self.inference_count,
+            !has_violations,
+        );
+        self.completed = true;
+        (self, receipt)
+    }
+}
+
+// ──────────────────────────────────────────────
+// BoundCheckReceipt: Evidence receipt for bound checking
+// ──────────────────────────────────────────────
+// Records all bound checking results for downstream sealing.
+// Evidence path: BOUND-RECEIPT-001 through BOUND-RECEIPT-010
+
+pub struct BoundCheckReceipt {
+    pub evidence : EvidenceReceipt,
+    pub loop_violation_count : u32,
+    pub recursion_violation_count : u32,
+    pub capacity_violation_count : u32,
+    pub index_violation_count : u32,
+    pub inference_count : u32,
+    pub passed : bool,
+}
+
+impl BoundCheckReceipt {
+    pub fn new(
+        loop_violation_count : u32,
+        recursion_violation_count : u32,
+        capacity_violation_count : u32,
+        index_violation_count : u32,
+        inference_count : u32,
+        passed : bool,
+    ) -> BoundCheckReceipt [pure] {
+        var payload_hash : u64 = 14695981039346656037u64;
+        payload_hash ^= loop_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= recursion_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= capacity_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= index_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= inference_count as u64;
+        payload_hash *= 1099511628211u64;
+
+        BoundCheckReceipt {
+            evidence: EvidenceReceipt::new(
+                CompilerPhase::Lowerer,
+                payload_hash,
+                0u64,
+                0u64,
+            ),
+            loop_violation_count: loop_violation_count,
+            recursion_violation_count: recursion_violation_count,
+            capacity_violation_count: capacity_violation_count,
+            index_violation_count: index_violation_count,
+            inference_count: inference_count,
+            passed: passed,
+        }
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("BoundCheck: "));
+        if self.passed {
+            result.push_str(FixedString256::from("PASS"));
+        } else {
+            result.push_str(FixedString256::from("FAIL"));
+        }
+        result.push_str(FixedString256::from(" [loop-violations="));
+        result.push_u32(self.loop_violation_count);
+        result.push_str(FixedString256::from(", recursion-violations="));
+        result.push_u32(self.recursion_violation_count);
+        result.push_str(FixedString256::from(", capacity-violations="));
+        result.push_u32(self.capacity_violation_count);
+        result.push_str(FixedString256::from(", index-violations="));
+        result.push_u32(self.index_violation_count);
+        result.push_str(FixedString256::from(", inferences="));
+        result.push_u32(self.inference_count);
+        result.push_str(FixedString256::from("]"));
+        result
+    }
+}

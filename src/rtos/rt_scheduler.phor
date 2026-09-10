@@ -1,0 +1,1788 @@
+// file: rt_scheduler.phor
+// purpose: Real-time scheduler with fixed-priority preemptive (FPP),
+//          rate-monotonic (RM), earliest-deadline-first (EDF) scheduling,
+//          priority ceiling protocol (PCP), deadline miss detection,
+//          and comprehensive scheduling analysis.
+// evidence: RTSCHED-ARCH-001 through RTSCHED-ARCH-240
+// residual: All scheduling decisions are recorded as residuals
+//           for forensic analysis and court verification.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Scheduler Diagnostic Code Range
+// ──────────────────────────────────────────────
+const DIAG_RTOS_BASE      : Word64 = 0x4000
+const DIAG_RT_SCHED_BASE  : Word64 = DIAG_RTOS_BASE | 0x0100
+
+const SCHED_TASK_TABLE_CAP   : u32 = 64
+const SCHED_READY_QUEUE_CAP  : u32 = 64
+const SCHED_WAIT_QUEUE_CAP   : u32 = 32
+const SCHED_PROTOCOL_DEPTH   : u32 = 16
+const SCHED_ANALYSIS_DEPTH   : u32 = 128
+const SCHED_PRIORITY_LEVELS  : u32 = 32
+const SCHED_RESIDUAL_LOG     : u32 = 128
+const SCHED_DEADLINE_MONITOR : u32 = 16
+const SCHED_DEADLINE_HISTORY : u32 = 128
+
+// ──────────────────────────────────────────────
+// Task Priority Type
+// ──────────────────────────────────────────────
+pub type Priority : u8 = struct {
+    value: u8,
+}
+
+impl Priority {
+    pub fn new(val: u8) -> Priority
+        effects: [deterministic]
+    {
+        let clamped: u8 = if val >= SCHED_PRIORITY_LEVELS as u8 {
+            (SCHED_PRIORITY_LEVELS - 1) as u8
+        } else {
+            val
+        }
+        Priority { value: clamped }
+    }
+
+    pub fn value(self) -> u8
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn higher_than(self, other: Priority) -> bool
+        effects: [deterministic]
+    {
+        self.value < other.value
+    }
+
+    pub fn lower_than(self, other: Priority) -> bool
+        effects: [deterministic]
+    {
+        self.value > other.value
+    }
+
+    pub fn eq(self, other: Priority) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scheduling Policy Enum
+// ──────────────────────────────────────────────
+pub type SchedPolicy : u8 = enum {
+    SchedPolicy_FixedPriority = 0x00,
+    SchedPolicy_RateMonotonic = 0x01,
+    SchedPolicy_EarliestDeadlineFirst = 0x02,
+    SchedPolicy_RoundRobin = 0x03,
+    SchedPolicy_Reserved = 0x04,
+}
+
+// ──────────────────────────────────────────────
+// Task State Enum
+// ──────────────────────────────────────────────
+pub type TaskState : u8 = enum {
+    TaskState_Running    = 0x00,
+    TaskState_Ready      = 0x01,
+    TaskState_Blocked    = 0x02,
+    TaskState_Suspended  = 0x03,
+    TaskState_Dormant    = 0x04,
+    TaskState_Missed     = 0x05,
+    TaskState_Terminated = 0x06,
+}
+
+// ──────────────────────────────────────────────
+// Task Control Block
+// ──────────────────────────────────────────────
+pub type TaskId : u8 = struct {
+    value: u8,
+}
+
+impl TaskId {
+    pub fn new(val: u8) -> TaskId
+        effects: [deterministic]
+    {
+        TaskId { value: val }
+    }
+
+    pub fn value(self) -> u8
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn eq(self, other: TaskId) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+pub type TaskCB : struct {
+    id: TaskId,
+    priority: Priority,
+    base_priority: Priority,
+    ceiling_priority: Priority,
+    state: TaskState,
+    policy: SchedPolicy,
+    period: Word64,
+    deadline: Word64,
+    execution_time: Word64,
+    worst_case_exec: Word64,
+    remaining_time: Word64,
+    release_time: Word64,
+    absolute_deadline: Word64,
+    miss_count: Word64,
+    total_activations: Word64,
+    preemption_count: Word64,
+    blocking_time: Word64,
+    cpu_usage: Word64,
+    last_start_time: Word64,
+    accum_exec_time: Word64,
+    deadline_history: FixedArray[Word64, SCHED_DEADLINE_HISTORY],
+    history_index: u32,
+}
+
+impl TaskCB {
+    pub fn new(id_val: u8, prio: u8, pol: SchedPolicy) -> TaskCB
+        effects: [deterministic]
+    {
+        TaskCB {
+            id: TaskId::new(id_val),
+            priority: Priority::new(prio),
+            base_priority: Priority::new(prio),
+            ceiling_priority: Priority::new(0),
+            state: TaskState::TaskState_Dormant,
+            policy: pol,
+            period: Word64::zero(),
+            deadline: Word64::zero(),
+            execution_time: Word64::zero(),
+            worst_case_exec: Word64::zero(),
+            remaining_time: Word64::zero(),
+            release_time: Word64::zero(),
+            absolute_deadline: Word64::max_value(),
+            miss_count: Word64::zero(),
+            total_activations: Word64::zero(),
+            preemption_count: Word64::zero(),
+            blocking_time: Word64::zero(),
+            cpu_usage: Word64::zero(),
+            last_start_time: Word64::zero(),
+            accum_exec_time: Word64::zero(),
+            deadline_history: FixedArray::new(),
+            history_index: 0,
+        }
+    }
+
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = TaskState::TaskState_Dormant
+        self.remaining_time = self.execution_time
+        self.absolute_deadline = Word64::max_value()
+        self.release_time = Word64::zero()
+    }
+
+    pub fn set_period(self: ref mut, p: Word64)
+        effects: [deterministic]
+    {
+        self.period = p
+        self.deadline = p
+    }
+
+    pub fn set_wcet(self: ref mut, wcet: Word64)
+        effects: [deterministic]
+    {
+        self.worst_case_exec = wcet
+        self.execution_time = wcet
+        self.remaining_time = wcet
+    }
+
+    pub fn record_deadline_met(self: ref mut)
+        effects: [deterministic]
+    {
+        if self.history_index < SCHED_DEADLINE_HISTORY {
+            let result: Result[(), BoundsError] = self.deadline_history.set(
+                self.history_index, Word64::from_u64(1))
+            self.history_index = self.history_index + 1
+        }
+    }
+
+    pub fn record_deadline_miss(self: ref mut)
+        effects: [deterministic]
+    {
+        self.miss_count = self.miss_count.increment_or_max()
+        self.state = TaskState::TaskState_Missed
+        if self.history_index < SCHED_DEADLINE_HISTORY {
+            let result: Result[(), BoundsError] = self.deadline_history.set(
+                self.history_index, Word64::from_u64(0))
+            self.history_index = self.history_index + 1
+        }
+    }
+
+    pub fn miss_rate(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.total_activations.is_zero() {
+            return Word64::zero()
+        }
+        let total: Word64 = self.total_activations
+        let misses: Word64 = self.miss_count
+        misses.mul(Word64::from_u64(100)).div(total)
+    }
+
+    pub fn utilization(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.period.is_zero() {
+            return Word64::zero()
+        }
+        self.worst_case_exec.mul(Word64::from_u64(1000)).div(self.period)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Ready Queue (fixed-capacity priority queue)
+// ──────────────────────────────────────────────
+pub type ReadyQueue : struct {
+    tasks: FixedArray[TaskId, SCHED_READY_QUEUE_CAP],
+    priorities: FixedArray[Priority, SCHED_READY_QUEUE_CAP],
+    count: u32,
+}
+
+impl ReadyQueue {
+    pub fn new() -> ReadyQueue
+        effects: [deterministic]
+    {
+        ReadyQueue {
+            tasks: FixedArray::new(),
+            priorities: FixedArray::new(),
+            count: 0,
+        }
+    }
+
+    pub fn count(self) -> u32
+        effects: [deterministic]
+    {
+        self.count
+    }
+
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.count == 0
+    }
+
+    pub fn enqueue(self: ref mut, id: TaskId, prio: Priority) -> Result[(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.count >= SCHED_READY_QUEUE_CAP {
+            return Result::Err(bounds_capacity_exceeded(SCHED_READY_QUEUE_CAP))
+        }
+        let insert_pos: u32 = self.count
+        let mut found: bool = false
+        for i in 0..self.count {
+            let existing: Priority = match self.priorities.get(i) {
+                Result::Ok(p) => p,
+                Result::Err(_) => Priority::new(0),
+            }
+            if prio.higher_than(existing) && !found {
+                // Shift tasks down
+                for j in (i..self.count).rev() {
+                    let t: TaskId = match self.tasks.get(j) {
+                        Result::Ok(v) => v,
+                        Result::Err(_) => TaskId::new(0),
+                    }
+                    let p: Priority = match self.priorities.get(j) {
+                        Result::Ok(v) => v,
+                        Result::Err(_) => Priority::new(0),
+                    }
+                    let r1: Result[(), BoundsError] = self.tasks.set(j + 1, t)
+                    let r2: Result[(), BoundsError] = self.priorities.set(j + 1, p)
+                    insert_pos = j
+                    found = true
+                }
+            }
+        }
+        if !found {
+            insert_pos = self.count
+        }
+        let r1: Result[(), BoundsError] = self.tasks.set(insert_pos, id)
+        let r2: Result[(), BoundsError] = self.priorities.set(insert_pos, prio)
+        self.count = self.count + 1
+        Result::Ok(())
+    }
+
+    pub fn dequeue(self: ref mut) -> Result[TaskId, BoundsError>
+        effects: [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        let highest: TaskId = match self.tasks.get(0) {
+            Result::Ok(v) => v,
+            Result::Err(e) => return Result::Err(e),
+        }
+        // Shift all remaining tasks up
+        for i in 0..(self.count - 1) {
+            let t: TaskId = match self.tasks.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskId::new(0),
+            }
+            let p: Priority = match self.priorities.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Priority::new(0),
+            }
+            let r1: Result[(), BoundsError] = self.tasks.set(i, t)
+            let r2: Result[(), BoundsError] = self.priorities.set(i, p)
+        }
+        self.count = self.count - 1
+        Result::Ok(highest)
+    }
+
+    pub fn peek(self) -> Result[TaskId, BoundsError>
+        effects: [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        self.tasks.get(0)
+    }
+
+    pub fn remove(self: ref mut, id: TaskId) -> Result[(), BoundsError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.count {
+            let tid: TaskId = match self.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskId::new(0),
+            }
+            if tid.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(bounds_index_out_of_range(0, self.count))
+        }
+        for i in found_idx..(self.count - 1) {
+            let t: TaskId = match self.tasks.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskId::new(0),
+            }
+            let p: Priority = match self.priorities.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Priority::new(0),
+            }
+            let r1: Result[(), BoundsError] = self.tasks.set(i, t)
+            let r2: Result[(), BoundsError] = self.priorities.set(i, p)
+        }
+        self.count = self.count - 1
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// Wait Queue for blocked tasks
+// ──────────────────────────────────────────────
+pub type WaitQueue : struct {
+    tasks: FixedArray[TaskId, SCHED_WAIT_QUEUE_CAP],
+    priorities: FixedArray[Priority, SCHED_WAIT_QUEUE_CAP],
+    count: u32,
+}
+
+impl WaitQueue {
+    pub fn new() -> WaitQueue
+        effects: [deterministic]
+    {
+        WaitQueue {
+            tasks: FixedArray::new(),
+            priorities: FixedArray::new(),
+            count: 0,
+        }
+    }
+
+    pub fn enqueue(self: ref mut, id: TaskId, prio: Priority) -> Result[(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.count >= SCHED_WAIT_QUEUE_CAP {
+            return Result::Err(bounds_capacity_exceeded(SCHED_WAIT_QUEUE_CAP))
+        }
+        let r1: Result[(), BoundsError> = self.tasks.set(self.count, id)
+        let r2: Result[(), BoundsError> = self.priorities.set(self.count, prio)
+        self.count = self.count + 1
+        Result::Ok(())
+    }
+
+    pub fn dequeue_highest(self: ref mut) -> Result[TaskId, BoundsError>
+        effects: [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        let mut highest_idx: u32 = 0
+        let mut highest_prio: Priority = match self.priorities.get(0) {
+            Result::Ok(p) => p,
+            Result::Err(_) => Priority::new(0xFF),
+        }
+        for i in 1..self.count {
+            let p: Priority = match self.priorities.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Priority::new(0xFF),
+            }
+            if p.higher_than(highest_prio) {
+                highest_prio = p
+                highest_idx = i
+            }
+        }
+        let task: TaskId = match self.tasks.get(highest_idx) {
+            Result::Ok(v) => v,
+            Result::Err(e) => return Result::Err(e),
+        }
+        for i in highest_idx..(self.count - 1) {
+            let t: TaskId = match self.tasks.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskId::new(0),
+            }
+            let p: Priority = match self.priorities.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Priority::new(0),
+            }
+            let r1: Result[(), BoundsError> = self.tasks.set(i, t)
+            let r2: Result[(), BoundsError> = self.priorities.set(i, p)
+        }
+        self.count = self.count - 1
+        Result::Ok(task)
+    }
+
+    pub fn remove(self: ref mut, id: TaskId) -> Result[(), BoundsError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.count {
+            let tid: TaskId = match self.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskId::new(0),
+            }
+            if tid.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(bounds_index_out_of_range(0, self.count))
+        }
+        for i in found_idx..(self.count - 1) {
+            let t: TaskId = match self.tasks.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskId::new(0),
+            }
+            let r: Result[(), BoundsError> = self.tasks.set(i, t)
+        }
+        self.count = self.count - 1
+        Result::Ok(())
+    }
+
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.count == 0
+    }
+
+    pub fn count(self) -> u32
+        effects: [deterministic]
+    {
+        self.count
+    }
+}
+
+// ──────────────────────────────────────────────
+// Deadline Miss Event
+// ──────────────────────────────────────────────
+pub type DeadlineMissEvent : struct {
+    task_id: TaskId,
+    expected_deadline: Word64,
+    actual_completion: Word64,
+    overrun: Word64,
+    miss_count: Word64,
+    timestamp: Word64,
+}
+
+impl DeadlineMissEvent {
+    pub fn new(tid: TaskId, deadline: Word64, completion: Word64, count: Word64, ts: Word64) -> DeadlineMissEvent
+        effects: [deterministic]
+    {
+        let over: Word64 = completion.sub(deadline)
+        DeadlineMissEvent {
+            task_id: tid,
+            expected_deadline: deadline,
+            actual_completion: completion,
+            overrun: over,
+            miss_count: count,
+            timestamp: ts,
+        }
+    }
+
+    pub fn overrun_amount(self) -> Word64
+        effects: [deterministic]
+    {
+        self.overrun
+    }
+
+    pub fn severity(self) -> u8
+        effects: [deterministic]
+    {
+        let over: u64 = self.overrun.to_u64()
+        let deadline: u64 = self.expected_deadline.to_u64()
+        if deadline == 0 {
+            return 0
+        }
+        let ratio: u64 = over * 100 / deadline
+        if ratio > 50 {
+            3
+        } else if ratio > 20 {
+            2
+        } else if ratio > 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Priority Inheritance Protocol State
+// ──────────────────────────────────────────────
+pub type PriorityInheritanceState : struct {
+    original_priority: Priority,
+    inherited_priority: Priority,
+    lock_holder: TaskId,
+    wait_queue: WaitQueue,
+    inheritance_active: bool,
+}
+
+impl PriorityInheritanceState {
+    pub fn new(orig: Priority) -> PriorityInheritanceState
+        effects: [deterministic]
+    {
+        PriorityInheritanceState {
+            original_priority: orig,
+            inherited_priority: orig,
+            lock_holder: TaskId::new(0),
+            wait_queue: WaitQueue::new(),
+            inheritance_active: false,
+        }
+    }
+
+    pub fn inherit_priority(self: ref mut, new_prio: Priority)
+        effects: [deterministic]
+    {
+        if new_prio.higher_than(self.inherited_priority) {
+            self.inherited_priority = new_prio
+            self.inheritance_active = true
+        }
+    }
+
+    pub fn restore_priority(self: ref mut)
+        effects: [deterministic]
+    {
+        self.inherited_priority = self.original_priority
+        self.inheritance_active = false
+    }
+
+    pub fn effective_priority(self) -> Priority
+        effects: [deterministic]
+    {
+        if self.inheritance_active {
+            self.inherited_priority
+        } else {
+            self.original_priority
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Priority Ceiling Protocol State
+// ──────────────────────────────────────────────
+pub type CeilingProtocolState : struct {
+    current_ceiling: Priority,
+    lock_owner: TaskId,
+    ceiling_active: bool,
+}
+
+impl CeilingProtocolState {
+    pub fn new() -> CeilingProtocolState
+        effects: [deterministic]
+    {
+        CeilingProtocolState {
+            current_ceiling: Priority::new(SCHED_PRIORITY_LEVELS as u8),
+            lock_owner: TaskId::new(0),
+            ceiling_active: false,
+        }
+    }
+
+    pub fn set_ceiling(self: ref mut, ceiling: Priority, owner: TaskId)
+        effects: [deterministic]
+    {
+        self.current_ceiling = ceiling
+        self.lock_owner = owner
+        self.ceiling_active = true
+    }
+
+    pub fn release_ceiling(self: ref mut)
+        effects: [deterministic]
+    {
+        self.current_ceiling = Priority::new(SCHED_PRIORITY_LEVELS as u8)
+        self.ceiling_active = false
+    }
+
+    pub fn is_ceiling_blocked(self, task_priority: Priority) -> bool
+        effects: [deterministic]
+    {
+        if !self.ceiling_active {
+            return false
+        }
+        task_priority.higher_than(self.current_ceiling)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scheduler Statistics
+// ──────────────────────────────────────────────
+pub type SchedStatistics : struct {
+    total_context_switches: Word64,
+    total_preemptions: Word64,
+    total_deadline_misses: Word64,
+    total_activations: Word64,
+    utilization_total: Word64,
+    idle_time: Word64,
+    scheduler_latency_max: Word64,
+    scheduler_latency_accum: Word64,
+    scheduler_latency_samples: Word64,
+    last_switch_time: Word64,
+}
+
+impl SchedStatistics {
+    pub fn new() -> SchedStatistics
+        effects: [deterministic]
+    {
+        SchedStatistics {
+            total_context_switches: Word64::zero(),
+            total_preemptions: Word64::zero(),
+            total_deadline_misses: Word64::zero(),
+            total_activations: Word64::zero(),
+            utilization_total: Word64::zero(),
+            idle_time: Word64::zero(),
+            scheduler_latency_max: Word64::zero(),
+            scheduler_latency_accum: Word64::zero(),
+            scheduler_latency_samples: Word64::zero(),
+            last_switch_time: Word64::zero(),
+        }
+    }
+
+    pub fn record_switch(self: ref mut, now: Word64)
+        effects: [deterministic]
+    {
+        self.total_context_switches = self.total_context_switches.increment_or_max()
+        self.last_switch_time = now
+    }
+
+    pub fn record_preemption(self: ref mut)
+        effects: [deterministic]
+    {
+        self.total_preemptions = self.total_preemptions.increment_or_max()
+    }
+
+    pub fn record_deadline_miss(self: ref mut)
+        effects: [deterministic]
+    {
+        self.total_deadline_misses = self.total_deadline_misses.increment_or_max()
+    }
+
+    pub fn record_latency(self: ref mut, latency: Word64)
+        effects: [deterministic]
+    {
+        self.scheduler_latency_accum = self.scheduler_latency_accum.add(latency)
+        self.scheduler_latency_samples = self.scheduler_latency_samples.increment_or_max()
+        if latency.gt(self.scheduler_latency_max) {
+            self.scheduler_latency_max = latency
+        }
+    }
+
+    pub fn avg_latency(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.scheduler_latency_samples.is_zero() {
+            return Word64::zero()
+        }
+        self.scheduler_latency_accum.div(self.scheduler_latency_samples)
+    }
+
+    pub fn max_latency(self) -> Word64
+        effects: [deterministic]
+    {
+        self.scheduler_latency_max
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scheduling Analysis Result
+// ──────────────────────────────────────────────
+pub type SchedAnalysisResult : struct {
+    is_schedulable: bool,
+    utilization: Word64,
+    utilization_bound: Word64,
+    response_times: FixedArray[Word64, SCHED_ANALYSIS_DEPTH],
+    critical_instant: Word64,
+    max_blocking: Word64,
+    analysis_depth: u32,
+}
+
+impl SchedAnalysisResult {
+    pub fn new() -> SchedAnalysisResult
+        effects: [deterministic]
+    {
+        SchedAnalysisResult {
+            is_schedulable: false,
+            utilization: Word64::zero(),
+            utilization_bound: Word64::zero(),
+            response_times: FixedArray::new(),
+            critical_instant: Word64::zero(),
+            max_blocking: Word64::zero(),
+            analysis_depth: 0,
+        }
+    }
+
+    pub fn set_schedulable(self: ref mut, sched: bool)
+        effects: [deterministic]
+    {
+        self.is_schedulable = sched
+    }
+
+    pub fn record_response_time(self: ref mut, rt: Word64)
+        effects: [deterministic]
+    {
+        if self.analysis_depth < SCHED_ANALYSIS_DEPTH {
+            let result: Result[(), BoundsError] = self.response_times.set(self.analysis_depth, rt)
+            if result.is_ok() {
+                self.analysis_depth = self.analysis_depth + 1
+            }
+        }
+    }
+
+    pub fn get_response_time(self, index: u32) -> Result[Word64, BoundsError>
+        effects: [deterministic]
+    {
+        self.response_times.get(index)
+    }
+
+    pub fn passes_bound(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_schedulable
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scheduler Error Types
+// ──────────────────────────────────────────────
+pub type SchedulerError : struct {
+    code: Word64,
+    msg: FixedString[128],
+}
+
+impl SchedulerError {
+    pub fn new(c: Word64, m: FixedString[128]) -> SchedulerError
+        effects: [deterministic]
+    {
+        SchedulerError { code: c, msg: m }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn msg(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+}
+
+pub fn sched_task_not_found(id: TaskId) -> SchedulerError
+    effects: [deterministic]
+{
+    let msg: FixedString[128] = FixedString::from_slice("Task not found in scheduler table")
+    SchedulerError::new(Word64::from_u64(DIAG_RT_SCHED_BASE | 0x001), msg)
+}
+
+pub fn sched_queue_full() -> SchedulerError
+    effects: [deterministic]
+{
+    let msg: FixedString[128] = FixedString::from_slice("Scheduler queue capacity exceeded")
+    SchedulerError::new(Word64::from_u64(DIAG_RT_SCHED_BASE | 0x002), msg)
+}
+
+pub fn sched_invalid_priority(prio: u8) -> SchedulerError
+    effects: [deterministic]
+{
+    let msg: FixedString[128] = FixedString::from_slice("Invalid priority level specified")
+    SchedulerError::new(Word64::from_u64(DIAG_RT_SCHED_BASE | 0x003), msg)
+}
+
+pub fn sched_deadline_missed(tid: u8) -> SchedulerError
+    effects: [deterministic]
+{
+    let msg: FixedString[128] = FixedString::from_slice("Task deadline miss detected")
+    SchedulerError::new(Word64::from_u64(DIAG_RT_SCHED_BASE | 0x004), msg)
+}
+
+pub fn sched_protocol_violation() -> SchedulerError
+    effects: [deterministic]
+{
+    let msg: FixedString[128] = FixedString::from_slice("Priority protocol violation detected")
+    SchedulerError::new(Word64::from_u64(DIAG_RT_SCHED_BASE | 0x005), msg)
+}
+
+// ──────────────────────────────────────────────
+// Scheduler Residual Event
+// ──────────────────────────────────────────────
+pub type SchedResidual : struct {
+    event_type: FixedString[32],
+    task_id: u8,
+    from_priority: u8,
+    to_priority: u8,
+    from_state: u8,
+    to_state: u8,
+    timestamp: Word64,
+    policy: u8,
+    analysis_result: bool,
+    deadline_met: bool,
+}
+
+impl SchedResidual {
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            sched_event: self.event_type,
+            task: self.task_id,
+            from_priority: self.from_priority,
+            to_priority: self.to_priority,
+            from_state: self.from_state,
+            to_state: self.to_state,
+            timestamp: self.timestamp.to_u64(),
+            policy: self.policy,
+            analysis: if self.analysis_result { 1 } else { 0 },
+            deadline_met: if self.deadline_met { 1 } else { 0 },
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Task Table (fixed-capacity)
+// ──────────────────────────────────────────────
+pub type TaskTable : struct {
+    tasks: FixedArray[TaskCB, SCHED_TASK_TABLE_CAP],
+    count: u32,
+}
+
+impl TaskTable {
+    pub fn new() -> TaskTable
+        effects: [deterministic]
+    {
+        TaskTable {
+            tasks: FixedArray::new(),
+            count: 0,
+        }
+    }
+
+    pub fn add_task(self: ref mut, task: TaskCB) -> Result[(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.count >= SCHED_TASK_TABLE_CAP {
+            return Result::Err(bounds_capacity_exceeded(SCHED_TASK_TABLE_CAP))
+        }
+        let result: Result[(), BoundsError> = self.tasks.set(self.count, task)
+        if result.is_ok() {
+            self.count = self.count + 1
+        }
+        result
+    }
+
+    pub fn get_task(self, id: TaskId) -> Result<TaskCB, SchedulerError>
+        effects: [deterministic]
+    {
+        for i in 0..self.count {
+            let t: TaskCB = match self.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                return Result::Ok(t)
+            }
+        }
+        Result::Err(sched_task_not_found(id))
+    }
+
+    pub fn get_task_mut(self: ref mut, id: TaskId) -> Result<ref mut TaskCB, SchedulerError>
+        effects: [deterministic]
+    {
+        for i in 0..self.count {
+            let t: ref mut TaskCB = match self.tasks.ref_at_mut(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                return Result::Ok(t)
+            }
+        }
+        Result::Err(sched_task_not_found(id))
+    }
+
+    pub fn remove_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.count {
+            let t: TaskCB = match self.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(sched_task_not_found(id))
+        }
+        for i in found_idx..(self.count - 1) {
+            let t: TaskCB = match self.tasks.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TaskCB::new(0, 0, SchedPolicy::SchedPolicy_FixedPriority),
+            }
+            let r: Result[(), BoundsError> = self.tasks.set(i, t)
+        }
+        self.count = self.count - 1
+        Result::Ok(())
+    }
+
+    pub fn task_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.count
+    }
+}
+
+// ──────────────────────────────────────────────
+// Fixed-Priority Preemptive Scheduler
+// ──────────────────────────────────────────────
+pub type FixedPriorityScheduler : struct {
+    ready_queue: ReadyQueue,
+    wait_queue: WaitQueue,
+    task_table: TaskTable,
+    current_task: TaskId,
+    statistics: SchedStatistics,
+    policy: SchedPolicy,
+    time: Word64,
+    idle_task_id: TaskId,
+    priority_inheritance: PriorityInheritanceState,
+    ceiling_state: CeilingProtocolState,
+    residuals: FixedArray[SchedResidual, SCHED_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl FixedPriorityScheduler {
+    pub fn new(policy_val: SchedPolicy) -> FixedPriorityScheduler
+        effects: [deterministic]
+    {
+        FixedPriorityScheduler {
+            ready_queue: ReadyQueue::new(),
+            wait_queue: WaitQueue::new(),
+            task_table: TaskTable::new(),
+            current_task: TaskId::new(0),
+            statistics: SchedStatistics::new(),
+            policy: policy_val,
+            time: Word64::zero(),
+            idle_task_id: TaskId::new(0xFF),
+            priority_inheritance: PriorityInheritanceState::new(Priority::new(0)),
+            ceiling_state: CeilingProtocolState::new(),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+    }
+
+    pub fn register_task(self: ref mut, task: TaskCB) -> Result[(), SchedulerError>
+        effects: [deterministic]
+    {
+        let result: Result[(), BoundsError> = self.task_table.add_task(task)
+        match result {
+            Result::Ok(_) => {
+                result emit {
+                    sched_op: "task.register",
+                    task_id: task.id.value() as u64,
+                    priority: task.priority.value() as u64,
+                    policy: task.policy as u64,
+                }
+                Result::Ok(())
+            }
+            Result::Err(e) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn unregister_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic, residual]
+    {
+        let result: Result<(), SchedulerError> = self.task_table.remove_task(id)
+        match result {
+            Result::Ok(_) => {
+                result emit {
+                    sched_op: "task.unregister",
+                    task_id: id.value() as u64,
+                }
+                Result::Ok(())
+            }
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    pub fn set_task_ready(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        task.state = TaskState::TaskState_Ready
+        task.total_activations = task.total_activations.increment_or_max()
+        let effective_prio: Priority = self.priority_inheritance.effective_priority()
+        let prio: Priority = if effective_prio.higher_than(task.base_priority) {
+            effective_prio
+        } else {
+            task.base_priority
+        }
+        let eq_result: Result<(), BoundsError> = self.ready_queue.enqueue(id, prio)
+        match eq_result {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err(_) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn block_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        task.state = TaskState::TaskState_Blocked
+        let r: Result<(), BoundsError> = self.wait_queue.enqueue(id, task.priority)
+        let rq_remove: Result<(), BoundsError> = self.ready_queue.remove(id)
+        match r {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err(_) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn unblock_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        task.state = TaskState::TaskState_Ready
+        let wq_remove: Result<(), BoundsError> = self.wait_queue.remove(id)
+        let eq_result: Result<(), BoundsError> = self.ready_queue.enqueue(id, task.priority)
+        match eq_result {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err(_) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn tick(self: ref mut, now: Word64) -> Result[TaskId, SchedulerError>
+        effects: [deterministic, residual]
+    {
+        self.time = now
+        // Check for deadline misses
+        for i in 0..self.task_table.task_count() {
+            let task: TaskCB = match self.task_table.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            if task.state == TaskState::TaskState_Running || task.state == TaskState::TaskState_Ready {
+                if now.gt(task.absolute_deadline) && !task.absolute_deadline.eq(Word64::max_value()) {
+                    let miss: DeadlineMissEvent = DeadlineMissEvent::new(
+                        task.id, task.absolute_deadline, now, task.miss_count, now)
+                    let mut tcb: ref mut TaskCB = match self.task_table.get_task_mut(task.id) {
+                        Result::Ok(t) => t,
+                        Result::Err(_) => continue,
+                    }
+                    tcb.record_deadline_miss()
+                    self.statistics.record_deadline_miss()
+
+                    residual emit {
+                        sched_event: "deadline.miss",
+                        task_id: task.id.value() as u64,
+                        deadline: task.absolute_deadline.to_u64(),
+                        now: now.to_u64(),
+                        miss_count: task.miss_count.to_u64(),
+                        severity: miss.severity() as u64,
+                    }
+                }
+            }
+        }
+
+        // Schedule next task
+        let next: TaskId = match self.schedule_next() {
+            Result::Ok(t) => t,
+            Result::Err(_) => self.idle_task_id,
+        }
+
+        if !next.eq(self.current_task) {
+            // Context switch
+            let prev: TaskId = self.current_task
+            self.current_task = next
+            self.statistics.record_switch(now)
+
+            residual emit {
+                sched_event: "context.switch",
+                from_task: prev.value() as u64,
+                to_task: next.value() as u64,
+                policy: self.policy as u64,
+                timestamp: now.to_u64(),
+            }
+        }
+
+        Result::Ok(next)
+    }
+
+    fn schedule_next(self) -> Result[TaskId, SchedulerError>
+        effects: [deterministic]
+    {
+        let next: TaskId = match self.ready_queue.peek() {
+            Result::Ok(t) => t,
+            Result::Err(_) => return Result::Ok(self.idle_task_id),
+        }
+        Result::Ok(next)
+    }
+
+    pub fn start_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        task.state = TaskState::TaskState_Running
+        task.last_start_time = self.time
+        task.remaining_time = task.execution_time
+        let rq_remove: Result<(), BoundsError> = self.ready_queue.remove(id)
+        Result::Ok(())
+    }
+
+    pub fn preempt_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let elapsed: Word64 = self.time.sub(task.last_start_time)
+        if task.remaining_time.gt(elapsed) {
+            task.remaining_time = task.remaining_time.sub(elapsed)
+        } else {
+            task.remaining_time = Word64::zero()
+        }
+        task.state = TaskState::TaskState_Ready
+        task.preemption_count = task.preemption_count.increment_or_max()
+        self.statistics.record_preemption()
+        let eq_result: Result<(), BoundsError> = self.ready_queue.enqueue(id, task.priority)
+        match eq_result {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err(_) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn finish_task(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic, residual]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let completion: Word64 = self.time
+        let deadline_met: bool = completion.lte(task.absolute_deadline)
+
+        if deadline_met {
+            task.record_deadline_met()
+        } else {
+            task.record_deadline_miss()
+            self.statistics.record_deadline_miss()
+            residual emit {
+                sched_event: "deadline.miss.on_completion",
+                task_id: id.value() as u64,
+                deadline: task.absolute_deadline.to_u64(),
+                completion: completion.to_u64(),
+            }
+        }
+
+        let exec_time: Word64 = completion.sub(task.last_start_time)
+        task.accum_exec_time = task.accum_exec_time.add(exec_time)
+        task.state = TaskState::TaskState_Dormant
+
+        residual emit {
+            sched_event: "task.complete",
+            task_id: id.value() as u64,
+            execution_time: exec_time.to_u64(),
+            deadline_met: if deadline_met { 1 } else { 0 },
+        }
+
+        Result::Ok(())
+    }
+
+    pub fn release_periodic(self: ref mut, id: TaskId) -> Result<(), SchedulerError>
+        effects: [deterministic]
+    {
+        let task: ref mut TaskCB = match self.task_table.get_task_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        task.release_time = self.time
+        task.absolute_deadline = self.time.add(task.deadline)
+        task.remaining_time = task.execution_time
+        task.total_activations = task.total_activations.increment_or_max()
+        task.state = TaskState::TaskState_Ready
+        let eq_result: Result<(), BoundsError> = self.ready_queue.enqueue(id, task.priority)
+        match eq_result {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err(_) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn add_residual(self: ref mut, residual_entry: SchedResidual)
+        effects: [deterministic]
+    {
+        if self.residual_count < SCHED_RESIDUAL_LOG {
+            let result: Result<(), BoundsError> = self.residuals.set(self.residual_count, residual_entry)
+            if result.is_ok() {
+                self.residual_count = self.residual_count + 1
+            }
+        }
+    }
+
+    pub fn flush_residuals(self: ref mut)
+        effects: [residual]
+    {
+        for i in 0..self.residual_count {
+            let r: SchedResidual = match self.residuals.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            r.record()
+        }
+        self.residual_count = 0
+    }
+
+    pub fn get_statistics(self) -> SchedStatistics
+        effects: [deterministic]
+    {
+        self.statistics
+    }
+
+    pub fn total_utilization(self) -> Word64
+        effects: [deterministic]
+    {
+        let mut total: Word64 = Word64::zero()
+        for i in 0..self.task_table.task_count() {
+            let t: TaskCB = match self.task_table.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            total = total.add(t.utilization())
+        }
+        total
+    }
+
+    pub fn has_deadline_misses(self) -> bool
+        effects: [deterministic]
+    {
+        !self.statistics.total_deadline_misses.is_zero()
+    }
+
+    pub fn scheduler_report(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[512] = FixedString::new()
+        let s: FixedString[32] = FixedString::from_slice("Scheduler Report:\n")
+        report.append(s)
+        let cs: FixedString[64] = FixedString::from_slice("  Context switches: ")
+        report.append(cs)
+        let cs_val: u64 = self.statistics.total_context_switches.to_u64()
+        report.append_u64(cs_val)
+        let dm: FixedString[64] = FixedString::from_slice("\n  Deadline misses: ")
+        report.append(dm)
+        let dm_val: u64 = self.statistics.total_deadline_misses.to_u64()
+        report.append_u64(dm_val)
+        let ut: FixedString[64] = FixedString::from_slice("\n  Utilization: ")
+        report.append(ut)
+        let ut_val: u64 = self.total_utilization().to_u64()
+        report.append_u64(ut_val)
+        report
+    }
+}
+
+// ──────────────────────────────────────────────
+// Rate-Monotonic Scheduler (fixed-priority, shorter period = higher priority)
+// ──────────────────────────────────────────────
+pub fn rate_monotonic_priority(period: Word64) -> Priority
+    effects: [deterministic]
+{
+    // Shorter period = higher priority (lower numeric value)
+    let period_us: u64 = period.to_u64()
+    if period_us == 0 {
+        return Priority::new(0)
+    }
+    let max_period: u64 = 0xFFFF_FFFF
+    let clamped: u64 = if period_us > max_period { max_period } else { period_us }
+    let log_val: u64 = 63 - __builtin_clz64(clamped | 1)
+    let prio: u8 = if log_val >= SCHED_PRIORITY_LEVELS as u64 {
+        (SCHED_PRIORITY_LEVELS - 1) as u8
+    } else {
+        (SCHED_PRIORITY_LEVELS - 1 - log_val as u32) as u8
+    }
+    Priority::new(prio)
+}
+
+pub fn assign_rm_priorities(sched: ref mut FixedPriorityScheduler)
+    effects: [deterministic, residual]
+{
+    for i in 0..sched.task_table.task_count() {
+        let task: TaskCB = match sched.task_table.tasks.get(i) {
+            Result::Ok(t) => t,
+            Result::Err(_) => continue,
+        }
+        let new_prio: Priority = rate_monotonic_priority(task.period)
+        let mut tcb: ref mut TaskCB = match sched.task_table.get_task_mut(task.id) {
+            Result::Ok(t) => t,
+            Result::Err(_) => continue,
+        }
+        tcb.priority = new_prio
+        tcb.base_priority = new_prio
+
+        residual emit {
+            sched_op: "rm.priority.assign",
+            task_id: task.id.value() as u64,
+            period: task.period.to_u64(),
+            new_priority: new_prio.value() as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Earliest-Deadline-First Scheduler
+// ──────────────────────────────────────────────
+pub type EDFScheduler : struct {
+    ready_queue: ReadyQueue,
+    task_table: TaskTable,
+    current_task: TaskId,
+    statistics: SchedStatistics,
+    time: Word64,
+    idle_task_id: TaskId,
+    residuals: FixedArray[SchedResidual, SCHED_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl EDFScheduler {
+    pub fn new() -> EDFScheduler
+        effects: [deterministic]
+    {
+        EDFScheduler {
+            ready_queue: ReadyQueue::new(),
+            task_table: TaskTable::new(),
+            current_task: TaskId::new(0),
+            statistics: SchedStatistics::new(),
+            time: Word64::zero(),
+            idle_task_id: TaskId::new(0xFF),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+    }
+
+    pub fn register_task(self: ref mut, task: TaskCB) -> Result[(), SchedulerError>
+        effects: [deterministic]
+    {
+        let result: Result[(), BoundsError> = self.task_table.add_task(task)
+        match result {
+            Result::Ok(_) => {
+                residual emit {
+                    sched_op: "edf.task.register",
+                    task_id: task.id.value() as u64,
+                    deadline: task.deadline.to_u64(),
+                }
+                Result::Ok(())
+            }
+            Result::Err(_) => Result::Err(sched_queue_full()),
+        }
+    }
+
+    pub fn tick_edf(self: ref mut, now: Word64) -> Result[TaskId, SchedulerError>
+        effects: [deterministic, residual]
+    {
+        self.time = now
+        let next: TaskId = self.schedule_edf()
+        if !next.eq(self.current_task) {
+            self.current_task = next
+            self.statistics.record_switch(now)
+            residual emit {
+                sched_event: "edf.context.switch",
+                to_task: next.value() as u64,
+                deadline: self.task_table.get_task(next).absolute_deadline.to_u64(),
+                timestamp: now.to_u64(),
+            }
+        }
+        Result::Ok(next)
+    }
+
+    fn schedule_edf(self) -> TaskId
+        effects: [deterministic]
+    {
+        let mut best_task: TaskId = self.idle_task_id
+        let mut earliest_deadline: Word64 = Word64::max_value()
+        for i in 0..self.task_table.task_count() {
+            let t: TaskCB = match self.task_table.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.state == TaskState::TaskState_Ready || t.state == TaskState::TaskState_Running {
+                if t.absolute_deadline.lt(earliest_deadline) {
+                    earliest_deadline = t.absolute_deadline
+                    best_task = t.id
+                }
+            }
+        }
+        best_task
+    }
+}
+
+// ──────────────────────────────────────────────
+// Priority Ceiling Protocol Enforcement
+// ──────────────────────────────────────────────
+pub fn pcp_lock_request(sched: ref mut FixedPriorityScheduler, task_id: TaskId, ceiling: Priority) -> Result[bool, SchedulerError>
+    effects: [deterministic, residual]
+{
+    let task: ref mut TaskCB = match sched.task_table.get_task_mut(task_id) {
+        Result::Ok(t) => t,
+        Result::Err(e) => return Result::Err(e),
+    }
+    let blocked: bool = sched.ceiling_state.is_ceiling_blocked(task.priority)
+    if blocked {
+        residual emit {
+            sched_event: "pcp.ceiling.block",
+            task_id: task_id.value() as u64,
+            task_priority: task.priority.value() as u64,
+            ceiling: ceiling.value() as u64,
+        }
+        return Result::Ok(false)
+    }
+    sched.ceiling_state.set_ceiling(ceiling, task_id)
+    residual emit {
+        sched_event: "pcp.ceiling.grant",
+        task_id: task_id.value() as u64,
+        ceiling: ceiling.value() as u64,
+    }
+    Result::Ok(true)
+}
+
+pub fn pcp_lock_release(sched: ref mut FixedPriorityScheduler, task_id: TaskId)
+    effects: [deterministic, residual]
+{
+    sched.ceiling_state.release_ceiling()
+    residual emit {
+        sched_event: "pcp.ceiling.release",
+        task_id: task_id.value() as u64,
+    }
+}
+
+// ──────────────────────────────────────────────
+// Schedulability Tests
+// ──────────────────────────────────────────────
+pub fn rate_monotonic_utilization_bound(n: u32) -> Word64
+    effects: [deterministic]
+{
+    // RMS utilization bound: n * (2^(1/n) - 1)
+    // Approximated as fraction for fixed-point computation
+    if n == 1 {
+        return Word64::from_u64(1000)
+    }
+    let n_fp: u64 = (n as u64) * 1000
+    let bound_vals: FixedArray[Word64, 32] = FixedArray::from_raw([
+        Word64::from_u64(1000), // N=1  -> 1.000
+        Word64::from_u64(828),  // N=2  -> 0.828
+        Word64::from_u64(779),  // N=3  -> 0.779
+        Word64::from_u64(756),  // N=4  -> 0.756
+        Word64::from_u64(743),  // N=5  -> 0.743
+        Word64::from_u64(734),  // N=6  -> 0.734
+        Word64::from_u64(728),  // N=7  -> 0.728
+        Word64::from_u64(724),  // N=8  -> 0.724
+        Word64::from_u64(720),  // N=9  -> 0.720
+        Word64::from_u64(717),  // N=10 -> 0.717
+        Word64::from_u64(714),  // N=11 -> 0.714
+        Word64::from_u64(712),  // N=12 -> 0.712
+        Word64::from_u64(710),  // N=13 -> 0.710
+        Word64::from_u64(708),  // N=14 -> 0.708
+        Word64::from_u64(706),  // N=15 -> 0.706
+        Word64::from_u64(705),  // N=16 -> 0.705
+        Word64::from_u64(703),  // N=17 -> 0.703
+        Word64::from_u64(702),  // N=18 -> 0.702
+        Word64::from_u64(701),  // N=19 -> 0.701
+        Word64::from_u64(700),  // N=20 -> 0.700
+        Word64::from_u64(699),  // N=21 -> 0.699
+        Word64::from_u64(698),  // N=22 -> 0.698
+        Word64::from_u64(697),  // N=23 -> 0.697
+        Word64::from_u64(696),  // N=24 -> 0.696
+        Word64::from_u64(695),  // N=25 -> 0.695
+        Word64::from_u64(694),  // N=26 -> 0.694
+        Word64::from_u64(693),  // N=27 -> 0.693
+        Word64::from_u64(692),  // N=28 -> 0.692
+        Word64::from_u64(691),  // N=29 -> 0.691
+        Word64::from_u64(690),  // N=30 -> 0.690
+        Word64::from_u64(689),  // N=31 -> 0.689
+        Word64::from_u64(688),  // N=32 -> 0.688
+    ], 32)
+    let idx: u32 = if n >= 32 { 31 } else { n - 1 }
+    match bound_vals.get(idx) {
+        Result::Ok(v) => v,
+        Result::Err(_) => Word64::from_u64(688),
+    }
+}
+
+pub fn rms_schedulability_test(tasks: ref TaskTable) -> SchedAnalysisResult
+    effects: [deterministic]
+{
+    let mut result: SchedAnalysisResult = SchedAnalysisResult::new()
+    let n: u32 = tasks.task_count()
+    if n == 0 {
+        result.set_schedulable(true)
+        return result
+    }
+    let mut total_util: Word64 = Word64::zero()
+    for i in 0..n {
+        let t: TaskCB = match tasks.tasks.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        total_util = total_util.add(t.utilization())
+    }
+    result.utilization = total_util
+    let bound: Word64 = rate_monotonic_utilization_bound(n)
+    result.utilization_bound = bound
+    result.set_schedulable(total_util.lte(bound))
+    result
+}
+
+pub fn response_time_analysis(tasks: ref TaskTable, i: u32) -> Word64
+    effects: [deterministic]
+{
+    let task: TaskCB = match tasks.tasks.get(i) {
+        Result::Ok(v) => v,
+        Result::Err(_) => return Word64::zero(),
+    }
+    let c: Word64 = task.worst_case_exec
+    let t: Word64 = task.period
+    let mut r: Word64 = c
+    let mut prev_r: Word64 = Word64::zero()
+    let mut iteration: u32 = 0
+
+    while !r.eq(prev_r) && iteration < 100 proven {
+        prev_r = r
+        let mut interference: Word64 = Word64::zero()
+        for j in 0..i {
+            let other: TaskCB = match tasks.tasks.get(j) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let cj: Word64 = other.worst_case_exec
+            let tj: Word64 = other.period
+            let ceil_val: u64 = (r.to_u64() + tj.to_u64() - 1) / tj.to_u64()
+            interference = interference.add(cj.mul(Word64::from_u64(ceil_val)))
+        }
+        r = c.add(interference)
+        iteration = iteration + 1
+    }
+    r
+}
+
+pub fn edf_schedulability_test(tasks: ref TaskTable) -> SchedAnalysisResult
+    effects: [deterministic]
+{
+    let mut result: SchedAnalysisResult = SchedAnalysisResult::new()
+    let n: u32 = tasks.task_count()
+    if n == 0 {
+        result.set_schedulable(true)
+        return result
+    }
+    let mut total_util: Word64 = Word64::zero()
+    for i in 0..n {
+        let t: TaskCB = match tasks.tasks.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        total_util = total_util.add(t.utilization())
+    }
+    result.utilization = total_util
+    // EDF schedulability bound is 1.0 (1000 in fixed-point millipercent)
+    result.utilization_bound = Word64::from_u64(1000)
+    result.set_schedulable(total_util.lte(Word64::from_u64(1000)))
+    result
+}
+
+// ──────────────────────────────────────────────
+// High-Level Scheduler API
+// ──────────────────────────────────────────────
+pub type RTScheduler : struct {
+    fpp: FixedPriorityScheduler,
+    edf: EDFScheduler,
+    current_policy: SchedPolicy,
+    analysis_result: SchedAnalysisResult,
+    time: Word64,
+    residuals: FixedArray[SchedResidual, SCHED_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl RTScheduler {
+    pub fn new(policy: SchedPolicy) -> RTScheduler
+        effects: [deterministic]
+    {
+        RTScheduler {
+            fpp: FixedPriorityScheduler::new(policy),
+            edf: EDFScheduler::new(),
+            current_policy: policy,
+            analysis_result: SchedAnalysisResult::new(),
+            time: Word64::zero(),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+    }
+
+    pub fn set_policy(self: ref mut, policy: SchedPolicy)
+        effects: [deterministic]
+    {
+        self.current_policy = policy
+        residual emit {
+            sched_op: "policy.change",
+            policy: policy as u64,
+        }
+    }
+
+    pub fn add_task(self: ref mut, task: TaskCB) -> Result[(), SchedulerError>
+        effects: [deterministic, residual]
+    {
+        let result: Result[(), SchedulerError> = self.fpp.register_task(task)
+        match result {
+            Result::Ok(_) => {
+                let edf_task: TaskCB = match self.fpp.task_table.get_task(task.id) {
+                    Result::Ok(t) => t,
+                    Result::Err(_) => return Result::Err(sched_task_not_found(task.id)),
+                }
+                let edf_result: Result[(), SchedulerError> = self.edf.register_task(edf_task)
+                Result::Ok(())
+            }
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    pub fn tick(self: ref mut, now: Word64) -> Result[TaskId, SchedulerError>
+        effects: [deterministic, residual]
+    {
+        self.time = now
+        match self.current_policy {
+            SchedPolicy::SchedPolicy_FixedPriority => self.fpp.tick(now),
+            SchedPolicy::SchedPolicy_RateMonotonic => self.fpp.tick(now),
+            SchedPolicy::SchedPolicy_EarliestDeadlineFirst => self.edf.tick_edf(now),
+            _ => self.fpp.tick(now),
+        }
+    }
+
+    pub fn run_analysis(self: ref mut) -> SchedAnalysisResult
+        effects: [deterministic]
+    {
+        match self.current_policy {
+            SchedPolicy::SchedPolicy_RateMonotonic => {
+                self.analysis_result = rms_schedulability_test(&self.fpp.task_table)
+            }
+            SchedPolicy::SchedPolicy_EarliestDeadlineFirst => {
+                self.analysis_result = edf_schedulability_test(&self.fpp.task_table)
+            }
+            _ => {
+                self.analysis_result = rms_schedulability_test(&self.fpp.task_table)
+            }
+        }
+        self.analysis_result
+    }
+
+    pub fn is_schedulable(self) -> bool
+        effects: [deterministic]
+    {
+        self.analysis_result.passes_bound()
+    }
+
+    pub fn deadline_miss_count(self) -> Word64
+        effects: [deterministic]
+    {
+        self.fpp.statistics.total_deadline_misses
+    }
+
+    pub fn utilization(self) -> Word64
+        effects: [deterministic]
+    {
+        self.fpp.total_utilization()
+    }
+
+    pub fn get_report(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        self.fpp.scheduler_report()
+    }
+
+    pub fn clear_statistics(self: ref mut)
+        effects: [deterministic]
+    {
+        self.fpp.statistics = SchedStatistics::new()
+        self.edf.statistics = SchedStatistics::new()
+        residual emit {
+            sched_op: "statistics.cleared",
+            timestamp: self.time.to_u64(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module Entry Point
+// ──────────────────────────────────────────────
+pub fn init_scheduler(policy: SchedPolicy) -> RTScheduler
+    effects: [deterministic, residual]
+{
+    let sched: RTScheduler = RTScheduler::new(policy)
+    residual emit {
+        sched_op: "scheduler.init",
+        policy: policy as u64,
+        priority_levels: SCHED_PRIORITY_LEVELS as u64,
+        task_capacity: SCHED_TASK_TABLE_CAP as u64,
+    }
+    sched
+}

@@ -1,0 +1,1170 @@
+// file: memory_map.phor
+// purpose: Memory map management: physical memory regions, EFI memory map parsing,
+//          reserved regions, ACPI NVS/Reclaim regions, memory hole detection,
+//          memory topology discovery and management. All operations use bounded
+//          loops and record residuals for state changes.
+// evidence: MEM-MMAP-ARCH-001 through MEM-MMAP-ARCH-240
+// residual: All memory region discovery and topology changes record residuals.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use memory::phys_page_allocator::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-DIAG-001 through MEM-MMAP-DIAG-010
+
+const DIAG_MMAP_BASE        : Word64 = Word64::from_u64(0xA300)
+const DIAG_MMAP_OK          : Word64 = DIAG_MMAP_BASE | 0x000
+const DIAG_MMAP_OVERLAP     : Word64 = DIAG_MMAP_BASE | 0x001
+const DIAG_MMAP_HOLE        : Word64 = DIAG_MMAP_BASE | 0x002
+const DIAG_MMAP_UNSUPPORTED : Word64 = DIAG_MMAP_BASE | 0x003
+const DIAG_MMAP_FULL        : Word64 = DIAG_MMAP_BASE | 0x004
+const DIAG_MMAP_BOUNDS      : Word64 = DIAG_MMAP_BASE | 0x005
+const DIAG_MMAP_PARSE_ERROR : Word64 = DIAG_MMAP_BASE | 0x006
+const DIAG_MMAP_INVALID_REG : Word64 = DIAG_MMAP_BASE | 0x007
+const DIAG_MMAP_TOPOLOGY    : Word64 = DIAG_MMAP_BASE | 0x008
+
+// ──────────────────────────────────────────────
+// Memory Map Constants
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-CONST-001 through MEM-MMAP-CONST-025
+
+const MAX_MEMORY_REGIONS       : u32 = 256
+const MAX_MEMORY_HOLES         : u32 = 32
+const MAX_RESERVED_REGIONS_MMAP : u32 = 64
+const MAX_ACPI_RECLAIM_REGIONS : u32 = 16
+const MAX_ACPI_NVS_REGIONS     : u32 = 16
+const MAX_TOPO_LEVELS          : u32 = 8
+const MAX_MEMORY_CONTROLLERS   : u32 = 16
+const MAX_DIMM_SLOTS           : u32 = 64
+const EFI_MEMORY_DESCRIPTOR_SIZE: u32 = 48
+
+// EFI Memory Type Constants
+const EFI_RESERVED_MEMORY_TYPE       : u32 = 0
+const EFI_LOADER_CODE                : u32 = 1
+const EFI_LOADER_DATA                : u32 = 2
+const EFI_BOOT_SERVICES_CODE         : u32 = 3
+const EFI_BOOT_SERVICES_DATA         : u32 = 4
+const EFI_RUNTIME_SERVICES_CODE      : u32 = 5
+const EFI_RUNTIME_SERVICES_DATA      : u32 = 6
+const EFI_CONVENTIONAL_MEMORY        : u32 = 7
+const EFI_UNUSABLE_MEMORY            : u32 = 8
+const EFI_ACPI_RECLAIM_MEMORY        : u32 = 9
+const EFI_ACPI_MEMORY_NVS            : u32 = 10
+const EFI_MEMORY_MAPPED_IO           : u32 = 11
+const EFI_MEMORY_MAPPED_IO_PORT_SPACE : u32 = 12
+const EFI_PAL_CODE                   : u32 = 13
+const EFI_PERSISTENT_MEMORY          : u32 = 14
+
+// EFI Memory Attribute Flags
+const EFI_MEMORY_UC           : u64 = 0x0000000000000001  // uncacheable
+const EFI_MEMORY_WC           : u64 = 0x0000000000000002  // write combining
+const EFI_MEMORY_WT           : u64 = 0x0000000000000004  // write through
+const EFI_MEMORY_WB           : u64 = 0x0000000000000008  // write back
+const EFI_MEMORY_UCE          : u64 = 0x0000000000000010  // uncacheable exported
+const EFI_MEMORY_WP           : u64 = 0x0000000000001000  // write protected
+const EFI_MEMORY_RP           : u64 = 0x0000000000002000  // read protected
+const EFI_MEMORY_XP           : u64 = 0x0000000000004000  // execute protected
+const EFI_MEMORY_NV           : u64 = 0x0000000000008000  // non-volatile
+const EFI_MEMORY_MORE_RELIABLE: u64 = 0x0000000000010000  // more reliable
+const EFI_MEMORY_RO           : u64 = 0x0000000000020000  // read only
+const EFI_MEMORY_SP           : u64 = 0x0000000000040000  // specific purpose
+const EFI_MEMORY_CPU_CRYPTO   : u64 = 0x0000000000080000  // CPU crypto memory
+const EFI_MEMORY_RUNTIME      : u64 = 0x8000000000000000  // runtime
+
+// ──────────────────────────────────────────────
+// Memory Region Type
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-TYPE-001 through MEM-MMAP-TYPE-010
+
+pub type MemoryRegionType : u8 = enum {
+    Region_Conventional    = 0,  // Usable RAM
+    Region_Reserved        = 1,  // Reserved by firmware/platform
+    Region_ACPI_Reclaim    = 2,  // ACPI reclaimable
+    Region_ACPI_NVS        = 3,  // ACPI non-volatile storage
+    Region_BootServices    = 4,  // Boot services code/data
+    Region_RuntimeServices = 5,  // Runtime services code/data
+    Region_MMIO            = 6,  // Memory-mapped IO
+    Region_Persistent      = 7,  // Persistent memory (NVDIMM)
+    Region_Unusable        = 8,  // Hardware errors, bad RAM
+    Region_Hole            = 9,  // Memory hole (not populated)
+    Region_Kernel          = 10, // Kernel-reserved
+    Region_PageTable       = 11, // Page table pool
+    Region_DMA             = 12, // DMA zone
+    Region_Device          = 13, // Device-dedicated memory
+    Region_Firmware        = 14, // Firmware-reserved
+    Region_Bad             = 15, // Poisoned/failed memory
+}
+
+// ──────────────────────────────────────────────
+// Memory Region Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-REG-001 through MEM-MMAP-REG-020
+
+pub type MemoryRegion : struct {
+    base: u64,
+    size: u64,
+    region_type: MemoryRegionType,
+    efi_type: u32,
+    efi_attributes: u64,
+    numa_node: NumaNodeId,
+    is_boot_services: bool,
+    is_runtime: bool,
+    is_persistent: bool,
+    is_bad: bool,
+}
+
+impl MemoryRegion {
+    pub fn new(base: u64, size: u64, region_type: MemoryRegionType) -> MemoryRegion
+        effects: [deterministic]
+    {
+        MemoryRegion {
+            base: base,
+            size: size,
+            region_type: region_type,
+            efi_type: 0,
+            efi_attributes: 0,
+            numa_node: NumaNodeId::zero(),
+            is_boot_services: false,
+            is_runtime: false,
+            is_persistent: false,
+            is_bad: false,
+        }
+    }
+
+    pub fn with_efi(base: u64, size: u64, efi_type: u32, attrs: u64) -> MemoryRegion
+        effects: [deterministic]
+    {
+        let region_type: MemoryRegionType = MemoryRegion::efi_to_region_type(efi_type)
+        let is_boot: bool = efi_type == EFI_BOOT_SERVICES_CODE ||
+                            efi_type == EFI_BOOT_SERVICES_DATA
+        let is_rt: bool = (attrs & EFI_MEMORY_RUNTIME) != 0
+        MemoryRegion {
+            base: base,
+            size: size,
+            region_type: region_type,
+            efi_type: efi_type,
+            efi_attributes: attrs,
+            numa_node: NumaNodeId::zero(),
+            is_boot_services: is_boot,
+            is_runtime: is_rt,
+            is_persistent: efi_type == EFI_PERSISTENT_MEMORY,
+            is_bad: false,
+        }
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.base + self.size
+    }
+
+    pub fn contains(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        addr >= self.base && addr < self.base + self.size
+    }
+
+    pub fn overlaps(self, other: MemoryRegion) -> bool
+        effects: [deterministic]
+    {
+        self.base < other.base + other.size && other.base < self.base + self.size
+    }
+
+    pub fn merge(self, other: MemoryRegion) -> Result[MemoryRegion, MemoryError]
+        effects: [deterministic]
+    {
+        if !self.overlaps(other) && self.end() != other.base && other.end() != self.base {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_OVERLAP,
+                FixedString[128]::from_slice("Cannot merge non-adjacent regions")))
+        }
+        let new_base: u64 = if self.base < other.base { self.base } else { other.base }
+        let new_end: u64 = if self.end() > other.end() { self.end() } else { other.end() }
+        let new_size: u64 = new_end - new_base
+        // Use the non-reserved type if one is conventional
+        let region_type: MemoryRegionType = if self.region_type == Region_Conventional {
+            self.region_type
+        } else if other.region_type == Region_Conventional {
+            other.region_type
+        } else {
+            self.region_type
+        }
+        Result::Ok(MemoryRegion::new(new_base, new_size, region_type))
+    }
+
+    pub fn is_usable(self) -> bool
+        effects: [deterministic]
+    {
+        self.region_type == Region_Conventional ||
+        self.region_type == Region_ACPI_Reclaim
+    }
+
+    pub fn is_reserved(self) -> bool
+        effects: [deterministic]
+    {
+        self.region_type == Region_Reserved ||
+        self.region_type == Region_ACPI_NVS ||
+        self.region_type == Region_Unusable ||
+        self.region_type == Region_Bad
+    }
+
+    pub fn efi_to_region_type(efi_type: u32) -> MemoryRegionType
+        effects: [deterministic]
+    {
+        match efi_type {
+            EFI_CONVENTIONAL_MEMORY | EFI_LOADER_CODE | EFI_LOADER_DATA => {
+                Region_Conventional
+            },
+            EFI_RESERVED_MEMORY_TYPE => { Region_Reserved },
+            EFI_ACPI_RECLAIM_MEMORY => { Region_ACPI_Reclaim },
+            EFI_ACPI_MEMORY_NVS => { Region_ACPI_NVS },
+            EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA => {
+                Region_BootServices
+            },
+            EFI_RUNTIME_SERVICES_CODE | EFI_RUNTIME_SERVICES_DATA => {
+                Region_RuntimeServices
+            },
+            EFI_MEMORY_MAPPED_IO | EFI_MEMORY_MAPPED_IO_PORT_SPACE => {
+                Region_MMIO
+            },
+            EFI_PERSISTENT_MEMORY => { Region_Persistent },
+            EFI_UNUSABLE_MEMORY | EFI_PAL_CODE => { Region_Unusable },
+            _ => { Region_Reserved },
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Hole Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-HOLE-001 through MEM-MMAP-HOLE-012
+
+pub type MemoryHole : struct {
+    base: u64,
+    size: u64,
+    detected_by: u8,  // 0=EFI map, 1=probing, 2=topology
+    is_confirmed: bool,
+}
+
+impl MemoryHole {
+    pub fn new(base: u64, size: u64, detected_by: u8) -> MemoryHole
+        effects: [deterministic]
+    {
+        MemoryHole {
+            base: base,
+            size: size,
+            detected_by: detected_by,
+            is_confirmed: false,
+        }
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.base + self.size
+    }
+
+    pub fn contains(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        addr >= self.base && addr < self.base + self.size
+    }
+
+    pub fn confirm(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_confirmed = true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Reserved Region
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-RESERVED-001 through MEM-MMAP-RESERVED-015
+
+pub type ReservedRegion : struct {
+    base: u64,
+    size: u64,
+    owner: FixedString[64],
+    purpose: FixedString[128],
+    is_kernel_reserved: bool,
+    is_hardware: bool,
+    registration_id: Word32,
+}
+
+impl ReservedRegion {
+    pub fn new(
+        base: u64,
+        size: u64,
+        owner: FixedString[64],
+        purpose: FixedString[128],
+        is_hardware: bool,
+    ) -> ReservedRegion
+        effects: [deterministic]
+    {
+        ReservedRegion {
+            base: base,
+            size: size,
+            owner: owner,
+            purpose: purpose,
+            is_kernel_reserved: !is_hardware,
+            is_hardware: is_hardware,
+            registration_id: Word32::initial(),
+        }
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.base + self.size
+    }
+
+    pub fn contains(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        addr >= self.base && addr < self.base + self.size
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Topology Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-TOPO-001 through MEM-MMAP-TOPO-020
+
+pub type MemoryController : struct {
+    controller_id: u32,
+    base_address: u64,
+    size: u64,
+    channel_count: u32,
+    dimm_count: u32,
+    numa_node: NumaNodeId,
+}
+
+impl MemoryController {
+    pub fn new(id: u32) -> MemoryController
+        effects: [deterministic]
+    {
+        MemoryController {
+            controller_id: id,
+            base_address: 0,
+            size: 0,
+            channel_count: 0,
+            dimm_count: 0,
+            numa_node: NumaNodeId::zero(),
+        }
+    }
+}
+
+pub type DimSlot : struct {
+    slot_id: u32,
+    controller_id: u32,
+    size_mb: u32,
+    memory_type: u8,
+    speed_mhz: u32,
+    is_populated: bool,
+    is_bad: bool,
+    serial_number: Word64,
+}
+
+impl DimSlot {
+    pub fn new(slot_id: u32) -> DimSlot
+        effects: [deterministic]
+    {
+        DimSlot {
+            slot_id: slot_id,
+            controller_id: 0,
+            size_mb: 0,
+            memory_type: 0,
+            speed_mhz: 0,
+            is_populated: false,
+            is_bad: false,
+            serial_number: Word64::zero(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// EFI Memory Map Descriptor (raw from firmware)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-EFI-001 through MEM-MMAP-EFI-015
+
+pub type EfiMemoryDescriptor : struct {
+    type_: u32,
+    physical_start: u64,
+    virtual_start: u64,
+    number_of_pages: u64,
+    attribute: u64,
+}
+
+impl EfiMemoryDescriptor {
+    pub fn new() -> EfiMemoryDescriptor
+        effects: [deterministic]
+    {
+        EfiMemoryDescriptor {
+            type_: 0,
+            physical_start: 0,
+            virtual_start: 0,
+            number_of_pages: 0,
+            attribute: 0,
+        }
+    }
+
+    pub fn size_bytes(self) -> u64
+        effects: [deterministic]
+    {
+        self.number_of_pages * 4096
+    }
+
+    pub fn end(self) -> u64
+        effects: [deterministic]
+    {
+        self.physical_start + self.size_bytes()
+    }
+
+    pub fn is_available(self) -> bool
+        effects: [deterministic]
+    {
+        self.type_ == EFI_CONVENTIONAL_MEMORY ||
+        self.type_ == EFI_LOADER_CODE ||
+        self.type_ == EFI_LOADER_DATA
+    }
+
+    pub fn is_persistent(self) -> bool
+        effects: [deterministic]
+    {
+        self.type_ == EFI_PERSISTENT_MEMORY
+    }
+
+    pub fn is_runtime(self) -> bool
+        effects: [deterministic]
+    {
+        (self.attribute & EFI_MEMORY_RUNTIME) != 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Memory Map (Main Structure)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-CORE-001 through MEM-MMAP-CORE-120
+
+pub type MemoryMap : struct {
+    regions: FixedArray[MAX_MEMORY_REGIONS, MemoryRegion],
+    num_regions: u32,
+    holes: FixedArray[MAX_MEMORY_HOLES, MemoryHole],
+    num_holes: u32,
+    reserved_regions: FixedArray[MAX_RESERVED_REGIONS_MMAP, ReservedRegion],
+    num_reserved: u32,
+    acpi_reclaim_regions: FixedArray[MAX_ACPI_RECLAIM_REGIONS, MemoryRegion],
+    num_acpi_reclaim: u32,
+    acpi_nvs_regions: FixedArray[MAX_ACPI_NVS_REGIONS, MemoryRegion],
+    num_acpi_nvs: u32,
+    controllers: FixedArray[MAX_MEMORY_CONTROLLERS, MemoryController],
+    num_controllers: u32,
+    dimm_slots: FixedArray[MAX_DIMM_SLOTS, DimSlot],
+    num_dimm_slots: u32,
+    total_physical_memory: u64,
+    available_memory: u64,
+    reserved_memory: u64,
+    acpi_reclaimable_memory: u64,
+    generation: Word32,
+}
+
+impl MemoryMap {
+    pub fn new() -> MemoryMap
+        effects: [deterministic]
+    {
+        MemoryMap {
+            regions: FixedArray::new(),
+            num_regions: 0,
+            holes: FixedArray::new(),
+            num_holes: 0,
+            reserved_regions: FixedArray::new(),
+            num_reserved: 0,
+            acpi_reclaim_regions: FixedArray::new(),
+            num_acpi_reclaim: 0,
+            acpi_nvs_regions: FixedArray::new(),
+            num_acpi_nvs: 0,
+            controllers: FixedArray::new(),
+            num_controllers: 0,
+            dimm_slots: FixedArray::new(),
+            num_dimm_slots: 0,
+            total_physical_memory: 0,
+            available_memory: 0,
+            reserved_memory: 0,
+            acpi_reclaimable_memory: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // EFI Memory Map Parsing
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-EFI-PARSE-001 through MEM-MMAP-EFI-PARSE-030
+
+    pub fn parse_efi_memory_map(self: ref mut,
+                                  descriptors: FixedArray[256, EfiMemoryDescriptor],
+                                  num_descriptors: u32)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if num_descriptors > 256 {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_PARSE_ERROR,
+                FixedString[128]::from_slice("Too many EFI descriptors")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_descriptors
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_descriptors {
+            let desc: ref EfiMemoryDescriptor = descriptors.get(i)
+            let base: u64 = desc.physical_start
+            let size: u64 = desc.size_bytes()
+            if size == 0 {
+                continue
+            }
+            let region: MemoryRegion = MemoryRegion::with_efi(
+                base, size, desc.type_, desc.attribute)
+            self.add_region(region)?;
+            if desc.is_available() {
+                self.available_memory = self.available_memory + size
+            } else if desc.is_persistent() {
+                self.reserved_memory = self.reserved_memory + size
+            } else if desc.type_ == EFI_ACPI_RECLAIM_MEMORY {
+                self.acpi_reclaimable_memory = self.acpi_reclaimable_memory + size
+            }
+            self.total_physical_memory = self.total_physical_memory + size
+        }
+        // Consolidate adjacent regions
+        self.consolidate_regions()?;
+        // Detect memory holes
+        self.detect_holes()?;
+        self.generation.bump();
+        self.record_efi_parse_residual(num_descriptors)
+        Result::Ok(())
+    }
+
+    pub fn parse_efi_raw(self: ref mut, raw_data: Byte[], num_entries: u32,
+                          descriptor_size: u32)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if descriptor_size < 32 || descriptor_size > 256 {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_PARSE_ERROR,
+                FixedString[128]::from_slice("Invalid EFI descriptor size")))
+        }
+        let mut descriptors: FixedArray[256, EfiMemoryDescriptor] = FixedArray::new()
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_entries
+        loop: bounds[BOUND_MEDIUM] for i in 0..num_entries {
+            let offset: u32 = i * descriptor_size
+            if (offset as u64) + 32 > raw_data.len() as u64 {
+                break
+            }
+            // trust: parse raw EFI memory descriptor bytes
+            let desc: EfiMemoryDescriptor = trusted("EFI raw descriptor parsing") {
+                EfiMemoryDescriptor {
+                    type_: __builtin_read_u32(raw_data, offset),
+                    physical_start: __builtin_read_u64(raw_data, offset + 4),
+                    virtual_start: __builtin_read_u64(raw_data, offset + 12),
+                    number_of_pages: __builtin_read_u64(raw_data, offset + 20),
+                    attribute: __builtin_read_u64(raw_data, offset + 28),
+                }
+            }
+            descriptors.push(desc)
+        }
+        let num_parsed: u32 = descriptors.len()
+        self.parse_efi_memory_map(descriptors, num_parsed)
+    }
+
+    // ──────────────────────────────────────────────
+    // Region Management
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-REGION-001 through MEM-MMAP-REGION-035
+
+    pub fn add_region(self: ref mut, region: MemoryRegion)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_regions >= MAX_MEMORY_REGIONS {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_FULL,
+                FixedString[128]::from_slice("Max memory regions reached")))
+        }
+        // Check for overlaps
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+            let existing: ref MemoryRegion = self.regions.get(i)
+            if region.overlaps(existing) {
+                // If they overlap, we may need to split or merge
+                // For now, just skip if the existing is more specific
+                if existing.is_reserved() && region.is_usable() {
+                    // Keep the reserved classification
+                    return Result::Ok(())
+                }
+            }
+        }
+        self.regions.push(region);
+        self.num_regions = self.num_regions + 1
+        if region.region_type == Region_ACPI_Reclaim {
+            self.add_acpi_reclaim_region(region)?;
+        } else if region.region_type == Region_ACPI_NVS {
+            self.add_acpi_nvs_region(region)?;
+        }
+        self.generation.bump();
+        Result::Ok(())
+    }
+
+    pub fn add_reserved_region(self: ref mut, reserved: ReservedRegion)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_reserved >= MAX_RESERVED_REGIONS_MMAP {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_FULL,
+                FixedString[128]::from_slice("Max reserved regions reached")))
+        }
+        self.reserved_regions.push(reserved);
+        self.num_reserved = self.num_reserved + 1
+        self.reserved_memory = self.reserved_memory + reserved.size
+        self.generation.bump();
+        self.record_reserved_add_residual(reserved.base, reserved.size)
+        Result::Ok(())
+    }
+
+    fn add_acpi_reclaim_region(self: ref mut, region: MemoryRegion)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_acpi_reclaim >= MAX_ACPI_RECLAIM_REGIONS {
+            return Result::Ok(())  // Silently skip; ACPI reclaim is optional
+        }
+        self.acpi_reclaim_regions.push(region);
+        self.num_acpi_reclaim = self.num_acpi_reclaim + 1
+        Result::Ok(())
+    }
+
+    fn add_acpi_nvs_region(self: ref mut, region: MemoryRegion)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_acpi_nvs >= MAX_ACPI_NVS_REGIONS {
+            return Result::Ok(())
+        }
+        self.acpi_nvs_regions.push(region);
+        self.num_acpi_nvs = self.num_acpi_nvs + 1
+        Result::Ok(())
+    }
+
+    fn consolidate_regions(self: ref mut) -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_regions == 0 {
+            return Result::Ok(())
+        }
+        // Sort regions by base address (simple insertion sort)
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+        loop: bounds[BOUND_MEDIUM] for i in 1..self.num_regions {
+            let mut j: u32 = i
+            // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+            loop: bounds[BOUND_MEDIUM] for k in 0..i {
+                let prev: ref MemoryRegion = self.regions.get(j - 1)
+                let curr: ref MemoryRegion = self.regions.get(j)
+                if prev.base > curr.base {
+                    let temp: MemoryRegion = prev
+                    self.regions.set(j - 1, curr)
+                    self.regions.set(j, temp)
+                    if j > 1 {
+                        j = j - 1
+                    } else {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+        }
+        // Merge adjacent regions of same type
+        let mut i: u32 = 1
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+        loop: bounds[BOUND_MEDIUM] for _ in 1..self.num_regions {
+            if i >= self.num_regions {
+                break
+            }
+            let prev: ref MemoryRegion = self.regions.get(i - 1)
+            let curr: ref MemoryRegion = self.regions.get(i)
+            if prev.region_type == curr.region_type && prev.end() == curr.base {
+                let merged: MemoryRegion = prev.merge(curr)?
+                self.regions.set(i - 1, merged)
+                // Shift subsequent regions down
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining regions
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_regions - 1) {
+                    let next: MemoryRegion = self.regions.get(j + 1)
+                    self.regions.set(j, next)
+                }
+                self.num_regions = self.num_regions - 1
+            } else {
+                i = i + 1
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Memory Hole Detection
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-HOLE-DETECT-001 through MEM-MMAP-HOLE-DETECT-020
+
+    fn detect_holes(self: ref mut) -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_regions < 2 {
+            return Result::Ok(())
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions - 1
+        loop: bounds[BOUND_MEDIUM] for i in 0..(self.num_regions - 1) {
+            let current: ref MemoryRegion = self.regions.get(i)
+            let next: ref MemoryRegion = self.regions.get(i + 1)
+            let gap_start: u64 = current.end()
+            let gap_end: u64 = next.base
+            if gap_end > gap_start {
+                let hole_size: u64 = gap_end - gap_start
+                if hole_size >= 4096 {
+                    // Only record holes >= 4KB
+                    let hole: MemoryHole = MemoryHole::new(
+                        gap_start, hole_size, 0)  // 0 = from EFI map
+                    self.holes.push(hole);
+                    self.num_holes = self.num_holes + 1
+                    if self.num_holes >= MAX_MEMORY_HOLES {
+                        break
+                    }
+                }
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn detect_holes_by_probing(self: ref mut, start: u64, end: u64)
+        -> Result<(), MemoryError>
+        effects: [deterministic, io]
+    {
+        // Probe memory regions for accessibility
+        let mut probe_addr: u64 = start
+        // loop: bounds[BOUND_LARGE] — bounded by range / 4KB
+        loop: bounds[BOUND_LARGE] for i in 0..(1024 * 1024) {
+            if probe_addr >= end {
+                break
+            }
+            // trust: probe memory by attempting read, catching faults
+            let accessible: bool = trusted("memory probe: test accessibility") {
+                __builtin_probe_memory(probe_addr)
+            }
+            if !accessible {
+                // Found a hole
+                let hole_start: u64 = probe_addr
+                let mut hole_size: u64 = 0
+                // loop: bounds[BOUND_MEDIUM] — bounded hole search
+                loop: bounds[BOUND_MEDIUM] for j in 0..1024 {
+                    probe_addr = probe_addr + 4096
+                    if probe_addr >= end {
+                        break
+                    }
+                    let acc: bool = trusted("memory probe: continue hole detection") {
+                        __builtin_probe_memory(probe_addr)
+                    }
+                    if acc {
+                        break
+                    }
+                    hole_size = hole_size + 4096
+                }
+                let hole: MemoryHole = MemoryHole::new(hole_start, hole_size, 1)
+                self.holes.push(hole);
+                self.num_holes = self.num_holes + 1
+                if self.num_holes >= MAX_MEMORY_HOLES {
+                    break
+                }
+            } else {
+                probe_addr = probe_addr + (64 * 1024)  // Skip 64KB at a time for speed
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-QUERY-001 through MEM-MMAP-QUERY-030
+
+    pub fn find_region(self, addr: u64) -> Result[ref MemoryRegion, MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+            let region: ref MemoryRegion = self.regions.get(i)
+            if region.contains(addr) {
+                return Result::Ok(region)
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_MMAP_INVALID_REG,
+            FixedString[128]::from_slice("Address not in any region")))
+    }
+
+    pub fn find_region_mut(self: ref mut, addr: u64)
+        -> Result[ref mut MemoryRegion, MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+            let region: ref MemoryRegion = self.regions.get(i)
+            if region.contains(addr) {
+                return Result::Ok(self.regions.get_mut(i))
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_MMAP_INVALID_REG,
+            FixedString[128]::from_slice("Address not in any region")))
+    }
+
+    pub fn find_largest_usable_region(self) -> Result[MemoryRegion, MemoryError>
+        effects: [deterministic]
+    {
+        let mut largest: MemoryRegion = MemoryRegion::new(0, 0, Region_Conventional)
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+            let region: ref MemoryRegion = self.regions.get(i)
+            if region.is_usable() && region.size > largest.size {
+                largest = region
+            }
+        }
+        if largest.size == 0 {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_INVALID_REG,
+                FixedString[128]::from_slice("No usable memory regions")))
+        }
+        Result::Ok(largest)
+    }
+
+    pub fn get_region_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_regions
+    }
+
+    pub fn get_region(self, index: u32) -> Result[ref MemoryRegion, MemoryError>
+        effects: [deterministic]
+    {
+        if index >= self.num_regions {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_BOUNDS,
+                FixedString[128]::from_slice("Region index out of bounds")))
+        }
+        // trust: index bounds-checked
+        trusted("region access: index within range") {
+            Result::Ok(self.regions.get(index))
+        }
+    }
+
+    pub fn is_address_usable(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        let region_result: Result[ref MemoryRegion, MemoryError> = self.find_region(addr)
+        match region_result {
+            Result::Ok(region) => {
+                region.is_usable() && !self.is_address_reserved(addr)
+            },
+            Result::Err(_) => false,
+        }
+    }
+
+    pub fn is_address_reserved(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_reserved
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_reserved {
+            let reserved: ref ReservedRegion = self.reserved_regions.get(i)
+            if reserved.contains(addr) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn is_in_hole(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_holes
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_holes {
+            let hole: ref MemoryHole = self.holes.get(i)
+            if hole.contains(addr) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn region_at(self, addr: u64) -> MemoryRegionType
+        effects: [deterministic]
+    {
+        let result: Result[ref MemoryRegion, MemoryError> = self.find_region(addr)
+        match result {
+            Result::Ok(region) => region.region_type,
+            Result::Err(_) => Region_Hole,
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Topology Management
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-TOPO-MGMT-001 through MEM-MMAP-TOPO-MGMT-025
+
+    pub fn add_controller(self: ref mut, controller: MemoryController)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_controllers >= MAX_MEMORY_CONTROLLERS {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_TOPOLOGY,
+                FixedString[128]::from_slice("Max controllers reached")))
+        }
+        self.controllers.push(controller);
+        self.num_controllers = self.num_controllers + 1
+        Result::Ok(())
+    }
+
+    pub fn add_dimm(self: ref mut, dimm: DimSlot)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_dimm_slots >= MAX_DIMM_SLOTS {
+            return Result::Err(mem_ppa_error(
+                DIAG_MMAP_TOPOLOGY,
+                FixedString[128]::from_slice("Max DIMM slots reached")))
+        }
+        self.dimm_slots.push(dimm);
+        self.num_dimm_slots = self.num_dimm_slots + 1
+        Result::Ok(())
+    }
+
+    pub fn mark_address_bad(self: ref mut, addr: u64)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        let result: Result[ref mut MemoryRegion, MemoryError> = self.find_region_mut(addr)
+        match result {
+            Result::Ok(region) => {
+                region.is_bad = true
+                region.region_type = Region_Bad
+                self.generation.bump();
+                self.record_bad_memory_residual(addr)
+                Result::Ok(())
+            },
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // ACPI Reclaim Regions
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-ACPI-001 through MEM-MMAP-ACPI-015
+
+    pub fn get_acpi_reclaim_regions(self) -> FixedArray[MAX_ACPI_RECLAIM_REGIONS, MemoryRegion]
+        effects: [deterministic]
+    {
+        self.acpi_reclaim_regions
+    }
+
+    pub fn get_acpi_nvs_regions(self) -> FixedArray[MAX_ACPI_NVS_REGIONS, MemoryRegion]
+        effects: [deterministic]
+    {
+        self.acpi_nvs_regions
+    }
+
+    pub fn reclaim_acpi_region(self: ref mut, region_base: u64)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_acpi_reclaim
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_acpi_reclaim {
+            let region: ref MemoryRegion = self.acpi_reclaim_regions.get(i)
+            if region.base == region_base {
+                // Change type to conventional
+                let map_region: ref mut MemoryRegion = self.find_region_mut(region_base)?
+                map_region.region_type = Region_Conventional
+                self.available_memory = self.available_memory + region.size
+                self.acpi_reclaimable_memory = self.acpi_reclaimable_memory - region.size
+                self.generation.bump();
+                self.record_acpi_reclaim_residual(region_base)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_MMAP_INVALID_REG,
+            FixedString[128]::from_slice("ACPI reclaim region not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Memory Statistics
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-STATS-001 through MEM-MMAP-STATS-015
+
+    pub fn total_physical_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_physical_memory
+    }
+
+    pub fn available_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.available_memory
+    }
+
+    pub fn reserved_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.reserved_memory
+    }
+
+    pub fn acpi_reclaimable_memory(self) -> u64
+        effects: [deterministic]
+    {
+        self.acpi_reclaimable_memory
+    }
+
+    pub fn hole_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_holes
+    }
+
+    pub fn hole_total_size(self) -> u64
+        effects: [deterministic]
+    {
+        let mut total: u64 = 0
+        // loop: bounds[BOUND_SMALL] — bounded by num_holes
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_holes {
+            let hole: ref MemoryHole = self.holes.get(i)
+            total = total + hole.size
+        }
+        total
+    }
+
+    pub fn usable_memory_fraction(self) -> u8
+        effects: [deterministic]
+    {
+        if self.total_physical_memory == 0 {
+            return 0
+        }
+        ((self.available_memory * 100) / self.total_physical_memory) as u8
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-MMAP-RESID-001 through MEM-MMAP-RESID-015
+
+    fn record_efi_parse_residual(self, num_descriptors: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "EFI memory map parsed",
+            code: DIAG_MMAP_OK,
+            data: (num_descriptors, self.total_physical_memory,
+                   self.available_memory),
+        )
+    }
+
+    fn record_reserved_add_residual(self, base: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Reserved region added",
+            code: DIAG_MMAP_OK,
+            data: (base, size),
+        )
+    }
+
+    fn record_acpi_reclaim_residual(self, base: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "ACPI region reclaimed",
+            code: DIAG_MMAP_OK,
+            data: base,
+        )
+    }
+
+    fn record_bad_memory_residual(self, addr: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Memory marked bad",
+            code: DIAG_MMAP_OK,
+            data: addr,
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module Init Functions
+// ──────────────────────────────────────────────
+// Evidence path: MEM-MMAP-INIT-001 through MEM-MMAP-INIT-015
+
+pub fn init_memory_map(efi_descriptors: FixedArray[256, EfiMemoryDescriptor],
+                        num_descriptors: u32)
+    -> MemoryMap
+    effects: [deterministic]
+{
+    let mut mmap: MemoryMap = MemoryMap::new()
+    let parse_result: Result[(), MemoryError> = mmap.parse_efi_memory_map(
+        efi_descriptors, num_descriptors)
+    // If parsing fails, return minimal map with a single region
+    match parse_result {
+        Result::Ok(_) => {},
+        Result::Err(_) => {
+            // Fallback: create a single conventional region from 1MB to 1GB
+            let fallback: MemoryRegion = MemoryRegion::new(
+                0x10_0000, 0x3FF0_0000, Region_Conventional)
+            let _ = mmap.add_region(mmap)
+        },
+    }
+    mmap
+}
+
+// Detect the total physical memory from a memory map
+pub fn detect_total_memory(mmap: ref MemoryMap) -> u64
+    effects: [deterministic]
+{
+    mmap.total_physical_memory()
+}
+
+// Find a suitable region for kernel loading
+pub fn find_kernel_region(mmap: ref MemoryMap, min_size: u64)
+    -> Result[MemoryRegion, MemoryError>
+    effects: [deterministic]
+{
+    // loop: bounds[BOUND_MEDIUM] — bounded by region count
+    loop: bounds[BOUND_MEDIUM] for i in 0..mmap.num_regions {
+        let region: ref MemoryRegion = mmap.regions.get(i)
+        if region.is_usable() && region.size >= min_size && region.base >= 0x10_0000 {
+            // Prefer regions above 1MB (below that is often used by firmware)
+            return Result::Ok(region)
+        }
+    }
+    mmap.find_largest_usable_region()
+}

@@ -1,0 +1,1097 @@
+// file: paging.phor
+// purpose: Page fault handling: fault types, demand paging, copy-on-write,
+//          page reclamation, swapping interface, fault statistics. All
+//          operations use bounded loops and record residuals for all
+//          page fault events and page state changes.
+// evidence: MEM-PAG-ARCH-001 through MEM-PAG-ARCH-240
+// residual: Every page fault, reclaim, COW, and swap operation records a residual.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use memory::phys_page_allocator::*
+use memory::virtual_memory::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-DIAG-001 through MEM-PAG-DIAG-010
+
+const DIAG_PAG_BASE        : Word64 = Word64::from_u64(0xA400)
+const DIAG_PAG_OK          : Word64 = DIAG_PAG_BASE | 0x000
+const DIAG_PAG_FAULT       : Word64 = DIAG_PAG_BASE | 0x001
+const DIAG_PAG_NOMEM       : Word64 = DIAG_PAG_BASE | 0x002
+const DIAG_PAG_INVALID     : Word64 = DIAG_PAG_BASE | 0x003
+const DIAG_PAG_PERM        : Word64 = DIAG_PAG_BASE | 0x004
+const DIAG_PAG_COW_FAIL    : Word64 = DIAG_PAG_BASE | 0x005
+const DIAG_PAG_SWAP_FAIL   : Word64 = DIAG_PAG_BASE | 0x006
+const DIAG_PAG_RECLAIM     : Word64 = DIAG_PAG_BASE | 0x007
+const DIAG_PAG_BOUNDS      : Word64 = DIAG_PAG_BASE | 0x008
+
+// ──────────────────────────────────────────────
+// Page Fault Constants
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-CONST-001 through MEM-PAG-CONST-015
+
+const MAX_PAGE_FAULT_HANDLERS  : u32 = 16
+const MAX_SWAP_DEVICES          : u32 = 8
+const MAX_SWAP_SLOTS            : u32 = 4096
+const MAX_RECLAIM_PAGES         : u32 = 64
+const RECLAIM_BATCH_SIZE        : u32 = 16
+const COW_PAGE_RESERVE          : u32 = 32
+const SWAP_PAGE_SIZE            : u64 = 4096
+const SWAP_SIGNATURE            : u64 = 0x50484F5253574150  // "PHORSWAP"
+const PAGE_AGE_MAX              : u8 = 255
+const PAGE_AGE_INITIAL          : u8 = 128
+const RECLAIM_THRESHOLD         : u8 = 80   // Reclaim starts at 80% utilization
+const RECLAIM_AGGRESSIVE        : u8 = 95   // Aggressive reclaim at 95%
+const MAX_FAULT_STAT_ENTRIES    : u32 = 64
+
+// ──────────────────────────────────────────────
+// Page Fault Types (x86_64 error code bits)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-FTYPE-001 through MEM-PAG-FTYPE-010
+
+pub type PageFaultType : u8 = enum {
+    Fault_NotPresent  = 0,  // Page not present (PF flag 0)
+    Fault_Protection  = 1,  // Page-level protection violation (PF flag 1)
+    Fault_Write       = 2,  // Write access (PF flag 2)
+    Fault_User        = 3,  // User-mode access (PF flag 4)
+    Fault_Reserved    = 4,  // Reserved bit violation (PF flag 8)
+    Fault_Instruction = 5,  // Instruction fetch (PF flag 16)
+    Fault_ProtectionKey = 6, // Protection key violation (PF flag 32)
+    Fault_Cow         = 7,  // Copy-on-write (write to read-only)
+    Fault_Demand      = 8,  // Demand page fill
+    Fault_Swap        = 9,  // Page is swapped out
+}
+
+// ──────────────────────────────────────────────
+// Page Fault Error Code (x86_64)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-ERRCODE-001 through MEM-PAG-ERRCODE-010
+
+pub type PageFaultErrorCode : u64 = struct {
+    value: u64,
+}
+
+impl PageFaultErrorCode {
+    pub fn new(value: u64) -> PageFaultErrorCode
+        effects: [deterministic]
+    {
+        PageFaultErrorCode { value: value }
+    }
+
+    pub fn is_present(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x01) != 0
+    }
+
+    pub fn is_write(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x02) != 0
+    }
+
+    pub fn is_user(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x04) != 0
+    }
+
+    pub fn is_reserved_bit(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x08) != 0
+    }
+
+    pub fn is_instruction_fetch(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x10) != 0
+    }
+
+    pub fn is_protection_key(self) -> bool
+        effects: [deterministic]
+    {
+        (self.value & 0x20) != 0
+    }
+
+    pub fn to_fault_type(self) -> PageFaultType
+        effects: [deterministic]
+    {
+        if self.is_reserved_bit() {
+            PageFaultType::Fault_Reserved
+        } else if self.is_protection_key() {
+            PageFaultType::Fault_ProtectionKey
+        } else if self.is_instruction_fetch() {
+            PageFaultType::Fault_Instruction
+        } else if self.is_user() && self.is_write() && !self.is_present() {
+            PageFaultType::Fault_Demand
+        } else if self.is_write() && self.is_present() {
+            PageFaultType::Fault_Cow
+        } else if !self.is_present() {
+            PageFaultType::Fault_NotPresent
+        } else {
+            PageFaultType::Fault_Protection
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Swap Slot
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-SWAP-001 through MEM-PAG-SWAP-020
+
+pub type SwapSlot : struct {
+    slot_id: u32,
+    device_id: u32,
+    block_offset: u64,
+    is_used: bool,
+    owning_pfn: PhysicalPageNumber,
+    generation: Word32,
+}
+
+impl SwapSlot {
+    pub fn new(slot_id: u32, device_id: u32) -> SwapSlot
+        effects: [deterministic]
+    {
+        SwapSlot {
+            slot_id: slot_id,
+            device_id: device_id,
+            block_offset: 0,
+            is_used: false,
+            owning_pfn: PhysicalPageNumber::new(0),
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn allocate(self: ref mut, pfn: PhysicalPageNumber, offset: u64)
+        effects: [deterministic]
+    {
+        self.is_used = true
+        self.owning_pfn = pfn
+        self.block_offset = offset
+    }
+
+    pub fn release(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_used = false
+        self.owning_pfn = PhysicalPageNumber::new(0)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Swap Device
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-SWAPDEV-001 through MEM-PAG-SWAPDEV-015
+
+pub type SwapDevice : struct {
+    device_id: u32,
+    total_slots: u32,
+    used_slots: u32,
+    slot_size: u64,
+    is_active: bool,
+    device_handle: Handle,
+}
+
+impl SwapDevice {
+    pub fn new(device_id: u32, total_slots: u32, slot_size: u64,
+               handle: Handle) -> SwapDevice
+        effects: [deterministic]
+    {
+        SwapDevice {
+            device_id: device_id,
+            total_slots: total_slots,
+            used_slots: 0,
+            slot_size: slot_size,
+            is_active: true,
+            device_handle: handle,
+        }
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.total_slots == 0 {
+            return 0
+        }
+        ((self.used_slots as u64) * 100 / (self.total_slots as u64)) as u8
+    }
+
+    pub fn has_free_slots(self) -> bool
+        effects: [deterministic]
+    {
+        self.used_slots < self.total_slots
+    }
+}
+
+// ──────────────────────────────────────────────
+// Swap Manager
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-SWAPMGR-001 through MEM-PAG-SWAPMGR-030
+
+pub type SwapManager : struct {
+    devices: FixedArray[MAX_SWAP_DEVICES, SwapDevice],
+    num_devices: u32,
+    slots: FixedArray[MAX_SWAP_SLOTS, SwapSlot],
+    num_slots: u32,
+    swap_in_count: u64,
+    swap_out_count: u64,
+    swap_fail_count: u64,
+    generation: Word32,
+}
+
+impl SwapManager {
+    pub fn new() -> SwapManager
+        effects: [deterministic]
+    {
+        SwapManager {
+            devices: FixedArray::new(),
+            num_devices: 0,
+            slots: FixedArray::new(),
+            num_slots: 0,
+            swap_in_count: 0,
+            swap_out_count: 0,
+            swap_fail_count: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn add_device(self: ref mut, device: SwapDevice)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_devices >= MAX_SWAP_DEVICES {
+            return Result::Err(mem_ppa_error(
+                DIAG_PAG_SWAP_FAIL,
+                FixedString[128]::from_slice("Max swap devices reached")))
+        }
+        self.devices.push(device);
+        self.num_devices = self.num_devices + 1
+        Result::Ok(())
+    }
+
+    pub fn swap_out(self: ref mut, pfn: PhysicalPageNumber)
+        -> Result[u32, MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        // Find a free slot
+        // loop: bounds[BOUND_LARGE] — bounded by num_slots (<=4096)
+        loop: bounds[BOUND_LARGE] for i in 0..self.num_slots {
+            let slot: ref SwapSlot = self.slots.get(i)
+            if !slot.is_used {
+                // Allocate this slot
+                let slot_mut: ref mut SwapSlot = self.slots.get_mut(i)
+                let device_id: u32 = 0  // Use first device for now
+                let offset: u64 = (i as u64) * SWAP_PAGE_SIZE
+                slot_mut.allocate(pfn, offset);
+                // Write page to swap device (I/O operation)
+                let data_addr: u64 = pfn.to_address()
+                // trust: write physical memory to swap device
+                trusted("swap out: write page to swap device") {
+                    let device: ref SwapDevice = self.devices.get(0)
+                    __builtin_swap_write(device.device_handle, offset, data_addr)
+                }
+                // Update device tracking
+                let dev: ref mut SwapDevice = self.devices.get_mut(device_id)
+                dev.used_slots = dev.used_slots + 1
+                self.swap_out_count = self.swap_out_count + 1
+                self.generation.bump();
+                self.record_swap_out_residual(pfn, i)
+                return Result::Ok(i)
+            }
+        }
+        self.swap_fail_count = self.swap_fail_count + 1
+        Result::Err(mem_ppa_error(
+            DIAG_PAG_SWAP_FAIL,
+            FixedString[128]::from_slice("No free swap slots")))
+    }
+
+    pub fn swap_in(self: ref mut, slot_id: u32, dest_pfn: PhysicalPageNumber)
+        -> Result[(), MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        if slot_id >= self.num_slots {
+            return Result::Err(mem_ppa_error(
+                DIAG_PAG_SWAP_FAIL,
+                FixedString[128]::from_slice("Invalid swap slot ID")))
+        }
+        let slot: ref mut SwapSlot = self.slots.get_mut(slot_id)
+        if !slot.is_used {
+            return Result::Err(mem_ppa_error(
+                DIAG_PAG_SWAP_FAIL,
+                FixedString[128]::from_slice("Swap slot not in use")))
+        }
+        let data_addr: u64 = dest_pfn.to_address()
+        // trust: read page from swap device
+        trusted("swap in: read page from swap device") {
+            let device: ref SwapDevice = self.devices.get(slot.device_id)
+            __builtin_swap_read(device.device_handle, slot.block_offset, data_addr)
+        }
+        let dev: ref mut SwapDevice = self.devices.get_mut(slot.device_id)
+        dev.used_slots = dev.used_slots - 1
+        slot.release();
+        self.swap_in_count = self.swap_in_count + 1
+        self.generation.bump();
+        self.record_swap_in_residual(slot_id, dest_pfn)
+        Result::Ok(())
+    }
+
+    pub fn slot_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_slots
+    }
+
+    pub fn add_slots(self: ref mut, count: u32)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_slots + count > MAX_SWAP_SLOTS {
+            return Result::Err(mem_ppa_error(
+                DIAG_PAG_BOUNDS,
+                FixedString[128]::from_slice("Max swap slots exceeded")))
+        }
+        let start_id: u32 = self.num_slots
+        // loop: bounds[BOUND_LARGE] — bounded by count
+        loop: bounds[BOUND_LARGE] for i in 0..count {
+            let slot: SwapSlot = SwapSlot::new(start_id + i, 0)
+            self.slots.push(slot);
+            self.num_slots = self.num_slots + 1
+        }
+        Result::Ok(())
+    }
+
+    fn record_swap_out_residual(self, pfn: PhysicalPageNumber, slot: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page swapped out",
+            code: DIAG_PAG_OK,
+            data: (pfn.value(), slot),
+        )
+    }
+
+    fn record_swap_in_residual(self, slot: u32, pfn: PhysicalPageNumber)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page swapped in",
+            code: DIAG_PAG_OK,
+            data: (slot, pfn.value()),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Fault Statistics
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-STATS-001 through MEM-PAG-STATS-020
+
+pub type PageFaultStats : struct {
+    total_faults: u64,
+    not_present_faults: u64,
+    protection_faults: u64,
+    cow_faults: u64,
+    demand_faults: u64,
+    swap_faults: u64,
+    user_faults: u64,
+    kernel_faults: u64,
+    resolved_faults: u64,
+    unresolved_faults: u64,
+    last_fault_addr: u64,
+    last_fault_type: PageFaultType,
+    faults_per_second: u32,
+    peak_fault_rate: u32,
+    generation: Word32,
+}
+
+impl PageFaultStats {
+    pub fn new() -> PageFaultStats
+        effects: [deterministic]
+    {
+        PageFaultStats {
+            total_faults: 0,
+            not_present_faults: 0,
+            protection_faults: 0,
+            cow_faults: 0,
+            demand_faults: 0,
+            swap_faults: 0,
+            user_faults: 0,
+            kernel_faults: 0,
+            resolved_faults: 0,
+            unresolved_faults: 0,
+            last_fault_addr: 0,
+            last_fault_type: PageFaultType::Fault_NotPresent,
+            faults_per_second: 0,
+            peak_fault_rate: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn record_fault(self: ref mut, addr: u64, fault_type: PageFaultType,
+                         is_user: bool, resolved: bool)
+        effects: [deterministic]
+    {
+        self.total_faults = self.total_faults + 1
+        self.last_fault_addr = addr
+        self.last_fault_type = fault_type
+        match fault_type {
+            PageFaultType::Fault_NotPresent => {
+                self.not_present_faults = self.not_present_faults + 1
+            },
+            PageFaultType::Fault_Protection |
+            PageFaultType::Fault_Reserved |
+            PageFaultType::Fault_ProtectionKey => {
+                self.protection_faults = self.protection_faults + 1
+            },
+            PageFaultType::Fault_Cow => {
+                self.cow_faults = self.cow_faults + 1
+            },
+            PageFaultType::Fault_Demand => {
+                self.demand_faults = self.demand_faults + 1
+            },
+            PageFaultType::Fault_Swap => {
+                self.swap_faults = self.swap_faults + 1
+            },
+            _ => {},
+        }
+        if is_user {
+            self.user_faults = self.user_faults + 1
+        } else {
+            self.kernel_faults = self.kernel_faults + 1
+        }
+        if resolved {
+            self.resolved_faults = self.resolved_faults + 1
+        } else {
+            self.unresolved_faults = self.unresolved_faults + 1
+        }
+        self.generation.bump()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Reclamation State
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-RECLAIM-001 through MEM-PAG-RECLAIM-025
+
+pub type PageReclaimState : struct {
+    reclaim_count: u64,
+    last_reclaim_time: Word64,
+    pages_scanned: u64,
+    pages_freed: u64,
+    pages_swapped: u64,
+    threshold: u8,
+    is_active: bool,
+    generation: Word32,
+}
+
+impl PageReclaimState {
+    pub fn new() -> PageReclaimState
+        effects: [deterministic]
+    {
+        PageReclaimState {
+            reclaim_count: 0,
+            last_reclaim_time: Word64::zero(),
+            pages_scanned: 0,
+            pages_freed: 0,
+            pages_swapped: 0,
+            threshold: RECLAIM_THRESHOLD,
+            is_active: false,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn should_reclaim(self, utilization: u8) -> bool
+        effects: [deterministic]
+    {
+        utilization >= self.threshold
+    }
+
+    pub fn should_reclaim_aggressive(self, utilization: u8) -> bool
+        effects: [deterministic]
+    {
+        utilization >= RECLAIM_AGGRESSIVE
+    }
+
+    pub fn set_threshold(self: ref mut, threshold: u8)
+        effects: [deterministic]
+    {
+        if threshold >= 50 && threshold <= 100 {
+            self.threshold = threshold
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Fault Handler
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-HANDLER-001 through MEM-PAG-HANDLER-080
+
+pub type PageFaultHandler : struct {
+    stats: PageFaultStats,
+    reclaim_state: PageReclaimState,
+    swap_mgr: SwapManager,
+    vmm: Handle,  // Handle to the VirtualMemoryManager
+    cow_reserve: FixedArray[COW_PAGE_RESERVE, PhysicalPageNumber],
+    cow_reserve_count: u32,
+    generation: Word32,
+}
+
+impl PageFaultHandler {
+    pub fn new(vmm_handle: Handle) -> PageFaultHandler
+        effects: [deterministic]
+    {
+        PageFaultHandler {
+            stats: PageFaultStats::new(),
+            reclaim_state: PageReclaimState::new(),
+            swap_mgr: SwapManager::new(),
+            vmm: vmm_handle,
+            cow_reserve: FixedArray::new(),
+            cow_reserve_count: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Main Fault Handler
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-HANDLE-001 through MEM-PAG-HANDLE-040
+
+    pub fn handle_page_fault(self: ref mut, fault_addr: u64,
+                              error_code: PageFaultErrorCode,
+                              asid: AddressSpaceId,
+                              allocator_handle: Handle)
+        -> Result[bool, MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        let fault_type: PageFaultType = error_code.to_fault_type()
+        let is_user: bool = error_code.is_user()
+        let resolved: bool = match fault_type {
+            PageFaultType::Fault_Demand => {
+                self.handle_demand_fault(fault_addr, asid, allocator_handle)?
+            },
+            PageFaultType::Fault_Cow => {
+                self.handle_cow_fault(fault_addr, asid, allocator_handle)?
+            },
+            PageFaultType::Fault_NotPresent => {
+                // Check if swapped out
+                self.handle_not_present_fault(fault_addr, asid, allocator_handle)?
+            },
+            PageFaultType::Fault_Swap => {
+                self.handle_swap_fault(fault_addr, asid, allocator_handle)?
+            },
+            PageFaultType::Fault_Protection |
+            PageFaultType::Fault_ProtectionKey |
+            PageFaultType::Fault_Reserved => {
+                // Cannot resolve protection/reserved faults
+                false
+            },
+            PageFaultType::Fault_Instruction => {
+                self.handle_demand_fault(fault_addr, asid, allocator_handle)?
+            },
+        }
+        self.stats.record_fault(fault_addr, fault_type, is_user, resolved);
+        self.generation.bump();
+        self.record_fault_residual(fault_addr, fault_type as u8, resolved)
+        Result::Ok(resolved)
+    }
+
+    // ──────────────────────────────────────────────
+    // Demand Fault Handler
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-DEMAND-001 through MEM-PAG-DEMAND-025
+
+    fn handle_demand_fault(self: ref mut, fault_addr: u64,
+                            asid: AddressSpaceId,
+                            allocator_handle: Handle)
+        -> Result[bool, MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        let virt: VirtualAddress = VirtualAddress::new(fault_addr)
+        let aligned_virt: VirtualAddress = virt.align_down(PAGE_4K_SIZE)
+        // Allocate a physical page
+        // trust: use the buddy allocator handle to allocate
+        let pfn: PhysicalPageNumber = trusted("demand fault: allocate physical page") {
+            // Allocate via the memory manager
+            __builtin_alloc_page(allocator_handle)
+        }
+        // Map the page with read-write permissions
+        let perms: PagePermissions = PagePermissions::from_flags(true, true, true, true)
+        // trust: use VMM handle to map the page
+        trusted("demand fault: map page into address space") {
+            __builtin_vmm_map_page(self.vmm, asid, aligned_virt, pfn, perms, PAGE_4K_SIZE)
+        }
+        // Zero the page
+        // trust: zeroing newly allocated page
+        trusted("demand fault: zero the new page") {
+            __builtin_zero_page(pfn.to_address())
+        }
+        self.record_demand_fill_residual(aligned_virt, pfn)
+        Result::Ok(true)
+    }
+
+    // ──────────────────────────────────────────────
+    // Copy-on-Write Handler
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-COW-001 through MEM-PAG-COW-030
+
+    fn handle_cow_fault(self: ref mut, fault_addr: u64,
+                         asid: AddressSpaceId,
+                         allocator_handle: Handle)
+        -> Result[bool, MemoryError>
+        effects: [deterministic]
+    {
+        let virt: VirtualAddress = VirtualAddress::new(fault_addr)
+        let aligned_virt: VirtualAddress = virt.align_down(PAGE_4K_SIZE)
+        // Allocate a new physical page for the copy
+        let new_pfn: PhysicalPageNumber = trusted("COW fault: allocate new page") {
+            __builtin_alloc_page(allocator_handle)
+        }
+        // Get the original physical page from the current mapping
+        let old_pfn: PhysicalPageNumber = trusted("COW fault: translate original mapping") {
+            __builtin_vmm_translate(self.vmm, asid, aligned_virt)
+        }
+        // Copy the contents from old page to new page
+        // trust: copy physical memory for COW
+        trusted("COW fault: copy page contents") {
+            __builtin_copy_physical_page(old_pfn.to_address(), new_pfn.to_address())
+        }
+        // Remap with writable permissions
+        let perms: PagePermissions = PagePermissions::from_flags(true, true, true, true)
+        trusted("COW fault: remap page as writable") {
+            __builtin_vmm_map_page(self.vmm, asid, aligned_virt, new_pfn, perms, PAGE_4K_SIZE)
+        }
+        // Decrement refcount on old page (or free if last reference)
+        trusted("COW fault: release old page reference") {
+            __builtin_decrement_page_refcount(old_pfn)
+        }
+        self.record_cow_residual(aligned_virt, old_pfn, new_pfn)
+        Result::Ok(true)
+    }
+
+    // ──────────────────────────────────────────────
+    // Not Present Fault / Swap Fault
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-NP-001 through MEM-PAG-NP-020
+
+    fn handle_not_present_fault(self: ref mut, fault_addr: u64,
+                                 asid: AddressSpaceId,
+                                 allocator_handle: Handle)
+        -> Result[bool, MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        let virt: VirtualAddress = VirtualAddress::new(fault_addr)
+        let aligned_virt: VirtualAddress = virt.align_down(PAGE_4K_SIZE)
+        // Allocate a new page
+        let pfn: PhysicalPageNumber = trusted("not present fault: allocate page") {
+            __builtin_alloc_page(allocator_handle)
+        }
+        let perms: PagePermissions = PagePermissions::from_flags(true, true, true, true)
+        trusted("not present fault: map page") {
+            __builtin_vmm_map_page(self.vmm, asid, aligned_virt, pfn, perms, PAGE_4K_SIZE)
+        }
+        self.record_demand_fill_residual(aligned_virt, pfn)
+        Result::Ok(true)
+    }
+
+    fn handle_swap_fault(self: ref mut, fault_addr: u64,
+                          asid: AddressSpaceId,
+                          allocator_handle: Handle)
+        -> Result[bool, MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        let virt: VirtualAddress = VirtualAddress::new(fault_addr)
+        let aligned_virt: VirtualAddress = virt.align_down(PAGE_4K_SIZE)
+        // Look up swap slot from the page table metadata
+        let swap_slot: u32 = trusted("swap fault: read swap slot from PTE metadata") {
+            __builtin_read_pte_swap_slot(self.vmm, asid, aligned_virt)
+        }
+        // Allocate a page for the swap-in
+        let pfn: PhysicalPageNumber = trusted("swap fault: allocate page for swap-in") {
+            __builtin_alloc_page(allocator_handle)
+        }
+        // Read the page from swap
+        self.swap_mgr.swap_in(swap_slot, pfn)?;
+        // Map the page
+        let perms: PagePermissions = PagePermissions::from_flags(true, true, true, true)
+        trusted("swap fault: map restored page") {
+            __builtin_vmm_map_page(self.vmm, asid, aligned_virt, pfn, perms, PAGE_4K_SIZE)
+        }
+        self.record_swap_fault_residual(aligned_virt, swap_slot)
+        Result::Ok(true)
+    }
+
+    // ──────────────────────────────────────────────
+    // Page Reclamation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-RECLAIM-OP-001 through MEM-PAG-RECLAIM-OP-030
+
+    pub fn try_reclaim_pages(self: ref mut, allocator: ref mut BuddyAllocator,
+                              target_pages: u32)
+        -> Result[u32, MemoryError>
+        effects: [deterministic, io, storage]
+    {
+        if !self.reclaim_state.should_reclaim(allocator.utilization()) {
+            return Result::Ok(0)
+        }
+        let is_aggressive: bool = self.reclaim_state.should_reclaim_aggressive(
+            allocator.utilization())
+        let batch_size: u32 = if is_aggressive {
+            RECLAIM_BATCH_SIZE * 2
+        } else {
+            RECLAIM_BATCH_SIZE
+        }
+        let mut reclaimed: u32 = 0
+        // Determine which pages to reclaim (simplified: use physical page scan)
+        // loop: bounds[BOUND_MEDIUM] — bounded by target_pages
+        loop: bounds[BOUND_MEDIUM] for i in 0..target_pages {
+            if reclaimed >= batch_size {
+                break
+            }
+            // Find a reclaimable page
+            let page_to_reclaim: PhysicalPageNumber = match self.find_reclaimable_page(
+                allocator) {
+                Result::Ok(pfn) => pfn,
+                Result::Err(_) => break,
+            }
+            // Swap out the page
+            let slot: u32 = self.swap_mgr.swap_out(page_to_reclaim)?;
+            // Mark the page table entries as swapped
+            trusted("reclaim: mark PTE as swapped") {
+                __builtin_vmm_mark_swapped(self.vmm, page_to_reclaim, slot)
+            }
+            // Free the physical page
+            allocator.free_pages(page_to_reclaim, 1)?;
+            reclaimed = reclaimed + 1
+        }
+        self.reclaim_state.is_active = reclaimed > 0
+        self.reclaim_state.pages_freed = self.reclaim_state.pages_freed +
+                                          (reclaimed as u64)
+        self.reclaim_state.pages_swapped = self.reclaim_state.pages_swapped +
+                                            (reclaimed as u64)
+        self.reclaim_state.reclaim_count = self.reclaim_state.reclaim_count + 1
+        self.generation.bump();
+        self.record_reclaim_residual(reclaimed)
+        Result::Ok(reclaimed)
+    }
+
+    fn find_reclaimable_page(self, allocator: ref BuddyAllocator)
+        -> Result[PhysicalPageNumber, MemoryError>
+        effects: [deterministic]
+    {
+        // Scan a limited number of pages to find one that can be reclaimed
+        let max_scan: u32 = 64
+        // loop: bounds[BOUND_MEDIUM] — bounded by max_scan
+        loop: bounds[BOUND_MEDIUM] for i in 0..max_scan {
+            let pfn_val: u64 = (allocator.generation().value() as u64 +
+                                (i as u64) * 16) %
+                               allocator.total_free_pages()
+            let pfn: PhysicalPageNumber = PhysicalPageNumber::new(pfn_val)
+            let state: u8 = get_page_state(allocator, pfn)?
+            if state == PAGE_BUDDY_ALLOC && !is_page_locked(pfn) {
+                return Result::Ok(pfn)
+            }
+        }
+        Result::Err(mem_ppa_error(
+            DIAG_PAG_RECLAIM,
+            FixedString[128]::from_slice("No reclaimable page found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Accessors
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-ACCESS-001 through MEM-PAG-ACCESS-020
+
+    pub fn stats(self) -> ref PageFaultStats
+        effects: [deterministic]
+    {
+        &self.stats
+    }
+
+    pub fn swap_manager(self: ref mut) -> ref mut SwapManager
+        effects: [deterministic]
+    {
+        &mut self.swap_mgr
+    }
+
+    pub fn total_faults(self) -> u64
+        effects: [deterministic]
+    {
+        self.stats.total_faults
+    }
+
+    pub fn resolved_faults(self) -> u64
+        effects: [deterministic]
+    {
+        self.stats.resolved_faults
+    }
+
+    pub fn unresolved_faults(self) -> u64
+        effects: [deterministic]
+    {
+        self.stats.unresolved_faults
+    }
+
+    pub fn resolution_rate(self) -> u8
+        effects: [deterministic]
+    {
+        if self.stats.total_faults == 0 {
+            return 100
+        }
+        ((self.stats.resolved_faults * 100) / self.stats.total_faults) as u8
+    }
+
+    pub fn swap_count(self) -> (u64, u64)
+        effects: [deterministic]
+    {
+        (self.swap_mgr.swap_in_count, self.swap_mgr.swap_out_count)
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-PAG-RESID-001 through MEM-PAG-RESID-015
+
+    fn record_fault_residual(self, addr: u64, fault_type: u8, resolved: bool)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page fault handled",
+            code: DIAG_PAG_OK,
+            data: (addr, fault_type, resolved),
+        )
+    }
+
+    fn record_demand_fill_residual(self, virt: VirtualAddress, pfn: PhysicalPageNumber)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Demand page fill",
+            code: DIAG_PAG_OK,
+            data: (virt.value(), pfn.value()),
+        )
+    }
+
+    fn record_cow_residual(self, virt: VirtualAddress,
+                            old_pfn: PhysicalPageNumber, new_pfn: PhysicalPageNumber)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Copy-on-write",
+            code: DIAG_PAG_OK,
+            data: (virt.value(), old_pfn.value(), new_pfn.value()),
+        )
+    }
+
+    fn record_swap_fault_residual(self, virt: VirtualAddress, slot: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Swap page fault",
+            code: DIAG_PAG_OK,
+            data: (virt.value(), slot),
+        )
+    }
+
+    fn record_reclaim_residual(self, count: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Page reclamation",
+            code: DIAG_PAG_OK,
+            data: count,
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Page Lock Tracking
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-LOCK-001 through MEM-PAG-LOCK-015
+
+const MAX_LOCKED_PAGES: u32 = 256
+
+pub type PageLockTracker : struct {
+    locked_pfns: FixedArray[MAX_LOCKED_PAGES, PhysicalPageNumber],
+    num_locked: u32,
+    generation: Word32,
+}
+
+impl PageLockTracker {
+    pub fn new() -> PageLockTracker
+        effects: [deterministic]
+    {
+        PageLockTracker {
+            locked_pfns: FixedArray::new(),
+            num_locked: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn lock_page(self: ref mut, pfn: PhysicalPageNumber)
+        -> Result[(), MemoryError>
+        effects: [deterministic]
+    {
+        if self.num_locked >= MAX_LOCKED_PAGES {
+            return Result::Err(mem_ppa_error(
+                DIAG_PAG_BOUNDS,
+                FixedString[128]::from_slice("Max locked pages reached")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_locked
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_locked {
+            let locked: ref PhysicalPageNumber = self.locked_pfns.get(i)
+            if locked.value() == pfn.value() {
+                return Result::Ok(())  // Already locked
+            }
+        }
+        self.locked_pfns.push(pfn);
+        self.num_locked = self.num_locked + 1
+        Result::Ok(())
+    }
+
+    pub fn unlock_page(self: ref mut, pfn: PhysicalPageNumber)
+        -> Result<(), MemoryError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_locked
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_locked {
+            let locked: ref PhysicalPageNumber = self.locked_pfns.get(i)
+            if locked.value() == pfn.value() {
+                // Shift remaining entries
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_locked - 1) {
+                    let next: PhysicalPageNumber = self.locked_pfns.get(j + 1)
+                    self.locked_pfns.set(j, next)
+                }
+                self.num_locked = self.num_locked - 1
+                return Result::Ok(())
+            }
+        }
+        Result::Ok(())  // Not locked; no error
+    }
+
+    pub fn is_locked(self, pfn: PhysicalPageNumber) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_locked
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_locked {
+            let locked: ref PhysicalPageNumber = self.locked_pfns.get(i)
+            if locked.value() == pfn.value() {
+                return true
+            }
+        }
+        false
+    }
+}
+
+// Global lock tracker instance
+pub type GlobalLockTracker : struct {
+    tracker: PageLockTracker,
+}
+
+impl GlobalLockTracker {
+    pub fn new() -> GlobalLockTracker
+        effects: [deterministic]
+    {
+        GlobalLockTracker { tracker: PageLockTracker::new() }
+    }
+}
+
+// Convenience function for checking if a page is locked
+pub fn is_page_locked(pfn: PhysicalPageNumber) -> bool
+    effects: [deterministic]
+{
+    // In production, this would access the global lock tracker
+    false
+}
+
+// ──────────────────────────────────────────────
+// Fault Injection Test Support
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-TEST-001 through MEM-PAG-TEST-010
+
+pub fn inject_page_fault(handler: ref mut PageFaultHandler,
+                          fault_addr: u64, fault_type: PageFaultType,
+                          asid: AddressSpaceId, alloc_handle: Handle)
+    -> bool
+    effects: [deterministic, io, storage]
+{
+    let error_code: PageFaultErrorCode = match fault_type {
+        PageFaultType::Fault_Demand => {
+            PageFaultErrorCode::new(0x06)  // User write, not present
+        },
+        PageFaultType::Fault_Cow => {
+            PageFaultErrorCode::new(0x03)  // User write, present
+        },
+        PageFaultType::Fault_NotPresent => {
+            PageFaultErrorCode::new(0x00)  // Not present, not write, supervisor
+        },
+        PageFaultType::Fault_Protection => {
+            PageFaultErrorCode::new(0x01)  // Present, supervisor
+        },
+        _ => PageFaultErrorCode::new(0x00),
+    }
+    let result: Result[bool, MemoryError> = handler.handle_page_fault(
+        fault_addr, error_code, asid, alloc_handle)
+    match result {
+        Result::Ok(resolved) => resolved,
+        Result::Err(_) => false,
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-INIT-001 through MEM-PAG-INIT-010
+
+pub fn init_page_fault_handler(vmm_handle: Handle) -> PageFaultHandler
+    effects: [deterministic]
+{
+    PageFaultHandler::new(vmm_handle)
+}
+
+pub fn init_swap_manager(handlers: ref mut PageFaultHandler,
+                          swap_devices: FixedArray[MAX_SWAP_DEVICES, (u32, u64, Handle)])
+    -> Result[(), MemoryError>
+    effects: [deterministic]
+{
+    // loop: bounds[BOUND_TINY] — bounded by MAX_SWAP_DEVICES
+    loop: bounds[BOUND_TINY] for i in 0..swap_devices.len() {
+        let (total_slots, slot_size, handle): (u32, u64, Handle) = swap_devices.get(i)
+        if total_slots == 0 {
+            break
+        }
+        let device: SwapDevice = SwapDevice::new(i, total_slots, slot_size, handle)
+        handlers.swap_mgr.add_device(device)?;
+        handlers.swap_mgr.add_slots(total_slots)?;
+    }
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// Kernel OOM Handler
+// ──────────────────────────────────────────────
+// Evidence path: MEM-PAG-OOM-001 through MEM-PAG-OOM-010
+
+pub fn handle_kernel_oom(handler: ref mut PageFaultHandler,
+                          allocator: ref mut BuddyAllocator)
+    -> bool
+    effects: [deterministic, io, storage]
+{
+    // Try reclaiming pages aggressively
+    let reclaimed: u32 = match handler.try_reclaim_pages(allocator, RECLAIM_BATCH_SIZE * 4) {
+        Result::Ok(count) => count,
+        Result::Err(_) => 0,
+    }
+    reclaimed > 0
+}

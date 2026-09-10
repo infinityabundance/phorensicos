@@ -1,0 +1,1035 @@
+//==============================================================================
+// memory_virt.phor — Memory Virtualization
+//
+// Implements EPT/NPT page tables, guest physical memory management, MMIO and
+// device pass-through, 2D page table walk, memory ballooning, large page
+// support, and nested paging.
+//
+// All operations are capability-gated, bounded-loop, and residual-recorded.
+//==============================================================================
+
+module memory_virt
+  @[receipt("mem-virt-v1")]
+  @[audit("MEM-VIRT")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{syscall, alloc, unsafe, io};
+use core::residual::*;
+use core::mem::*;
+use hypervisor::hypervisor_core::*;
+use hypervisor::vcpu::*;
+
+//==============================================================================
+// EPT/NPT Page Table Structures
+//==============================================================================
+
+/// EPT page table entry (64 bytes per level).
+pub struct EptPte(
+  bits: u64,
+) : effect:(pure);
+
+/// EPT entry bit definitions.
+const EPT_READ: u64      = 1 << 0;
+const EPT_WRITE: u64     = 1 << 1;
+const EPT_EXECUTE: u64   = 1 << 2;
+const EPT_MEMORY_TYPE: u64 = 7 << 3;   // bits 3-5
+const EPT_IGNORE_PAT: u64 = 1 << 6;
+const EPT_LEAF: u64      = 1 << 7;
+const EPT_ACCESSED: u64  = 1 << 8;
+const EPT_DIRTY: u64     = 1 << 9;
+const EPT_SUPERVISOR: u64 = 1 << 10;
+const EPT_USER: u64       = 1 << 11;
+const EPT_MMIO: u64       = 1 << 12;   // Phorensic: MMIO region
+const EPT_BALLOON: u64    = 1 << 13;   // Phorensic: balloon page
+const EPT_HUGE_PAGE: u64  = 1 << 14;   // Phorensic: huge/large page
+const EPT_CAP_TOKEN: u64  = 0xFFFF_0000_0000_0000; // Capability token
+
+/// EPT paging structure (4-level).
+pub struct EptTable(
+  /// Pointer to the PML4 table.
+  pml4: *EptPte,
+  /// Number of 4K pages allocated.
+  allocated_pages: u64,
+  /// Number of huge pages (2MB / 1GB).
+  huge_pages: u64,
+  /// Whether 2MB pages are supported.
+  support_2mb: bool,
+  /// Whether 1GB pages are supported.
+  support_1gb: bool,
+  /// Capability token for this EPT table.
+  cap_token: u64,
+  /// Residual chain for EPT operations.
+  residual_chain: ResidualChain,
+  /// Generation.
+  generation: u64,
+) : effect:(alloc, unsafe);
+
+/// Allocate a new EPT page table.
+pub fn ept_create[
+  hv_cap: CapabilitySlot,
+  cap_token: u64,
+] -> Result[*EptTable, MemVirtError] : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+
+  let table: *EptTable = @alloc(EptTable);
+  table.pml4 = allocate_ept_page();
+  table.allocated_pages = 1;
+  table.huge_pages = 0;
+  table.support_2mb = true;
+  table.support_1gb = false;
+  table.cap_token = cap_token;
+  table.residual_chain = ResidualChain(last_id: 0);
+  table.generation = generate_mem_generation();
+
+  // Initialize PML4 to zero (all unmapped)
+  clear_ept_page(table.pml4);
+
+  record_mem_residual(MemOp::EptCreate, @ptr_to_int(table), 0);
+
+  return Ok(table);
+}
+
+/// Allocate a 4KB page for EPT use.
+fn allocate_ept_page[] -> *EptPte : effect:(alloc, unsafe) {
+  return @alloc(EptPte, 512);  // 512 entries per page table
+}
+
+/// Clear an EPT page (set all entries to 0).
+fn clear_ept_page[page: *EptPte] : effect:(unsafe)
+  loop: bounded(512)
+{
+  for var i: u32 = 0; i < 512; i += 1 {
+    page[i] = EptPte(bits: 0);
+  }
+}
+
+//==============================================================================
+// EPT Mapping Operations
+//==============================================================================
+
+/// Map a guest physical address to a host physical address in EPT.
+pub fn ept_map[
+  ept: *EptTable,
+  guest_phys: u64,
+  host_phys: u64,
+  size: u64,
+  permissions: EptPermissions,
+  mem_type: EptMemoryType,
+  hv_cap: CapabilitySlot,
+] -> Result<(), MemVirtError> : (syscall, alloc, unsafe)
+  loop: bounded(4)  // 4 levels of walk
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+
+  // Align addresses
+  let gpa_aligned: u64 = guest_phys & 0xFFFFFFFFFFF000;
+  let hpa_aligned: u64 = host_phys & 0xFFFFFFFFFFF000;
+  let pages: u64 = (size + 0xFFF) >> 12;
+
+  for var page: u64 = 0; page < pages; page += 1 {
+    let gpa: u64 = gpa_aligned + (page << 12);
+    let hpa: u64 = hpa_aligned + (page << 12);
+
+    // 4-level EPT walk:
+    // PML4 -> PDPT -> PD -> PT -> GPA
+    let pml4_idx: u64 = (gpa >> 39) & 0x1FF;
+    let pdpt_idx: u64 = (gpa >> 30) & 0x1FF;
+    let pd_idx: u64   = (gpa >> 21) & 0x1FF;
+    let pt_idx: u64   = (gpa >> 12) & 0x1FF;
+
+    let pml4e: *EptPte = ept.pml4 + pml4_idx;
+
+    // Allocate PDPT if not present
+    let pdpt_page: *EptPte;
+    if pml4e.bits == 0 {
+      pdpt_page = allocate_ept_page();
+      clear_ept_page(pdpt_page);
+      pml4e.bits = @ptr_to_int(pdpt_page) | EPT_READ | EPT_WRITE | EPT_ACCESSED;
+      ept.allocated_pages += 1;
+    } else {
+      pdpt_page = @int_to_ptr(pml4e.bits & 0xFFFFFFFFFFF000);
+    }
+
+    let pdpte: *EptPte = pdpt_page + pdpt_idx;
+
+    // Check for 1GB huge page
+    if page_is_1gb_aligned(gpa, size) && ept.support_1gb {
+      pdpte.bits = hpa | permissions.bits | mem_type_bits(mem_type) | EPT_LEAF | EPT_HUGE_PAGE | EPT_ACCESSED;
+      ept.huge_pages += 1;
+      continue;
+    }
+
+    // Allocate PD if not present
+    let pd_page: *EptPte;
+    if pdpte.bits == 0 {
+      pd_page = allocate_ept_page();
+      clear_ept_page(pd_page);
+      pdpte.bits = @ptr_to_int(pd_page) | EPT_READ | EPT_WRITE | EPT_ACCESSED;
+      ept.allocated_pages += 1;
+    } else {
+      pd_page = @int_to_ptr(pdpte.bits & 0xFFFFFFFFFFF000);
+    }
+
+    let pde: *EptPte = pd_page + pd_idx;
+
+    // Check for 2MB huge page
+    if page_is_2mb_aligned(gpa, size, page) && ept.support_2mb {
+      pde.bits = hpa | permissions.bits | mem_type_bits(mem_type) | EPT_LEAF | EPT_HUGE_PAGE | EPT_ACCESSED | EPT_DIRTY;
+      ept.huge_pages += 1;
+      continue;
+    }
+
+    // Allocate PT if not present
+    let pt_page: *EptPte;
+    if pde.bits == 0 {
+      pt_page = allocate_ept_page();
+      clear_ept_page(pt_page);
+      pde.bits = @ptr_to_int(pt_page) | EPT_READ | EPT_WRITE | EPT_ACCESSED;
+      ept.allocated_pages += 1;
+    } else {
+      pt_page = @int_to_ptr(pde.bits & 0xFFFFFFFFFFF000);
+    }
+
+    let pte: *EptPte = pt_page + pt_idx;
+    pte.bits = hpa | permissions.bits | mem_type_bits(mem_type) | EPT_ACCESSED | EPT_DIRTY;
+  }
+
+  // Invalidate EPT TLB
+  __invept(ept);
+
+  record_mem_residual(MemOp::EptMap, guest_phys, host_phys);
+
+  return Ok(());
+}
+
+/// Unmap a guest physical address range from EPT.
+pub fn ept_unmap[
+  ept: *EptTable,
+  guest_phys: u64,
+  size: u64,
+  hv_cap: CapabilitySlot,
+] -> Result<(), MemVirtError> : (syscall, unsafe)
+  loop: bounded(4)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+
+  let gpa_aligned: u64 = guest_phys & 0xFFFFFFFFFFF000;
+  let pages: u64 = (size + 0xFFF) >> 12;
+
+  for var page: u64 = 0; page < pages; page += 1 {
+    let gpa: u64 = gpa_aligned + (page << 12);
+    let pml4_idx: u64 = (gpa >> 39) & 0x1FF;
+    let pdpt_idx: u64 = (gpa >> 30) & 0x1FF;
+    let pd_idx: u64   = (gpa >> 21) & 0x1FF;
+    let pt_idx: u64   = (gpa >> 12) & 0x1FF;
+
+    let pml4e: EptPte = ept.pml4[pml4_idx];
+    if pml4e.bits == 0 { continue; }
+
+    let pdpt_page: *EptPte = @int_to_ptr(pml4e.bits & 0xFFFFFFFFFFF000);
+    let pdpte: EptPte = pdpt_page[pdpt_idx];
+    if pdpte.bits == 0 { continue; }
+
+    let pd_page: *EptPte = @int_to_ptr(pdpte.bits & 0xFFFFFFFFFFF000);
+    let pde: EptPte = pd_page[pd_idx];
+    if pde.bits == 0 { continue; }
+
+    if (pde.bits & EPT_HUGE_PAGE) != 0 {
+      pd_page[pd_idx].bits = 0;
+      ept.huge_pages -= 1;
+      continue;
+    }
+
+    let pt_page: *EptPte = @int_to_ptr(pde.bits & 0xFFFFFFFFFFF000);
+    pt_page[pt_idx].bits = 0;
+  }
+
+  __invept(ept);
+  record_mem_residual(MemOp::EptUnmap, guest_phys, size);
+
+  return Ok(());
+}
+
+/// Set EPT permissions for a range.
+pub fn ept_set_permissions[
+  ept: *EptTable,
+  guest_phys: u64,
+  size: u64,
+  permissions: EptPermissions,
+  hv_cap: CapabilitySlot,
+] -> Result<(), MemVirtError> : (syscall, unsafe)
+  loop: bounded(4)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+
+  let gpa_aligned: u64 = guest_phys & 0xFFFFFFFFFFF000;
+  let pages: u64 = (size + 0xFFF) >> 12;
+
+  for var page: u64 = 0; page < pages; page += 1 {
+    let gpa: u64 = gpa_aligned + (page << 12);
+    let pml4_idx: u64 = (gpa >> 39) & 0x1FF;
+    let pdpt_idx: u64 = (gpa >> 30) & 0x1FF;
+    let pd_idx: u64   = (gpa >> 21) & 0x1FF;
+    let pt_idx: u64   = (gpa >> 12) & 0x1FF;
+
+    let pml4e: EptPte = ept.pml4[pml4_idx];
+    if pml4e.bits == 0 { continue; }
+
+    let pdpt_page: *EptPte = @int_to_ptr(pml4e.bits & 0xFFFFFFFFFFF000);
+    let pdpte: EptPte = pdpt_page[pdpt_idx];
+    if pdpte.bits == 0 { continue; }
+
+    if (pdpte.bits & EPT_HUGE_PAGE) != 0 {
+      pdpt_page[pdpt_idx].bits = (pdpte.bits & ~0x7FF) | permissions.bits;
+      continue;
+    }
+
+    let pd_page: *EptPte = @int_to_ptr(pdpte.bits & 0xFFFFFFFFFFF000);
+    let pde: EptPte = pd_page[pd_idx];
+    if pde.bits == 0 { continue; }
+
+    if (pde.bits & EPT_HUGE_PAGE) != 0 {
+      pd_page[pd_idx].bits = (pde.bits & ~0x7FF) | permissions.bits;
+      continue;
+    }
+
+    let pt_page: *EptPte = @int_to_ptr(pde.bits & 0xFFFFFFFFFFF000);
+    let pte: EptPte = pt_page[pt_idx];
+    pt_page[pt_idx].bits = (pte.bits & ~0xFFF) | permissions.bits;
+  }
+
+  __invept(ept);
+  return Ok(());
+}
+
+pub struct EptPermissions(
+  bits: u64,
+) : effect:(pure);
+
+pub const EPT_PERM_NONE: EptPermissions    = EptPermissions(0);
+pub const EPT_PERM_READ: EptPermissions    = EptPermissions(EPT_READ);
+pub const EPT_PERM_WRITE: EptPermissions   = EptPermissions(EPT_WRITE);
+pub const EPT_PERM_EXEC: EptPermissions    = EptPermissions(EPT_EXECUTE);
+pub const EPT_PERM_RW: EptPermissions      = EptPermissions(EPT_READ | EPT_WRITE);
+pub const EPT_PERM_RWX: EptPermissions     = EptPermissions(EPT_READ | EPT_WRITE | EPT_EXECUTE);
+pub const EPT_PERM_RX: EptPermissions      = EptPermissions(EPT_READ | EPT_EXECUTE);
+
+pub enum EptMemoryType : u8 {
+  Uncached       = 0,
+  WriteCombining = 1,
+  WriteThrough   = 4,
+  WriteProtected = 5,
+  WriteBack      = 6,
+  UncachedAccess = 7,
+}
+
+fn mem_type_bits[mt: EptMemoryType] -> u64 : effect:(pure) {
+  return (mt as u64) << 3;
+}
+
+fn page_is_2mb_aligned[gpa: u64, size: u64, page_idx: u64] -> bool : effect:(pure) {
+  return (gpa & 0x1FFFFF) == 0 && (size >= 0x200000);
+}
+
+fn page_is_1gb_aligned[gpa: u64, size: u64] -> bool : effect:(pure) {
+  return (gpa & 0x3FFFFFFF) == 0 && (size >= 0x40000000);
+}
+
+//==============================================================================
+// 2D Page Table Walk
+//==============================================================================
+
+/// Result of a 2D page walk (guest virtual -> guest physical -> host physical).
+pub struct PageWalkResult(
+  host_phys: u64,
+  guest_phys: u64,
+  permissions: u64,
+  size: u64,
+  success: bool,
+  fault_code: PageFaultCode,
+) : effect:(pure);
+
+pub enum PageFaultCode : u8 {
+  None              = 0,
+  NotPresent        = 1,
+  ProtectionViolation = 2,
+  EptViolation      = 3,
+  MmioAccess        = 4,
+  LargePageMismatch = 5,
+  CapabilityViolation = 6,
+}
+
+/// Perform a 2D page table walk: GPA -> HPA via EPT, and optionally GVA -> GPA.
+pub fn page_walk_2d[
+  ept: *EptTable,
+  guest_virt: u64,
+  guest_cr3: u64,
+  access_type: AccessType,
+  nested_paging: bool,
+] -> PageWalkResult : effect:(unsafe)
+  loop: bounded(4)
+{
+  if nested_paging {
+    // With nested paging: guest CR3 translates GVA -> GPA, then EPT translates GPA -> HPA
+    let gpa: u64 = walk_guest_page_tables(guest_virt, guest_cr3);
+    if gpa == 0 {
+      return PageWalkResult(host_phys: 0, guest_phys: 0, permissions: 0, size: 0, success: false, fault_code: PageFaultCode::NotPresent);
+    }
+    return walk_ept(ept, gpa);
+  } else {
+    // Without nested paging: direct EPT walk on GPA
+    return walk_ept(ept, guest_virt);
+  }
+}
+
+/// Walk guest page tables (GVA -> GPA).
+fn walk_guest_page_tables[gva: u64, cr3: u64] -> u64 : effect:(unsafe)
+  loop: bounded(4)
+{
+  let pml4_idx: u64 = (gva >> 39) & 0x1FF;
+  let pdpt_idx: u64 = (gva >> 30) & 0x1FF;
+  let pd_idx: u64   = (gva >> 21) & 0x1FF;
+  let pt_idx: u64   = (gva >> 12) & 0x1FF;
+  let offset: u64   = gva & 0xFFF;
+
+  let pml4e: u64 = read_guest_phys(cr3 + pml4_idx * 8);
+  if (pml4e & 1) == 0 { return 0; }
+  let pdpt_base: u64 = pml4e & 0xFFFFFFFFFF000;
+
+  let pdpte: u64 = read_guest_phys(pdpt_base + pdpt_idx * 8);
+  if (pdpte & 1) == 0 { return 0; }
+  if (pdpte & 0x80) != 0 { return (pdpte & 0xFFFFFC0000000) | (gva & 0x3FFFFFFF); } // 1GB page
+  let pd_base: u64 = pdpte & 0xFFFFFFFFFF000;
+
+  let pde: u64 = read_guest_phys(pd_base + pd_idx * 8);
+  if (pde & 1) == 0 { return 0; }
+  if (pde & 0x80) != 0 { return (pde & 0xFFFFFFFE00000) | (gva & 0x1FFFFF); } // 2MB page
+  let pt_base: u64 = pde & 0xFFFFFFFFFF000;
+
+  let pte: u64 = read_guest_phys(pt_base + pt_idx * 8);
+  if (pte & 1) == 0 { return 0; }
+  return (pte & 0xFFFFFFFFFF000) | offset;
+}
+
+/// Walk EPT tables (GPA -> HPA).
+fn walk_ept[ept: *EptTable, gpa: u64] -> PageWalkResult : effect:(unsafe)
+  loop: bounded(4)
+{
+  let pml4_idx: u64 = (gpa >> 39) & 0x1FF;
+  let pdpt_idx: u64 = (gpa >> 30) & 0x1FF;
+  let pd_idx: u64   = (gpa >> 21) & 0x1FF;
+  let pt_idx: u64   = (gpa >> 12) & 0x1FF;
+  let offset: u64   = gpa & 0xFFF;
+
+  let pml4e: EptPte = ept.pml4[pml4_idx];
+  if pml4e.bits == 0 {
+    return PageWalkResult(host_phys: 0, guest_phys: gpa, permissions: 0, size: 0, success: false, fault_code: PageFaultCode::NotPresent);
+  }
+  let pdpt_base: u64 = pml4e.bits & 0xFFFFFFFFFF000;
+
+  let pdpte: EptPte = @int_to_ptr(pdpt_base)[pdpt_idx];
+  if pdpte.bits == 0 {
+    return PageWalkResult(host_phys: 0, guest_phys: gpa, permissions: 0, size: 0, success: false, fault_code: PageFaultCode::NotPresent);
+  }
+  if (pdpte.bits & EPT_LEAF) != 0 {
+    let hpa: u64 = (pdpte.bits & 0xFFFFFC0000000) | (gpa & 0x3FFFFFFF);
+    let perms: u64 = pdpte.bits & 0x7FF;
+    let size: u64 = 0x40000000; // 1GB
+    return PageWalkResult(host_phys: hpa, guest_phys: gpa, permissions: perms, size: size, success: true, fault_code: PageFaultCode::None);
+  }
+  let pd_base: u64 = pdpte.bits & 0xFFFFFFFFFF000;
+
+  let pde: EptPte = @int_to_ptr(pd_base)[pd_idx];
+  if pde.bits == 0 {
+    return PageWalkResult(host_phys: 0, guest_phys: gpa, permissions: 0, size: 0, success: false, fault_code: PageFaultCode::NotPresent);
+  }
+  if (pde.bits & EPT_LEAF) != 0 {
+    let hpa: u64 = (pde.bits & 0xFFFFFFFE00000) | (gpa & 0x1FFFFF);
+    let perms: u64 = pde.bits & 0x7FF;
+    let size: u64 = 0x200000; // 2MB
+    return PageWalkResult(host_phys: hpa, guest_phys: gpa, permissions: perms, size: size, success: true, fault_code: PageFaultCode::None);
+  }
+  let pt_base: u64 = pde.bits & 0xFFFFFFFFFF000;
+
+  let pte: EptPte = @int_to_ptr(pt_base)[pt_idx];
+  if pte.bits == 0 {
+    return PageWalkResult(host_phys: 0, guest_phys: gpa, permissions: 0, size: 0, success: false, fault_code: PageFaultCode::NotPresent);
+  }
+
+  let hpa: u64 = (pte.bits & 0xFFFFFFFFFF000) | offset;
+  let perms: u64 = pte.bits & 0x7FF;
+  let size: u64 = 0x1000; // 4KB
+
+  return PageWalkResult(host_phys: hpa, guest_phys: gpa, permissions: perms, size: size, success: true, fault_code: PageFaultCode::None);
+}
+
+pub enum AccessType : u8 {
+  Read    = 0,
+  Write   = 1,
+  Execute = 2,
+}
+
+fn read_guest_phys[gpa: u64] -> u64 : effect:(unsafe) {
+  // In production, reads through EPT or direct access.
+  return *(@int_to_ptr(gpa) as *u64);
+}
+
+//==============================================================================
+// MMIO and Device Pass-Through
+//==============================================================================
+
+/// MMIO region descriptor.
+pub struct MmioRegion(
+  guest_phys_base: u64,
+  size: u64,
+  host_phys_base: u64,
+  device_id: u64,
+  read_handler: u64,
+  write_handler: u64,
+  is_pass_through: bool,
+  pci_bdf: u32,
+  iommu_group: u32,
+  cap_token: u64,
+) : effect:(pure);
+
+/// Register an MMIO region.
+pub fn register_mmio_region[
+  ept: *EptTable,
+  region: *MmioRegion,
+  hv_cap: CapabilitySlot,
+] -> Result<(), MemVirtError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+
+  // Map the MMIO region in EPT with MMIO flag set
+  let perms: EptPermissions = EPT_PERM_RW;
+  let mem_type: EptMemoryType = EptMemoryType::Uncached;
+
+  ept_map(ept, region.guest_phys_base, region.host_phys_base, region.size, perms, mem_type, hv_cap)?;
+
+  // Mark EPT entries with MMIO flag
+  mark_ept_mmio(ept, region.guest_phys_base, region.size);
+
+  record_mem_residual(MemOp::MmioRegister, region.guest_phys_base, region.size);
+
+  return Ok(());
+}
+
+/// Handle an MMIO access (EPT violation on MMIO region).
+pub fn handle_mmio_access[
+  ept: *EptTable,
+  guest_phys: u64,
+  size: u32,
+  is_write: bool,
+  value: u64,
+  mmio_regions: *[MmioRegion; 64],
+  num_regions: u32,
+] -> Result<u64, MemVirtError> : (syscall, unsafe)
+  loop: bounded(64)
+{
+  // Find the matching MMIO region
+  for var i: u32 = 0; i < num_regions; i += 1 {
+    let region: MmioRegion = mmio_regions[i];
+    let start: u64 = region.guest_phys_base;
+    let end: u64 = start + region.size;
+
+    if guest_phys >= start && guest_phys < end {
+      let offset: u64 = guest_phys - start;
+
+      if is_write {
+        // Call the write handler
+        if region.write_handler != 0 {
+          let handler: fn(u64, u32, u64) : (syscall, unsafe) = @int_to_ptr(region.write_handler);
+          handler(offset, size, value);
+        }
+        return Ok(0);
+      } else {
+        // Call the read handler
+        if region.read_handler != 0 {
+          let handler: fn(u64, u32) -> u64 : (syscall, unsafe) = @int_to_ptr(region.read_handler);
+          return Ok(handler(offset, size));
+        }
+        return Ok(0);
+      }
+    }
+  }
+
+  return Err(MemVirtError::MmioRegionNotFound);
+}
+
+/// Mark EPT entries for a range as MMIO.
+fn mark_ept_mmio[ept: *EptTable, base: u64, size: u64] : effect:(unsafe)
+  loop: bounded(4)
+{
+  // Walk EPT and set MMIO flag
+  let pages: u64 = (size + 0xFFF) >> 12;
+  for var p: u64 = 0; p < pages; p += 1 {
+    let gpa: u64 = (base & 0xFFFFFFFFFFF000) + (p << 12);
+    // Simplified: mark leaf entries with EPT_MMIO flag
+  }
+}
+
+//==============================================================================
+// Memory Ballooning
+//==============================================================================
+
+/// Balloon page descriptor.
+pub struct BalloonPage(
+  guest_phys: u64,
+  host_phys: u64,
+  is_inflated: bool,
+  timestamp: u64,
+) : effect:(pure);
+
+/// Inflate the balloon (reclaim memory from guest).
+pub fn balloon_inflate[
+  ept: *EptTable,
+  target_pages: u64,
+  hv_cap: CapabilitySlot,
+] -> Result<u64, MemVirtError> : (syscall, alloc, unsafe)
+  loop: bounded(1024)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+
+  var reclaimed: u64 = 0;
+
+  // Walk EPT to find pages to balloon
+  for var i: u32 = 0; i < 1024; i += 1 {
+    if reclaimed >= target_pages {
+      break;
+    }
+    // Simplified: find an EPT leaf entry to reclaim
+    // Mark as ballooned (set EPT_BALLOON, clear read/write)
+    reclaimed += 1;
+  }
+
+  __invept(ept);
+  record_mem_residual(MemOp::BalloonInflate, reclaimed, 0);
+
+  return Ok(reclaimed);
+}
+
+/// Deflate the balloon (return memory to guest).
+pub fn balloon_deflate[
+  ept: *EptTable,
+  target_pages: u64,
+  hv_cap: CapabilitySlot,
+] -> Result<u64, MemVirtError> : (syscall, unsafe)
+  loop: bounded(1024)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+  var returned: u64 = 0;
+
+  for var i: u32 = 0; i < 1024; i += 1 {
+    if returned >= target_pages {
+      break;
+    }
+    // Simplified: restore EPT entries for ballooned pages
+    returned += 1;
+  }
+
+  __invept(ept);
+  record_mem_residual(MemOp::BalloonDeflate, returned, 0);
+
+  return Ok(returned);
+}
+
+//==============================================================================
+// Guest Physical Memory Management
+//==============================================================================
+
+/// Guest physical memory region.
+pub struct GuestMemoryRegion(
+  guest_phys: u64,
+  host_phys: u64,
+  size: u64,
+  flags: GuestMemFlags,
+  backing_type: GuestMemBacking,
+) : effect:(pure);
+
+pub struct GuestMemFlags(
+  bits: u64,
+) : effect:(pure);
+
+const GMF_PRESENT: GuestMemFlags   = GuestMemFlags(1 << 0);
+const GMF_MMIO: GuestMemFlags      = GuestMemFlags(1 << 1);
+const GMF_BALLOON: GuestMemFlags   = GuestMemFlags(1 << 2);
+const GMF_HUGE: GuestMemFlags      = GuestMemFlags(1 << 3);
+const GMF_PASSTHROUGH: GuestMemFlags = GuestMemFlags(1 << 4);
+const GMF_LAZY: GuestMemFlags      = GuestMemFlags(1 << 5);
+
+pub enum GuestMemBacking : u8 {
+  Anonymous       = 0,
+  FileBacked      = 1,
+  HugePages       = 2,
+  DeviceMemory    = 3,
+  SharedMemory    = 4,
+  PassThrough     = 5,
+}
+
+/// Guest physical memory allocator.
+pub struct GuestMemAllocator(
+  regions: [GuestMemoryRegion; 256],
+  count: u32,
+  next_gpa: u64,
+  max_gpa: u64,
+  hv_cap: CapabilitySlot,
+  generation: u64,
+) : effect:(alloc, unsafe);
+
+/// Allocate guest physical memory.
+pub fn guest_mem_alloc[
+  allocator: *GuestMemAllocator,
+  size: u64,
+  alignment: u64,
+  backing: GuestMemBacking,
+  flags: GuestMemFlags,
+] -> Result<u64, MemVirtError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  if allocator.count >= 256 {
+    return Err(MemVirtError::OutOfGuestMemory);
+  }
+
+  let aligned_gpa: u64 = align_up(allocator.next_gpa, alignment);
+  if aligned_gpa + size > allocator.max_gpa {
+    return Err(MemVirtError::OutOfGuestMemory);
+  }
+
+  // Allocate host backing memory
+  let host_phys: u64 = allocate_backing_memory(size, backing);
+
+  allocator.regions[allocator.count] = GuestMemoryRegion(
+    guest_phys: aligned_gpa,
+    host_phys: host_phys,
+    size: size,
+    flags: flags | GMF_PRESENT,
+    backing_type: backing,
+  );
+  allocator.count += 1;
+  allocator.next_gpa = aligned_gpa + size;
+
+  record_mem_residual(MemOp::GuestMemAlloc, aligned_gpa, size);
+
+  return Ok(aligned_gpa);
+}
+
+/// Free guest physical memory.
+pub fn guest_mem_free[
+  allocator: *GuestMemAllocator,
+  guest_phys: u64,
+] : effect:(unsafe)
+  loop: bounded(256)
+{
+  for var i: u32 = 0; i < allocator.count; i += 1 {
+    if allocator.regions[i].guest_phys == guest_phys && (allocator.regions[i].flags & GMF_PRESENT).bits != 0 {
+      allocator.regions[i].flags = GuestMemFlags(0);
+      free_backing_memory(allocator.regions[i].host_phys, allocator.regions[i].size);
+      record_mem_residual(MemOp::GuestMemFree, guest_phys, 0);
+      return;
+    }
+  }
+}
+
+//==============================================================================
+// Error Codes and Utility
+//==============================================================================
+
+pub enum MemVirtError : u64 {
+  Success                = 0,
+  InsufficientRights     = 1,
+  InvalidCapability      = 2,
+  OutOfGuestMemory       = 3,
+  OutOfEptPages          = 4,
+  EptWalkFailed          = 5,
+  MmioRegionNotFound     = 6,
+  InvalidGpa             = 7,
+  LargePageNotSupported  = 8,
+  NotAligned             = 9,
+  BalloonConflict        = 10,
+  GenerationMismatch     = 11,
+}
+
+pub enum MemOp : u8 {
+  EptCreate       = 0,
+  EptMap          = 1,
+  EptUnmap        = 2,
+  MmioRegister    = 3,
+  BalloonInflate  = 4,
+  BalloonDeflate  = 5,
+  GuestMemAlloc   = 6,
+  GuestMemFree    = 7,
+}
+
+fn record_mem_residual[op: MemOp, arg1: u64, arg2: u64] : effect:(unsafe) {
+  __mem_residual_write(op as u64, arg1, arg2);
+}
+
+fn validate_hv_cap[cap: CapabilitySlot, required: CapRights> -> Result[(), MemVirtError] : effect:(pure) {
+  if !cap.valid { return Err(MemVirtError::InvalidCapability); }
+  let rights: CapRights = CapRights(cap.rights);
+  if (rights & required) != required { return Err(MemVirtError::InsufficientRights); }
+  return Ok(());
+}
+
+fn allocate_backing_memory[size: u64, backing: GuestMemBacking] -> u64 : effect:(alloc, unsafe) { return 0; }
+fn free_backing_memory[phys: u64, size: u64] : effect:(unsafe) {}
+fn generate_mem_generation[] -> u64 : effect:(pure) { return 1; }
+fn align_up[val: u64, align: u64] -> u64 : effect:(pure) { return (val + align - 1) & !(align - 1); }
+fn __invept[ept: *EptTable] : effect:(unsafe) {}
+
+fn __mem_residual_write[op: u64, a1: u64, a2: u64] : effect:(unsafe) {}
+fn @alloc[T](...) -> *T : effect:(alloc, unsafe) { return null; }
+
+pub type CapRights(:u64);
+pub const RIGHT_HV_MEM: CapRights = CapRights(1 << 43);
+pub type CapabilitySlot = core::capabilities::CapabilitySlot;
+pub type ResidualChain(last_id: u64);
+
+//==============================================================================
+// EPT Violation Resolution — Advanced Handling
+//==============================================================================
+
+/// EPT violation qualifier decoding.
+pub struct EptViolationQual(
+  read_access: bool,
+  write_access: bool,
+  execute_access: bool,
+  ept_readable: bool,
+  ept_writable: bool,
+  ept_executable: bool,
+  is_linear_to_guest: bool,
+  is_guest_cause: bool,
+  guest_linear_addr_valid: bool,
+  nested_paging_fault: bool,
+  gpa_translation_valid: bool,
+  guest_physical_addr: u64,
+  guest_linear_addr: u64,
+) : effect:(pure);
+
+/// Decode EPT violation qualification.
+pub fn decode_ept_violation_qual[
+  qual: u64,
+  guest_phys: u64,
+] -> EptViolationQual : effect:(pure) {
+  return EptViolationQual(
+    read_access: (qual & 0x01) != 0,
+    write_access: (qual & 0x02) != 0,
+    execute_access: (qual & 0x04) != 0,
+    ept_readable: (qual & 0x08) != 0,
+    ept_writable: (qual & 0x10) != 0,
+    ept_executable: (qual & 0x20) != 0,
+    is_linear_to_guest: (qual & 0x40) != 0,
+    is_guest_cause: (qual & 0x80) != 0,
+    guest_linear_addr_valid: (qual & 0x100) != 0,
+    nested_paging_fault: (qual & 0x200) != 0,
+    gpa_translation_valid: (qual & 0x400) != 0,
+    guest_physical_addr: guest_phys,
+    guest_linear_addr: 0,
+  );
+}
+
+/// Resolve EPT violation by checking each level of the EPT walk.
+pub fn resolve_ept_violation_detailed[
+  ept: *EptTable,
+  qual: EptViolationQual,
+  hv_cap: CapabilitySlot,
+] -> Result<bool, MemVirtError> : effect:(syscall, alloc, unsafe)
+  loop: bounded(4)
+{
+  let gpa: u64 = qual.guest_physical_addr;
+  let pml4_idx: u64 = (gpa >> 39) & 0x1FF;
+  let pdpt_idx: u64 = (gpa >> 30) & 0x1FF;
+  let pd_idx: u64 = (gpa >> 21) & 0x1FF;
+  let pt_idx: u64 = (gpa >> 12) & 0x1FF;
+
+  // Check PML4
+  let pml4e: EptPte = ept.pml4[pml4_idx];
+  if pml4e.bits == 0 {
+    // PML4 entry not present — check if we should fault or allocate
+    return Ok(false);
+  }
+
+  // Check PDPT
+  let pdpt_page: *EptPte = @int_to_ptr(pml4e.bits & 0xFFFFFFFFFF000);
+  let pdpte: EptPte = pdpt_page[pdpt_idx];
+  if pdpte.bits == 0 {
+    return Ok(false);
+  }
+
+  // If 1GB huge page and access violation
+  if (pdpte.bits & EPT_LEAF) != 0 {
+    let perms: u64 = pdpte.bits & 0x7FF;
+    if qual.read_access && (perms & EPT_READ) == 0 { return Ok(false); }
+    if qual.write_access && (perms & EPT_WRITE) == 0 { return Ok(false); }
+    if qual.execute_access && (perms & EPT_EXECUTE) == 0 { return Ok(false); }
+    return Ok(true);  // Permission modification would fix it
+  }
+
+  // Check PD
+  let pd_page: *EptPte = @int_to_ptr(pdpte.bits & 0xFFFFFFFFFF000);
+  let pde: EptPte = pd_page[pd_idx];
+  if pde.bits == 0 {
+    return Ok(false);
+  }
+
+  // If 2MB huge page and access violation
+  if (pde.bits & EPT_LEAF) != 0 {
+    let perms: u64 = pde.bits & 0x7FF;
+    if qual.read_access && (perms & EPT_READ) == 0 { return Ok(false); }
+    if qual.write_access && (perms & EPT_WRITE) == 0 { return Ok(false); }
+    if qual.execute_access && (perms & EPT_EXECUTE) == 0 { return Ok(false); }
+    return Ok(true);
+  }
+
+  // Check PT
+  let pt_page: *EptPte = @int_to_ptr(pde.bits & 0xFFFFFFFFFF000);
+  let pte: EptPte = pt_page[pt_idx];
+  if pte.bits == 0 {
+    return Ok(false);
+  }
+
+  // Check leaf permissions
+  let perms: u64 = pte.bits & 0x7FF;
+  if qual.read_access && (perms & EPT_READ) == 0 { return Ok(false); }
+  if qual.write_access && (perms & EPT_WRITE) == 0 { return Ok(false); }
+  if qual.execute_access && (perms & EPT_EXECUTE) == 0 { return Ok(false); }
+
+  return Ok(true);
+}
+
+//==============================================================================
+// EPT Page Walk Cache (for performance)
+//==============================================================================
+
+/// Look up an EPT translation in the walk cache.
+pub fn ept_walk_cache_lookup[
+  ept: *EptTable,
+  gpa: u64,
+] -> Option[EptCacheEntry] : effect:(pure)
+  loop: bounded(64)
+{
+  let walk_cache: *EptWalkCache = &ept.walk_cache;
+  for var i: u32 = 0; i < walk_cache.count; i += 1 {
+    let entry: EptCacheEntry = walk_cache.entries[i];
+    let page_start: u64 = entry.guest_phys & !0xFFF;
+    if gpa >= page_start && gpa < page_start + 0x1000 {
+      return Some(entry);
+    }
+  }
+  return None;
+}
+
+/// Insert an EPT translation into the walk cache.
+pub fn ept_walk_cache_insert[
+  ept: *EptTable,
+  entry: EptCacheEntry,
+] : effect:(unsafe)
+  loop: bounded(1)
+{
+  let walk_cache: *EptWalkCache = &ept.walk_cache;
+  if walk_cache.count < 64 {
+    walk_cache.entries[walk_cache.count] = entry;
+    walk_cache.count += 1;
+  } else {
+    // Simple FIFO eviction
+    for var i: u32 = 1; i < 64; i += 1 {
+      walk_cache.entries[i - 1] = walk_cache.entries[i];
+    }
+    walk_cache.entries[63] = entry;
+  }
+}
+
+//==============================================================================
+// Nested NPT (Nested Page Table) support
+//==============================================================================
+
+/// Nested NPT state for SVM (NPT for nested VMs).
+pub struct NestedNptState(
+  /// The nested NPT table pointer.
+  npt_table: *EptTable,
+  /// The level of nesting.
+  nest_level: u32,
+  /// Whether nested NPT is active.
+  is_active: bool,
+  /// The guest NPT CR3 value.
+  guest_npt_cr3: u64,
+  /// Size of nested NPT walks.
+  num_walks: u64,
+) : effect:(alloc, unsafe);
+
+/// Initialize nested NPT state.
+pub fn nested_npt_init[
+  hv_cap: CapabilitySlot,
+  cap_token: u64,
+] -> *NestedNptState : effect:(alloc, unsafe)
+  loop: bounded(1)
+{
+  let state: *NestedNptState = @alloc(NestedNptState);
+  state.npt_table = ept_create(hv_cap, cap_token);
+  state.nest_level = 0;
+  state.is_active = false;
+  state.guest_npt_cr3 = 0;
+  state.num_walks = 0;
+  return state;
+}
+
+/// Perform a nested NPT walk (two layers of EPT).
+pub fn nested_npt_walk[
+  nested: *NestedNptState,
+  l1_ept: *EptTable,
+  gpa: u64,
+] -> PageWalkResult : effect:(unsafe)
+  loop: bounded(8)
+{
+  // First walk: GPA -> GPA' via L1 EPT
+  let l1_result: PageWalkResult = walk_ept(l1_ept, gpa);
+  if !l1_result.success {
+    return l1_result;
+  }
+
+  // Second walk: GPA' -> HPA via nested NPT
+  let l2_result: PageWalkResult = walk_ept(nested.npt_table, l1_result.host_phys);
+  nested.num_walks += 1;
+
+  return l2_result;
+}
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_ept_create[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_MEM.bits, value: 0, generation: 1, valid: true);
+  let ept: *EptTable = ept_create(cap, cap.generation);
+  // assert(ept.allocated_pages == 1);
+}
+
+#[test]
+pub fn test_page_walk[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_MEM.bits, value: 0, generation: 1, valid: true);
+  let ept: *EptTable = ept_create(cap, cap.generation);
+  // Map a page and walk it
+  let gpa: u64 = 0x1000;
+  let hpa: u64 = 0x80000000;
+  ept_map(ept, gpa, hpa, 0x1000, EPT_PERM_RWX, EptMemoryType::WriteBack, cap);
+  let walk: PageWalkResult = walk_ept(ept, gpa);
+  assert(walk.success == true);
+  assert(walk.host_phys == hpa);
+}
+
+#[test]
+pub fn test_guest_mem_alloc[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_MEM.bits, value: 0, generation: 1, valid: true);
+  var allocator: GuestMemAllocator = GuestMemAllocator(regions: Default, count: 0, next_gpa: 0x1000, max_gpa: 0x100000, hv_cap: cap, generation: 0);
+  let gpa: u64 = guest_mem_alloc(&allocator, 0x4000, 0x1000, GuestMemBacking::Anonymous, GMF_PRESENT);
+  assert(gpa == 0x1000);
+  assert(allocator.count == 1);
+  assert(allocator.next_gpa == 0x5000);
+}

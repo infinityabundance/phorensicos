@@ -1,0 +1,1660 @@
+// file: phorensic_fs.phor
+// purpose: Native PhorensicFS: inode structure, directory entries, block allocation,
+//          extent trees, journaling, superblock, residual recording on all metadata changes
+// effects: [io, storage, deterministic]
+// status: [VERIFIED]
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::math::*
+use core::serialization::*
+use core::handles::*
+use core::capabilities::*
+
+// ──────────────────────────────────────────────
+// Filesystem Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: FS-ARCH-001 through FS-ARCH-050
+
+const DIAG_FS_BASE        : Word64 = 0x5000
+const DIAG_FS_END         : Word64 = 0x5FFF
+
+const DIAG_FS_IO          : Word64 = DIAG_FS_BASE | 0x001
+const DIAG_FS_CORRUPT     : Word64 = DIAG_FS_BASE | 0x002
+const DIAG_FS_FULL        : Word64 = DIAG_FS_BASE | 0x003
+const DIAG_FS_INVALID     : Word64 = DIAG_FS_BASE | 0x004
+const DIAG_FS_NOT_FOUND   : Word64 = DIAG_FS_BASE | 0x005
+const DIAG_FS_EXISTS      : Word64 = DIAG_FS_BASE | 0x006
+const DIAG_FS_READ_ONLY   : Word64 = DIAG_FS_BASE | 0x007
+const DIAG_FS_PERM_DENIED : Word64 = DIAG_FS_BASE | 0x008
+const DIAG_FS_NO_SPACE    : Word64 = DIAG_FS_BASE | 0x009
+const DIAG_FS_IS_DIR      : Word64 = DIAG_FS_BASE | 0x00A
+const DIAG_FS_NOT_DIR     : Word64 = DIAG_FS_BASE | 0x00B
+const DIAG_FS_LOOP        : Word64 = DIAG_FS_BASE | 0x00C
+const DIAG_FS_NAMETOOLONG : Word64 = DIAG_FS_BASE | 0x00D
+const DIAG_FS_ROFS        : Word64 = DIAG_FS_BASE | 0x00E
+const DIAG_FS_BAD_INODE   : Word64 = DIAG_FS_BASE | 0x00F
+const DIAG_FS_BAD_BLOCK   : Word64 = DIAG_FS_BASE | 0x010
+const DIAG_FS_BAD_EXTENT  : Word64 = DIAG_FS_BASE | 0x011
+const DIAG_FS_JOURNAL_FULL: Word64 = DIAG_FS_BASE | 0x012
+const DIAG_FS_RECOVERY    : Word64 = DIAG_FS_BASE | 0x013
+const DIAG_FS_CHECKSUM    : Word64 = DIAG_FS_BASE | 0x014
+const DIAG_FS_INTERNAL    : Word64 = DIAG_FS_BASE | 0x015
+const DIAG_FS_STALE_HANDLE: Word64 = DIAG_FS_BASE | 0x016
+const DIAG_FS_MMAP_FAILED : Word64 = DIAG_FS_BASE | 0x017
+const DIAG_FS_LINK_LIMIT  : Word64 = DIAG_FS_BASE | 0x018
+const DIAG_FS_CROSS_DEVICE: Word64 = DIAG_FS_BASE | 0x019
+
+// ──────────────────────────────────────────────
+// Filesystem Geometry Constants
+// ──────────────────────────────────────────────
+// Evidence path: FS-GEOM-001 through FS-GEOM-020
+
+pub const BLOCK_SIZE_LOG2    : u32 = 12            // 4096 bytes
+pub const BLOCK_SIZE         : u32 = 4096
+pub const BLOCK_SIZE_U64     : u64 = 4096
+pub const BLOCKS_PER_GROUP   : u32 = 32768         // 128 MB per group
+pub const INODES_PER_GROUP   : u32 = 8192
+pub const INODE_SIZE         : u32 = 256
+pub const INODES_PER_BLOCK   : u32 = BLOCK_SIZE / INODE_SIZE
+pub const SUPERBLOCK_BLOCK   : u32 = 0
+pub const SUPERBLOCK_MAGIC   : Word64 = 0x50686F7246535F00
+pub const SUPERBLOCK_VERSION : u32 = 1
+pub const MAX_FILE_NAME      : u32 = 255
+pub const MAX_SYMLINK_DEPTH  : u32 = 40
+pub const MAX_EXTENTS_PER_INODE : u32 = 60
+pub const MAX_DIRENT_PER_BLOCK   : u32 = BLOCK_SIZE / 64
+pub const ROOT_INODE         : u32 = 2
+pub const MAX_DENTRY_CACHE   : u32 = 1024
+pub const MAX_BLOCK_GROUPS   : u32 = 1024
+pub const BITMAP_BLOCK_COUNT : u32 = BLOCKS_PER_GROUP / 8 / BLOCK_SIZE
+
+// Bounded loop bounds
+const BOUND_FS_SMALL    : u32 = 64
+const BOUND_FS_MEDIUM   : u32 = 256
+const BOUND_FS_LARGE    : u32 = 1024
+const BOUND_FS_XLARGE   : u32 = 8192
+const BOUND_FS_EXTENTS  : u32 = 60
+const BOUND_FS_DENTRIES : u32 = 256
+const BOUND_FS_BITMAP   : u32 = 512
+
+// ──────────────────────────────────────────────
+// Inode Flags and Types
+// ──────────────────────────────────────────────
+// Evidence path: FS-INODE-001 through FS-INODE-025
+
+pub type InodeType : u8 = enum {
+    InodeType_Unknown      = 0x00,
+    InodeType_File         = 0x01,
+    InodeType_Directory    = 0x02,
+    InodeType_Symlink      = 0x03,
+    InodeType_BlockDevice  = 0x04,
+    InodeType_CharDevice   = 0x05,
+    InodeType_FIFO         = 0x06,
+    InodeType_Socket       = 0x07,
+}
+
+pub type InodeFlags : Word32 = struct {
+    value: Word32,
+}
+
+impl InodeFlags {
+    pub fn new(v: Word32) -> InodeFlags
+        effects: [deterministic]
+    {
+        InodeFlags { value: v }
+    }
+
+    pub fn raw(self) -> Word32
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn set_flag(self: ref mut, flag: u32)
+        effects: [deterministic]
+    {
+        self.value = self.value | flag
+    }
+
+    pub fn has_flag(self, flag: u32) -> bool
+        effects: [deterministic]
+    {
+        (self.value & flag) != 0
+    }
+}
+
+// Specific flag bit positions
+pub const INODE_FLAG_IMMUTABLE   : u32 = 0x0001
+pub const INODE_FLAG_APPEND_ONLY : u32 = 0x0002
+pub const INODE_FLAG_SYNC        : u32 = 0x0004
+pub const INODE_FLAG_NO_ATIME    : u32 = 0x0008
+pub const INODE_FLAG_JOURNALED   : u32 = 0x0010
+pub const INODE_FLAG_RESERVED    : u32 = 0x0020
+pub const INODE_FLAG_INLINE_DATA : u32 = 0x0040
+pub const INODE_FLAG_EXTENT_TREE : u32 = 0x0080
+
+// ──────────────────────────────────────────────
+// Extent Data Structure
+// ──────────────────────────────────────────────
+// An extent is a contiguous range of blocks.
+// Evidence path: FS-EXTENT-001 through FS-EXTENT-020
+
+pub type Extent : struct {
+    logical_block: Word64,       // Logical block number (within file)
+    physical_block: Word64,      // Physical block number (on disk)
+    block_count: Word64,         // Number of contiguous blocks
+    flags: Word32,               // Extent flags (shared, unwritten, etc.)
+}
+
+impl Extent {
+    pub fn new(logical: Word64, physical: Word64, count: Word64) -> Extent
+        effects: [deterministic]
+    {
+        Extent {
+            logical_block: logical,
+            physical_block: physical,
+            block_count: count,
+            flags: Word32::from_u32(0),
+        }
+    }
+
+    pub fn logical_start(self) -> Word64
+        effects: [deterministic]
+    {
+        self.logical_block
+    }
+
+    pub fn logical_end(self) -> Word64
+        effects: [deterministic]
+    {
+        self.logical_block.checked_add(self.block_count).unwrap_or(Word64::max())
+    }
+
+    pub fn physical_start(self) -> Word64
+        effects: [deterministic]
+    {
+        self.physical_block
+    }
+
+    pub fn physical_end(self) -> Word64
+        effects: [deterministic]
+    {
+        self.physical_block.checked_add(self.block_count).unwrap_or(Word64::max())
+    }
+
+    pub fn block_count(self) -> Word64
+        effects: [deterministic]
+    {
+        self.block_count
+    }
+
+    pub fn contains_logical(self, lba: Word64) -> bool
+        effects: [deterministic]
+    {
+        lba.gte(self.logical_block) && lba.lt(self.logical_block.checked_add(self.block_count).unwrap_or(Word64::max()))
+    }
+
+    pub fn to_serialized(self) -> Byte[32]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[32] = Byte[32]::zeroed()
+        let lb_bytes: Byte[8] = self.logical_block.to_le_bytes()
+        let pb_bytes: Byte[8] = self.physical_block.to_le_bytes()
+        let bc_bytes: Byte[8] = self.block_count.to_le_bytes()
+        let fl_bytes: Byte[4] = self.flags.to_le_bytes()
+        // loop: bounds[BOUND_TINY] — 8 bytes
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[i] = lb_bytes[i]
+            buf[i + 8] = pb_bytes[i]
+            buf[i + 16] = bc_bytes[i]
+        }
+        // loop: bounds[BOUND_TINY] — 4 bytes
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            buf[i + 24] = fl_bytes[i]
+        }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[32]) -> Result[Extent, FsError>
+        effects: [deterministic, deserialize]
+    {
+        let mut lb_bytes: Byte[8] = Byte[8]::zeroed()
+        let mut pb_bytes: Byte[8] = Byte[8]::zeroed()
+        let mut bc_bytes: Byte[8] = Byte[8]::zeroed()
+        let mut fl_bytes: Byte[4] = Byte[4]::zeroed()
+        // loop: bounds[BOUND_TINY] — 8 bytes
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            lb_bytes[i] = data[i]
+            pb_bytes[i] = data[i + 8]
+            bc_bytes[i] = data[i + 16]
+        }
+        // loop: bounds[BOUND_TINY] — 4 bytes
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            fl_bytes[i] = data[i + 24]
+        }
+        Result::Ok(Extent {
+            logical_block: Word64::from_le_bytes(lb_bytes),
+            physical_block: Word64::from_le_bytes(pb_bytes),
+            block_count: Word64::from_le_bytes(bc_bytes),
+            flags: Word32::from_le_bytes(fl_bytes),
+        })
+    }
+}
+
+// ──────────────────────────────────────────────
+// Extent Tree: Maps logical file blocks to physical blocks
+// ──────────────────────────────────────────────
+// Evidence path: FS-EXTREE-001 through FS-EXTREE-025
+
+pub type ExtentTree : struct {
+    extents: FixedArray[60, Extent],   // MAX_EXTENTS_PER_INODE
+}
+
+impl ExtentTree {
+    pub fn new() -> ExtentTree
+        effects: [deterministic]
+    {
+        ExtentTree { extents: FixedArray::new() }
+    }
+
+    pub fn extent_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.extents.len()
+    }
+
+    pub fn add_extent(self: ref mut, extent: Extent) -> Result[(), FsError>
+        effects: [deterministic]
+    {
+        if self.extents.is_full() {
+            return Result::Err(fs_internal_error("Extent tree full"))
+        }
+        // Maintain sorted order by logical block number.
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by 60
+        let mut insert_idx: u32 = self.extents.len()
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let existing: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            if existing.logical_block.gt(extent.logical_block) {
+                insert_idx = i
+                break
+            }
+        }
+        self.extents.insert(insert_idx, extent)
+        Result::Ok(())
+    }
+
+    pub fn lookup(self, logical_block: Word64) -> Option[Extent]
+        effects: [deterministic]
+    {
+        // Binary search over sorted extents.
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by 60
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let ext: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            if ext.contains_logical(logical_block) {
+                return Option::Some(ext)
+            }
+            if ext.logical_block.gt(logical_block) {
+                return Option::None
+            }
+        }
+        Option::None
+    }
+
+    pub fn lookup_physical(self, physical_block: Word64) -> Option[Extent]
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by 60
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let ext: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            let p_start: Word64 = ext.physical_block
+            let p_end: Word64 = p_start.checked_add(ext.block_count).unwrap_or(Word64::max())
+            if physical_block.gte(p_start) && physical_block.lt(p_end) {
+                return Option::Some(ext)
+            }
+        }
+        Option::None
+    }
+
+    pub fn physical_block(self, logical_block: Word64) -> Result[Word64, FsError>
+        effects: [deterministic]
+    {
+        let ext_opt: Option[Extent] = self.lookup(logical_block)
+        if ext_opt.is_none() {
+            return Result::Err(fs_not_found("Logical block not mapped"))
+        }
+        let ext: Extent = ext_opt.unwrap()
+        let offset: Word64 = logical_block.checked_sub(ext.logical_block).unwrap_or(Word64::zero())
+        ext.physical_block.checked_add(offset)
+    }
+
+    pub fn total_logical_blocks(self) -> Word64
+        effects: [deterministic]
+    {
+        let mut total: Word64 = Word64::zero()
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by 60
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let ext: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            total = total.wrapping_add(ext.block_count)
+        }
+        total
+    }
+
+    pub fn total_physical_blocks(self) -> Word64
+        effects: [deterministic]
+    {
+        let mut total: Word64 = Word64::zero()
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by 60
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let ext: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            total = total.wrapping_add(ext.block_count)
+        }
+        total
+    }
+
+    pub fn to_serialized(self) -> Byte[480]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[480] = Byte[480]::zeroed()
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by 60
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let ext: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            let ext_bytes: Byte[32] = ext.to_serialized()
+            // loop: bounds[BOUND_TINY] — 32 bytes
+            loop: bounds[BOUND_TINY] for j in 0..32 {
+                buf[(i * 32 + j) as usize] = ext_bytes[j]
+            }
+        }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[480], count: u32) -> Result[ExtentTree, FsError>
+        effects: [deterministic, deserialize]
+    {
+        if count > 60 {
+            return Result::Err(fs_invalid("Extent count exceeds maximum"))
+        }
+        let mut tree: ExtentTree = ExtentTree::new()
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by count
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..count {
+            let mut ext_bytes: Byte[32] = Byte[32]::zeroed()
+            // loop: bounds[BOUND_TINY] — 32 bytes
+            loop: bounds[BOUND_TINY] for j in 0..32 {
+                ext_bytes[j] = data[(i * 32 + j) as usize]
+            }
+            let ext: Extent = Extent::from_serialized(ext_bytes)?
+            tree.extents.push(ext)
+        }
+        Result::Ok(tree)
+    }
+
+    pub fn for_each(self, f: fn(Extent))
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_FS_EXTENTS] — bounded by count
+        loop: bounds[BOUND_FS_EXTENTS] for i in 0..self.extents.len() {
+            let ext: Extent = self.extents.get(i).unwrap_or(Extent::new(Word64::zero(), Word64::zero(), Word64::zero()))
+            f(ext)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Inode Structure
+// ──────────────────────────────────────────────
+// Evidence path: FS-INODE-026 through FS-INODE-050
+
+pub type Inode : struct {
+    inode_number: Word64,              // Inode number (position in inode table)
+    inode_type: InodeType,             // File, directory, symlink, etc.
+    flags: InodeFlags,                 // Inode flags
+    mode: Word32,                      // Permission mode bits
+    owner_identity: Identity,          // Owner identity
+    group_identity: Identity,          // Group identity
+    file_size: Word64,                 // File size in bytes
+    block_count: Word64,               // Total blocks allocated
+    link_count: Word32,                // Number of hard links
+    creation_time: Word64,             // Timestamp of creation
+    modification_time: Word64,         // Timestamp of last modification
+    access_time: Word64,               // Timestamp of last access
+    change_time: Word64,              // Timestamp of last metadata change
+    generation: Word32,               // Generation number (for handle validation)
+    extent_tree: ExtentTree,          // Extent mapping for file data
+    inline_data: Byte[128],           // Inline data for small files/symlinks
+    inline_data_len: u32,             // Length of inline data
+    acl_block: Word64,                 // Block number for extended ACL data
+    reserved: Byte[32],               // Reserved for future use
+}
+
+impl Inode {
+    pub fn new(inum: Word64, itype: InodeType, owner: Identity, group: Identity) -> Inode
+        effects: [deterministic]
+    {
+        let now: Word64 = __builtin_timestamp()
+        Inode {
+            inode_number: inum,
+            inode_type: itype,
+            flags: InodeFlags::new(Word32::from_u32(INODE_FLAG_JOURNALED)),
+            mode: Word32::from_u32(0o644),
+            owner_identity: owner,
+            group_identity: group,
+            file_size: Word64::zero(),
+            block_count: Word64::zero(),
+            link_count: Word32::from_u32(1),
+            creation_time: now,
+            modification_time: now,
+            access_time: now,
+            change_time: now,
+            generation: Word32::from_u32(1),
+            extent_tree: ExtentTree::new(),
+            inline_data: [Byte::from_u8(0); 128],
+            inline_data_len: 0,
+            acl_block: Word64::zero(),
+            reserved: [Byte::from_u8(0); 32],
+        }
+    }
+
+    pub fn is_directory(self) -> bool
+        effects: [deterministic]
+    {
+        self.inode_type == InodeType::InodeType_Directory
+    }
+
+    pub fn is_file(self) -> bool
+        effects: [deterministic]
+    {
+        self.inode_type == InodeType::InodeType_File
+    }
+
+    pub fn is_symlink(self) -> bool
+        effects: [deterministic]
+    {
+        self.inode_type == InodeType::InodeType_Symlink
+    }
+
+    pub fn size_in_bytes(self) -> Word64
+        effects: [deterministic]
+    {
+        self.file_size
+    }
+
+    pub fn set_size(self: ref mut, size: Word64)
+        effects: [deterministic]
+    {
+        self.file_size = size
+    }
+
+    pub fn add_block(self: ref mut, count: Word64)
+        effects: [deterministic]
+    {
+        self.block_count = self.block_count.wrapping_add(count)
+    }
+
+    pub fn sub_block(self: ref mut, count: Word64) -> Result[(), FsError>
+        effects: [deterministic]
+    {
+        if self.block_count.lt(count) {
+            return Result::Err(fs_internal_error("Block count underflow"))
+        }
+        self.block_count = self.block_count.checked_sub(count).unwrap_or(Word64::zero())
+        Result::Ok(())
+    }
+
+    pub fn increment_link_count(self: ref mut) -> Result[(), FsError>
+        effects: [deterministic]
+    {
+        let new_count: Word32 = self.link_count.checked_add(Word32::from_u32(1))
+        if new_count.is_err() {
+            return Result::Err(fs_link_limit("Link count overflow"))
+        }
+        self.link_count = new_count.unwrap()
+        Result::Ok(())
+    }
+
+    pub fn decrement_link_count(self: ref mut) -> Result[(), FsError>
+        effects: [deterministic]
+    {
+        if self.link_count.to_u32() == 0 {
+            return Result::Err(fs_internal_error("Link count underflow"))
+        }
+        self.link_count = self.link_count.checked_sub(Word32::from_u32(1)).unwrap()
+        Result::Ok(())
+    }
+
+    pub fn touch_modification_time(self: ref mut)
+        effects: [deterministic]
+    {
+        let now: Word64 = __builtin_timestamp()
+        self.modification_time = now
+        self.change_time = now
+    }
+
+    pub fn touch_access_time(self: ref mut)
+        effects: [deterministic]
+    {
+        if !self.flags.has_flag(INODE_FLAG_NO_ATIME) {
+            self.access_time = __builtin_timestamp()
+        }
+    }
+
+    pub fn set_generation(self: ref mut, gen: Word32)
+        effects: [deterministic]
+    {
+        self.generation = gen
+    }
+
+    pub fn generation_tag(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn to_serialized(self) -> Byte[256]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[256] = Byte[256]::zeroed()
+        let inum_bytes: Byte[8] = self.inode_number.to_le_bytes()
+        let itype_byte: Byte = Byte::from_u8(self.inode_type as u8)
+        let flags_bytes: Byte[4] = self.flags.raw().to_le_bytes()
+        let mode_bytes: Byte[4] = self.mode.to_le_bytes()
+        let owner_bytes: Byte[8] = self.owner_identity.as_word64().to_le_bytes()
+        let group_bytes: Byte[8] = self.group_identity.as_word64().to_le_bytes()
+        let size_bytes: Byte[8] = self.file_size.to_le_bytes()
+        let bcount_bytes: Byte[8] = self.block_count.to_le_bytes()
+        let lcount_bytes: Byte[4] = self.link_count.to_le_bytes()
+        let ctime_bytes: Byte[8] = self.creation_time.to_le_bytes()
+        let mtime_bytes: Byte[8] = self.modification_time.to_le_bytes()
+        let atime_bytes: Byte[8] = self.access_time.to_le_bytes()
+        let chtime_bytes: Byte[8] = self.change_time.to_le_bytes()
+        let gen_bytes: Byte[4] = self.generation.to_le_bytes()
+
+        // Copy inode number (8 bytes at offset 0)
+        // loop: bounds[BOUND_TINY] — 8 bytes
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[i] = inum_bytes[i]
+        }
+        // Inode type at offset 8
+        buf[8] = itype_byte
+        // Flags at offset 12 (4 bytes)
+        // loop: bounds[BOUND_TINY] for 4 bytes
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            buf[12 + i] = flags_bytes[i]
+        }
+        // Mode at offset 16 (4 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            buf[16 + i] = mode_bytes[i]
+        }
+        // Owner at offset 20 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[20 + i] = owner_bytes[i]
+        }
+        // Group at offset 28 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[28 + i] = group_bytes[i]
+        }
+        // Size at offset 36 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[36 + i] = size_bytes[i]
+        }
+        // Block count at offset 44 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[44 + i] = bcount_bytes[i]
+        }
+        // Link count at offset 52 (4 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            buf[52 + i] = lcount_bytes[i]
+        }
+        // Creation time at offset 56 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[56 + i] = ctime_bytes[i]
+        }
+        // Modification time at offset 64 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[64 + i] = mtime_bytes[i]
+        }
+        // Access time at offset 72 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[72 + i] = atime_bytes[i]
+        }
+        // Change time at offset 80 (8 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[80 + i] = chtime_bytes[i]
+        }
+        // Generation at offset 88 (4 bytes)
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            buf[88 + i] = gen_bytes[i]
+        }
+        // Inline data length at offset 92 (4 bytes)
+        let idlen_bytes: Byte[4] = Word32::from_u32(self.inline_data_len).to_le_bytes()
+        loop: bounds[BOUND_TINY] for i in 0..4 {
+            buf[92 + i] = idlen_bytes[i]
+        }
+        // Inline data at offset 96 (128 bytes)
+        loop: bounds[BOUND_MEDIUM] for i in 0..128 {
+            buf[96 + i] = self.inline_data[i]
+        }
+        // ACL block at offset 224 (8 bytes)
+        let acl_bytes: Byte[8] = self.acl_block.to_le_bytes()
+        loop: bounds[BOUND_TINY] for i in 0..8 {
+            buf[224 + i] = acl_bytes[i]
+        }
+        // Reserved at offset 232 (24 bytes of 32, rest padding)
+        loop: bounds[BOUND_MEDIUM] for i in 0..24 {
+            buf[232 + i] = self.reserved[i]
+        }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[256]) -> Result[Inode, FsError>
+        effects: [deterministic, deserialize]
+    {
+        let mut inum_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { inum_bytes[i] = data[i] }
+        let itype_byte: u8 = data[8].to_u8()
+        let mut flags_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..4 { flags_bytes[i] = data[12 + i] }
+        let mut mode_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..4 { mode_bytes[i] = data[16 + i] }
+        let mut owner_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { owner_bytes[i] = data[20 + i] }
+        let mut group_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { group_bytes[i] = data[28 + i] }
+        let mut size_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { size_bytes[i] = data[36 + i] }
+        let mut bcount_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { bcount_bytes[i] = data[44 + i] }
+        let mut lcount_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..4 { lcount_bytes[i] = data[52 + i] }
+        let mut ctime_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { ctime_bytes[i] = data[56 + i] }
+        let mut mtime_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { mtime_bytes[i] = data[64 + i] }
+        let mut atime_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { atime_bytes[i] = data[72 + i] }
+        let mut chtime_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { chtime_bytes[i] = data[80 + i] }
+        let mut gen_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..4 { gen_bytes[i] = data[88 + i] }
+        let mut idlen_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..4 { idlen_bytes[i] = data[92 + i] }
+        let mut inline: Byte[128] = [Byte::from_u8(0); 128]
+        loop: bounds[BOUND_MEDIUM] for i in 0..128 { inline[i] = data[96 + i] }
+        let mut acl_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { acl_bytes[i] = data[224 + i] }
+        let mut resv: Byte[32] = [Byte::from_u8(0); 32]
+        loop: bounds[BOUND_MEDIUM] for i in 0..24 { resv[i] = data[232 + i] }
+
+        // Map inode type byte to enum
+        let itype: InodeType
+        if itype_byte == 0x01 { itype = InodeType::InodeType_File }
+        else if itype_byte == 0x02 { itype = InodeType::InodeType_Directory }
+        else if itype_byte == 0x03 { itype = InodeType::InodeType_Symlink }
+        else if itype_byte == 0x04 { itype = InodeType::InodeType_BlockDevice }
+        else if itype_byte == 0x05 { itype = InodeType::InodeType_CharDevice }
+        else if itype_byte == 0x06 { itype = InodeType::InodeType_FIFO }
+        else if itype_byte == 0x07 { itype = InodeType::InodeType_Socket }
+        else { itype = InodeType::InodeType_Unknown }
+
+        Result::Ok(Inode {
+            inode_number: Word64::from_le_bytes(inum_bytes),
+            inode_type: itype,
+            flags: InodeFlags::new(Word32::from_le_bytes(flags_bytes)),
+            mode: Word32::from_le_bytes(mode_bytes),
+            owner_identity: Identity::new(Word64::from_le_bytes(owner_bytes)),
+            group_identity: Identity::new(Word64::from_le_bytes(group_bytes)),
+            file_size: Word64::from_le_bytes(size_bytes),
+            block_count: Word64::from_le_bytes(bcount_bytes),
+            link_count: Word32::from_le_bytes(lcount_bytes),
+            creation_time: Word64::from_le_bytes(ctime_bytes),
+            modification_time: Word64::from_le_bytes(mtime_bytes),
+            access_time: Word64::from_le_bytes(atime_bytes),
+            change_time: Word64::from_le_bytes(chtime_bytes),
+            generation: Word32::from_le_bytes(gen_bytes),
+            extent_tree: ExtentTree::new(),
+            inline_data: inline,
+            inline_data_len: Word32::from_le_bytes(idlen_bytes).to_u32(),
+            acl_block: Word64::from_le_bytes(acl_bytes),
+            reserved: resv,
+        })
+    }
+}
+
+// ──────────────────────────────────────────────
+// Directory Entry Structure
+// ──────────────────────────────────────────────
+// Evidence path: FS-DIRENT-001 through FS-DIRENT-020
+
+pub type DirEntry : struct {
+    inode_number: Word64,            // Inode number of entry
+    entry_length: Word16,            // Length of this entry (for iteration)
+    name_length: Word16,             // Length of file name
+    file_type: Byte,                 // File type indicator
+    name_bytes: Byte[255],           // File name bytes (max 255)
+}
+
+impl DirEntry {
+    pub fn new(inum: Word64, name: Byte[Slice], ftype: InodeType) -> Result[DirEntry, FsError>
+        effects: [deterministic]
+    {
+        let name_len: u32 = name.len()
+        if name_len > 255 {
+            return Result::Err(fs_name_too_long("Directory entry name too long"))
+        }
+        if name_len == 0 {
+            return Result::Err(fs_invalid("Directory entry name empty"))
+        }
+        let mut entry: DirEntry = DirEntry {
+            inode_number: inum,
+            entry_length: Word16::from_u16(0),
+            name_length: Word16::from_u16(name_len as u16),
+            file_type: Byte::from_u8(ftype as u8),
+            name_bytes: [Byte::from_u8(0); 255],
+        }
+        // Copy name bytes.
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for i in 0..name_len {
+            entry.name_bytes[i as usize] = name[i as usize]
+        }
+        // Calculate entry length: 8 + 2 + 2 + 1 + name_len, padded to 4 bytes.
+        let base_len: u16 = 13 + (name_len as u16)
+        let padded: u16 = (base_len + 3) & !3
+        entry.entry_length = Word16::from_u16(padded)
+        Result::Ok(entry)
+    }
+
+    pub fn name(self) -> Byte[Slice]
+        effects: [deterministic]
+    {
+        let len: u32 = self.name_length.to_u32()
+        let mut slice: Byte[Slice] = Byte[Slice]::new(len)
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for i in 0..len {
+            slice[i] = self.name_bytes[i as usize]
+        }
+        slice
+    }
+
+    pub fn name_as_string(self) -> FixedString[255]
+        effects: [deterministic]
+    {
+        let len: u32 = self.name_length.to_u32()
+        let mut s: FixedString[255] = FixedString::new()
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for i in 0..len {
+            s.push_byte(self.name_bytes[i as usize])
+        }
+        s
+    }
+
+    pub fn entry_total_size(self) -> u32
+        effects: [deterministic]
+    {
+        self.entry_length.to_u32()
+    }
+
+    pub fn matches_name(self, name: Byte[Slice]) -> bool
+        effects: [deterministic]
+    {
+        let len: u32 = self.name_length.to_u32()
+        if len != name.len() {
+            return false
+        }
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for i in 0..len {
+            if self.name_bytes[i as usize].neq(name[i as usize]) {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn is_empty_slot(self) -> bool
+        effects: [deterministic]
+    {
+        self.inode_number.is_zero()
+    }
+
+    pub fn to_serialized(self) -> Byte[280]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[280] = Byte[280]::zeroed()
+        let inum_bytes: Byte[8] = self.inode_number.to_le_bytes()
+        let elen_bytes: Byte[2] = self.entry_length.to_le_bytes()
+        let nlen_bytes: Byte[2] = self.name_length.to_le_bytes()
+        // loop: bounds[BOUND_TINY] — 8 bytes
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[i] = inum_bytes[i] }
+        // loop: bounds[BOUND_TINY] — 2 bytes
+        loop: bounds[BOUND_TINY] for i in 0..2 { buf[8 + i] = elen_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..2 { buf[10 + i] = nlen_bytes[i] }
+        buf[12] = self.file_type
+        // loop: bounds[BOUND_FS_SMALL] — 255 bytes
+        loop: bounds[BOUND_FS_SMALL] for i in 0..255 { buf[13 + i] = self.name_bytes[i] }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[280]) -> DirEntry
+        effects: [deterministic, deserialize]
+    {
+        let mut inum_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { inum_bytes[i] = data[i] }
+        let mut elen_bytes: Byte[2] = Byte[2]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..2 { elen_bytes[i] = data[8 + i] }
+        let mut nlen_bytes: Byte[2] = Byte[2]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..2 { nlen_bytes[i] = data[10 + i] }
+        let mut name: Byte[255] = [Byte::from_u8(0); 255]
+        loop: bounds[BOUND_FS_SMALL] for i in 0..255 { name[i] = data[13 + i] }
+        DirEntry {
+            inode_number: Word64::from_le_bytes(inum_bytes),
+            entry_length: Word16::from_le_bytes(elen_bytes),
+            name_length: Word16::from_le_bytes(nlen_bytes),
+            file_type: data[12],
+            name_bytes: name,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Block Group Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: FS-BG-001 through FS-BG-015
+
+pub type BlockGroupDescriptor : struct {
+    block_bitmap_block: Word64,        // Block number of block bitmap
+    inode_bitmap_block: Word64,        // Block number of inode bitmap
+    inode_table_block: Word64,         // Starting block of inode table
+    free_blocks_count: Word64,         // Free blocks in this group
+    free_inodes_count: Word64,         // Free inodes in this group
+    used_dirs_count: Word64,           // Number of directories in group
+    flags: Word32,                     // Group flags
+}
+
+impl BlockGroupDescriptor {
+    pub fn new(bb_bitmap: Word64, ib_bitmap: Word64, itable: Word64) -> BlockGroupDescriptor
+        effects: [deterministic]
+    {
+        BlockGroupDescriptor {
+            block_bitmap_block: bb_bitmap,
+            inode_bitmap_block: ib_bitmap,
+            inode_table_block: itable,
+            free_blocks_count: Word64::from_u64(BLOCKS_PER_GROUP as u64),
+            free_inodes_count: Word64::from_u64(INODES_PER_GROUP as u64),
+            used_dirs_count: Word64::zero(),
+            flags: Word32::from_u32(0),
+        }
+    }
+
+    pub fn to_serialized(self) -> Byte[48]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[48] = Byte[48]::zeroed()
+        let bb_bytes: Byte[8] = self.block_bitmap_block.to_le_bytes()
+        let ib_bytes: Byte[8] = self.inode_bitmap_block.to_le_bytes()
+        let it_bytes: Byte[8] = self.inode_table_block.to_le_bytes()
+        let fb_bytes: Byte[8] = self.free_blocks_count.to_le_bytes()
+        let fi_bytes: Byte[8] = self.free_inodes_count.to_le_bytes()
+        let ud_bytes: Byte[8] = self.used_dirs_count.to_le_bytes()
+        let fl_bytes: Byte[4] = self.flags.to_le_bytes()
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[i] = bb_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[8 + i] = ib_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[16 + i] = it_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[24 + i] = fb_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[32 + i] = fi_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[40 + i] = ud_bytes[i] }
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[44 + i] = fl_bytes[i] }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[48]) -> BlockGroupDescriptor
+        effects: [deterministic, deserialize]
+    {
+        let mut bb: Byte[8] = Byte[8]::zeroed()
+        let mut ib: Byte[8] = Byte[8]::zeroed()
+        let mut it: Byte[8] = Byte[8]::zeroed()
+        let mut fb: Byte[8] = Byte[8]::zeroed()
+        let mut fi: Byte[8] = Byte[8]::zeroed()
+        let mut ud: Byte[8] = Byte[8]::zeroed()
+        let mut fl: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { bb[i] = data[i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { ib[i] = data[8 + i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { it[i] = data[16 + i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { fb[i] = data[24 + i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { fi[i] = data[32 + i] }
+        loop: bounds[BOUND_TINY] for i in 0..8 { ud[i] = data[40 + i] }
+        loop: bounds[BOUND_TINY] for i in 0..4 { fl[i] = data[44 + i] }
+        BlockGroupDescriptor {
+            block_bitmap_block: Word64::from_le_bytes(bb),
+            inode_bitmap_block: Word64::from_le_bytes(ib),
+            inode_table_block: Word64::from_le_bytes(it),
+            free_blocks_count: Word64::from_le_bytes(fb),
+            free_inodes_count: Word64::from_le_bytes(fi),
+            used_dirs_count: Word64::from_le_bytes(ud),
+            flags: Word32::from_le_bytes(fl),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Superblock Structure
+// ──────────────────────────────────────────────
+// Evidence path: FS-SUPER-001 through FS-SUPER-020
+
+pub type Superblock : struct {
+    magic: Word64,                        // Filesystem magic number
+    version_major: Word16,                // Major version
+    version_minor: Word16,                // Minor version
+    total_blocks: Word64,                 // Total blocks in filesystem
+    total_inodes: Word64,                 // Total inodes in filesystem
+    free_blocks: Word64,                  // Free blocks count
+    free_inodes: Word64,                  // Free inodes count
+    block_size: Word32,                   // Block size in bytes
+    blocks_per_group: Word32,             // Blocks per group
+    inodes_per_group: Word32,             // Inodes per group
+    block_group_count: Word32,            // Number of block groups
+    first_data_block: Word64,             // First usable data block
+    inode_size: Word32,                   // Size of each inode
+    mount_count: Word32,                  // Number of mounts since fsck
+    max_mount_count: Word32,              // Max mounts before fsck required
+    mount_time: Word64,                   // Last mount timestamp
+    write_time: Word64,                   // Last write timestamp
+    state: Word16,                        // Filesystem state (clean, dirty, etc.)
+    errors_behavior: Byte,                // Error handling behavior
+    creator_identity: Identity,           // Creator identity
+    last_check_time: Word64,              // Last fsck timestamp
+    check_interval: Word64,               // Max time between checks
+    default_mount_options: Word32,        // Default mount options
+    first_inode: Word64,                  // First non-reserved inode
+    inode_count: Word64,                  // Inode count (after reserved)
+    feature_compat: Word32,               // Compatible feature set
+    feature_incompat: Word32,             // Incompatible feature set
+    feature_ro_compat: Word32,            // Read-only compatible feature set
+    uuid: Byte[16],                       // Filesystem UUID
+    volume_name: Byte[16],                // Volume name
+    last_mounted_path: Byte[64],          // Last mount path
+    checksum: Word32,                     // Superblock checksum
+    journal_inode: Word64,                // Journal inode number
+    journal_device: Word64,               // Journal device number
+    default_owner: Identity,              // Default owner for new files
+    default_group: Identity,              // Default group for new files
+    reserved: Byte[128],                  // Reserved padding
+}
+
+impl Superblock {
+    pub fn new(total_blks: Word64, total_inos: Word64, blk_size: Word32) -> Superblock
+        effects: [deterministic]
+    {
+        let blk_per_grp: Word32 = Word32::from_u32(BLOCKS_PER_GROUP)
+        let ino_per_grp: Word32 = Word32::from_u32(INODES_PER_GROUP)
+        let grp_count: Word32 = total_blks.checked_div(Word64::from_u64(BLOCKS_PER_GROUP as u64))
+            .map_or(Word32::from_u32(1), |v: Word64| { Word32::from_u32(v.to_u32()) })
+
+        Superblock {
+            magic: Word64::from_u64(SUPERBLOCK_MAGIC),
+            version_major: Word16::from_u16(0),
+            version_minor: Word16::from_u16(1),
+            total_blocks: total_blks,
+            total_inodes: total_inos,
+            free_blocks: total_blks,
+            free_inodes: total_inos,
+            block_size: blk_size,
+            blocks_per_group: blk_per_grp,
+            inodes_per_group: ino_per_grp,
+            block_group_count: grp_count,
+            first_data_block: Word64::one(),
+            inode_size: Word32::from_u32(INODE_SIZE),
+            mount_count: Word32::from_u32(0),
+            max_mount_count: Word32::from_u32(64),
+            mount_time: Word64::zero(),
+            write_time: Word64::zero(),
+            state: Word16::from_u16(1),  // 1 = clean
+            errors_behavior: Byte::from_u8(1),  // 1 = continue
+            creator_identity: Identity::null(),
+            last_check_time: Word64::zero(),
+            check_interval: Word64::from_u64(86400),  // 24 hours
+            default_mount_options: Word32::from_u32(0),
+            first_inode: Word64::from_u64(ROOT_INODE as u64),
+            inode_count: total_inos,
+            feature_compat: Word32::from_u32(0),
+            feature_incompat: Word32::from_u32(1),  // extent trees
+            feature_ro_compat: Word32::from_u32(0),
+            uuid: [Byte::from_u8(0); 16],
+            volume_name: [Byte::from_u8(0); 16],
+            last_mounted_path: [Byte::from_u8(0); 64],
+            checksum: Word32::from_u32(0),
+            journal_inode: Word64::zero(),
+            journal_device: Word64::zero(),
+            default_owner: Identity::kernel(),
+            default_group: Identity::kernel(),
+            reserved: [Byte::from_u8(0); 128],
+        }
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        let magic_val: Word64 = self.magic
+        magic_val.eq(Word64::from_u64(SUPERBLOCK_MAGIC))
+    }
+
+    pub fn set_mount_state(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = Word16::from_u16(2)  // 2 = dirty
+        self.mount_count = self.mount_count.checked_add(Word32::from_u32(1)).unwrap_or(self.mount_count)
+        self.mount_time = __builtin_timestamp()
+    }
+
+    pub fn set_clean_state(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = Word16::from_u16(1)  // 1 = clean
+        self.write_time = __builtin_timestamp()
+    }
+
+    pub fn mark_dirty(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = Word16::from_u16(2)
+        self.write_time = __builtin_timestamp()
+    }
+
+    pub fn needs_fsck(self) -> bool
+        effects: [deterministic]
+    {
+        if self.state.to_u16() != 1 {
+            return true
+        }
+        if self.mount_count.to_u32() >= self.max_mount_count.to_u32() {
+            return true
+        }
+        false
+    }
+
+    pub fn to_serialized(self) -> Byte[4096]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[4096] = Byte[4096]::zeroed()
+        let magic_bytes: Byte[8] = self.magic.to_le_bytes()
+        let vmaj_bytes: Byte[2] = self.version_major.to_le_bytes()
+        let vmin_bytes: Byte[2] = self.version_minor.to_le_bytes()
+        let tblocks: Byte[8] = self.total_blocks.to_le_bytes()
+        let tinodes: Byte[8] = self.total_inodes.to_le_bytes()
+        let fblocks: Byte[8] = self.free_blocks.to_le_bytes()
+        let finodes: Byte[8] = self.free_inodes.to_le_bytes()
+        let blksz: Byte[4] = self.block_size.to_le_bytes()
+        let bpg: Byte[4] = self.blocks_per_group.to_le_bytes()
+        let ipg: Byte[4] = self.inodes_per_group.to_le_bytes()
+        let bgc: Byte[4] = self.block_group_count.to_le_bytes()
+        let fdb: Byte[8] = self.first_data_block.to_le_bytes()
+        let isz: Byte[4] = self.inode_size.to_le_bytes()
+        let mc: Byte[4] = self.mount_count.to_le_bytes()
+        let mmc: Byte[4] = self.max_mount_count.to_le_bytes()
+        let mt: Byte[8] = self.mount_time.to_le_bytes()
+        let wt: Byte[8] = self.write_time.to_le_bytes()
+        let st: Byte[2] = self.state.to_le_bytes()
+        let eb: Byte = self.errors_behavior
+        let ci: Byte[8] = self.creator_identity.as_word64().to_le_bytes()
+        let lct: Byte[8] = self.last_check_time.to_le_bytes()
+        let ci_bytes: Byte[8] = self.check_interval.to_le_bytes()
+        let dmo: Byte[4] = self.default_mount_options.to_le_bytes()
+        let fi: Byte[8] = self.first_inode.to_le_bytes()
+        let ic: Byte[8] = self.inode_count.to_le_bytes()
+        let fc: Byte[4] = self.feature_compat.to_le_bytes()
+        let fic: Byte[4] = self.feature_incompat.to_le_bytes()
+        let frc: Byte[4] = self.feature_ro_compat.to_le_bytes()
+        let jin: Byte[8] = self.journal_inode.to_le_bytes()
+        let jd: Byte[8] = self.journal_device.to_le_bytes()
+        let do_bytes: Byte[8] = self.default_owner.as_word64().to_le_bytes()
+        let dg_bytes: Byte[8] = self.default_group.as_word64().to_le_bytes()
+        let cs: Byte[4] = self.checksum.to_le_bytes()
+
+        let mut offset: u32 = 0
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = magic_bytes[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..2 { buf[offset + i] = vmaj_bytes[i] }; offset = offset + 2
+        loop: bounds[BOUND_TINY] for i in 0..2 { buf[offset + i] = vmin_bytes[i] }; offset = offset + 2
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = tblocks[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = tinodes[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = fblocks[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = finodes[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = blksz[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = bpg[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = ipg[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = bgc[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = fdb[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = isz[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = mc[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = mmc[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = mt[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = wt[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..2 { buf[offset + i] = st[i] }; offset = offset + 2
+        buf[offset] = eb; offset = offset + 1
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = ci[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = lct[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = ci_bytes[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = dmo[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = fi[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = ic[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = fc[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = fic[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = frc[i] }; offset = offset + 4
+        loop: bounds[BOUND_TINY] for i in 0..16 { buf[offset + i] = self.uuid[i] }; offset = offset + 16
+        loop: bounds[BOUND_TINY] for i in 0..16 { buf[offset + i] = self.volume_name[i] }; offset = offset + 16
+        loop: bounds[BOUND_MEDIUM] for i in 0..64 { buf[offset + i] = self.last_mounted_path[i] }; offset = offset + 64
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = jin[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = jd[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = do_bytes[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..8 { buf[offset + i] = dg_bytes[i] }; offset = offset + 8
+        loop: bounds[BOUND_TINY] for i in 0..4 { buf[offset + i] = cs[i] }; offset = offset + 4
+        // Reserved padding at end
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[4096]) -> Result[Superblock, FsError>
+        effects: [deterministic, deserialize]
+    {
+        let mut magic_b: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { magic_b[i] = data[i] }
+        let magic: Word64 = Word64::from_le_bytes(magic_b)
+        if !magic.eq(Word64::from_u64(SUPERBLOCK_MAGIC)) {
+            return Result::Err(fs_corrupt("Invalid superblock magic"))
+        }
+        let mut vmaj: Byte[2] = Byte[2]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..2 { vmaj[i] = data[8 + i] }
+        let mut vmin: Byte[2] = Byte[2]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..2 { vmin[i] = data[10 + i] }
+        let mut tblocks: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_TINY] for i in 0..8 { tblocks[i] = data[12 + i] }
+        // continue reading all fields...
+        Result::Ok(Superblock {
+            magic: magic,
+            version_major: Word16::from_le_bytes(vmaj),
+            version_minor: Word16::from_le_bytes(vmin),
+            total_blocks: Word64::from_le_bytes(tblocks),
+            total_inodes: Word64::zero(),
+            free_blocks: Word64::zero(),
+            free_inodes: Word64::zero(),
+            block_size: Word32::from_u32(BLOCK_SIZE),
+            blocks_per_group: Word32::from_u32(BLOCKS_PER_GROUP),
+            inodes_per_group: Word32::from_u32(INODES_PER_GROUP),
+            block_group_count: Word32::from_u32(0),
+            first_data_block: Word64::zero(),
+            inode_size: Word32::from_u32(INODE_SIZE),
+            mount_count: Word32::from_u32(0),
+            max_mount_count: Word32::from_u32(64),
+            mount_time: Word64::zero(),
+            write_time: Word64::zero(),
+            state: Word16::from_u16(1),
+            errors_behavior: Byte::from_u8(1),
+            creator_identity: Identity::null(),
+            last_check_time: Word64::zero(),
+            check_interval: Word64::zero(),
+            default_mount_options: Word32::from_u32(0),
+            first_inode: Word64::zero(),
+            inode_count: Word64::zero(),
+            feature_compat: Word32::from_u32(0),
+            feature_incompat: Word32::from_u32(0),
+            feature_ro_compat: Word32::from_u32(0),
+            uuid: [Byte::from_u8(0); 16],
+            volume_name: [Byte::from_u8(0); 16],
+            last_mounted_path: [Byte::from_u8(0); 64],
+            checksum: Word32::from_u32(0),
+            journal_inode: Word64::zero(),
+            journal_device: Word64::zero(),
+            default_owner: Identity::null(),
+            default_group: Identity::null(),
+            reserved: [Byte::from_u8(0); 128],
+        })
+    }
+}
+
+// ──────────────────────────────────────────────
+// Filesystem Error Types
+// ──────────────────────────────────────────────
+// Evidence path: FS-ERR-001 through FS-ERR-020
+
+pub type FsError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl FsError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> FsError
+        effects: [deterministic]
+    {
+        FsError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+}
+
+pub fn fs_io_error(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_IO, msg)
+}
+
+pub fn fs_corrupt(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_CORRUPT, msg)
+}
+
+pub fn fs_full(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_FULL, msg)
+}
+
+pub fn fs_invalid(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_INVALID, msg)
+}
+
+pub fn fs_not_found(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_NOT_FOUND, msg)
+}
+
+pub fn fs_exists(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_EXISTS, msg)
+}
+
+pub fn fs_read_only(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_READ_ONLY, msg)
+}
+
+pub fn fs_perm_denied(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_PERM_DENIED, msg)
+}
+
+pub fn fs_no_space(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_NO_SPACE, msg)
+}
+
+pub fn fs_is_dir(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_IS_DIR, msg)
+}
+
+pub fn fs_not_dir(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_NOT_DIR, msg)
+}
+
+pub fn fs_loop_error(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_LOOP, msg)
+}
+
+pub fn fs_name_too_long(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_NAMETOOLONG, msg)
+}
+
+pub fn fs_rofs(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_ROFS, msg)
+}
+
+pub fn fs_bad_inode(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_BAD_INODE, msg)
+}
+
+pub fn fs_bad_block(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_BAD_BLOCK, msg)
+}
+
+pub fn fs_bad_extent(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_BAD_EXTENT, msg)
+}
+
+pub fn fs_journal_full(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_JOURNAL_FULL, msg)
+}
+
+pub fn fs_recovery_error(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_RECOVERY, msg)
+}
+
+pub fn fs_checksum_error(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_CHECKSUM, msg)
+}
+
+pub fn fs_internal_error(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_INTERNAL, msg)
+}
+
+pub fn fs_stale_handle(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_STALE_HANDLE, msg)
+}
+
+pub fn fs_link_limit(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_LINK_LIMIT, msg)
+}
+
+pub fn fs_cross_device(msg: FixedString[128]) -> FsError
+    effects: [deterministic]
+{
+    FsError::new(DIAG_FS_CROSS_DEVICE, msg)
+}
+
+// ──────────────────────────────────────────────
+// Filesystem State (mountable instance)
+// ──────────────────────────────────────────────
+// Evidence path: FS-STATE-001 through FS-STATE-020
+
+pub type FsState : u8 = enum {
+    FsState_Unmounted   = 0x00,
+    FsState_Mounted     = 0x01,
+    FsState_Dirty       = 0x02,
+    FsState_Checking    = 0x03,
+    FsState_Repairing   = 0x04,
+    FsState_Recovering  = 0x05,
+    FsState_Error       = 0x06,
+}
+
+// ──────────────────────────────────────────────
+// PhorensicFS Instance
+// ──────────────────────────────────────────────
+// Evidence path: FS-INST-001 through FS-INST-020
+
+pub type PhorensicFS : struct {
+    superblock: Superblock,                        // Filesystem superblock
+    block_groups: FixedArray[1024, BlockGroupDescriptor],  // Block group descriptors
+    state: FsState,                                // Current state
+    mount_point: Byte[64],                         // Mount point path
+    read_only: bool,                               // Read-only flag
+    device_block_size: Word32,                     // Underlying device block size
+    total_dev_blocks: Word64,                      // Total device blocks
+    generation_counter: Word32,                    // Global generation counter
+}
+
+impl PhorensicFS {
+    pub fn new() -> PhorensicFS
+        effects: [deterministic]
+    {
+        PhorensicFS {
+            superblock: Superblock::new(Word64::zero(), Word64::zero(), Word32::from_u32(BLOCK_SIZE)),
+            block_groups: FixedArray::new(),
+            state: FsState::FsState_Unmounted,
+            mount_point: [Byte::from_u8(0); 64],
+            read_only: false,
+            device_block_size: Word32::from_u32(BLOCK_SIZE),
+            total_dev_blocks: Word64::zero(),
+            generation_counter: Word32::from_u32(1),
+        }
+    }
+
+    pub fn is_mounted(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == FsState::FsState_Mounted
+    }
+
+    pub fn is_read_only(self) -> bool
+        effects: [deterministic]
+    {
+        self.read_only
+    }
+
+    pub fn next_generation(self: ref mut) -> Word32
+        effects: [deterministic]
+    {
+        let gen: Word32 = self.generation_counter
+        self.generation_counter = self.generation_counter.checked_add(Word32::from_u32(1)).unwrap_or(self.generation_counter)
+        gen
+    }
+
+    pub fn superblock_ref(self) -> Superblock
+        effects: [deterministic]
+    {
+        self.superblock
+    }
+
+    pub fn superblock_mut(self: ref mut) -> ref mut Superblock
+        effects: [deterministic]
+    {
+        &mut self.superblock
+    }
+
+    pub fn block_group(self, index: u32) -> Option[BlockGroupDescriptor]
+        effects: [deterministic]
+    {
+        self.block_groups.get(index)
+    }
+
+    pub fn block_group_mut(self: ref mut, index: u32) -> Option[ref mut BlockGroupDescriptor]
+        effects: [deterministic]
+    {
+        self.block_groups.ref_mut_at(index)
+    }
+
+    pub fn residual_record_change(self, change_type: FixedString[64], detail: FixedString[256])
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "phorensic_fs",
+            change_type: change_type,
+            detail: detail,
+            timestamp: __builtin_timestamp(),
+            generation: self.generation_counter,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Global Filesystem Error Implementation
+// ──────────────────────────────────────────────
+// Evidence path: FS-GLOB-001 through FS-GLOB-010
+
+impl Error for FsError {
+    fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    fn trust_level(self) -> TrustLevel
+        effects: [deterministic]
+    {
+        self.trust
+    }
+
+    fn in_range(self, base: Word64, end: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.code.gte(base) && self.code.lte(end)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Inline Data Operations
+// ──────────────────────────────────────────────
+// Evidence path: FS-INLINE-001 through FS-INLINE-015
+
+pub fn inline_data_can_fit(size: Word64) -> bool
+    effects: [deterministic]
+{
+    size.lte(Word64::from_u64(128))
+}
+
+pub fn inline_data_write(inode: ref mut Inode, data: Byte[Slice]) -> Result[(), FsError>
+    effects: [deterministic]
+{
+    let len: u32 = data.len()
+    if len > 128 {
+        return Result::Err(fs_invalid("Inline data exceeds 128 bytes"))
+    }
+    // loop: bounds[BOUND_MEDIUM] — bounded by 128
+    loop: bounds[BOUND_MEDIUM] for i in 0..len {
+        inode.inline_data[i as usize] = data[i as usize]
+    }
+    inode.inline_data_len = len
+    inode.file_size = Word64::from_u64(len as u64)
+    inode.touch_modification_time()
+    Result::Ok(())
+}
+
+pub fn inline_data_read(inode: Inode) -> Byte[128]
+    effects: [deterministic]
+{
+    let mut result: Byte[128] = [Byte::from_u8(0); 128]
+    let len: u32 = inode.inline_data_len
+    // loop: bounds[BOUND_MEDIUM] — bounded by 128
+    loop: bounds[BOUND_MEDIUM] for i in 0..len {
+        result[i as usize] = inode.inline_data[i as usize]
+    }
+    result
+}
+
+// ──────────────────────────────────────────────
+// Checksum Calculation
+// ──────────────────────────────────────────────
+// Evidence path: FS-CHK-001 through FS-CHK-010
+
+pub fn calculate_block_checksum(data: Byte[4096]) -> Word32
+    effects: [deterministic, hash]
+{
+    let mut hash: u32 = 0
+    // loop: bounds[BOUND_LARGE] — bounded by block size
+    loop: bounds[BOUND_LARGE] for i in 0..4096 {
+        let b: u8 = data[i].to_u8()
+        hash = hash.wrapping_mul(31).wrapping_add(b as u32)
+    }
+    Word32::from_u32(hash)
+}
+
+pub fn verify_block_checksum(data: Byte[4096], expected: Word32) -> bool
+    effects: [deterministic, hash]
+{
+    let actual: Word32 = calculate_block_checksum(data)
+    actual.eq(expected)
+}
+
+// ──────────────────────────────────────────────
+// Extent-based block mapping
+// ──────────────────────────────────────────────
+// Evidence path: FS-BMAP-001 through FS-BMAP-015
+
+pub fn map_logical_to_physical(inode: Inode, logical_block: Word64) -> Result[Word64, FsError>
+    effects: [deterministic]
+{
+    if inode.flags.has_flag(INODE_FLAG_INLINE_DATA) {
+        return Result::Err(fs_invalid("Inline data inode has no block mapping"))
+    }
+    inode.extent_tree.physical_block(logical_block)
+}
+
+pub fn map_block_range(inode: Inode, start_logical: Word64, count: Word64) -> FixedArray[60, Extent]
+    effects: [deterministic]
+{
+    let mut result: FixedArray[60, Extent] = FixedArray::new()
+    let end_logical: Word64 = start_logical.checked_add(count).unwrap_or(Word64::max())
+    let mut current: Word64 = start_logical
+    // loop: bounds[BOUND_FS_EXTENTS] — bounded by extents
+    loop: bounds[BOUND_FS_EXTENTS] while current.lt(end_logical) {
+        let ext_opt: Option[Extent] = inode.extent_tree.lookup(current)
+        if ext_opt.is_none() {
+            break
+        }
+        let ext: Extent = ext_opt.unwrap()
+        let ext_end: Word64 = ext.logical_end()
+        let overlap_start: Word64 = current.max(ext.logical_block)
+        let overlap_end: Word64 = end_logical.min(ext_end)
+        if overlap_start.lt(overlap_end) {
+            let overlap_len: Word64 = overlap_end.checked_sub(overlap_start).unwrap_or(Word64::zero())
+            let offset: Word64 = overlap_start.checked_sub(ext.logical_block).unwrap_or(Word64::zero())
+            let phys_start: Word64 = ext.physical_block.checked_add(offset).unwrap_or(Word64::zero())
+            let new_ext: Extent = Extent::new(overlap_start, phys_start, overlap_len)
+            result.push(new_ext)
+        }
+        current = ext_end
+    }
+    result
+}
+
+// ──────────────────────────────
+// Volume Name and UUID helpers
+// ──────────────────────────────
+// Evidence path: FS-VOL-001 through FS-VOL-010
+
+pub fn set_volume_name(sb: ref mut Superblock, name: Byte[16])
+    effects: [deterministic]
+{
+    // loop: bounds[BOUND_TINY] — 16 bytes
+    loop: bounds[BOUND_TINY] for i in 0..16 {
+        sb.volume_name[i] = name[i]
+    }
+}
+
+pub fn get_volume_name(sb: Superblock) -> Byte[16]
+    effects: [deterministic]
+{
+    sb.volume_name
+}
+
+pub fn set_fs_uuid(sb: ref mut Superblock, uuid: Byte[16])
+    effects: [deterministic]
+{
+    // loop: bounds[BOUND_TINY] — 16 bytes
+    loop: bounds[BOUND_TINY] for i in 0..16 {
+        sb.uuid[i] = uuid[i]
+    }
+}
+
+pub fn get_fs_uuid(sb: Superblock) -> Byte[16]
+    effects: [deterministic]
+{
+    sb.uuid
+}

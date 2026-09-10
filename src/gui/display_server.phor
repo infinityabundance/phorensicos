@@ -1,0 +1,1037 @@
+// display_server.phor — Phorensic DisplayServer
+// Protocol dispatcher, surface registry, output registry, buffer management, session management
+// Capability-verified message routing. All operations bounded. Every function declares effects.
+
+package gui.display_server;
+
+import gui.protocol;
+import gui.surface;
+import gui.compositor;
+
+// ──────────────────────────────────────────────
+// Display Server Constants
+// ──────────────────────────────────────────────
+
+const MAX_SESSIONS: u64 = 256;
+const MAX_CLIENTS: u64 = 256;
+const MAX_REGISTERED_CAPS: u64 = 1024;
+const MAX_PENDING_MESSAGES: u64 = 512;
+const MAX_SHARED_BUFFERS: u64 = 512;
+const MAX_SURFACE_REGISTRY: u64 = 4096;
+const MAX_OUTPUT_REGISTRY: u64 = 16;
+const MAX_HANDLE_GEN: u64 = 65536;
+const DISPATCH_TIMEOUT_US: u64 = 1000;
+const MAX_SESSION_BUFFERS: u64 = 32;
+
+// ──────────────────────────────────────────────
+// Client Connection
+// ──────────────────────────────────────────────
+
+struct ClientConnection {
+    client_id: u64,
+    session_id: u64,
+    connected: bool,
+    protocol_major: u64,
+    protocol_minor: u64,
+    connected_at_ns: u64,
+    last_activity_ns: u64,
+    message_count: u64,
+    error_count: u64,
+    max_surfaces: u64,
+    surface_count: u64,
+    fd: u64,
+    send_buffer: Array(u8, 4096),
+    recv_buffer: Array(u8, 4096),
+    send_offset: u32,
+    recv_offset: u32,
+    send_pending: bool,
+    recv_pending: bool,
+}
+
+// ──────────────────────────────────────────────
+// Shared Buffer Tracking
+// ──────────────────────────────────────────────
+
+struct SharedBuffer {
+    buffer_id: u64,
+    session_id: u64,
+    size: protocol.Size,
+    format: protocol.BufferFormat,
+    stride: u32,
+    data_addr: u64,
+    data_size: u64,
+    refcount: u64,
+    shared_with: Array(u64, 16),
+    shared_count: u64,
+    created_at_ns: u64,
+    last_access_ns: u64,
+    locked: bool,
+    locked_by: u64,
+}
+
+// ──────────────────────────────────────────────
+// DisplayServer Main State
+// ──────────────────────────────────────────────
+
+struct DisplayServer {
+    initialized: bool,
+
+    // Session management
+    sessions: RingBuf(protocol.SessionInfo, MAX_SESSIONS),
+    session_count: u64,
+    next_session_id: u64,
+
+    // Client connections
+    clients: RingBuf(ClientConnection, MAX_CLIENTS),
+    client_count: u64,
+    next_client_id: u64,
+
+    // Surface registry
+    surface_registry: surface.SurfaceRegistry,
+
+    // Output registry
+    output_registry: RingBuf(protocol.OutputInfo, MAX_OUTPUT_REGISTRY),
+    output_count: u64,
+    next_output_id: u64,
+
+    // Buffer management
+    shared_buffers: RingBuf(SharedBuffer, MAX_SHARED_BUFFERS),
+    buffer_count: u64,
+    next_buffer_id: u64,
+
+    // Message dispatch
+    pending_messages: RingBuf(protocol.ProtocolMessage, MAX_PENDING_MESSAGES),
+    message_count: u64,
+    dispatch_serial: u64,
+
+    // Capability registry
+    cap_registry: RingBuf(protocol.CapGrantRecord, MAX_REGISTERED_CAPS),
+    cap_count: u64,
+
+    // Compositor reference
+    compositor_info: compositor.CompositorInfo,
+
+    // Timing
+    started_at_ns: u64,
+    uptime_ns: u64,
+    dispatch_count: u64,
+    error_count: u64,
+
+    // Residual tracking
+    dispatch_residuals: RingBuf(u64, 256),
+    residual_count: u64,
+}
+
+// ──────────────────────────────────────────────
+// DisplayServer Initialization
+// ──────────────────────────────────────────────
+
+fn display_server_init(now: u64) -> DisplayServer
+    effect [compute, io:write, io:read, residual]
+{
+    let ds: DisplayServer = DisplayServer {
+        initialized: true,
+        sessions: RingBuf::new(),
+        session_count: 0,
+        next_session_id: 1,
+        clients: RingBuf::new(),
+        client_count: 0,
+        next_client_id: 1,
+        surface_registry: surface.registry_init(),
+        output_registry: RingBuf::new(),
+        output_count: 0,
+        next_output_id: 1,
+        shared_buffers: RingBuf::new(),
+        buffer_count: 0,
+        next_buffer_id: 1,
+        pending_messages: RingBuf::new(),
+        message_count: 0,
+        dispatch_serial: 0,
+        cap_registry: RingBuf::new(),
+        cap_count: 0,
+        compositor_info: compositor.CompositorInfo {
+            initialized: false,
+            mode: protocol.CompositingMode::Software,
+            refresh_hz: 60,
+            output_count: 0,
+            layer_count: 0,
+            dirty_count: 0,
+            pending_presents: 0,
+            frame_count: 0,
+            vsync_count: 0,
+            vsync_enabled: true,
+            software_fallback: true,
+            uptime_ns: 0,
+        },
+        started_at_ns: now,
+        uptime_ns: 0,
+        dispatch_count: 0,
+        error_count: 0,
+        dispatch_residuals: RingBuf::new(),
+        residual_count: 0,
+    };
+    residual emit {
+        op: "display_server:init",
+        timestamp: now,
+    };
+    return ds;
+}
+
+// ──────────────────────────────────────────────
+// Session Management
+// ──────────────────────────────────────────────
+
+fn ds_create_session(ds: DisplayServer, client_id: u64, now: u64) -> Result((DisplayServer, protocol.SessionInfo), u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_SESSIONS
+{
+    let mut updated: DisplayServer = ds;
+    if updated.session_count >= MAX_SESSIONS {
+        return Result::Err(1); // max sessions
+    }
+    let session_id: u64 = updated.next_session_id;
+    updated.next_session_id = updated.next_session_id + 1;
+
+    let session: protocol.SessionInfo = protocol.SessionInfo {
+        session_id: session_id,
+        state: protocol.SessionState::Active,
+        client_id: client_id,
+        connected_at: now,
+        capabilities: RingBuf::new(),
+        surfaces: RingBuf::new(),
+        pending_events: 0,
+        protocol_version: (protocol.PROTOCOL_MAJOR, protocol.PROTOCOL_MINOR),
+    };
+
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::None => {
+                updated.sessions[i] = Option::Some(session);
+                updated.session_count = updated.session_count + 1;
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+
+    residual emit {
+        op: "session:create",
+        session_id: session_id,
+        client_id: client_id,
+        timestamp: now,
+    };
+    return Result::Ok((updated, session));
+}
+
+fn ds_destroy_session(ds: DisplayServer, session_id: u64, now: u64) -> Result(DisplayServer, u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_SESSIONS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                if s.session_id == session_id {
+                    let destroyed: protocol.SessionInfo = protocol.SessionInfo {
+                        session_id: s.session_id,
+                        state: protocol.SessionState::Disconnected,
+                        client_id: s.client_id,
+                        connected_at: s.connected_at,
+                        capabilities: s.capabilities,
+                        surfaces: s.surfaces,
+                        pending_events: s.pending_events,
+                        protocol_version: s.protocol_version,
+                    };
+                    updated.sessions[i] = Option::Some(destroyed);
+                    updated.session_count = updated.session_count - 1;
+                    residual emit {
+                        op: "session:destroy",
+                        session_id: session_id,
+                        timestamp: now,
+                    };
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2); // session not found
+}
+
+fn ds_get_session(ds: DisplayServer, session_id: u64) -> Option(protocol.SessionInfo)
+    effect [compute]
+    bound iterations MAX_SESSIONS
+{
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = ds.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                if s.session_id == session_id {
+                    return Option::Some(s);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Option::None;
+}
+
+fn ds_update_session(ds: DisplayServer, session: protocol.SessionInfo) -> Result(DisplayServer, u64)
+    effect [compute]
+    bound iterations MAX_SESSIONS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                if s.session_id == session.session_id {
+                    updated.sessions[i] = Option::Some(session);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2);
+}
+
+// ──────────────────────────────────────────────
+// Client Connection Management
+// ──────────────────────────────────────────────
+
+fn ds_connect_client(ds: DisplayServer, fd: u64, major: u64, minor: u64, now: u64) -> Result((DisplayServer, u64), protocol.ProtocolErrorCode)
+    effect [compute, io:write, residual]
+    bound iterations MAX_CLIENTS
+{
+    let mut updated: DisplayServer = ds;
+    if !protocol.validate_protocol_version(major, minor) {
+        return Result::Err(protocol.ProtocolErrorCode::ProtocolVersionMismatch(major, minor));
+    }
+    if updated.client_count >= MAX_CLIENTS {
+        return Result::Err(protocol.ProtocolErrorCode::MaxClientsExceeded);
+    }
+
+    let client_id: u64 = updated.next_client_id;
+    updated.next_client_id = updated.next_client_id + 1;
+
+    let conn: ClientConnection = ClientConnection {
+        client_id: client_id,
+        session_id: 0,
+        connected: true,
+        protocol_major: major,
+        protocol_minor: minor,
+        connected_at_ns: now,
+        last_activity_ns: now,
+        message_count: 0,
+        error_count: 0,
+        max_surfaces: MAX_SURFACE_REGISTRY,
+        surface_count: 0,
+        fd: fd,
+        send_buffer: Array::zeroed(),
+        recv_buffer: Array::zeroed(),
+        send_offset: 0,
+        recv_offset: 0,
+        send_pending: false,
+        recv_pending: false,
+    };
+
+    for i in 0..MAX_CLIENTS {
+        let c_opt: Option(ClientConnection) = updated.clients[i];
+        match c_opt {
+            Option::None => {
+                updated.clients[i] = Option::Some(conn);
+                updated.client_count = updated.client_count + 1;
+                // Auto-create session
+                let (ds2, session) = match ds_create_session(updated, client_id, now) {
+                    Result::Ok((ds, s)) => { (ds, s) }
+                    Result::Err(_) => { return Result::Err(protocol.ProtocolErrorCode::InternalError(1)); }
+                };
+                updated = ds2;
+                // Update client with session id
+                let conn2: ClientConnection = ClientConnection {
+                    client_id: conn.client_id,
+                    session_id: session.session_id,
+                    connected: conn.connected,
+                    protocol_major: conn.protocol_major,
+                    protocol_minor: conn.protocol_minor,
+                    connected_at_ns: conn.connected_at_ns,
+                    last_activity_ns: now,
+                    message_count: conn.message_count,
+                    error_count: conn.error_count,
+                    max_surfaces: conn.max_surfaces,
+                    surface_count: conn.surface_count,
+                    fd: conn.fd,
+                    send_buffer: conn.send_buffer,
+                    recv_buffer: conn.recv_buffer,
+                    send_offset: conn.send_offset,
+                    recv_offset: conn.recv_offset,
+                    send_pending: conn.send_pending,
+                    recv_pending: conn.recv_pending,
+                };
+                updated.clients[i] = Option::Some(conn2);
+                residual emit {
+                    op: "client:connect",
+                    client_id: client_id,
+                    session_id: session.session_id,
+                    timestamp: now,
+                };
+                return Result::Ok((updated, session.session_id));
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return Result::Err(protocol.ProtocolErrorCode::MaxClientsExceeded);
+}
+
+fn ds_disconnect_client(ds: DisplayServer, client_id: u64, now: u64) -> Result(DisplayServer, u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_CLIENTS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_CLIENTS {
+        let c_opt: Option(ClientConnection) = updated.clients[i];
+        match c_opt {
+            Option::Some(c) => {
+                if c.client_id == client_id {
+                    // Destroy session
+                    if c.session_id > 0 {
+                        let res = ds_destroy_session(updated, c.session_id, now);
+                        match res {
+                            Result::Ok(ds) => { updated = ds; }
+                            Result::Err(_) => {}
+                        }
+                    }
+                    updated.clients[i] = Option::None;
+                    updated.client_count = updated.client_count - 1;
+                    residual emit {
+                        op: "client:disconnect",
+                        client_id: client_id,
+                        timestamp: now,
+                    };
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(3);
+}
+
+fn ds_get_client(ds: DisplayServer, client_id: u64) -> Option(ClientConnection)
+    effect [compute]
+    bound iterations MAX_CLIENTS
+{
+    for i in 0..MAX_CLIENTS {
+        let c_opt: Option(ClientConnection) = ds.clients[i];
+        match c_opt {
+            Option::Some(c) => {
+                if c.client_id == client_id {
+                    return Option::Some(c);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Option::None;
+}
+
+// ──────────────────────────────────────────────
+// Surface Registry Operations (delegated)
+// ──────────────────────────────────────────────
+
+fn ds_register_surface(ds: DisplayServer, type_: protocol.SurfaceType, client_id: u64, now: u64) -> Result((DisplayServer, u64, u64), protocol.ProtocolErrorCode)
+    effect [compute, io:write, residual]
+{
+    let mut updated: DisplayServer = ds;
+    let (reg, id) = surface.registry_alloc_id(updated.surface_registry);
+    updated.surface_registry = reg;
+    if id == 0 {
+        return Result::Err(protocol.ProtocolErrorCode::MaxSurfacesExceeded(updated.surface_registry.active_count));
+    }
+    let gen: u64 = (id + updated.dispatch_count + 1) % MAX_HANDLE_GEN;
+    let reg2 = surface.registry_register(updated.surface_registry, id, type_, gen, client_id, now);
+    updated.surface_registry = reg2;
+
+    // Track surface on session
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                for j in 0..protocol.MAX_SURFACE_PER_CLIENT {
+                    let surf_opt: Option(u64) = s.surfaces[j];
+                    match surf_opt {
+                        Option::None => {
+                            let mut updated_session = s;
+                            updated_session.surfaces[j] = Option::Some(id);
+                            updated.sessions[i] = Option::Some(updated_session);
+                            break;
+                        }
+                        Option::Some(_) => {}
+                    }
+                }
+                break;
+            }
+            Option::None => {}
+        }
+    }
+
+    residual emit {
+        op: "display_server:register_surface",
+        surface_id: id,
+        type_: type_ as u64,
+        client: client_id,
+        timestamp: now,
+    };
+    return Result::Ok((updated, id, gen));
+}
+
+fn ds_unregister_surface(ds: DisplayServer, surface_id: u64, now: u64) -> Result(DisplayServer, protocol.ProtocolErrorCode)
+    effect [compute, io:write, residual]
+{
+    let mut updated: DisplayServer = ds;
+    let entry_opt: Option(surface.SurfaceRegistryEntry) = surface.registry_lookup(updated.surface_registry, surface_id);
+    match entry_opt {
+        Option::Some(e) => {
+            if !e.in_use {
+                return Result::Err(protocol.ProtocolErrorCode::SurfaceNotFound(surface_id));
+            }
+            let reg = surface.registry_unregister(updated.surface_registry, surface_id, now);
+            updated.surface_registry = reg;
+            residual emit {
+                op: "display_server:unregister_surface",
+                surface_id: surface_id,
+                timestamp: now,
+            };
+            return Result::Ok(updated);
+        }
+        Option::None => {
+            return Result::Err(protocol.ProtocolErrorCode::SurfaceNotFound(surface_id));
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Output Registry
+// ──────────────────────────────────────────────
+
+fn ds_register_output(ds: DisplayServer, info: protocol.OutputInfo) -> Result(DisplayServer, u64)
+    effect [compute]
+    bound iterations MAX_OUTPUT_REGISTRY
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_OUTPUT_REGISTRY {
+        let o_opt: Option(protocol.OutputInfo) = updated.output_registry[i];
+        match o_opt {
+            Option::None => {
+                updated.output_registry[i] = Option::Some(info);
+                updated.output_count = updated.output_count + 1;
+                return Result::Ok(updated);
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return Result::Err(4); // full
+}
+
+fn ds_unregister_output(ds: DisplayServer, output_id: u64) -> Result(DisplayServer, u64)
+    effect [compute]
+    bound iterations MAX_OUTPUT_REGISTRY
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_OUTPUT_REGISTRY {
+        let o_opt: Option(protocol.OutputInfo) = updated.output_registry[i];
+        match o_opt {
+            Option::Some(o) => {
+                if o.output_id == output_id {
+                    updated.output_registry[i] = Option::None;
+                    updated.output_count = updated.output_count - 1;
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(5);
+}
+
+fn ds_enumerate_outputs(ds: DisplayServer) -> RingBuf(protocol.OutputInfo, MAX_OUTPUT_REGISTRY)
+    effect [compute]
+{
+    let mut outputs: RingBuf(protocol.OutputInfo, MAX_OUTPUT_REGISTRY) = RingBuf::new();
+    for i in 0..MAX_OUTPUT_REGISTRY {
+        let o_opt: Option(protocol.OutputInfo) = ds.output_registry[i];
+        match o_opt {
+            Option::Some(o) => {
+                for j in 0..MAX_OUTPUT_REGISTRY {
+                    let slot_opt: Option(protocol.OutputInfo) = outputs[j];
+                    match slot_opt {
+                        Option::None => {
+                            outputs[j] = Option::Some(o);
+                            break;
+                        }
+                        Option::Some(_) => {}
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return outputs;
+}
+
+// ──────────────────────────────────────────────
+// Buffer Management
+// ──────────────────────────────────────────────
+
+fn ds_allocate_buffer(ds: DisplayServer, session_id: u64, size: protocol.Size, fmt: protocol.BufferFormat) -> Result((DisplayServer, SharedBuffer), protocol.ProtocolErrorCode)
+    effect [compute, io:write, io:read, residual]
+    bound iterations MAX_SHARED_BUFFERS
+{
+    let mut updated: DisplayServer = ds;
+    if updated.buffer_count >= MAX_SHARED_BUFFERS {
+        return Result::Err(protocol.ProtocolErrorCode::OutOfMemory);
+    }
+
+    let buf_id: u64 = updated.next_buffer_id;
+    updated.next_buffer_id = updated.next_buffer_id + 1;
+
+    let stride: u32 = size.width * 4; // RGBA32 default
+    let data_size: u64 = (stride as u64) * (size.height as u64);
+
+    let buf: SharedBuffer = SharedBuffer {
+        buffer_id: buf_id,
+        session_id: session_id,
+        size: size,
+        format: fmt,
+        stride: stride,
+        data_addr: 0,
+        data_size: data_size,
+        refcount: 1,
+        shared_with: Array::zeroed(),
+        shared_count: 0,
+        created_at_ns: updated.started_at_ns,
+        last_access_ns: updated.started_at_ns,
+        locked: false,
+        locked_by: 0,
+    };
+
+    for i in 0..MAX_SHARED_BUFFERS {
+        let b_opt: Option(SharedBuffer) = updated.shared_buffers[i];
+        match b_opt {
+            Option::None => {
+                updated.shared_buffers[i] = Option::Some(buf);
+                updated.buffer_count = updated.buffer_count + 1;
+                residual emit {
+                    op: "buffer:allocate",
+                    buffer_id: buf_id,
+                    session: session_id,
+                    width: size.width,
+                    height: size.height,
+                    format: fmt as u64,
+                };
+                return Result::Ok((updated, buf));
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return Result::Err(protocol.ProtocolErrorCode::OutOfMemory);
+}
+
+fn ds_release_buffer(ds: DisplayServer, buffer_id: u64, session_id: u64) -> Result(DisplayServer, protocol.ProtocolErrorCode)
+    effect [compute, io:write, residual]
+    bound iterations MAX_SHARED_BUFFERS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SHARED_BUFFERS {
+        let b_opt: Option(SharedBuffer) = updated.shared_buffers[i];
+        match b_opt {
+            Option::Some(b) => {
+                if b.buffer_id == buffer_id && b.session_id == session_id {
+                    if b.refcount <= 1 {
+                        updated.shared_buffers[i] = Option::None;
+                        updated.buffer_count = updated.buffer_count - 1;
+                    } else {
+                        let released: SharedBuffer = SharedBuffer {
+                            buffer_id: b.buffer_id,
+                            session_id: b.session_id,
+                            size: b.size,
+                            format: b.format,
+                            stride: b.stride,
+                            data_addr: b.data_addr,
+                            data_size: b.data_size,
+                            refcount: b.refcount - 1,
+                            shared_with: b.shared_with,
+                            shared_count: b.shared_count,
+                            created_at_ns: b.created_at_ns,
+                            last_access_ns: b.last_access_ns,
+                            locked: b.locked,
+                            locked_by: b.locked_by,
+                        };
+                        updated.shared_buffers[i] = Option::Some(released);
+                    }
+                    residual emit {
+                        op: "buffer:release",
+                        buffer_id: buffer_id,
+                        session: session_id,
+                    };
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(protocol.ProtocolErrorCode::BufferNotFound(buffer_id));
+}
+
+fn ds_share_buffer(ds: DisplayServer, buffer_id: u64, target_session_id: u64) -> Result(DisplayServer, protocol.ProtocolErrorCode)
+    effect [compute, io:write]
+    bound iterations MAX_SHARED_BUFFERS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SHARED_BUFFERS {
+        let b_opt: Option(SharedBuffer) = updated.shared_buffers[i];
+        match b_opt {
+            Option::Some(b) => {
+                if b.buffer_id == buffer_id {
+                    let mut new_shared = b;
+                    // Add to shared list
+                    for j in 0..16 {
+                        let sid_opt: Option(u64) = new_shared.shared_with[j];
+                        match sid_opt {
+                            Option::None => {
+                                new_shared.shared_with[j] = Option::Some(target_session_id);
+                                new_shared.shared_count = new_shared.shared_count + 1;
+                                new_shared.refcount = new_shared.refcount + 1;
+                                break;
+                            }
+                            Option::Some(_) => {}
+                        }
+                    }
+                    updated.shared_buffers[i] = Option::Some(new_shared);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(protocol.ProtocolErrorCode::BufferNotFound(buffer_id));
+}
+
+// ──────────────────────────────────────────────
+// Capability Granting
+// ──────────────────────────────────────────────
+
+fn ds_grant_capability(ds: DisplayServer, cap: protocol.CapabilityId, from: u64, to: u64, now: u64) -> Result((DisplayServer, protocol.CapGrantRecord), u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_REGISTERED_CAPS
+{
+    let mut updated: DisplayServer = ds;
+    let grant: protocol.CapGrantRecord = protocol.make_cap_grant(cap, from, to, now);
+    for i in 0..MAX_REGISTERED_CAPS {
+        let r_opt: Option(protocol.CapGrantRecord) = updated.cap_registry[i];
+        match r_opt {
+            Option::None => {
+                updated.cap_registry[i] = Option::Some(grant);
+                updated.cap_count = updated.cap_count + 1;
+                return Result::Ok((updated, grant));
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return Result::Err(6); // cap registry full
+}
+
+fn ds_revoke_capability(ds: DisplayServer, cap_id: protocol.CapabilityId, target: u64, now: u64) -> Result(DisplayServer, u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_REGISTERED_CAPS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_REGISTERED_CAPS {
+        let r_opt: Option(protocol.CapGrantRecord) = updated.cap_registry[i];
+        match r_opt {
+            Option::Some(r) => {
+                if r.cap_id == cap_id && r.granted_to == target && !r.revoked {
+                    let revoked: protocol.CapGrantRecord = protocol.revoke_capability(r, now);
+                    updated.cap_registry[i] = Option::Some(revoked);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(7);
+}
+
+fn ds_validate_capability(ds: DisplayServer, session_id: u64, cap: protocol.CapabilityId) -> bool
+    effect [compute]
+    bound iterations MAX_REGISTERED_CAPS
+{
+    for i in 0..MAX_REGISTERED_CAPS {
+        let r_opt: Option(protocol.CapGrantRecord) = ds.cap_registry[i];
+        match r_opt {
+            Option::Some(r) => {
+                if r.cap_id == cap && !r.revoked {
+                    // Check if this is an active session
+                    for j in 0..MAX_SESSIONS {
+                        let s_opt: Option(protocol.SessionInfo) = ds.sessions[j];
+                        match s_opt {
+                            Option::Some(s) => {
+                                if s.session_id == session_id || s.client_id == r.granted_to {
+                                    return true;
+                                }
+                            }
+                            Option::None => {}
+                        }
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return false;
+}
+
+// ──────────────────────────────────────────────
+// Message Dispatch
+// ──────────────────────────────────────────────
+
+fn ds_enqueue_message(ds: DisplayServer, msg: protocol.ProtocolMessage) -> Result(DisplayServer, protocol.ProtocolErrorCode)
+    effect [compute, io:write]
+    bound iterations MAX_PENDING_MESSAGES
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_PENDING_MESSAGES {
+        let m_opt: Option(protocol.ProtocolMessage) = updated.pending_messages[i];
+        match m_opt {
+            Option::None => {
+                updated.pending_messages[i] = Option::Some(msg);
+                updated.message_count = updated.message_count + 1;
+                return Result::Ok(updated);
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return Result::Err(protocol.ProtocolErrorCode::ResourceBusy(updated.message_count));
+}
+
+fn ds_dispatch_next(ds: DisplayServer, now: u64) -> (DisplayServer, Option(protocol.ProtocolMessage))
+    effect [compute, io:write, io:read, residual]
+    bound iterations MAX_PENDING_MESSAGES
+{
+    let mut updated: DisplayServer = ds;
+    let mut dispatched: Option(protocol.ProtocolMessage) = Option::None;
+
+    for i in 0..MAX_PENDING_MESSAGES {
+        let m_opt: Option(protocol.ProtocolMessage) = updated.pending_messages[i];
+        match m_opt {
+            Option::Some(msg) => {
+                updated.pending_messages[i] = Option::None;
+                updated.message_count = updated.message_count - 1;
+                updated.dispatch_serial = updated.dispatch_serial + 1;
+                updated.dispatch_count = updated.dispatch_count + 1;
+                dispatched = Option::Some(msg);
+
+                residual emit {
+                    op: "dispatch:message",
+                    serial: msg.header.serial,
+                    sender: msg.header.sender_id,
+                    timestamp: now,
+                };
+                break;
+            }
+            Option::None => {}
+        }
+    }
+    return (updated, dispatched);
+}
+
+// ──────────────────────────────────────────────
+// Session Capability Management
+// ──────────────────────────────────────────────
+
+fn ds_grant_session_cap(ds: DisplayServer, session_id: u64, cap: protocol.CapabilityId, now: u64) -> Result(DisplayServer, u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_SESSIONS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                if s.session_id == session_id {
+                    let session_cap: protocol.SessionCapability = protocol.SessionCapability {
+                        cap_id: cap,
+                        granted_at: now,
+                        expires_at: now + 3600000000000,
+                        provenance: updated.dispatch_count,
+                        revoked: false,
+                    };
+                    let mut updated_session = s;
+                    for j in 0..protocol.MAX_CAP_GRANTS {
+                        let c_opt: Option(protocol.SessionCapability) = updated_session.capabilities[j];
+                        match c_opt {
+                            Option::None => {
+                                updated_session.capabilities[j] = Option::Some(session_cap);
+                                updated.sessions[i] = Option::Some(updated_session);
+                                return Result::Ok(updated);
+                            }
+                            Option::Some(_) => {}
+                        }
+                    }
+                    return Result::Err(8); // no cap slots
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2); // session not found
+}
+
+fn ds_revoke_session_cap(ds: DisplayServer, session_id: u64, cap: protocol.CapabilityId) -> Result(DisplayServer, u64)
+    effect [compute]
+    bound iterations MAX_SESSIONS
+{
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                if s.session_id == session_id {
+                    let mut updated_session = s;
+                    for j in 0..protocol.MAX_CAP_GRANTS {
+                        let c_opt: Option(protocol.SessionCapability) = updated_session.capabilities[j];
+                        match c_opt {
+                            Option::Some(c) => {
+                                if c.cap_id == cap && !c.revoked {
+                                    let revoked: protocol.SessionCapability = protocol.SessionCapability {
+                                        cap_id: c.cap_id,
+                                        granted_at: c.granted_at,
+                                        expires_at: c.expires_at,
+                                        provenance: c.provenance,
+                                        revoked: true,
+                                    };
+                                    updated_session.capabilities[j] = Option::Some(revoked);
+                                    updated.sessions[i] = Option::Some(updated_session);
+                                    return Result::Ok(updated);
+                                }
+                            }
+                            Option::None => {}
+                        }
+                    }
+                    return Result::Err(9); // cap not found
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2);
+}
+
+// ──────────────────────────────────────────────
+// Server Info and Status
+// ──────────────────────────────────────────────
+
+struct DisplayServerInfo {
+    initialized: bool,
+    session_count: u64,
+    client_count: u64,
+    surface_count: u64,
+    output_count: u64,
+    buffer_count: u64,
+    cap_count: u64,
+    pending_messages: u64,
+    dispatch_count: u64,
+    error_count: u64,
+    uptime_ns: u64,
+    started_at_ns: u64,
+}
+
+fn ds_get_info(ds: DisplayServer, now: u64) -> DisplayServerInfo
+    effect [compute]
+{
+    return DisplayServerInfo {
+        initialized: ds.initialized,
+        session_count: ds.session_count,
+        client_count: ds.client_count,
+        surface_count: ds.surface_registry.active_count,
+        output_count: ds.output_count,
+        buffer_count: ds.buffer_count,
+        cap_count: ds.cap_count,
+        pending_messages: ds.message_count,
+        dispatch_count: ds.dispatch_count,
+        error_count: ds.error_count,
+        uptime_ns: now - ds.started_at_ns,
+        started_at_ns: ds.started_at_ns,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Graceful Shutdown
+// ──────────────────────────────────────────────
+
+fn ds_shutdown(ds: DisplayServer, now: u64) -> DisplayServer
+    effect [compute, io:write, residual]
+{
+    // Mark all sessions as disconnected
+    let mut updated: DisplayServer = ds;
+    for i in 0..MAX_SESSIONS {
+        let s_opt: Option(protocol.SessionInfo) = updated.sessions[i];
+        match s_opt {
+            Option::Some(s) => {
+                let disconnected: protocol.SessionInfo = protocol.SessionInfo {
+                    session_id: s.session_id,
+                    state: protocol.SessionState::Disconnected,
+                    client_id: s.client_id,
+                    connected_at: s.connected_at,
+                    capabilities: s.capabilities,
+                    surfaces: s.surfaces,
+                    pending_events: s.pending_events,
+                    protocol_version: s.protocol_version,
+                };
+                updated.sessions[i] = Option::Some(disconnected);
+            }
+            Option::None => {}
+        }
+    }
+    // Disconnect all clients
+    for i in 0..MAX_CLIENTS {
+        let c_opt: Option(ClientConnection) = updated.clients[i];
+        match c_opt {
+            Option::Some(c) => {
+                let disconnected: ClientConnection = ClientConnection {
+                    client_id: c.client_id,
+                    session_id: c.session_id,
+                    connected: false,
+                    protocol_major: c.protocol_major,
+                    protocol_minor: c.protocol_minor,
+                    connected_at_ns: c.connected_at_ns,
+                    last_activity_ns: now,
+                    message_count: c.message_count,
+                    error_count: c.error_count,
+                    max_surfaces: c.max_surfaces,
+                    surface_count: c.surface_count,
+                    fd: c.fd,
+                    send_buffer: c.send_buffer,
+                    recv_buffer: c.recv_buffer,
+                    send_offset: c.send_offset,
+                    recv_offset: c.recv_offset,
+                    send_pending: c.send_pending,
+                    recv_pending: c.recv_pending,
+                };
+                updated.clients[i] = Option::Some(disconnected);
+            }
+            Option::None => {}
+        }
+    }
+    updated.initialized = false;
+    residual emit {
+        op: "display_server:shutdown",
+        sessions: updated.session_count,
+        clients: updated.client_count,
+        timestamp: now,
+    };
+    return updated;
+}

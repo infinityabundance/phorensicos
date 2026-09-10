@@ -1,0 +1,1395 @@
+//==============================================================================
+// phor_abi.phor — Native Phorensic ABI
+//
+// This module defines the complete native ABI for the Phorensic architecture:
+// calling convention (register usage, stack frame layout, return values),
+// argument passing rules, structure layout with affine tracking,
+// Thread-Local Storage (TLS) ABI, stack unwinding protocol, exception
+// handling ABI, syscall ABI, and capability passing ABI.
+//
+// All operations are residual-recorded and effect-declared.
+//==============================================================================
+
+module phor_abi
+  @[receipt("phor-abi-v1")]
+  @[audit("ABI-DEF")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{io, alloc, unsafe, unwind, syscall, audit};
+use core::residual::*;
+use core::mem::*;
+use core::sync::atomic;
+
+//==============================================================================
+// Register File Definition
+//==============================================================================
+
+/// Architecture register set with capability metadata.
+pub struct RegisterFile[CapT: Capability](
+  // General-purpose registers
+  gp_regs: [u64; 32],
+  // Capability registers — each is (address, base, length, permissions, tag)
+  cap_regs: [CapabilitySlot; 16],
+  // Floating-point / SIMP registers
+  simd_regs: [SimdReg; 32],
+  // Special registers
+  pc: u64,
+  sp: u64,
+  fp: u64,
+  tp: u64,           // thread pointer
+  root_cap: CapT,    // root capability for the thread
+  ddc: CapT,         // default data capability
+  pcc: CapT,         // program counter capability
+  // Generation tag for residual provenance
+  generation: u64,
+  // Affine type tracking bits
+  affine_state: [u8; 32],
+) : effect:(alloc, unsafe);
+
+/// A 128/256-bit SIMD register encoding.
+pub struct SimdReg(
+  low: u64,
+  high: u64,
+  lane_count: u8,
+  element_width: u8,
+) : effect:(unsafe);
+
+/// A capability slot binding a (type_tag, rights, value) triple.
+pub struct CapabilitySlot(
+  type_tag: CapabilityType,
+  rights: CapabilityRights,
+  value: u64,
+  generation: u64,
+  valid: bool,
+) : effect:(unsafe);
+
+//==============================================================================
+// Calling Convention — Register Usage
+//==============================================================================
+
+/// Register roles for the standard calling convention.
+pub enum RegisterRole : u8 {
+  Argument0   = 0,   // a0 – first argument / return value
+  Argument1   = 1,   // a1
+  Argument2   = 2,   // a2
+  Argument3   = 3,   // a3
+  Argument4   = 4,   // a4
+  Argument5   = 5,   // a5
+  Argument6   = 6,   // a6
+  Argument7   = 7,   // a7 — also syscall number
+  CalleeSaved0 = 8,  // s0 / fp
+  CalleeSaved1 = 9,  // s1
+  CalleeSaved2 = 10, // s2
+  CalleeSaved3 = 11, // s3
+  CalleeSaved4 = 12, // s4
+  CalleeSaved5 = 13, // s5
+  CalleeSaved6 = 14, // s6
+  CalleeSaved7 = 15, // s7
+  Temporary0   = 16, // t0
+  Temporary1   = 17, // t1
+  Temporary2   = 18, // t2
+  Temporary3   = 19, // t3
+  Temporary4   = 20, // t4
+  Temporary5   = 21, // t5
+  Temporary6   = 22, // t6
+  StackPtr     = 23, // sp
+  FramePtr     = 24, // fp
+  ThreadPtr    = 25, // tp
+  GlobalPtr    = 26, // gp
+  ReturnAddr   = 27, // ra
+  Kernel0      = 28, // k0 – reserved for kernel
+  Kernel1      = 29, // k1 – reserved for kernel
+  CapArgs0     = 30, // ca0 – first capability argument
+  CapArgs1     = 31, // ca1 – second capability argument
+}
+
+/// Calling convention classification for a function signature.
+pub enum CallConvKind : u8 {
+  /// Standard Phorensic calling convention.
+  Phorensic     = 0,
+  /// C-compatible calling convention.
+  CCompatible   = 1,
+  /// Fast (interrupt-like) entry convention.
+  FastEntry     = 2,
+  /// Syscall convention (a7 = syscall number, a0..a5 = args).
+  Syscall       = 3,
+  /// Capability-sealed entry convention.
+  SealedEntry   = 4,
+  /// Unwind recovery entry convention.
+  UnwindRecovery = 5,
+}
+
+/// Fixed-size table of calling convention rules.
+pub struct CallConvTable(
+  entries: [CallConvEntry; 8],
+  count: u32,
+) : effect:(alloc);
+
+pub struct CallConvEntry(
+  kind: CallConvKind,
+  arg_regs: Range,
+  cap_arg_regs: Range,
+  callee_saved: Range,
+  temp_regs: Range,
+  stack_arg_offset: u32,
+  requires_stack_frame: bool,
+  shadow_stack: bool,
+) : effect:(unsafe);
+
+//==============================================================================
+// Stack Frame Layout
+//==============================================================================
+
+/// Layout of a standard stack frame (frame pointer points here).
+pub struct StackFrame(
+  // Saved frame pointer (fp) of caller
+  saved_fp: u64,
+  // Return address (ra) to caller
+  saved_ra: u64,
+  // Capability token for callee's return — sealed with caller's authority
+  return_cap: CapabilitySlot,
+  // Size of local variables area (padded to 16 bytes)
+  local_size: u32,
+  // Size of outgoing argument area
+  outgoing_size: u32,
+  // Reserved for shadow stack cookie
+  shadow_cookie: u64,
+  // Padding to maintain 16-byte alignment
+  padding: u64,
+) : effect:(unsafe);
+
+/// Compute the minimum stack frame size for a given set of locals.
+pub fn frame_size[
+  local_bytes: u32,
+  outgoing_bytes: u32,
+  has_variadic: bool,
+] -> u32 : effect:(pure) {
+  var sz: u32 = 48;  // base: saved_fp + saved_ra + return_cap + cookie
+  sz = sz + align_up(local_bytes, 16);
+  sz = sz + align_up(outgoing_bytes, 16);
+  if has_variadic {
+    sz = sz + 128;  // area for register save/restore
+  }
+  return sz;
+}
+
+/// Align a value up to a power-of-two boundary.
+fn align_up[val: u32, alignment: u32] -> u32 : effect:(pure) {
+  var mask: u32 = alignment - 1;
+  return (val + mask) & !mask;
+}
+
+/// Validate that a stack frame is properly aligned and has valid cap token.
+pub fn validate_stack_frame[
+  frame: *StackFrame,
+  expected_cap_token: u64,
+] -> Result[(), FrameError] : effect:(unsafe) {
+  let fp_val: u64 = @ptr_to_int(frame);
+  if (fp_val & 15) != 0 {
+    return Err(FrameError::MisalignedFrame);
+  }
+  if frame.shadow_cookie != compute_shadow_cookie() {
+    return Err(FrameError::ShadowCookieMismatch);
+  }
+  if frame.return_cap.generation != expected_cap_token {
+    return Err(FrameError::CapabilityTokenMismatch);
+  }
+  return Ok(());
+}
+
+/// Compute the shadow stack cookie from thread-local entropy.
+fn compute_shadow_cookie[] -> u64 : effect:(pure) {
+  // In real implementation, derived from thread's secret entropy.
+  return 0xDEADBEEF_CAFEBABE;
+}
+
+pub enum FrameError : u64 {
+  MisalignedFrame        = 1,
+  ShadowCookieMismatch   = 2,
+  CapabilityTokenMismatch = 3,
+  StackOverflow          = 4,
+  InvalidFramePointer    = 5,
+  CorruptReturnAddress   = 6,
+  UnwindTableNotFound    = 7,
+}
+
+//==============================================================================
+// Argument Passing
+//==============================================================================
+
+/// Argument classification for ABI argument marshaling.
+pub struct ArgDescriptor(
+  kind: ArgKind,
+  size: u32,
+  alignment: u32,
+  num_regs: u32,
+  is_capability: bool,
+  is_affine: bool,
+  type_id: TypeId,
+) : effect:(pure);
+
+pub enum ArgKind : u8 {
+  Integer    = 0,
+  Float      = 1,
+  SIMD       = 2,
+  Capability = 3,
+  Structure  = 4,
+  Variadic   = 5,
+  AffineType = 6,
+  Opaque     = 7,
+}
+
+/// Classify a type into argument descriptor for ABI.
+pub fn classify_argument[
+  type_id: TypeId,
+  offset: u32,
+  is_variadic: bool,
+] -> ArgDescriptor : effect:(pure) {
+  let info: TypeInfo = lookup_type_info(type_id);
+  let kind: ArgKind = ArgKind::Integer;
+  let is_cap: bool = false;
+  let is_aff: bool = false;
+
+  if info.flags & TYPE_FLAG_CAPABILITY != 0 {
+    kind = ArgKind::Capability;
+    is_cap = true;
+  } else if info.flags & TYPE_FLAG_AFFINE != 0 {
+    kind = ArgKind::AffineType;
+    is_aff = true;
+  } else if info.flags & TYPE_FLAG_FLOAT != 0 {
+    kind = ArgKind::Float;
+  } else if info.flags & TYPE_FLAG_SIMD != 0 {
+    kind = ArgKind::SIMD;
+  } else if info.size > 16 {
+    kind = ArgKind::Structure;
+  }
+
+  let alignment: u32 = if info.alignment > 16 { 16 } else { info.alignment };
+  if alignment < 8 {
+    alignment = 8;  // minimum ABI alignment
+  }
+
+  return ArgDescriptor(
+    kind: kind,
+    size: info.size,
+    alignment: alignment,
+    num_regs: if kind == ArgKind::Capability { 2 } else { (info.size + 7) / 8 },
+    is_capability: is_cap,
+    is_affine: is_aff,
+    type_id: type_id,
+  );
+}
+
+/// Maximum number of integer registers used for argument passing.
+const MAX_INT_ARGS: u32 = 8;
+
+/// Maximum number of capability registers used for argument passing.
+const MAX_CAP_ARGS: u32 = 2;
+
+/// Maximum number of stack argument bytes (beyond register args).
+const MAX_STACK_ARGS_BYTES: u32 = 2048;
+
+/// Marshal a set of arguments into registers and stack.
+pub fn marshal_arguments[
+  args: [ArgDescriptor; MAX_INT_ARGS as u64],
+  num_args: u32,
+  call_conv: CallConvKind,
+] -> ArgumentMarshaling : effect:(alloc, unsafe)
+  loop: bounded(MAX_INT_ARGS + MAX_CAP_ARGS + 1)
+{
+  var result: ArgumentMarshaling = ArgumentMarshaling::new();
+  var int_reg_idx: u32 = 0;
+  var cap_reg_idx: u32 = 0;
+  var stack_offset: u32 = 0;
+
+  for var i: u32 = 0; i < num_args; i += 1 {
+    let desc: ArgDescriptor = args[i];
+    match desc.kind {
+      ArgKind::Capability => {
+        if cap_reg_idx < MAX_CAP_ARGS {
+          result.cap_reg_map[cap_reg_idx] = ArgMapping(i, 0, 8);
+          cap_reg_idx += 1;
+        } else {
+          // spill to stack
+          result.stack_map[stack_offset] = ArgMapping(i, stack_offset, 16);
+          stack_offset += align_up(16, 8);
+        }
+      },
+      ArgKind::AffineType => {
+        // Affine types occupy a cap register for tracking, int for value
+        if cap_reg_idx < MAX_CAP_ARGS {
+          result.cap_reg_map[cap_reg_idx] = ArgMapping(i, cap_reg_idx, 8);
+          cap_reg_idx += 1;
+        }
+        if int_reg_idx < MAX_INT_ARGS {
+          result.int_reg_map[int_reg_idx] = ArgMapping(i, int_reg_idx, 8);
+          int_reg_idx += 1;
+        } else {
+          result.stack_map[stack_offset] = ArgMapping(i, stack_offset, 8);
+          stack_offset += align_up(8, 8);
+        }
+      },
+      _ => {
+        // Integer, float, SIMD, or small struct — pass in int/fp regs
+        let regs_needed: u32 = desc.num_regs;
+        if regs_needed == 1 {
+          if int_reg_idx < MAX_INT_ARGS {
+            result.int_reg_map[int_reg_idx] = ArgMapping(i, int_reg_idx, desc.size);
+            int_reg_idx += 1;
+          } else {
+            result.stack_map[stack_offset] = ArgMapping(i, stack_offset, desc.size);
+            stack_offset += align_up(desc.size, desc.alignment);
+          }
+        } else if regs_needed <= 2 && int_reg_idx + regs_needed <= MAX_INT_ARGS {
+          for var j: u32 = 0; j < regs_needed; j += 1 {
+            result.int_reg_map[int_reg_idx] = ArgMapping(i, int_reg_idx + j, 8);
+            int_reg_idx += 1;
+          }
+        } else {
+          let sz: u32 = desc.size;
+          result.stack_map[stack_offset] = ArgMapping(i, stack_offset, sz);
+          stack_offset += align_up(sz, desc.alignment);
+        }
+      },
+    }
+  }
+
+  result.total_stack_bytes = stack_offset;
+  return result;
+}
+
+/// Result of argument marshaling — maps original args to register/stack
+pub struct ArgumentMarshaling(
+  int_reg_map: [ArgMapping; MAX_INT_ARGS as u64],
+  cap_reg_map: [ArgMapping; MAX_CAP_ARGS as u64],
+  stack_map: [ArgMapping; 64],
+  int_reg_count: u32,
+  cap_reg_count: u32,
+  stack_count: u32,
+  total_stack_bytes: u32,
+) : effect:(alloc);
+
+pub struct ArgMapping(
+  arg_index: u32,
+  location: u32,
+  size: u32,
+) : effect:(pure);
+
+//==============================================================================
+// Return Value Conventions
+//==============================================================================
+
+/// Return value classification.
+pub enum ReturnKind : u8 {
+  /// Return in integer register a0 (up to 64 bits).
+  Integer    = 0,
+  /// Return in float register fa0.
+  Float      = 1,
+  /// Return in capability register ca0.
+  Capability = 2,
+  /// Return via hidden first pointer argument.
+  HiddenPtr  = 3,
+  /// Return via capability-gated buffer.
+  SealedBuffer = 4,
+  /// Return via residual channel (for fallible effects).
+  Residual   = 5,
+  /// Return via async continuation.
+  Continuation = 6,
+}
+
+pub struct ReturnDescriptor(
+  kind: ReturnKind,
+  size: u32,
+  alignment: u32,
+  is_fallible: bool,
+  residual_type: Option[TypeId],
+  requires_cleanup: bool,
+) : effect:(pure);
+
+/// Classify the return type for the ABI.
+pub fn classify_return[
+  return_type: TypeId,
+  effects: EffectSet,
+] -> ReturnDescriptor : effect:(pure) {
+  let info: TypeInfo = lookup_type_info(return_type);
+  let kind: ReturnKind = ReturnKind::Integer;
+  let is_fallible: bool = false;
+  let residual_ty: Option[TypeId] = None;
+
+  if effects.contains(Effect::Fallible) {
+    is_fallible = true;
+    residual_ty = Some(lookup_residual_type(return_type));
+  }
+
+  if info.flags & TYPE_FLAG_CAPABILITY != 0 {
+    kind = ReturnKind::Capability;
+  } else if info.flags & TYPE_FLAG_FLOAT != 0 {
+    kind = ReturnKind::Float;
+  } else if info.size > 16 {
+    kind = ReturnKind::HiddenPtr;
+  } else if effects.contains(Effect::Async) {
+    kind = ReturnKind::Continuation;
+  }
+
+  return ReturnDescriptor(
+    kind: kind,
+    size: info.size,
+    alignment: info.alignment,
+    is_fallible: is_fallible,
+    residual_type: residual_ty,
+    requires_cleanup: info.flags & TYPE_FLAG_AFFINE != 0,
+  );
+}
+
+/// Encode a return value according to the ABI return convention.
+pub fn encode_return[
+  value: u64,
+  desc: ReturnDescriptor,
+  cap_value: Option[CapabilitySlot],
+  residual: Option[Residual],
+] -> ReturnEncoding : effect:(unsafe) {
+  var encoding: ReturnEncoding = ReturnEncoding(
+    a0: value,
+    ca0: None,
+    residual_handle: 0,
+    has_error: false,
+    error_code: 0,
+  );
+
+  match desc.kind {
+    ReturnKind::Capability => {
+      encoding.ca0 = cap_value;
+    },
+    ReturnKind::Residual => {
+      if let Some(r) = residual {
+        encoding.residual_handle = r.encode();
+        encoding.has_error = r.is_error();
+        encoding.error_code = r.error_code();
+      }
+    },
+    ReturnKind::SealedBuffer => {
+      encoding.a0 = value;
+      encoding.ca0 = cap_value;
+    },
+    _ => {
+      encoding.a0 = value;
+    },
+  }
+
+  return encoding;
+}
+
+pub struct ReturnEncoding(
+  a0: u64,
+  ca0: Option[CapabilitySlot],
+  residual_handle: u64,
+  has_error: bool,
+  error_code: u64,
+) : effect:(unsafe);
+
+//==============================================================================
+// Structure Layout
+//==============================================================================
+
+/// Type flags used in structure layout.
+const TYPE_FLAG_CAPABILITY: u64 = 1 << 0;
+const TYPE_FLAG_AFFINE: u64    = 1 << 1;
+const TYPE_FLAG_FLOAT: u64     = 1 << 2;
+const TYPE_FLAG_SIMD: u64      = 1 << 3;
+const TYPE_FLAG_UNSIZED: u64   = 1 << 4;
+const TYPE_FLAG_RESIDUAL: u64  = 1 << 5;
+const TYPE_FLAG_SEALED: u64    = 1 << 6;
+
+pub struct TypeInfo(
+  size: u32,
+  alignment: u32,
+  flags: u64,
+  field_count: u32,
+  fields: [FieldInfo; 64],
+) : effect:(pure);
+
+pub struct FieldInfo(
+  offset: u32,
+  size: u32,
+  type_id: TypeId,
+  is_capability: bool,
+  is_affine: bool,
+  name_hash: u64,
+) : effect:(pure);
+
+/// Compute structure layout with proper alignment and capability tracking.
+pub fn compute_structure_layout[
+  fields: [FieldInfo; 64],
+  num_fields: u32,
+] -> StructureLayout : effect:(pure)
+  loop: bounded(64)
+{
+  var layout: StructureLayout = StructureLayout::new();
+  var current_offset: u32 = 0;
+  var max_alignment: u32 = 1;
+
+  for var i: u32 = 0; i < num_fields; i += 1 {
+    let field: FieldInfo = fields[i];
+    let align: u32 = field.size;
+    if align > 16 {
+      align = 16;
+    }
+    if align > max_alignment {
+      max_alignment = align;
+    }
+
+    current_offset = align_up(current_offset, align);
+
+    layout.fields[i] = FieldPlacement(
+      field_index: i,
+      offset: current_offset,
+      size: field.size,
+      is_capability: field.is_capability,
+      is_affine: field.is_affine,
+    );
+
+    // Record capability positions for ABI scanning
+    if field.is_capability || field.is_affine {
+      layout.cap_offset_map[layout.cap_count] = (current_offset, field.size);
+      layout.cap_count += 1;
+    }
+
+    current_offset += field.size;
+  }
+
+  // Final alignment of the structure
+  let total_size: u32 = align_up(current_offset, max_alignment);
+  layout.total_size = total_size;
+  layout.alignment = max_alignment;
+
+  return layout;
+}
+
+pub struct StructureLayout(
+  fields: [FieldPlacement; 64],
+  cap_offset_map: [(u32, u32); 16],
+  field_count: u32,
+  cap_count: u32,
+  total_size: u32,
+  alignment: u32,
+) : effect:(alloc);
+
+pub struct FieldPlacement(
+  field_index: u32,
+  offset: u32,
+  size: u32,
+  is_capability: bool,
+  is_affine: bool,
+) : effect:(pure);
+
+//==============================================================================
+// Thread-Local Storage (TLS) ABI
+//==============================================================================
+
+/// TLS access model.
+pub enum TlsAccessModel : u8 {
+  /// Local exec — static offset from thread pointer.
+  LocalExec  = 0,
+  /// Initial exec — link-time known offset, resolved at load.
+  InitialExec = 1,
+  /// General dynamic — fully dynamic TLS relocation.
+  GeneralDynamic = 2,
+  /// Local dynamic — group of TLS variables in one module.
+  LocalDynamic  = 3,
+}
+
+/// TLS block layout for a single thread.
+pub struct TlsLayout(
+  /// Offset from thread pointer to TLS block start.
+  base_offset: i64,
+  /// Total size of TLS block for all modules.
+  total_size: u32,
+  /// Number of TLS modules loaded.
+  module_count: u32,
+  /// Per-module offsets.
+  module_offsets: [TlsModule; 32],
+  /// Static (local-exec) variable offsets.
+  static_vars: [TlsVar; 128],
+  /// Dynamic (general-dynamic) module indices.
+  dynamic_modules: [u32; 32],
+) : effect:(alloc);
+
+pub struct TlsModule(
+  module_id: u32,
+  offset_from_tp: i64,
+  size: u32,
+  alignment: u32,
+  generation: u64,
+) : effect:(pure);
+
+pub struct TlsVar(
+  name_hash: u64,
+  module_id: u32,
+  offset_in_block: u32,
+  size: u32,
+  access_model: TlsAccessModel,
+  is_affine: bool,
+) : effect:(pure);
+
+/// Offset of the TLS block relative to the thread pointer register.
+const TLS_BLOCK_OFFSET: i64 = -2048;  // tp points 2KB into TLS block
+
+/// Compute the address of a TLS variable given the thread pointer.
+pub fn get_tls_address[
+  tp: u64,
+  var_info: TlsVar,
+  layout: *TlsLayout,
+] -> u64 : effect:(unsafe) {
+  let block_start: u64 = tp + TLS_BLOCK_OFFSET as u64;
+  let module_base: u64 = block_start + layout.module_offsets[var_info.module_id].offset_from_tp as u64;
+  return module_base + var_info.offset_in_block as u64;
+}
+
+/// Maximum TLS block size.
+const MAX_TLS_SIZE: u32 = 16 * 1024 * 1024;  // 16 MB
+
+/// TLS destructor entry (for affine-typed TLS variables).
+pub struct TlsDestructor(
+  var_offset: u32,
+  destructor_fn: u64,
+  type_id: TypeId,
+  is_active: bool,
+) : effect:(pure);
+
+//==============================================================================
+// Stack Unwinding ABI
+//==============================================================================
+
+/// Unwind reason codes communicated during stack unwinding.
+pub enum UnwindReason : u64 {
+  ExplicitThrow       = 0,
+  CapabilityViolation = 1,
+  EffectViolation     = 2,
+  ResidualTriggered   = 3,
+  BoundaryCrossed     = 4,
+  StackOverflow       = 5,
+  UserSignal          = 6,
+  DebugBreak          = 7,
+  AsyncCancellation   = 8,
+  ResourceExhausted   = 9,
+  AffineViolation     = 10,
+  AuditFailure        = 11,
+}
+
+/// Unwind action returned by personality routines.
+pub enum UnwindAction : u8 {
+  /// Continue unwinding up the stack.
+  Continue    = 0,
+  /// Install a landing pad at this frame.
+  InstallPad  = 1,
+  /// Execute cleanup handlers then continue.
+  CleanupThenContinue = 2,
+  /// Halt unwinding — error was handled.
+  Handled     = 3,
+  /// Capture residual and terminate.
+  CaptureResidual = 4,
+  /// Force termination of the thread.
+  Terminate   = 5,
+}
+
+/// Frame unwind information stored in the .eh_frame / .phor_unwind section.
+pub struct UnwindFrameInfo(
+  /// Start PC of the function.
+  start_pc: u64,
+  /// End PC of the function.
+  end_pc: u64,
+  /// Language-specific data area pointer.
+  lsda: u64,
+  /// Personality routine pointer.
+  personality: u64,
+  /// CFA definition rule.
+  cfa_rule: CfaRule,
+  /// Register save rules for callee-saved regs.
+  save_rules: [RegisterRule; 24],
+  /// Landing pad information for exception handling.
+  landing_pad: Option[LandingPadInfo],
+  /// Capability token required for this frame's unwinding.
+  unwind_cap_token: u64,
+) : effect:(unsafe);
+
+pub enum CfaRule : u8 {
+  /// CFA = (register) + offset
+  RegPlusOffset = 0,
+  /// CFA = *(register + offset)
+  RegIndirect   = 1,
+  /// CFA expressed via DWARF expression
+  Expression    = 2,
+  /// CFA is the frame pointer value
+  FramePointer  = 3,
+  /// CFA is the stack pointer value
+  StackPointer  = 4,
+}
+
+pub struct RegisterRule(
+  reg_num: u8,
+  rule: RuleKind,
+  value: i64,
+) : effect:(pure);
+
+pub enum RuleKind : u8 {
+  Undefined      = 0,
+  SameValue      = 1,
+  Offset         = 2,   // *(CFA + value)
+  ValOffset      = 3,   // CFA + value
+  Register       = 4,   // value = register number
+  Expression     = 5,
+  ValExpression  = 6,
+  Architectural = 7,
+}
+
+//==============================================================================
+// Exception Handling ABI
+//==============================================================================
+
+/// Exception handling personality routine interface.
+pub trait PersonalityRoutine {
+  /// Called during unwind to examine a frame and decide action.
+  fn examine_frame[
+    context: *UnwindContext,
+    exception: *ExceptionObject,
+    frame_info: *UnwindFrameInfo,
+  ] -> UnwindAction : (unwind, unsafe);
+
+  /// Called to install a landing pad (cleanup/catch).
+  fn install_landing_pad[
+    context: *UnwindContext,
+    landing_pad: *LandingPadInfo,
+    exception: *ExceptionObject,
+  ] : (unwind, unsafe);
+}
+
+pub struct UnwindContext(
+  pc: u64,
+  sp: u64,
+  fp: u64,
+  callee_saved: [u64; 8],
+  unwind_table: *UnwindTable,
+  capability_state: CapabilityState,
+  residual_chain: ResidualChain,
+) : effect:(unsafe);
+
+pub struct ExceptionObject(
+  exception_type: TypeId,
+  exception_value: u64,
+  cause: UnwindReason,
+  message: [u8; 256],
+  source_location: SourceLocation,
+  residual: Residual,
+  capability_violation: Option[CapabilityViolation],
+  effect_violation: Option[EffectViolation],
+  backtrace: Backtrace,
+  generation: u64,
+) : effect:(unsafe, alloc);
+
+pub struct LandingPadInfo(
+  landing_pad_pc: u64,
+  action_kind: ActionKind,
+  catch_type_info: TypeId,
+  cleanup_code: u64,
+  requires_capability: bool,
+  capability_token: u64,
+) : effect:(pure);
+
+pub enum ActionKind : u8 {
+  Catch      = 0,
+  Cleanup    = 1,
+  Filter     = 2,
+  Terminate  = 3,
+  Residual   = 4,
+  AuditTrail = 5,
+}
+
+/// Throw an exception with full residual recording.
+pub fn throw_exception[
+  exception: *ExceptionObject,
+] : (unwind, unsafe, alloc)
+  loop: bounded(1024)
+{
+  // Record the throw in the residual chain
+  record_residual_event(
+    event_kind: ResidualEventKind::ExceptionThrow,
+    data: @ptr_to_int(exception),
+    generation: exception.generation,
+  );
+
+  // Perform stack unwinding
+  let action: UnwindAction = unwind_stack(
+    exception: exception,
+    max_frames: 1024,
+  );
+
+  match action {
+    UnwindAction::Handled => {
+      record_residual_event(
+        event_kind: ResidualEventKind::ExceptionHandled,
+        data: @ptr_to_int(exception),
+        generation: exception.generation,
+      );
+    },
+    UnwindAction::CaptureResidual => {
+      record_residual_event(
+        event_kind: ResidualEventKind::ExceptionUnhandled,
+        data: @ptr_to_int(exception),
+        generation: exception.generation,
+      );
+      terminate_with_residual(exception);
+    },
+    UnwindAction::Terminate => {
+      record_residual_event(
+        event_kind: ResidualEventKind::ExceptionTerminate,
+        data: @ptr_to_int(exception),
+        generation: exception.generation,
+      );
+      abort_with_message("Unhandled exception — terminating");
+    },
+    _ => {
+      // Continue unwinding
+    },
+  }
+}
+
+/// Perform stack unwinding, calling personality routines.
+fn unwind_stack[
+  exception: *ExceptionObject,
+  max_frames: u32,
+] -> UnwindAction : (unwind, unsafe)
+  loop: bounded(1024)
+{
+  let context: UnwindContext = capture_unwind_context();
+  var current_action: UnwindAction = UnwindAction::Continue;
+  var frames_visited: u32 = 0;
+
+  for var i: u32 = 0; i < max_frames; i += 1 {
+    if frames_visited >= max_frames {
+      break;
+    }
+    frames_visited += 1;
+
+    let frame_info: Option[*UnwindFrameInfo] = lookup_unwind_info(context.pc);
+    if let Some(fi) = frame_info {
+      let personality: *PersonalityRoutine = @int_to_ptr(fi.personality);
+      current_action = personality.examine_frame(
+        context: &context,
+        exception: exception,
+        frame_info: fi,
+      );
+
+      match current_action {
+        UnwindAction::Handled => {
+          // Install landing pad and transfer control
+          if let Some(lp) = fi.landing_pad {
+            personality.install_landing_pad(
+              context: &context,
+              landing_pad: &lp,
+              exception: exception,
+            );
+          }
+          return UnwindAction::Handled;
+        },
+        UnwindAction::InstallPad => {
+          if let Some(lp) = fi.landing_pad {
+            personality.install_landing_pad(
+              context: &context,
+              landing_pad: &lp,
+              exception: exception,
+            );
+          }
+          return UnwindAction::Handled;
+        },
+        UnwindAction::CaptureResidual => {
+          capture_frame_residual(&context, exception);
+        },
+        _ => {
+          // Unwind to previous frame
+          unwind_one_frame(&context);
+          record_residual_event(
+            event_kind: ResidualEventKind::UnwindFrame,
+            data: context.pc,
+            generation: exception.generation,
+          );
+        },
+      }
+    } else {
+      // No unwind info — can't proceed further
+      return UnwindAction::CaptureResidual;
+    }
+  }
+
+  return current_action;
+}
+
+//==============================================================================
+// Syscall ABI
+//==============================================================================
+
+/// Syscall argument layout.
+pub struct SyscallArgs(
+  number: u64,          // a7 — syscall number
+  arg0: u64,            // a0
+  arg1: u64,            // a1
+  arg2: u64,            // a2
+  arg3: u64,            // a3
+  arg4: u64,            // a4
+  arg5: u64,            // a5
+  cap0: Option[CapabilitySlot],  // ca0
+  cap1: Option[CapabilitySlot],  // ca1
+) : effect:(pure);
+
+/// Syscall return value encoding.
+pub struct SyscallReturn(
+  result: u64,
+  error: SyscallError,
+  residual_handle: u64,
+  has_capability_return: bool,
+  capability: Option[CapabilitySlot>,
+  generation: u64,
+) : effect:(unsafe);
+
+/// Syscall error codes.
+pub enum SyscallError : u64 {
+  Success              = 0,
+  InvalidNumber        = 1,
+  InvalidArgument      = 2,
+  InvalidCapability    = 3,
+  InsufficientRights   = 4,
+  BadAddress           = 5,
+  ResourceExhausted    = 6,
+  NotFound             = 7,
+  AlreadyExists        = 8,
+  PermissionDenied     = 9,
+  WouldBlock           = 10,
+  Interrupted          = 11,
+  NotSupported         = 12,
+  CapabilityViolation  = 13,
+  AffineViolation      = 14,
+  ResidualOverflow     = 15,
+  AuditFailure         = 16,
+}
+
+/// The syscall instruction mnemonic in assembly is `phor_syscall`.
+/// Arguments are in a0-a5 (or via cap registers ca0-ca1 for capabilities).
+/// Syscall number in a7.
+/// Return value in a0, error in a1, residual handle in a2.
+pub fn invoke_syscall[
+  args: SyscallArgs,
+] -> SyscallReturn : (syscall, unsafe)
+  effect_syscall: true
+{
+  // Perform the syscall via the architecture-specific instruction
+  let result: SyscallReturn = __phor_syscall_asm(args);
+  record_residual_event(
+    event_kind: ResidualEventKind::Syscall,
+    data: result.generation,
+    generation: result.generation,
+  );
+  return result;
+}
+
+//==============================================================================
+// Capability Passing ABI
+//==============================================================================
+
+/// How a capability is transferred across an ABI boundary.
+pub enum CapPassingMode : u8 {
+  /// Capability passed in a dedicated capability register.
+  RegDirect    = 0,
+  /// Capability sealed and passed in an integer register.
+  SealedInt    = 1,
+  /// Capability passed via a memory slot with token.
+  MemorySlot   = 2,
+  /// Capability delegated with restricted rights.
+  Delegated    = 3,
+  /// Capability temporarily granted (revocable).
+  Revocable    = 4,
+  /// Capability forwarded from caller to callee.
+  Forwarded    = 5,
+}
+
+/// Encode a capability for ABI transfer.
+pub fn encode_cap_for_abi[
+  cap: CapabilitySlot,
+  mode: CapPassingMode,
+  caller_token: u64,
+] -> EncodedCap : effect:(unsafe) {
+  match mode {
+    CapPassingMode::RegDirect => {
+      return EncodedCap(
+        raw_value: cap.value,
+        type_tag: cap.type_tag,
+        rights: cap.rights,
+        generation: cap.generation,
+        encoding_mode: mode,
+        sealed: false,
+      );
+    },
+    CapPassingMode::SealedInt => {
+      let sealed: u64 = seal_capability(cap, caller_token);
+      return EncodedCap(
+        raw_value: sealed,
+        type_tag: cap.type_tag,
+        rights: cap.rights,
+        generation: cap.generation,
+        encoding_mode: mode,
+        sealed: true,
+      );
+    },
+    CapPassingMode::Delegated => {
+      let delegated: CapabilitySlot = restrict_capability(cap, cap.rights);
+      return EncodedCap(
+        raw_value: delegated.value,
+        type_tag: delegated.type_tag,
+        rights: delegated.rights,
+        generation: cap.generation,
+        encoding_mode: mode,
+        sealed: false,
+      );
+    },
+    CapPassingMode::Revocable => {
+      let rev_token: u64 = register_revocable_cap(cap);
+      return EncodedCap(
+        raw_value: rev_token,
+        type_tag: cap.type_tag,
+        rights: cap.rights,
+        generation: cap.generation,
+        encoding_mode: mode,
+        sealed: true,
+      );
+    },
+    _ => {
+      return EncodedCap(
+        raw_value: cap.value,
+        type_tag: cap.type_tag,
+        rights: cap.rights,
+        generation: cap.generation,
+        encoding_mode: mode,
+        sealed: false,
+      );
+    },
+  }
+}
+
+pub struct EncodedCap(
+  raw_value: u64,
+  type_tag: CapabilityType,
+  rights: CapabilityRights,
+  generation: u64,
+  encoding_mode: CapPassingMode,
+  sealed: bool,
+) : effect:(unsafe);
+
+/// Decode a capability received through the ABI.
+pub fn decode_cap_from_abi[
+  encoded: EncodedCap,
+  callee_token: u64,
+] -> Result[CapabilitySlot, CapAbiError] : effect:(unsafe) {
+  if encoded.sealed {
+    let unsealed: Result[CapabilitySlot, _] = unseal_capability(encoded.raw_value, callee_token);
+    return unsealed;
+  }
+
+  if !validate_generation(encoded.generation) {
+    return Err(CapAbiError::StaleGeneration);
+  }
+
+  return Ok(CapabilitySlot(
+    type_tag: encoded.type_tag,
+    rights: encoded.rights,
+    value: encoded.raw_value,
+    generation: encoded.generation,
+    valid: true,
+  ));
+}
+
+pub enum CapAbiError : u64 {
+  StaleGeneration    = 1,
+  InvalidSealing     = 2,
+  TokenMismatch      = 3,
+  RevokedCapability  = 4,
+  RightsInsufficient = 5,
+  TypeMismatch       = 6,
+  BadCapability      = 7,
+}
+
+//==============================================================================
+// TLS ABI Integration
+//==============================================================================
+
+/// Initialize the TLS block for a new thread.
+pub fn init_tls_for_thread[
+  tp: u64,
+  layout: *TlsLayout,
+  main_module_tls: [u8; 4096],
+] -> u64 : effect:(alloc, unsafe) {
+  let block_start: u64 = tp + TLS_BLOCK_OFFSET as u64;
+  let total: u32 = layout.total_size;
+
+  if total > MAX_TLS_SIZE {
+    abort_with_message("TLS block exceeds maximum size");
+  }
+
+  // Copy initial TLS data for the main module
+  @memcpy(
+    dest: @int_to_ptr(block_start + layout.module_offsets[0].offset_from_tp as u64),
+    src: main_module_tls,
+    len: layout.module_offsets[0].size as u64,
+  );
+
+  // Initialize generation tags for TLS capabilities
+  for var i: u32 = 0; i < layout.module_count; i += 1 {
+    layout.module_offsets[i].generation = generate_unique_id();
+  }
+
+  record_residual_event(
+    event_kind: ResidualEventKind::TlsInit,
+    data: tp,
+    generation: generate_unique_id(),
+  );
+
+  return block_start;
+}
+
+/// Destroy TLS affine variables on thread exit.
+pub fn finalize_tls_for_thread[
+  tp: u64,
+  layout: *TlsLayout,
+  destructors: [TlsDestructor; 32],
+  num_destructors: u32,
+] : effect:(unsafe)
+  loop: bounded(32)
+{
+  for var i: u32 = 0; i < num_destructors; i += 1 {
+    let d: TlsDestructor = destructors[i];
+    if d.is_active {
+      let addr: u64 = tp + TLS_BLOCK_OFFSET as u64 + d.var_offset as u64;
+      let dest_fn: fn(*u8) : (unsafe) = @int_to_ptr(d.destructor_fn);
+      dest_fn(@int_to_ptr(addr));
+      record_residual_event(
+        event_kind: ResidualEventKind::TlsDestruct,
+        data: addr,
+        generation: 0,
+      );
+    }
+  }
+}
+
+//==============================================================================
+// Reserved Registers and Constants
+//==============================================================================
+
+/// Stack alignment requirement (16 bytes per the ABI).
+const STACK_ALIGNMENT: u32 = 16;
+
+/// Minimum stack frame size (48 bytes).
+const MIN_FRAME_SIZE: u32 = 48;
+
+/// Maximum function arguments passed in registers.
+const MAX_REG_ARGS: u32 = 8;
+
+/// Size of a red zone below the stack pointer (128 bytes).
+const RED_ZONE_SIZE: u32 = 128;
+
+/// Guard page size for stack overflow detection.
+const STACK_GUARD_SIZE: u32 = 4096;
+
+/// Default stack size for a user thread.
+const DEFAULT_STACK_SIZE: u32 = 1024 * 1024;  // 1 MB
+
+/// TLS block total size (max 16 MB).
+const TLS_MAX_BLOCK: u32 = 16 * 1024 * 1024;
+
+/// Number of callee-saved registers.
+const NUM_CALLEE_SAVED: u32 = 8;
+
+//==============================================================================
+// ABI Validation and Integrity
+//==============================================================================
+
+/// Validate a function pointer's ABI compatibility before indirect call.
+pub fn validate_call_target[
+  fn_ptr: u64,
+  expected_conv: CallConvKind,
+  capability_token: u64,
+] -> Result[(), CallValidationError] : effect:(unsafe) {
+  // Read function descriptor from the .phor_symtab section
+  let sym: Option[*SymbolEntry] = lookup_symbol_by_address(fn_ptr);
+  if let Some(s) = sym {
+    let actual_conv: CallConvKind = s.call_conv;
+    if actual_conv != expected_conv {
+      return Err(CallValidationError::ConventionMismatch);
+    }
+    if s.requires_capability && s.cap_token != capability_token {
+      return Err(CallValidationError::CapabilityTokenMismatch);
+    }
+    return Ok(());
+  }
+  return Err(CallValidationError::SymbolNotFound);
+}
+
+pub enum CallValidationError : u64 {
+  ConventionMismatch     = 1,
+  CapabilityTokenMismatch = 2,
+  SymbolNotFound         = 3,
+  InvalidEntryPoint      = 4,
+  SealViolation          = 5,
+}
+
+/// ABI version identifier for compatibility checks.
+const PHOR_ABI_VERSION: u64 = 1;
+
+/// Feature flags for the ABI.
+const ABI_FEATURE_CAPABILITIES: u64 = 1 << 0;
+const ABI_FEATURE_AFFINE_TYPES: u64 = 1 << 1;
+const ABI_FEATURE_RESIDUALS: u64   = 1 << 2;
+const ABI_FEATURE_SHADOW_STACK: u64 = 1 << 3;
+const ABI_FEATURE_SEALED_ENTRY: u64 = 1 << 4;
+
+pub fn query_abi_features[] -> u64 : effect:(pure) {
+  return ABI_FEATURE_CAPABILITIES
+       | ABI_FEATURE_AFFINE_TYPES
+       | ABI_FEATURE_RESIDUALS
+       | ABI_FEATURE_SHADOW_STACK
+       | ABI_FEATURE_SEALED_ENTRY;
+}
+
+//==============================================================================
+// Forward Declarations of Core Lookups (stubs for compilation)
+//==============================================================================
+
+fn lookup_type_info[tid: TypeId] -> TypeInfo : effect:(pure) {
+  // In practice, this queries the debug/type info section.
+  return TypeInfo(size: 8, alignment: 8, flags: 0, field_count: 0, fields: Default);
+}
+
+fn lookup_residual_type[tid: TypeId] -> TypeId : effect:(pure) {
+  return TypeId(0);
+}
+
+fn lookup_symbol_by_address[addr: u64] -> Option[*SymbolEntry] : effect:(unsafe) {
+  return None;
+}
+
+fn lookup_unwind_info[pc: u64] -> Option[*UnwindFrameInfo] : effect:(unsafe) {
+  return None;
+}
+
+fn capture_unwind_context[] -> UnwindContext : effect:(unsafe) {
+  return UnwindContext(pc: 0, sp: 0, fp: 0, callee_saved: Default, unwind_table: null, capability_state: Default, residual_chain: Default);
+}
+
+fn unwind_one_frame[ctx: *UnwindContext] : effect:(unsafe) {
+}
+
+fn capture_frame_residual[ctx: *UnwindContext, exc: *ExceptionObject] : effect:(unsafe) {
+}
+
+fn seal_capability[cap: CapabilitySlot, token: u64] -> u64 : effect:(unsafe) {
+  return cap.value ^ token;
+}
+
+fn unseal_capability[sealed: u64, token: u64] -> Result[CapabilitySlot, CapAbiError] : effect:(unsafe) {
+  return Err(CapAbiError::InvalidSealing);
+}
+
+fn restrict_capability[cap: CapabilitySlot, rights: CapabilityRights] -> CapabilitySlot : effect:(unsafe) {
+  return cap;
+}
+
+fn register_revocable_cap[cap: CapabilitySlot] -> u64 : effect:(unsafe) {
+  return 0;
+}
+
+fn validate_generation[gen: u64] -> bool : effect:(pure) {
+  return gen > 0;
+}
+
+fn generate_unique_id[] -> u64 : effect:(pure) {
+  return 1;
+}
+
+fn record_residual_event[event_kind: ResidualEventKind, data: u64, generation: u64] : effect:(unsafe) {
+}
+
+fn terminate_with_residual[exc: *ExceptionObject] : effect:(unsafe) {
+}
+
+fn abort_with_message[msg: str] : effect:(unsafe) {
+}
+
+fn __phor_syscall_asm[args: SyscallArgs] -> SyscallReturn : effect:(syscall, unsafe) {
+  return SyscallReturn(result: 0, error: SyscallError::NotSupported, residual_handle: 0, has_capability_return: false, capability: None, generation: 0);
+}
+
+// External type aliases
+pub type TypeId = u64;
+pub type EffectSet = u64;
+pub struct CapabilityType(:u64);
+pub struct CapabilityRights(:u64);
+pub struct CapabilityState(:u64);
+pub struct ResidualChain(:u64);
+pub struct Residual(:u64);
+pub struct Backtrace(:u64);
+pub struct CapabilityViolation(:u64);
+pub struct EffectViolation(:u64);
+pub enum ResidualEventKind : u64 {
+  ExceptionThrow = 0,
+  ExceptionHandled = 1,
+  ExceptionUnhandled = 2,
+  ExceptionTerminate = 3,
+  UnwindFrame = 4,
+  Syscall = 5,
+  TlsInit = 6,
+  TlsDestruct = 7,
+}
+pub enum Effect : u64 {
+  Fallible = 1,
+  Async = 2,
+}
+pub struct SymbolEntry(
+  call_conv: CallConvKind,
+  requires_capability: bool,
+  cap_token: u64,
+);
+
+pub struct SourceLocation(
+  file_hash: u64,
+  line: u32,
+  column: u32,
+);
+
+pub struct UnwindTable(:u64);
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_classify_argument[] : effect:(pure) {
+  let desc: ArgDescriptor = classify_argument(TypeId(1), 0, false);
+  assert(desc.kind == ArgKind::Integer);
+  assert(desc.size == 8);
+}
+
+@Test
+pub fn test_frame_size_alignment[] : effect:(pure) {
+  let sz: u32 = frame_size(0, 0, false);
+  assert(sz == 48);
+  let sz2: u32 = frame_size(16, 16, false);
+  assert(sz2 == 80);
+  let sz3: u32 = frame_size(0, 0, true);
+  assert(sz3 == 176);
+}
+
+@Test
+pub fn test_validate_stack_frame_alignment[] : effect:(unsafe) {
+  var frame: StackFrame = Default;
+  frame.shadow_cookie = compute_shadow_cookie();
+  let result: Result[(), FrameError] = validate_stack_frame(&frame, 0);
+  assert(result.is_err());  // cap token mismatch
+}

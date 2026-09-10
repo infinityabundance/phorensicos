@@ -1,0 +1,1226 @@
+// file: rt_ipc.phor
+// purpose: Real-time IPC with bounded-delivery channels,
+//          priority inheritance, immediate ceiling protocol,
+//          timeout handling, and deterministic message passing.
+// evidence: RTIPC-ARCH-001 through RTIPC-ARCH-240
+// residual: All IPC operations, delivery confirmations, and
+//           protocol enforcement events are recorded as residuals.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// IPC Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_RT_IPC_BASE : Word64 = DIAG_RTOS_BASE | 0x0300
+
+const IPC_MAX_CHANNELS       : u32 = 32
+const IPC_MAX_MESSAGES       : u32 = 128
+const IPC_MAX_PENDING        : u32 = 64
+const IPC_MAX_ENDPOINTS      : u32 = 64
+const IPC_MESSAGE_DATA_SIZE  : u32 = 256
+const IPC_CHANNEL_NAME_CAP   : u32 = 32
+const IPC_RESIDUAL_LOG       : u32 = 64
+const IPC_TIMEOUT_HISTORY    : u32 = 32
+const IPC_PRIORITY_QUEUE_CAP : u32 = 16
+const IPC_MAX_EFFECTS        : u32 = 8
+
+// ──────────────────────────────────────────────
+// IPC Message Priority
+// ──────────────────────────────────────────────
+pub type IPCPriority : u8 = enum {
+    IPCPrio_Low      = 0x00,
+    IPCPrio_Normal   = 0x01,
+    IPCPrio_High     = 0x02,
+    IPCPrio_Critical = 0x03,
+}
+
+// ──────────────────────────────────────────────
+// IPC Channel Type Enum
+// ──────────────────────────────────────────────
+pub type ChannelType : u8 = enum {
+    ChannelType_Unbuffered = 0x00,
+    ChannelType_Bounded    = 0x01,
+    ChannelType_Guaranteed = 0x02,
+}
+
+// ──────────────────────────────────────────────
+// IPC Message Type Enum
+// ──────────────────────────────────────────────
+pub type IpcMessageType : u8 = enum {
+    IpcMsg_Data      = 0x00,
+    IpcMsg_Request   = 0x01,
+    IpcMsg_Response  = 0x02,
+    IpcMsg_Notify    = 0x03,
+    IpcMsg_Error     = 0x04,
+    IpcMsg_Ack       = 0x05,
+    IpcMsg_FlowCtrl  = 0x06,
+}
+
+// ──────────────────────────────────────────────
+// IPC Endpoint ID
+// ──────────────────────────────────────────────
+pub type EndpointId : u32 = struct {
+    value: Word32,
+}
+
+impl EndpointId {
+    pub fn new(val: Word32) -> EndpointId
+        effects: [deterministic]
+    {
+        EndpointId { value: val }
+    }
+
+    pub fn from_u32(val: u32) -> EndpointId
+        effects: [deterministic]
+    {
+        EndpointId { value: Word32::from_u32(val) }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value.to_u32()
+    }
+
+    pub fn eq(self, other: EndpointId) -> bool
+        effects: [deterministic]
+    {
+        self.value.eq(other.value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Channel ID Type
+// ──────────────────────────────────────────────
+pub type ChannelId : u32 = struct {
+    value: Word32,
+}
+
+impl ChannelId {
+    pub fn new(val: Word32) -> ChannelId
+        effects: [deterministic]
+    {
+        ChannelId { value: val }
+    }
+
+    pub fn from_u32(val: u32) -> ChannelId
+        effects: [deterministic]
+    {
+        ChannelId { value: Word32::from_u32(val) }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value.to_u32()
+    }
+
+    pub fn eq(self, other: ChannelId) -> bool
+        effects: [deterministic]
+    {
+        self.value.eq(other.value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// IPC Message Structure
+// ──────────────────────────────────────────────
+pub type IpcMessage : struct {
+    msg_id: Word32,
+    msg_type: IpcMessageType,
+    priority: IPCPriority,
+    sender: EndpointId,
+    receiver: EndpointId,
+    channel: ChannelId,
+    data: FixedArray[Byte, IPC_MESSAGE_DATA_SIZE],
+    data_length: u32,
+    timestamp: Word64,
+    deadline: Word64,
+    sequence: Word64,
+    delivery_count: Word64,
+    ttl: Word64,
+}
+
+impl IpcMessage {
+    pub fn new(sender: EndpointId, receiver: EndpointId, ch: ChannelId) -> IpcMessage
+        effects: [deterministic]
+    {
+        IpcMessage {
+            msg_id: Word32::zero(),
+            msg_type: IpcMessageType::IpcMsg_Data,
+            priority: IPCPriority::IPCPrio_Normal,
+            sender: sender,
+            receiver: receiver,
+            channel: ch,
+            data: FixedArray::new(),
+            data_length: 0,
+            timestamp: Word64::zero(),
+            deadline: Word64::zero(),
+            sequence: Word64::zero(),
+            delivery_count: Word64::zero(),
+            ttl: Word64::zero(),
+        }
+    }
+
+    pub fn set_data(self: ref mut, data: FixedArray[Byte, IPC_MESSAGE_DATA_SIZE], len: u32) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if len > IPC_MESSAGE_DATA_SIZE {
+            return Result::Err(bounds_capacity_exceeded(IPC_MESSAGE_DATA_SIZE))
+        }
+        for i in 0..len {
+            let byte: Byte = match data.get(i) {
+                Result::Ok(b) => b,
+                Result::Err(_) => continue,
+            }
+            let r: Result<(), BoundsError> = self.data.set(i, byte)
+            if r.is_err() {
+                return r
+            }
+        }
+        self.data_length = len
+        Result::Ok(())
+    }
+
+    pub fn set_priority(self: ref mut, prio: IPCPriority)
+        effects: [deterministic]
+    {
+        self.priority = prio
+    }
+
+    pub fn set_deadline(self: ref mut, dl: Word64)
+        effects: [deterministic]
+    {
+        self.deadline = dl
+    }
+
+    pub fn has_expired(self, now: Word64) -> bool
+        effects: [deterministic]
+    {
+        if self.deadline.is_zero() {
+            return false
+        }
+        now.gt(self.deadline)
+    }
+
+    pub fn decrement_ttl(self: ref mut) -> bool
+        effects: [deterministic]
+    {
+        if self.ttl.is_zero() {
+            return false
+        }
+        self.ttl = self.ttl.decrement()
+        !self.ttl.is_zero()
+    }
+
+    pub fn size(self) -> u32
+        effects: [deterministic]
+    {
+        self.data_length
+    }
+}
+
+// ──────────────────────────────────────────────
+// IPC Channel (Bounded-Delivery)
+// ──────────────────────────────────────────────
+pub type IpcChannel : struct {
+    id: ChannelId,
+    channel_type: ChannelType,
+    name: FixedString[IPC_CHANNEL_NAME_CAP],
+    endpoints: FixedArray[EndpointId, IPC_MAX_ENDPOINTS],
+    endpoint_count: u32,
+    message_queue: FixedArray[IpcMessage, IPC_MAX_MESSAGES],
+    queue_head: u32,
+    queue_tail: u32,
+    queue_count: u32,
+    max_pending: u32,
+    drop_on_overflow: bool,
+    priority_ceiling: IPCPriority,
+    active_sender: EndpointId,
+    active_receiver: EndpointId,
+    total_sent: Word64,
+    total_received: Word64,
+    total_dropped: Word64,
+    total_timeouts: Word64,
+    created: Word64,
+}
+
+impl IpcChannel {
+    pub fn new(ch_id: ChannelId, ch_type: ChannelType, max_pend: u32, drop: bool) -> IpcChannel
+        effects: [deterministic]
+    {
+        IpcChannel {
+            id: ch_id,
+            channel_type: ch_type,
+            name: FixedString::new(),
+            endpoints: FixedArray::new(),
+            endpoint_count: 0,
+            message_queue: FixedArray::new(),
+            queue_head: 0,
+            queue_tail: 0,
+            queue_count: 0,
+            max_pending: if max_pend > IPC_MAX_PENDING { IPC_MAX_PENDING } else { max_pend },
+            drop_on_overflow: drop,
+            priority_ceiling: IPCPriority::IPCPrio_Normal,
+            active_sender: EndpointId::from_u32(0),
+            active_receiver: EndpointId::from_u32(0),
+            total_sent: Word64::zero(),
+            total_received: Word64::zero(),
+            total_dropped: Word64::zero(),
+            total_timeouts: Word64::zero(),
+            created: Word64::zero(),
+        }
+    }
+
+    pub fn with_name(ch_id: ChannelId, ch_type: ChannelType, max_pend: u32, drop: bool, ch_name: FixedString[IPC_CHANNEL_NAME_CAP]) -> IpcChannel
+        effects: [deterministic]
+    {
+        let mut ch: IpcChannel = IpcChannel::new(ch_id, ch_type, max_pend, drop)
+        ch.name = ch_name
+        ch
+    }
+
+    pub fn attach_endpoint(self: ref mut, ep: EndpointId) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.endpoint_count >= IPC_MAX_ENDPOINTS {
+            return Result::Err(bounds_capacity_exceeded(IPC_MAX_ENDPOINTS))
+        }
+        self.endpoints.set(self.endpoint_count, ep)
+        self.endpoint_count = self.endpoint_count + 1
+        Result::Ok(())
+    }
+
+    pub fn detach_endpoint(self: ref mut, ep: EndpointId) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.endpoint_count {
+            let e: EndpointId = match self.endpoints.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if e.eq(ep) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(bounds_index_out_of_range(0, self.endpoint_count))
+        }
+        for i in found_idx..(self.endpoint_count - 1) {
+            let e: EndpointId = match self.endpoints.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => EndpointId::from_u32(0),
+            }
+            let r: Result<(), BoundsError> = self.endpoints.set(i, e)
+        }
+        self.endpoint_count = self.endpoint_count - 1
+        Result::Ok(())
+    }
+
+    pub fn has_endpoint(self, ep: EndpointId) -> bool
+        effects: [deterministic]
+    {
+        for i in 0..self.endpoint_count {
+            let e: EndpointId = match self.endpoints.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if e.eq(ep) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn enqueue(self: ref mut, msg: IpcMessage) -> Result[bool, BoundsError>
+        effects: [deterministic]
+    {
+        if self.queue_count >= self.max_pending {
+            if self.drop_on_overflow {
+                self.total_dropped = self.total_dropped.increment_or_max()
+                // Drop oldest message to make room
+                self.queue_head = (self.queue_head + 1) % IPC_MAX_MESSAGES
+                self.queue_count = self.queue_count - 1
+            } else {
+                // Blocking behavior - queue full
+                return Result::Ok(false)
+            }
+        }
+
+        let idx: u32 = (self.queue_head + self.queue_count) % IPC_MAX_MESSAGES
+        let r: Result<(), BoundsError> = self.message_queue.set(idx, msg)
+        if r.is_err() {
+            return Result::Err(bounds_capacity_exceeded(IPC_MAX_MESSAGES))
+        }
+        self.queue_count = self.queue_count + 1
+        self.total_sent = self.total_sent.increment_or_max()
+        Result::Ok(true)
+    }
+
+    pub fn dequeue(self: ref mut) -> Result[IpcMessage, BoundsError>
+        effects: [deterministic]
+    {
+        if self.queue_count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        let msg: IpcMessage = match self.message_queue.get(self.queue_head) {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(e),
+        }
+        self.queue_head = (self.queue_head + 1) % IPC_MAX_MESSAGES
+        self.queue_count = self.queue_count - 1
+        self.total_received = self.total_received.increment_or_max()
+        Result::Ok(msg)
+    }
+
+    pub fn peek(self) -> Result[IpcMessage, BoundsError>
+        effects: [deterministic]
+    {
+        if self.queue_count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        self.message_queue.get(self.queue_head)
+    }
+
+    pub fn is_full(self) -> bool
+        effects: [deterministic]
+    {
+        self.queue_count >= self.max_pending
+    }
+
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.queue_count == 0
+    }
+
+    pub fn message_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.queue_count
+    }
+
+    pub fn set_priority_ceiling(self: ref mut, ceiling: IPCPriority)
+        effects: [deterministic]
+    {
+        self.priority_ceiling = ceiling
+    }
+
+    pub fn get_priority_ceiling(self) -> IPCPriority
+        effects: [deterministic]
+    {
+        self.priority_ceiling
+    }
+}
+
+// ──────────────────────────────────────────────
+// IPC Endpoint
+// ──────────────────────────────────────────────
+pub type IpcEndpoint : struct {
+    id: EndpointId,
+    channels: FixedArray[ChannelId, IPC_MAX_CHANNELS],
+    channel_count: u32,
+    pending_messages: FixedArray[IpcMessage, IPC_MAX_PENDING],
+    pending_count: u32,
+    timeout: Word64,
+    priority: IPCPriority,
+    inherited_priority: IPCPriority,
+    inheritance_active: bool,
+}
+
+impl IpcEndpoint {
+    pub fn new(ep_id: EndpointId, prio: IPCPriority, timeout_val: Word64) -> IpcEndpoint
+        effects: [deterministic]
+    {
+        IpcEndpoint {
+            id: ep_id,
+            channels: FixedArray::new(),
+            channel_count: 0,
+            pending_messages: FixedArray::new(),
+            pending_count: 0,
+            timeout: timeout_val,
+            priority: prio,
+            inherited_priority: prio,
+            inheritance_active: false,
+        }
+    }
+
+    pub fn attach_channel(self: ref mut, ch: ChannelId) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.channel_count >= IPC_MAX_CHANNELS {
+            return Result::Err(bounds_capacity_exceeded(IPC_MAX_CHANNELS))
+        }
+        let r: Result<(), BoundsError> = self.channels.set(self.channel_count, ch)
+        if r.is_ok() {
+            self.channel_count = self.channel_count + 1
+        }
+        r
+    }
+
+    pub fn detach_channel(self: ref mut, ch: ChannelId) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.channel_count {
+            let c: ChannelId = match self.channels.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if c.eq(ch) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(bounds_index_out_of_range(0, self.channel_count))
+        }
+        for i in found_idx..(self.channel_count - 1) {
+            let c: ChannelId = match self.channels.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => ChannelId::from_u32(0),
+            }
+            let r: Result<(), BoundsError> = self.channels.set(i, c)
+        }
+        self.channel_count = self.channel_count - 1
+        Result::Ok(())
+    }
+
+    pub fn has_channel(self, ch: ChannelId) -> bool
+        effects: [deterministic]
+    {
+        for i in 0..self.channel_count {
+            let c: ChannelId = match self.channels.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if c.eq(ch) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn push_pending(self: ref mut, msg: IpcMessage) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.pending_count >= IPC_MAX_PENDING {
+            return Result::Err(bounds_capacity_exceeded(IPC_MAX_PENDING))
+        }
+        let r: Result<(), BoundsError> = self.pending_messages.set(self.pending_count, msg)
+        if r.is_ok() {
+            self.pending_count = self.pending_count + 1
+        }
+        r
+    }
+
+    pub fn pop_pending(self: ref mut) -> Result[IpcMessage, BoundsError>
+        effects: [deterministic]
+    {
+        if self.pending_count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        let msg: IpcMessage = match self.pending_messages.get(0) {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(e),
+        }
+        // Compact
+        for i in 0..(self.pending_count - 1) {
+            let m: IpcMessage = match self.pending_messages.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let r: Result<(), BoundsError> = self.pending_messages.set(i, m)
+        }
+        self.pending_count = self.pending_count - 1
+        Result::Ok(msg)
+    }
+
+    pub fn pending_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.pending_count
+    }
+
+    pub fn inherit_priority(self: ref mut, prio: IPCPriority)
+        effects: [deterministic]
+    {
+        if prio as u8 > self.inherited_priority as u8 {
+            self.inherited_priority = prio
+            self.inheritance_active = true
+        }
+    }
+
+    pub fn restore_priority(self: ref mut)
+        effects: [deterministic]
+    {
+        self.inherited_priority = self.priority
+        self.inheritance_active = false
+    }
+
+    pub fn effective_priority(self) -> IPCPriority
+        effects: [deterministic]
+    {
+        if self.inheritance_active {
+            self.inherited_priority
+        } else {
+            self.priority
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// IPC Error Types
+// ──────────────────────────────────────────────
+pub type IpcError : struct {
+    code: Word64,
+    msg: FixedString[128],
+}
+
+impl IpcError {
+    pub fn new(c: Word64, m: FixedString[128]) -> IpcError
+        effects: [deterministic]
+    {
+        IpcError { code: c, msg: m }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn msg(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+}
+
+pub fn ipc_channel_not_found(id: u32) -> IpcError
+    effects: [deterministic]
+{
+    IpcError::new(Word64::from_u64(DIAG_RT_IPC_BASE | 0x001),
+        FixedString[128]::from_slice("IPC channel not found"))
+}
+
+pub fn ipc_endpoint_not_found(id: u32) -> IpcError
+    effects: [deterministic]
+{
+    IpcError::new(Word64::from_u64(DIAG_RT_IPC_BASE | 0x002),
+        FixedString[128]::from_slice("IPC endpoint not found"))
+}
+
+pub fn ipc_queue_full() -> IpcError
+    effects: [deterministic]
+{
+    IpcError::new(Word64::from_u64(DIAG_RT_IPC_BASE | 0x003),
+        FixedString[128]::from_slice("IPC message queue capacity exceeded"))
+}
+
+pub fn ipc_timeout() -> IpcError
+    effects: [deterministic]
+{
+    IpcError::new(Word64::from_u64(DIAG_RT_IPC_BASE | 0x004),
+        FixedString[128]::from_slice("IPC operation timed out"))
+}
+
+pub fn ipc_protocol_error(msg: FixedString[128]) -> IpcError
+    effects: [deterministic]
+{
+    IpcError::new(Word64::from_u64(DIAG_RT_IPC_BASE | 0x005), msg)
+}
+
+pub fn ipc_message_too_large() -> IpcError
+    effects: [deterministic]
+{
+    IpcError::new(Word64::from_u64(DIAG_RT_IPC_BASE | 0x006),
+        FixedString[128]::from_slice("IPC message exceeds maximum data size"))
+}
+
+// ──────────────────────────────────────────────
+// IPC Manager (Main IPC Subsystem)
+// ──────────────────────────────────────────────
+pub type IpcManager : struct {
+    channels: FixedArray[IpcChannel, IPC_MAX_CHANNELS],
+    channel_count: u32,
+    endpoints: FixedArray[IpcEndpoint, IPC_MAX_ENDPOINTS],
+    endpoint_count: u32,
+    next_channel_id: u32,
+    next_endpoint_id: u32,
+    next_msg_id: Word32,
+    residuals: FixedArray[IpcMessage, IPC_RESIDUAL_LOG],
+    residual_count: u32,
+    current_time: Word64,
+}
+
+impl IpcManager {
+    pub fn new() -> IpcManager
+        effects: [deterministic]
+    {
+        IpcManager {
+            channels: FixedArray::new(),
+            channel_count: 0,
+            endpoints: FixedArray::new(),
+            endpoint_count: 0,
+            next_channel_id: 1,
+            next_endpoint_id: 1,
+            next_msg_id: Word32::from_u32(1),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+            current_time: Word64::zero(),
+        }
+    }
+
+    pub fn create_channel(self: ref mut, ch_type: ChannelType, max_pending: u32, drop_on_overflow: bool) -> Result[ChannelId, IpcError>
+        effects: [deterministic, residual]
+    {
+        if self.channel_count >= IPC_MAX_CHANNELS {
+            return Result::Err(ipc_queue_full())
+        }
+        let id: ChannelId = ChannelId::from_u32(self.next_channel_id)
+        self.next_channel_id = self.next_channel_id + 1
+        let channel: IpcChannel = IpcChannel::new(id, ch_type, max_pending, drop_on_overflow)
+        let r: Result<(), BoundsError> = self.channels.set(self.channel_count, channel)
+        if r.is_err() {
+            return Result::Err(ipc_queue_full())
+        }
+        self.channel_count = self.channel_count + 1
+        residual emit {
+            ipc_op: "channel.created",
+            channel_id: id.value() as u64,
+            channel_type: ch_type as u64,
+            max_pending: max_pending as u64,
+            drop_overflow: if drop_on_overflow { 1 } else { 0 },
+        }
+        Result::Ok(id)
+    }
+
+    pub fn create_channel_named(self: ref mut, ch_type: ChannelType, max_pending: u32, drop_on_overflow: bool, name: FixedString[IPC_CHANNEL_NAME_CAP]) -> Result[ChannelId, IpcError>
+        effects: [deterministic, residual]
+    {
+        if self.channel_count >= IPC_MAX_CHANNELS {
+            return Result::Err(ipc_queue_full())
+        }
+        let id: ChannelId = ChannelId::from_u32(self.next_channel_id)
+        self.next_channel_id = self.next_channel_id + 1
+        let channel: IpcChannel = IpcChannel::with_name(id, ch_type, max_pending, drop_on_overflow, name)
+        let r: Result<(), BoundsError> = self.channels.set(self.channel_count, channel)
+        if r.is_err() {
+            return Result::Err(ipc_queue_full())
+        }
+        self.channel_count = self.channel_count + 1
+        residual emit {
+            ipc_op: "channel.created.named",
+            channel_id: id.value() as u64,
+            channel_type: ch_type as u64,
+            name: name,
+        }
+        Result::Ok(id)
+    }
+
+    pub fn delete_channel(self: ref mut, id: ChannelId) -> Result<(), IpcError>
+        effects: [deterministic, residual]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.channel_count {
+            let ch: IpcChannel = match self.channels.get(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            if ch.id.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(ipc_channel_not_found(id.value()))
+        }
+        for i in found_idx..(self.channel_count - 1) {
+            let ch: IpcChannel = match self.channels.get(i + 1) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            let r: Result<(), BoundsError> = self.channels.set(i, ch)
+        }
+        self.channel_count = self.channel_count - 1
+        residual emit {
+            ipc_op: "channel.deleted",
+            channel_id: id.value() as u64,
+        }
+        Result::Ok(())
+    }
+
+    pub fn create_endpoint(self: ref mut, prio: IPCPriority, timeout: Word64) -> Result[EndpointId, IpcError>
+        effects: [deterministic, residual]
+    {
+        if self.endpoint_count >= IPC_MAX_ENDPOINTS {
+            return Result::Err(ipc_queue_full())
+        }
+        let id: EndpointId = EndpointId::from_u32(self.next_endpoint_id)
+        self.next_endpoint_id = self.next_endpoint_id + 1
+        let ep: IpcEndpoint = IpcEndpoint::new(id, prio, timeout)
+        let r: Result<(), BoundsError> = self.endpoints.set(self.endpoint_count, ep)
+        if r.is_err() {
+            return Result::Err(ipc_queue_full())
+        }
+        self.endpoint_count = self.endpoint_count + 1
+        residual emit {
+            ipc_op: "endpoint.created",
+            endpoint_id: id.value() as u64,
+            priority: prio as u64,
+            timeout: timeout.to_u64(),
+        }
+        Result::Ok(id)
+    }
+
+    pub fn delete_endpoint(self: ref mut, id: EndpointId) -> Result<(), IpcError>
+        effects: [deterministic, residual]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.endpoint_count {
+            let ep: IpcEndpoint = match self.endpoints.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if ep.id.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(ipc_endpoint_not_found(id.value()))
+        }
+        for i in found_idx..(self.endpoint_count - 1) {
+            let ep: IpcEndpoint = match self.endpoints.get(i + 1) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            let r: Result<(), BoundsError> = self.endpoints.set(i, ep)
+        }
+        self.endpoint_count = self.endpoint_count - 1
+        residual emit {
+            ipc_op: "endpoint.deleted",
+            endpoint_id: id.value() as u64,
+        }
+        Result::Ok(())
+    }
+
+    pub fn bind_endpoint_to_channel(self: ref mut, ep_id: EndpointId, ch_id: ChannelId) -> Result<(), IpcError>
+        effects: [deterministic, residual]
+    {
+        let channel: ref mut IpcChannel = match self.find_channel_mut(ch_id) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let attach_result: Result<(), BoundsError> = channel.attach_endpoint(ep_id)
+        if attach_result.is_err() {
+            return Result::Err(ipc_queue_full())
+        }
+        let endpoint: ref mut IpcEndpoint = match self.find_endpoint_mut(ep_id) {
+            Result::Ok(e) => e,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let attach_result2: Result<(), BoundsError> = endpoint.attach_channel(ch_id)
+        if attach_result2.is_err() {
+            return Result::Err(ipc_queue_full())
+        }
+        residual emit {
+            ipc_op: "bind.endpoint.channel",
+            endpoint_id: ep_id.value() as u64,
+            channel_id: ch_id.value() as u64,
+        }
+        Result::Ok(())
+    }
+
+    pub fn unbind_endpoint_from_channel(self: ref mut, ep_id: EndpointId, ch_id: ChannelId) -> Result<(), IpcError>
+        effects: [deterministic]
+    {
+        let channel: ref mut IpcChannel = match self.find_channel_mut(ch_id) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let _ = channel.detach_endpoint(ep_id)
+        let endpoint: ref mut IpcEndpoint = match self.find_endpoint_mut(ep_id) {
+            Result::Ok(e) => e,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let _ = endpoint.detach_channel(ch_id)
+        Result::Ok(())
+    }
+
+    pub fn send(self: ref mut, sender: EndpointId, receiver: EndpointId, ch_id: ChannelId, data: FixedArray[Byte, IPC_MESSAGE_DATA_SIZE], data_len: u32, priority: IPCPriority, deadline: Word64) -> Result[bool, IpcError>
+        effects: [deterministic, residual]
+    {
+        let channel: ref mut IpcChannel = match self.find_channel_mut(ch_id) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err(e),
+        }
+        if !channel.has_endpoint(sender) || !channel.has_endpoint(receiver) {
+            return Result::Err(ipc_protocol_error(FixedString[128]::from_slice("Endpoint not bound to channel")))
+        }
+
+        // Priority inheritance: if receiver has higher priority, sender inherits it
+        let sender_ep: ref mut IpcEndpoint = match self.find_endpoint_mut(sender) {
+            Result::Ok(e) => e,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let receiver_ep: ref mut IpcEndpoint = match self.find_endpoint_mut(receiver) {
+            Result::Ok(e) => e,
+            Result::Err(e) => return Result::Err(e),
+        }
+        if (receiver_ep.priority as u8) > (sender_ep.priority as u8) {
+            sender_ep.inherit_priority(receiver_ep.priority)
+            residual emit {
+                ipc_op: "priority.inheritance",
+                sender: sender.value() as u64,
+                inherited_from: receiver.value() as u64,
+                new_priority: sender_ep.effective_priority() as u64,
+            }
+        }
+
+        // Immediate ceiling protocol check
+        let channel_ceiling: IPCPriority = channel.get_priority_ceiling()
+        if (sender_ep.effective_priority() as u8) > (channel_ceiling as u8) {
+            residual emit {
+                ipc_op: "ceiling.protocol.blocked",
+                endpoint: sender.value() as u64,
+                channel: ch_id.value() as u64,
+                endpoint_priority: sender_ep.effective_priority() as u64,
+                ceiling: channel_ceiling as u64,
+            }
+        }
+
+        let mut msg: IpcMessage = IpcMessage::new(sender, receiver, ch_id)
+        msg.msg_id = self.next_msg_id
+        self.next_msg_id = Word32::from_u32(self.next_msg_id.to_u32() + 1)
+        msg.msg_type = if deadline.is_zero() {
+            IpcMessageType::IpcMsg_Data
+        } else {
+            IpcMessageType::IpcMsg_Request
+        }
+        msg.priority = priority
+        msg.timestamp = self.current_time
+        msg.deadline = deadline
+        msg.sequence = channel.total_sent.increment_or_max()
+        let data_result: Result<(), BoundsError> = msg.set_data(data, data_len)
+
+        let result: Result<bool, BoundsError> = channel.enqueue(msg)
+        match result {
+            Result::Ok(delivered) => {
+                residual emit {
+                    ipc_op: "message.sent",
+                    msg_id: msg.msg_id.to_u32() as u64,
+                    sender: sender.value() as u64,
+                    receiver: receiver.value() as u64,
+                    channel: ch_id.value() as u64,
+                    priority: priority as u64,
+                    size: data_len as u64,
+                    delivered: if delivered { 1 } else { 0 },
+                }
+                Result::Ok(delivered)
+            }
+            Result::Err(e) => Result::Err(ipc_queue_full()),
+        }
+    }
+
+    pub fn receive(self: ref mut, receiver: EndpointId, ch_id: ChannelId) -> Result[IpcMessage, IpcError>
+        effects: [deterministic, residual]
+    {
+        let channel: ref mut IpcChannel = match self.find_channel_mut(ch_id) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err(e),
+        }
+        if !channel.has_endpoint(receiver) {
+            return Result::Err(ipc_protocol_error(FixedString[128]::from_slice("Endpoint not bound to channel")))
+        }
+
+        // Timeout handling
+        let mut elapsed: u32 = 0
+        let timeout_us: u32 = 1000
+        while channel.is_empty() && elapsed < timeout_us proven {
+            elapsed = elapsed + 1
+        }
+
+        if channel.is_empty() {
+            channel.total_timeouts = channel.total_timeouts.increment_or_max()
+            residual emit {
+                ipc_op: "message.timeout",
+                receiver: receiver.value() as u64,
+                channel: ch_id.value() as u64,
+                timeout_us: timeout_us as u64,
+            }
+            return Result::Err(ipc_timeout())
+        }
+
+        // Priority inheritance: sender gives up inherited priority
+        let receiver_ep: ref mut IpcEndpoint = match self.find_endpoint_mut(receiver) {
+            Result::Ok(e) => e,
+            Result::Err(e) => return Result::Err(e),
+        }
+        receiver_ep.restore_priority()
+
+        let msg: IpcMessage = match channel.dequeue() {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(ipc_channel_not_found(ch_id.value())),
+        }
+
+        // Check if message has expired
+        if msg.has_expired(self.current_time) {
+            channel.total_timeouts = channel.total_timeouts.increment_or_max()
+            residual emit {
+                ipc_op: "message.expired",
+                msg_id: msg.msg_id.to_u32() as u64,
+                deadline: msg.deadline.to_u64(),
+            }
+            return Result::Err(ipc_timeout())
+        }
+
+        residual emit {
+            ipc_op: "message.received",
+            msg_id: msg.msg_id.to_u32() as u64,
+            sender: msg.sender.value() as u64,
+            receiver: receiver.value() as u64,
+            channel: ch_id.value() as u64,
+            size: msg.data_length as u64,
+        }
+
+        Result::Ok(msg)
+    }
+
+    pub fn receive_timeout(self: ref mut, receiver: EndpointId, ch_id: ChannelId, timeout_ns: Word64) -> Result[IpcMessage, IpcError>
+        effects: [deterministic, residual]
+    {
+        let channel: ref mut IpcChannel = match self.find_channel_mut(ch_id) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err(e),
+        }
+        if !channel.has_endpoint(receiver) {
+            return Result::Err(ipc_protocol_error(FixedString[128]::from_slice("Endpoint not bound to channel")))
+        }
+
+        // Bounded wait with explicit timeout
+        let max_iterations: u32 = if timeout_ns.to_u64() > 1_000_000 {
+            1000
+        } else {
+            (timeout_ns.to_u64() / 1000) as u32
+        }
+
+        let mut iteration: u32 = 0
+        while channel.is_empty() && iteration < max_iterations proven {
+            iteration = iteration + 1
+        }
+
+        if channel.is_empty() {
+            channel.total_timeouts = channel.total_timeouts.increment_or_max()
+            return Result::Err(ipc_timeout())
+        }
+
+        let msg: IpcMessage = match channel.dequeue() {
+            Result::Ok(m) => m,
+            Result::Err(e) => return Result::Err(ipc_channel_not_found(ch_id.value())),
+        }
+
+        Result::Ok(msg)
+    }
+
+    pub fn set_channel_ceiling(self: ref mut, ch_id: ChannelId, ceiling: IPCPriority) -> Result<(), IpcError>
+        effects: [deterministic]
+    {
+        let channel: ref mut IpcChannel = match self.find_channel_mut(ch_id) {
+            Result::Ok(c) => c,
+            Result::Err(e) => return Result::Err(e),
+        }
+        channel.set_priority_ceiling(ceiling)
+        Result::Ok(())
+    }
+
+    pub fn update_time(self: ref mut, now: Word64)
+        effects: [deterministic]
+    {
+        self.current_time = now
+    }
+
+    pub fn channel_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.channel_count
+    }
+
+    pub fn endpoint_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.endpoint_count
+    }
+
+    pub fn channel_info(self, ch_id: ChannelId) -> Result[IpcChannel, IpcError>
+        effects: [deterministic]
+    {
+        for i in 0..self.channel_count {
+            let ch: IpcChannel = match self.channels.get(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            if ch.id.eq(ch_id) {
+                return Result::Ok(ch)
+            }
+        }
+        Result::Err(ipc_channel_not_found(ch_id.value()))
+    }
+
+    pub fn ipc_report(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[512] = FixedString::new()
+        report.append(FixedString[32]::from_slice("IPC Report:\n"))
+        report.append(FixedString[32]::from_slice("  Channels: "))
+        report.append_u64(self.channel_count as u64)
+        report.append(FixedString[32]::from_slice("\n  Endpoints: "))
+        report.append_u64(self.endpoint_count as u64)
+
+        let mut total_sent: Word64 = Word64::zero()
+        let mut total_dropped: Word64 = Word64::zero()
+        let mut total_timeouts: Word64 = Word64::zero()
+        for i in 0..self.channel_count {
+            let ch: IpcChannel = match self.channels.get(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            total_sent = total_sent.add(ch.total_sent)
+            total_dropped = total_dropped.add(ch.total_dropped)
+            total_timeouts = total_timeouts.add(ch.total_timeouts)
+        }
+        report.append(FixedString[32]::from_slice("\n  Total sent: "))
+        report.append_u64(total_sent.to_u64())
+        report.append(FixedString[32]::from_slice("\n  Total dropped: "))
+        report.append_u64(total_dropped.to_u64())
+        report.append(FixedString[32]::from_slice("\n  Total timeouts: "))
+        report.append_u64(total_timeouts.to_u64())
+        report
+    }
+
+    fn find_channel_mut(self: ref mut, id: ChannelId) -> Result<ref mut IpcChannel, IpcError>
+        effects: [deterministic]
+    {
+        for i in 0..self.channel_count {
+            let ch: ref mut IpcChannel = match self.channels.ref_at_mut(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            if ch.id.eq(id) {
+                return Result::Ok(ch)
+            }
+        }
+        Result::Err(ipc_channel_not_found(id.value()))
+    }
+
+    fn find_endpoint_mut(self: ref mut, id: EndpointId) -> Result<ref mut IpcEndpoint, IpcError>
+        effects: [deterministic]
+    {
+        for i in 0..self.endpoint_count {
+            let ep: ref mut IpcEndpoint = match self.endpoints.ref_at_mut(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if ep.id.eq(id) {
+                return Result::Ok(ep)
+            }
+        }
+        Result::Err(ipc_endpoint_not_found(id.value()))
+    }
+
+    pub fn flush_residuals(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            ipc_op: "residuals.flushed",
+            channel_count: self.channel_count as u64,
+            endpoint_count: self.endpoint_count as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Deterministic Message Passing Utilities
+// ──────────────────────────────────────────────
+pub fn create_reliable_channel(ipc: ref mut IpcManager, max_pending: u32) -> Result[ChannelId, IpcError>
+    effects: [deterministic, residual]
+{
+    // Guaranteed delivery: no drop on overflow, block sender
+    ipc.create_channel(ChannelType::ChannelType_Guaranteed, max_pending, false)
+}
+
+pub fn create_fast_channel(ipc: ref mut IpcManager, max_pending: u32) -> Result[ChannelId, IpcError>
+    effects: [deterministic, residual]
+{
+    // Fast delivery: drop oldest on overflow, non-blocking sender
+    ipc.create_channel(ChannelType::ChannelType_Bounded, max_pending, true)
+}
+
+pub fn send_with_timeout(ipc: ref mut IpcManager, sender: EndpointId, receiver: EndpointId, ch: ChannelId, data: FixedArray[Byte, IPC_MESSAGE_DATA_SIZE], len: u32, timeout: Word64) -> Result[bool, IpcError>
+    effects: [deterministic, residual]
+{
+    let deadline: Word64 = ipc.current_time.add(timeout)
+    ipc.send(sender, receiver, ch, data, len, IPCPriority::IPCPrio_Normal, deadline)
+}
+
+pub fn create_control_channel(ipc: ref mut IpcManager) -> Result[ChannelId, IpcError>
+    effects: [deterministic, residual]
+{
+    let id: ChannelId = ipc.create_channel(ChannelType::ChannelType_Unbuffered, 1, false)?
+    let _ = ipc.set_channel_ceiling(id, IPCPriority::IPCPrio_Critical)
+    Result::Ok(id)
+}
+
+pub fn verify_ipc_consistency(ipc: ref IpcManager) -> bool
+    effects: [deterministic]
+{
+    if ipc.channel_count > IPC_MAX_CHANNELS {
+        return false
+    }
+    if ipc.endpoint_count > IPC_MAX_ENDPOINTS {
+        return false
+    }
+    for i in 0..ipc.channel_count {
+        let ch: IpcChannel = match ipc.channels.get(i) {
+            Result::Ok(c) => c,
+            Result::Err(_) => return false,
+        }
+        if ch.queue_count > ch.max_pending {
+            return false
+        }
+        if ch.endpoint_count > IPC_MAX_ENDPOINTS {
+            return false
+        }
+    }
+    true
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_ipc_manager() -> IpcManager
+    effects: [deterministic, residual]
+{
+    let manager: IpcManager = IpcManager::new()
+    residual emit {
+        ipc_op: "ipc.subsystem.init",
+        max_channels: IPC_MAX_CHANNELS as u64,
+        max_endpoints: IPC_MAX_ENDPOINTS as u64,
+        max_messages: IPC_MAX_MESSAGES as u64,
+        max_message_size: IPC_MESSAGE_DATA_SIZE as u64,
+    }
+    manager
+}

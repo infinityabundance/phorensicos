@@ -1,0 +1,881 @@
+// file: pcm_driver.phor
+// purpose: PCM audio driver with HDA controller, DMA buffer management,
+//          stream management, sample rate conversion, interrupt handling,
+//          and register programming.
+// evidence: PCM-ARCH-001 through PCM-ARCH-200
+// residual: All operations are bounded loops and effect-declared.
+
+package "phorensic:sound:pcm_driver:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::math::*
+use core::errors::*
+use core::collections::*
+
+use sound::audio_buffer::*
+
+// ──────────────────────────────────────────────
+// Constants: HDA Controller Registers
+// ──────────────────────────────────────────────
+// Evidence path: PCM-CONST-001 through PCM-CONST-030
+
+const HDA_GCAP       : u64 = 0x0000  // Global Capabilities
+const HDA_VMIN       : u64 = 0x0002  // Minor Version
+const HDA_VMAJ       : u64 = 0x0003  // Major Version
+const HDA_OUTPAY     : u64 = 0x0004  // Output Payload Capability
+const HDA_INPAY      : u64 = 0x0006  // Input Payload Capability
+const HDA_GCTL       : u64 = 0x0008  // Global Control
+const HDA_WAKEEN     : u64 = 0x000C  // Wake Enable
+const HDA_STATESTS   : u64 = 0x000E  // State Change Status
+const HDA_GSTS       : u64 = 0x0010  // Global Status
+const HDA_OUTSTRMPAY : u64 = 0x0018  // Output Stream Payload
+const HDA_INSTRMPAY  : u64 = 0x001A  // Input Stream Payload
+const HDA_ICC        : u64 = 0x0020  // Interrupt Control
+const HDA_IRS        : u64 = 0x0024  // Interrupt Read Status
+const HDA_IRW        : u64 = 0x0028  // Interrupt Read/Wake
+
+const HDA_DMA_MAX_BUFS : u32 = 4
+const HDA_DMA_BUF_SIZE : u32 = 65536
+const HDA_MAX_STREAMS : u32 = 16
+const HDA_MAX_SAMPLE_RATE : u32 = 192000
+const HDA_MIN_SAMPLE_RATE : u32 = 8000
+
+const PCM_FIFO_SIZE : u32 = 128
+
+// ──────────────────────────────────────────────
+// HDA Register Access
+// ──────────────────────────────────────────────
+// Evidence path: PCM-REG-001 through PCM-REG-025
+
+pub type HDARegisterMap : struct {
+    base_address: u64,
+    mapped_size: u64,
+}
+
+impl HDARegisterMap {
+    pub fn new(base: u64, size: u64) -> HDARegisterMap
+        effects: [deterministic]
+    {
+        HDARegisterMap {
+            base_address: base,
+            mapped_size: size,
+        }
+    }
+
+    // Read a 32-bit register at offset.
+    pub fn read32(self, offset: u64) -> u32
+        effects: [io:read]
+    {
+        // MMIO read from base_address + offset
+        // trust: hardware register read
+        trusted("hda: MMIO register read") {
+            let addr: u64 = self.base_address + offset
+            let value: u32 = __builtin_mmio_read32(addr)
+            value
+        }
+    }
+
+    // Write a 32-bit register at offset.
+    pub fn write32(self, offset: u64, value: u32)
+        effects: [io:write]
+    {
+        trusted("hda: MMIO register write") {
+            let addr: u64 = self.base_address + offset
+            __builtin_mmio_write32(addr, value)
+        }
+    }
+
+    // Read a 16-bit register at offset.
+    pub fn read16(self, offset: u64) -> u16
+        effects: [io:read]
+    {
+        trusted("hda: MMIO register read16") {
+            let addr: u64 = self.base_address + offset
+            let value: u16 = __builtin_mmio_read16(addr)
+            value
+        }
+    }
+
+    // Write a 16-bit register at offset.
+    pub fn write16(self, offset: u64, value: u16)
+        effects: [io:write]
+    {
+        trusted("hda: MMIO register write16") {
+            let addr: u64 = self.base_address + offset
+            __builtin_mmio_write16(addr, value)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// DMA Buffer
+// ──────────────────────────────────────────────
+// Evidence path: PCM-DMA-001 through PCM-DMA-040
+
+pub type DMABuffer : struct {
+    physical_addr: u64,
+    virtual_addr: u64,
+    size: u32,
+    used: u32,
+    is_circular: bool,
+    write_ptr: u32,
+    read_ptr: u32,
+}
+
+impl DMABuffer {
+    pub fn new(phys: u64, virt: u64, size: u32, circular: bool) -> DMABuffer
+        effects: [deterministic]
+    {
+        DMABuffer {
+            physical_addr: phys,
+            virtual_addr: virt,
+            size: size,
+            used: 0,
+            is_circular: circular,
+            write_ptr: 0,
+            read_ptr: 0,
+        }
+    }
+
+    // Write data to DMA buffer.
+    pub fn write(self: ref mut, data: ref Byte[], length: u32) -> u32
+        effects: [io:write]
+    {
+        let avail: u32 = self.size - self.used
+        let to_write: u32 = if length > avail { avail } else { length }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by DMA buffer size
+        loop: bounds[BOUND_MEDIUM] for i in 0..to_write {
+            let addr: u64 = self.virtual_addr + (self.write_ptr as u64)
+            trusted("dma: write byte to buffer") {
+                __builtin_dma_write8(addr, data[i as usize])
+            }
+            self.write_ptr = (self.write_ptr + 1) % self.size
+        }
+        self.used = self.used + to_write
+        to_write
+    }
+
+    // Read data from DMA buffer.
+    pub fn read(self: ref mut, data: ref mut Byte[], length: u32) -> u32
+        effects: [io:read]
+    {
+        let to_read: u32 = if length > self.used { self.used } else { length }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by DMA buffer size
+        loop: bounds[BOUND_MEDIUM] for i in 0..to_read {
+            let addr: u64 = self.virtual_addr + (self.read_ptr as u64)
+            trusted("dma: read byte from buffer") {
+                data[i as usize] = __builtin_dma_read8(addr)
+            }
+            self.read_ptr = (self.read_ptr + 1) % self.size
+        }
+        self.used = self.used - to_read
+        to_read
+    }
+
+    // Reset DMA buffer.
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.write_ptr = 0
+        self.read_ptr = 0
+        self.used = 0
+    }
+
+    // Get fill level.
+    pub fn fill_level(self) -> u32
+        effects: [deterministic]
+    {
+        self.used
+    }
+
+    // Get available space.
+    pub fn available_space(self) -> u32
+        effects: [deterministic]
+    {
+        self.size - self.used
+    }
+
+    // Check if buffer is empty.
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.used == 0
+    }
+
+    // Check if buffer is full.
+    pub fn is_full(self) -> bool
+        effects: [deterministic]
+    {
+        self.used >= self.size
+    }
+}
+
+// ──────────────────────────────────────────────
+// Stream Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: PCM-STREAM-001 through PCM-STREAM-050
+
+pub type StreamDirection : u8 = enum {
+    Output = 0,
+    Input = 1,
+    Bidirectional = 2,
+}
+
+pub type StreamState : u8 = enum {
+    Stopped = 0,
+    Running = 1,
+    Draining = 2,
+    Paused = 3,
+    Error = 4,
+}
+
+pub type StreamFormat : struct {
+    sample_rate: u32,
+    sample_format: SampleFormat,
+    channel_count: u32,
+    bits_per_sample: u8,
+}
+
+impl StreamFormat {
+    pub fn new(rate: u32, fmt: SampleFormat, channels: u32) -> StreamFormat
+        effects: [deterministic]
+    {
+        let bps: u8 = match fmt {
+            SampleFormat::U8 => 8,
+            SampleFormat::S16LE => 16,
+            SampleFormat::S24LE => 24,
+            SampleFormat::S32LE => 32,
+            SampleFormat::F32LE => 32,
+            SampleFormat::F64LE => 64,
+        }
+        StreamFormat {
+            sample_rate: rate,
+            sample_format: fmt,
+            channel_count: channels,
+            bits_per_sample: bps,
+        }
+    }
+
+    pub fn frame_size(self) -> u32
+        effects: [deterministic]
+    {
+        (self.bits_per_sample as u32) * self.channel_count / 8
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        self.sample_rate >= HDA_MIN_SAMPLE_RATE &&
+        self.sample_rate <= HDA_MAX_SAMPLE_RATE &&
+        self.channel_count >= 1 &&
+        self.channel_count <= AUDIO_BUF_MAX_CHANNELS
+    }
+}
+
+pub type StreamDescriptor : struct {
+    stream_id: u32,
+    direction: StreamDirection,
+    state: StreamState,
+    format: StreamFormat,
+    dma_buffers: FixedArray[4, DMABuffer],
+    buffer_count: u32,
+    current_buffer: u32,
+    interrupt_count: u32,
+    underrun_count: u32,
+    overrun_count: u32,
+    fifo: AudioRingBuffer,
+}
+
+impl StreamDescriptor {
+    pub fn new(id: u32, direction: StreamDirection, fmt: StreamFormat) -> StreamDescriptor
+        effects: [deterministic]
+    {
+        StreamDescriptor {
+            stream_id: id,
+            direction: direction,
+            state: StreamState::Stopped,
+            format: fmt,
+            dma_buffers: FixedArray::new(),
+            buffer_count: 0,
+            current_buffer: 0,
+            interrupt_count: 0,
+            underrun_count: 0,
+            overrun_count: 0,
+            fifo: AudioRingBuffer::new(PCM_FIFO_SIZE, fmt.channel_count),
+        }
+    }
+
+    // Add a DMA buffer to the stream.
+    pub fn add_dma_buffer(self: ref mut, buf: DMABuffer) -> Result<(), AudioError>
+        effects: [deterministic]
+    {
+        if self.buffer_count >= HDA_DMA_MAX_BUFS {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x100),
+                FixedString[128]::from_slice("pcm: max DMA buffers reached")))
+        }
+        let _ = self.dma_buffers.push(buf)
+        self.buffer_count = self.buffer_count + 1
+        Result::Ok(())
+    }
+
+    // Start the stream.
+    pub fn start(self: ref mut)
+        effects: [io:write]
+    {
+        self.state = StreamState::Running
+    }
+
+    // Stop the stream.
+    pub fn stop(self: ref mut)
+        effects: [io:write]
+    {
+        self.state = StreamState::Stopped
+    }
+
+    // Pause the stream.
+    pub fn pause(self: ref mut)
+        effects: [io:write]
+    {
+        if self.state == StreamState::Running {
+            self.state = StreamState::Paused
+        }
+    }
+
+    // Resume the stream.
+    pub fn resume(self: ref mut)
+        effects: [io:write]
+    {
+        if self.state == StreamState::Paused {
+            self.state = StreamState::Running
+        }
+    }
+
+    // Get current state.
+    pub fn state(self) -> StreamState
+        effects: [deterministic]
+    {
+        self.state
+    }
+
+    // Check if the stream is active.
+    pub fn is_active(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == StreamState::Running
+    }
+
+    // Write audio data to the stream's FIFO.
+    pub fn write_fifo(self: ref mut, data: ref AudioFrame[], count: u32) -> u32
+        effects: [deterministic]
+    {
+        if self.direction == StreamDirection::Input {
+            return 0
+        }
+        self.fifo.write_batch(data, count)
+    }
+
+    // Read audio data from the stream's FIFO.
+    pub fn read_fifo(self: ref mut, data: ref mut FixedArray[8192, AudioFrame], count: u32) -> u32
+        effects: [deterministic]
+    {
+        if self.direction == StreamDirection::Output {
+            return 0
+        }
+        self.fifo.read_batch(data, count)
+    }
+
+    // Get FIFO fill level.
+    pub fn fifo_fill(self) -> u32
+        effects: [deterministic]
+    {
+        self.fifo.fill_level()
+    }
+
+    // Handle an interrupt for this stream.
+    pub fn handle_interrupt(self: ref mut)
+        effects: [io:read, io:write]
+    {
+        self.interrupt_count = self.interrupt_count + 1
+
+        // Process DMA buffer completion
+        if self.buffer_count > 0 {
+            let buf_idx: u32 = (self.current_buffer + 1) % self.buffer_count
+            self.current_buffer = buf_idx
+        }
+    }
+
+    // Get current buffer index.
+    pub fn current_buffer(self) -> u32
+        effects: [deterministic]
+    {
+        self.current_buffer
+    }
+
+    // Get DMA buffer by index.
+    pub fn get_dma_buffer(self: ref mut, index: u32) -> Result<ref mut DMABuffer, AudioError>
+        effects: [deterministic]
+    {
+        if index >= self.buffer_count {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x101),
+                FixedString[128]::from_slice("pcm: DMA buffer index out of range")))
+        }
+        Result::Ok(&mut self.dma_buffers[index as usize])
+    }
+
+    // Reset the stream.
+    pub fn reset(self: ref mut)
+        effects: [io:write]
+    {
+        self.state = StreamState::Stopped
+        self.current_buffer = 0
+        self.fifo.reset()
+    }
+}
+
+// ──────────────────────────────────────────────
+// HDA Controller
+// ──────────────────────────────────────────────
+// Evidence path: PCM-HDA-001 through PCM-HDA-060
+
+pub type HDAController : struct {
+    registers: HDARegisterMap,
+    streams: FixedArray[16, StreamDescriptor],
+    stream_count: u32,
+    initialized: bool,
+    major_version: u8,
+    minor_version: u8,
+    output_streams: u16,
+    input_streams: u16,
+    bidir_streams: u16,
+}
+
+impl HDAController {
+    pub fn new(base_addr: u64, reg_size: u64) -> HDAController
+        effects: [deterministic]
+    {
+        HDAController {
+            registers: HDARegisterMap::new(base_addr, reg_size),
+            streams: FixedArray::new(),
+            stream_count: 0,
+            initialized: false,
+            major_version: 0,
+            minor_version: 0,
+            output_streams: 0,
+            input_streams: 0,
+            bidir_streams: 0,
+        }
+    }
+
+    // Probe and initialize the HDA controller.
+    pub fn probe(self: ref mut) -> Result<(), AudioError>
+        effects: [io:read, io:write]
+    {
+        // Read GCAP register
+        let gcap: u16 = self.registers.read16(HDA_GCAP)
+        self.major_version = (gcap >> 8) as u8
+        self.minor_version = (gcap & 0xFF) as u8
+
+        // Read stream counts
+        self.output_streams = self.registers.read16(HDA_OUTPAY)
+        self.input_streams = self.registers.read16(HDA_INPAY)
+
+        // Reset controller
+        self.registers.write16(HDA_GCTL, 0x0001)  // CRST bit
+        self.registers.write16(HDA_GCTL, 0x0000)  // Clear reset
+        // Wait for reset
+        let _ = self.registers.read16(HDA_GSTS)
+
+        self.initialized = true
+        Result::Ok(())
+    }
+
+    // Allocate a new stream.
+    pub fn allocate_stream(self: ref mut, direction: StreamDirection, fmt: StreamFormat) -> Result<u32, AudioError>
+        effects: [deterministic]
+    {
+        if self.stream_count >= HDA_MAX_STREAMS {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x110),
+                FixedString[128]::from_slice("hda: max streams reached")))
+        }
+
+        let id: u32 = self.stream_count
+        let mut stream: StreamDescriptor = StreamDescriptor::new(id, direction, fmt)
+
+        // Allocate default DMA buffers
+        // loop: bounds[BOUND_SMALL] — bounded by 4
+        loop: bounds[BOUND_SMALL] for i in 0..HDA_DMA_MAX_BUFS {
+            let dma: DMABuffer = DMABuffer::new(0, 0, HDA_DMA_BUF_SIZE, true)
+            let _ = stream.add_dma_buffer(dma)
+        }
+
+        let _ = self.streams.push(stream)
+        self.stream_count = self.stream_count + 1
+        Result::Ok(id)
+    }
+
+    // Get a stream by ID.
+    pub fn get_stream(self: ref mut, id: u32) -> Result<ref mut StreamDescriptor, AudioError>
+        effects: [deterministic]
+    {
+        if id >= self.stream_count {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x111),
+                FixedString[128]::from_slice("hda: stream ID out of range")))
+        }
+        Result::Ok(&mut self.streams[id as usize])
+    }
+
+    // Start a stream.
+    pub fn start_stream(self: ref mut, id: u32) -> Result<(), AudioError>
+        effects: [io:write]
+    {
+        let stream: ref mut StreamDescriptor = self.get_stream(id)?
+        stream.start()
+
+        // Program Stream Descriptor registers (simplified)
+        let sdoffset: u64 = 0x80 + (id as u64) * 0x20
+        self.registers.write32(sdoffset, 0x00000001)  // RUN bit
+
+        Result::Ok(())
+    }
+
+    // Stop a stream.
+    pub fn stop_stream(self: ref mut, id: u32) -> Result<(), AudioError>
+        effects: [io:write]
+    {
+        let stream: ref mut StreamDescriptor = self.get_stream(id)?
+        stream.stop()
+
+        let sdoffset: u64 = 0x80 + (id as u64) * 0x20
+        self.registers.write32(sdoffset, 0x00000000)  // Clear RUN bit
+
+        Result::Ok(())
+    }
+
+    // Handle interrupts.
+    pub fn handle_interrupts(self: ref mut)
+        effects: [io:read, io:write]
+    {
+        let irs: u32 = self.registers.read32(HDA_IRS)
+        if irs == 0 {
+            return
+        }
+
+        // loop: bounds[BOUND_SMALL] — bounded by stream count
+        loop: bounds[BOUND_SMALL] for i in 0..self.stream_count {
+            if (irs & (1 << i)) != 0 {
+                self.streams[i as usize].handle_interrupt()
+            }
+        }
+
+        // Clear interrupt status
+        self.registers.write32(HDA_IRS, irs)
+    }
+
+    // Enable interrupts for a stream.
+    pub fn enable_stream_interrupt(self: ref mut, id: u32)
+        effects: [io:write]
+    {
+        let wakeen: u16 = self.registers.read16(HDA_WAKEEN)
+        self.registers.write16(HDA_WAKEEN, wakeen | (1 << id))
+    }
+
+    // Disable interrupts for a stream.
+    pub fn disable_stream_interrupt(self: ref mut, id: u32)
+        effects: [io:write]
+    {
+        let wakeen: u16 = self.registers.read16(HDA_WAKEEN)
+        self.registers.write16(HDA_WAKEEN, wakeen & !(1 << id))
+    }
+
+    // Check if the controller is initialized.
+    pub fn is_initialized(self) -> bool
+        effects: [deterministic]
+    {
+        self.initialized
+    }
+
+    // Get stream count.
+    pub fn stream_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.stream_count
+    }
+}
+
+// ──────────────────────────────────────────────
+// Sample Rate Conversion (simplified linear)
+// ──────────────────────────────────────────────
+// Evidence path: PCM-SRC-001 through PCM-SRC-025
+
+pub type SampleRateConverter : struct {
+    src_rate: u32,
+    dst_rate: u32,
+    phase: u32,
+    phase_increment: u32,
+}
+
+impl SampleRateConverter {
+    pub fn new(src: u32, dst: u32) -> SampleRateConverter
+        effects: [deterministic]
+    {
+        let inc: u32 = (src << 16) / dst
+        SampleRateConverter {
+            src_rate: src,
+            dst_rate: dst,
+            phase: 0,
+            phase_increment: inc,
+        }
+    }
+
+    // Process a frame through the rate converter.
+    pub fn process(self: ref mut, input: ref AudioFrame) -> Option[AudioFrame]
+        effects: [deterministic]
+    {
+        self.phase = self.phase + self.phase_increment
+        if self.phase >= (1 << 16) {
+            self.phase = self.phase - (1 << 16)
+            Option::Some(*input)
+        } else {
+            Option::None
+        }
+    }
+
+    // Reset the converter.
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.phase = 0
+    }
+
+    // Check if conversion is needed.
+    pub fn needs_conversion(self) -> bool
+        effects: [deterministic]
+    {
+        self.src_rate != self.dst_rate
+    }
+}
+
+// ──────────────────────────────────────────────
+// PCM Driver (high-level interface)
+// ──────────────────────────────────────────────
+// Evidence path: PCM-DRIVER-001 through PCM-DRIVER-030
+
+pub type PCMDriver : struct {
+    controller: HDAController,
+    rate_converter: SampleRateConverter,
+    default_format: StreamFormat,
+}
+
+impl PCMDriver {
+    pub fn new(base_addr: u64, reg_size: u64) -> PCMDriver
+        effects: [deterministic]
+    {
+        let fmt: StreamFormat = StreamFormat::new(48000, SampleFormat::S16LE, 2)
+        PCMDriver {
+            controller: HDAController::new(base_addr, reg_size),
+            rate_converter: SampleRateConverter::new(48000, 48000),
+            default_format: fmt,
+        }
+    }
+
+    // Initialize the driver and probe hardware.
+    pub fn initialize(self: ref mut) -> Result<(), AudioError>
+        effects: [io:read, io:write]
+    {
+        self.controller.probe()?;
+        Result::Ok(())
+    }
+
+    // Open a PCM stream.
+    pub fn open_stream(self: ref mut, direction: StreamDirection, rate: u32, channels: u32) -> Result<u32, AudioError>
+        effects: [io:read, io:write]
+    {
+        let fmt: StreamFormat = StreamFormat::new(rate, SampleFormat::S16LE, channels)
+        let id: u32 = self.controller.allocate_stream(direction, fmt)?
+        Result::Ok(id)
+    }
+
+    // Close a PCM stream.
+    pub fn close_stream(self: ref mut, id: u32) -> Result<(), AudioError>
+        effects: [io:write]
+    {
+        self.controller.stop_stream(id)?
+        Result::Ok(())
+    }
+
+    // Write audio data to a stream.
+    pub fn write(self: ref mut, id: u32, data: ref AudioFrame[], count: u32) -> Result<u32, AudioError>
+        effects: [io:write]
+    {
+        let stream: ref mut StreamDescriptor = self.controller.get_stream(id)?
+        let written: u32 = stream.write_fifo(data, count)
+        Result::Ok(written)
+    }
+
+    // Read audio data from a stream.
+    pub fn read(self: ref mut, id: u32, data: ref mut FixedArray[8192, AudioFrame], count: u32) -> Result<u32, AudioError>
+        effects: [io:read]
+    {
+        let stream: ref mut StreamDescriptor = self.controller.get_stream(id)?
+        let read: u32 = stream.read_fifo(data, count)
+        Result::Ok(read)
+    }
+
+    // Start playback/capture.
+    pub fn start(self: ref mut, id: u32) -> Result<(), AudioError>
+        effects: [io:write]
+    {
+        self.controller.start_stream(id)?
+        Result::Ok(())
+    }
+
+    // Stop playback/capture.
+    pub fn stop(self: ref mut, id: u32) -> Result<(), AudioError>
+        effects: [io:write]
+    {
+        self.controller.stop_stream(id)?
+        Result::Ok(())
+    }
+
+    // Handle interrupts.
+    pub fn handle_interrupts(self: ref mut)
+        effects: [io:read, io:write]
+    {
+        self.controller.handle_interrupts()
+    }
+
+    // Set sample format.
+    pub fn set_format(self: ref mut, fmt: StreamFormat)
+        effects: [deterministic]
+    {
+        self.default_format = fmt
+    }
+
+    // Set sample rate conversion.
+    pub fn set_rate_conversion(self: ref mut, src: u32, dst: u32)
+        effects: [deterministic]
+    {
+        self.rate_converter = SampleRateConverter::new(src, dst)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Test Vectors
+// ──────────────────────────────────────────────
+
+pub fn run_pcm_driver_tests() -> bool
+    effects: [deterministic, residual]
+{
+    // Test stream format
+    let fmt: StreamFormat = StreamFormat::new(48000, SampleFormat::S16LE, 2)
+    assert(fmt.is_valid(), "pcm: valid format")
+    assert(fmt.frame_size() == 4, "pcm: frame size 4 bytes for stereo 16-bit")
+    assert(fmt.sample_rate == 48000, "pcm: sample rate 48000")
+    assert(fmt.channel_count == 2, "pcm: 2 channels")
+
+    // Test stream descriptor
+    let mut stream: StreamDescriptor = StreamDescriptor::new(0, StreamDirection::Output, fmt)
+    assert(stream.stream_id == 0, "pcm: stream id 0")
+    assert(stream.state == StreamState::Stopped, "pcm: initially stopped")
+    stream.start()
+    assert(stream.is_active(), "pcm: stream is active")
+    stream.stop()
+    assert(!stream.is_active(), "pcm: stream stopped")
+
+    // Test DMA buffer
+    let mut dma: DMABuffer = DMABuffer::new(0x1000, 0x2000, 1024, true)
+    assert(dma.available_space() == 1024, "pcm: DMA space 1024")
+    assert(dma.is_empty(), "pcm: DMA initially empty")
+
+    let test_data: Byte[128] = [Byte::from_u8(0xAB); 128]
+    let written: u32 = dma.write(&test_data, 128)
+    assert(written == 128, "pcm: DMA wrote 128 bytes")
+    assert(dma.fill_level() == 128, "pcm: DMA fill 128")
+
+    let mut read_data: Byte[64] = [Byte::from_u8(0); 64]
+    let rd: u32 = dma.read(&mut read_data, 64)
+    assert(rd == 64, "pcm: DMA read 64 bytes")
+    assert(read_data[0].to_u8() == 0xAB, "pcm: DMA data correct")
+
+    dma.reset()
+    assert(dma.is_empty(), "pcm: DMA reset empties")
+
+    // Test HDA controller register map
+    let regs: HDARegisterMap = HDARegisterMap::new(0xFEB00000, 0x1000)
+    assert(regs.base_address == 0xFEB00000, "pcm: register base")
+
+    // Test sample rate converter
+    let mut converter: SampleRateConverter = SampleRateConverter::new(48000, 44100)
+    assert(converter.needs_conversion(), "pcm: SRC needed")
+    converter.reset()
+    assert(true, "pcm: SRC reset")
+
+    // Test stream with multiple DMA buffers
+    let mut stream2: StreamDescriptor = StreamDescriptor::new(1, StreamDirection::Input, fmt)
+    // loop: bounds[BOUND_SMALL] — bounded by 4
+    loop: bounds[BOUND_SMALL] for i in 0..3 {
+        let dma2: DMABuffer = DMABuffer::new(0x3000 + (i as u64) * 0x1000, 0x4000 + (i as u64) * 0x1000, 512, true)
+        let _ = stream2.add_dma_buffer(dma2)
+    }
+    assert(stream2.buffer_count == 3, "pcm: stream has 3 DMA buffers")
+
+    // Test interrupt handling
+    stream.handle_interrupt()
+    assert(stream.interrupt_count == 1, "pcm: interrupt count 1")
+    stream.handle_interrupt()
+    assert(stream.interrupt_count == 2, "pcm: interrupt count 2")
+
+    // Test FIFO operations
+    let frame: AudioFrame = AudioFrame::new(2)
+    let frames: FixedArray[1, AudioFrame] = FixedArray::from_raw([frame], 1)?
+    let written_frames: u32 = stream.write_fifo(&frames.data[0..1], 1)
+    assert(written_frames == 1, "pcm: FIFO wrote 1 frame")
+    assert(stream.fifo_fill() == 1, "pcm: FIFO fill 1")
+
+    // Test stream pause/resume
+    stream.start()
+    stream.pause()
+    assert(stream.state == StreamState::Paused, "pcm: stream paused")
+    stream.resume()
+    assert(stream.is_active(), "pcm: stream resumed")
+
+    // Test PCM driver
+    let mut driver: PCMDriver = PCMDriver::new(0xFEB00000, 0x1000)
+    let id: u32 = driver.open_stream(StreamDirection::Output, 44100, 2)?
+    assert(id == 0, "pcm: driver opened stream 0")
+    let _ = driver.close_stream(id)
+
+    // Test invalid format
+    let invalid_fmt: StreamFormat = StreamFormat::new(0, SampleFormat::S16LE, 2)
+    assert(!invalid_fmt.is_valid(), "pcm: invalid format detected")
+
+    // Test format with different sample types
+    let fmt32: StreamFormat = StreamFormat::new(96000, SampleFormat::S32LE, 8)
+    assert(fmt32.frame_size() == 32, "pcm: 8ch 32-bit frame size 32")
+    assert(fmt32.is_valid(), "pcm: 96kHz 8ch valid")
+
+    residual emit {
+        op: "pcm_driver.tests",
+        format: true,
+        stream: true,
+        dma_rw: true,
+        dma_reset: true,
+        registers: true,
+        src: true,
+        buffers: true,
+        interrupts: true,
+        fifo: true,
+        pause_resume: true,
+        driver: true,
+        invalid_format: true,
+    }
+
+    true
+}

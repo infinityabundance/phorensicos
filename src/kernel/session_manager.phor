@@ -1,0 +1,1044 @@
+// session_manager.phor — Session lifecycle manager
+// Create, close, grant, revoke capabilities within sessions
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/session_manager.phor
+// Court: session_manager:v2
+
+package kernel.session_manager;
+
+import kernel.nucleus_interface.*;
+import kernel.capability_manager.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type SessionError = enum {
+    SessionNotFound        = 0x30,  // E0030: session ID not found
+    SessionClosed          = 0x31,  // E0031: session is closed
+    SessionTableFull       = 0x32,  // E0032: maximum session count reached
+    CapabilityNotInSession = 0x33,  // E0033: capability not owned by this session
+    CapabilityGrantFailed  = 0x34,  // E0034: failed to grant capability to session
+    CapabilityRevokeFailed = 0x35,  // E0035: failed to revoke capability from session
+    SessionLimitExceeded   = 0x36,  // E0036: session resource limit reached
+    InvalidSessionType     = 0x37,  // E0037: invalid session type
+    SessionStaleGeneration = 0x38,  // E0038: session generation is stale
+    DuplicateSession       = 0x39,  // E0039: session already exists
+    MaxCapabilityPerSession = 0x3A, // E003A: per-session capability limit reached
+    SessionNotAuthorized   = 0x3B,  // E003B: caller not authorized for this session
+    ResidualLogFull        = 0x3C,  // E003C: session residual log is full
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Types
+// ─────────────────────────────────────────────────────────────
+
+type SessionType = enum {
+    UserSession         = 0,  // Interactive user session
+    SystemSession       = 1,  // System service session
+    DriverSession       = 2,  // Hardware driver session
+    KernelSession       = 3,  // Kernel internal session
+    AuditSession        = 4,  // Audit/forensic session
+    CourtSession        = 5,  // Court/replay session
+    ServiceSession      = 6,  // Named service session
+    AnonymousSession    = 7,  // Ephemeral session with limited rights
+    NucleusSession      = 8,  // Trusted nucleus session (highest privilege)
+    GuestSession        = 9,  // Guest/untrusted session
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session State
+// ─────────────────────────────────────────────────────────────
+
+type SessionState = enum {
+    Active          = 0,  // Session is active and accepting operations
+    Suspended       = 1,  // Session is suspended (no new operations)
+    Closing         = 2,  // Session is in process of closing
+    Closed          = 3,  // Session has been closed
+    Revoked         = 4,  // Session was revoked (forced close)
+    AuditHeld       = 5,  // Session held for audit review
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Entry
+// ─────────────────────────────────────────────────────────────
+
+struct SessionEntry {
+    session_id: Identity,
+    session_type: SessionType,
+    session_state: SessionState,
+    owner_identity: Identity,
+    creation_timestamp: u64,
+    last_active_timestamp: u64,
+    session_generation: u64,
+    parent_session: Option(Identity),
+    capabilities: Array(Identity, 64),      // capability IDs in this session
+    capability_count: u64,
+    max_capabilities: u64,
+    residual_log: RingBuf(ResidualRecord, 128),
+    metadata: SessionMetadata,
+    trust_state: TrustState,
+    activity_counter: u64,
+    error_counter: u64,
+    is_privileged: bool,
+    resource_limits: SessionResourceLimits,
+}
+
+struct SessionMetadata {
+    label: String(128),
+    description: String(256),
+    service_name: String(64),
+    dialect_profile: String(64),
+    creation_reason: String(256),
+    court_casefile: String(128),
+}
+
+struct SessionResourceLimits {
+    max_capabilities: u64,
+    max_ports: u64,
+    max_memory_pages: u64,
+    max_children: u64,
+    max_residuals: u64,
+    max_active_operations: u64,
+    max_cpu_time_ms: u64,
+    priority_boost: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Manager State
+// ─────────────────────────────────────────────────────────────
+
+struct SessionManagerState {
+    sessions: Array(SessionEntry, 128),
+    session_count: u64,
+    next_session_generation: u64,
+    manager_identity: Identity,
+    capability_manager: Handle(CapabilityManagerState),
+    initialization_timestamp: u64,
+    audit_trail: RingBuf(AuditRecord, 256),
+    root_session: Option(Identity),
+    default_limits: SessionResourceLimits,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Manager Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn session_manager_init(
+    manager_identity: Identity,
+    cap_manager: Handle(CapabilityManagerState),
+    timestamp: u64,
+) -> SessionManagerState
+    effect [deterministic]
+    court "session_manager_init:v1"
+{
+    let limits: SessionResourceLimits = SessionResourceLimits {
+        max_capabilities: 64,
+        max_ports: 16,
+        max_memory_pages: 0,
+        max_children: 8,
+        max_residuals: 128,
+        max_active_operations: 32,
+        max_cpu_time_ms: 10000,
+        priority_boost: 0,
+    };
+
+    let state: SessionManagerState = SessionManagerState {
+        sessions: Array::zeroed(),
+        session_count: 0,
+        next_session_generation: 1,
+        manager_identity: manager_identity,
+        capability_manager: cap_manager,
+        initialization_timestamp: timestamp,
+        audit_trail: RingBuf::new(),
+        root_session: Option::None,
+        default_limits: limits,
+    };
+
+    residual emit {
+        op: "session_manager.init",
+        manager_identity: manager_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create Session
+// ─────────────────────────────────────────────────────────────
+
+fn session_create(
+    state: Handle(SessionManagerState),
+    session_type: SessionType,
+    owner: Identity,
+    creator_cap: Cap(CapabilityToken),
+    metadata: SessionMetadata,
+    timestamp: u64,
+) -> Result(SessionEntry, SessionError)
+    effect [deterministic, residual]
+    court "session_create:v2"
+{
+    // Check session table capacity
+    if state.session_count >= 128 {
+        return Result::Err(SessionError::SessionTableFull);
+    };
+
+    // Generate session identity
+    let session_id: Identity = identity_new(
+        owner.id_hash,
+        timestamp,
+        state.next_session_generation,
+        state.session_count,
+    );
+
+    let generation: u64 = state.next_session_generation;
+    state.next_session_generation = state.next_session_generation + 1;
+
+    // Find empty slot
+    let mut slot_idx: u64 = 0;
+    let mut found_slot: bool = false;
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if entry.session_state == SessionState::Closed
+            || (entry.session_id.id_hash == 0 && entry.session_generation == 0)
+        {
+            slot_idx = i;
+            found_slot = true;
+            break;
+        };
+    };
+
+    if !found_slot {
+        return Result::Err(SessionError::SessionTableFull);
+    };
+
+    // Determine resource limits based on session type
+    let limits: SessionResourceLimits = match session_type {
+        SessionType::NucleusSession => SessionResourceLimits {
+            max_capabilities: 64, max_ports: 32, max_memory_pages: 1024,
+            max_children: 64, max_residuals: 256, max_active_operations: 128,
+            max_cpu_time_ms: 0, priority_boost: 10,
+        },
+        SessionType::KernelSession => SessionResourceLimits {
+            max_capabilities: 64, max_ports: 32, max_memory_pages: 512,
+            max_children: 32, max_residuals: 256, max_active_operations: 64,
+            max_cpu_time_ms: 0, priority_boost: 5,
+        },
+        SessionType::SystemSession => SessionResourceLimits {
+            max_capabilities: 32, max_ports: 16, max_memory_pages: 256,
+            max_children: 16, max_residuals: 128, max_active_operations: 32,
+            max_cpu_time_ms: 5000, priority_boost: 3,
+        },
+        SessionType::DriverSession => SessionResourceLimits {
+            max_capabilities: 16, max_ports: 8, max_memory_pages: 64,
+            max_children: 4, max_residuals: 256, max_active_operations: 16,
+            max_cpu_time_ms: 2000, priority_boost: 2,
+        },
+        SessionType::UserSession => SessionResourceLimits {
+            max_capabilities: 32, max_ports: 8, max_memory_pages: 128,
+            max_children: 8, max_residuals: 64, max_active_operations: 16,
+            max_cpu_time_ms: 10000, priority_boost: 0,
+        },
+        _ => state.default_limits,
+    };
+
+    let is_priv: bool = match session_type {
+        SessionType::NucleusSession => true,
+        SessionType::KernelSession => true,
+        _ => false,
+    };
+
+    let session: SessionEntry = SessionEntry {
+        session_id: session_id,
+        session_type: session_type,
+        session_state: SessionState::Active,
+        owner_identity: owner,
+        creation_timestamp: timestamp,
+        last_active_timestamp: timestamp,
+        session_generation: generation,
+        parent_session: Option::None,
+        capabilities: Array::zeroed(),
+        capability_count: 0,
+        max_capabilities: limits.max_capabilities,
+        residual_log: RingBuf::new(),
+        metadata: metadata,
+        trust_state: TrustState::Unknown,
+        activity_counter: 0,
+        error_counter: 0,
+        is_privileged: is_priv,
+        resource_limits: limits,
+    };
+
+    state.sessions[slot_idx] = session;
+    state.session_count = state.session_count + 1;
+
+    // Set as root session if first session
+    match state.root_session {
+        Option::None => {
+            state.root_session = Option::Some(session_id);
+        },
+        Option::Some(_) => {},
+    };
+
+    // Audit
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::CreateCapability,
+        capability_id: session_id,
+        actor_identity: owner,
+        success: true,
+        detail: String::from_bytes(Slice(u8)::from_str("session created")),
+    };
+    state.audit_trail.push(audit);
+
+    // Emit residual
+    residual emit {
+        op: "session_manager.create",
+        session_id: session_id.id_hash,
+        session_type: session_type as u64,
+        owner: owner.id_hash,
+        generation: generation,
+        slot: slot_idx,
+    };
+
+    return Result::Ok(state.sessions[slot_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Close Session
+// ─────────────────────────────────────────────────────────────
+
+fn session_close(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    closer_cap: Cap(CapabilityToken),
+    reason: Slice(u8),
+    timestamp: u64,
+) -> Result(void, SessionError)
+    effect [deterministic, residual]
+    court "session_close:v1"
+{
+    // Find session
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state != SessionState::Closed
+        {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SessionError::SessionNotFound);
+    };
+
+    let session: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[slot_idx]);
+
+    // Set state to closing
+    session.session_state = SessionState::Closing;
+
+    // Revoke all capabilities in session
+    for j in 0..session.capability_count {
+        let cap_id: Identity = session.capabilities[j];
+        // Revoke via capability manager
+        // This is a simplified revocation - real system would call capability_revoke
+        session.capabilities[j] = Identity {
+            id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+        };
+    };
+
+    // Record residuals for each revoked capability
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x20,
+        event_data_hash: session.capability_count,
+        cause_identity: session.owner_identity,
+        prior_state_hash: SessionState::Active as u64,
+        new_state_hash: SessionState::Closed as u64,
+        delta_description: String::from_bytes(reason),
+        generation_at_event: session.session_generation,
+        verified: false,
+    };
+    session.residual_log.push(residual);
+
+    // Finalize closure
+    session.session_state = SessionState::Closed;
+    session.last_active_timestamp = timestamp;
+    session.capability_count = 0;
+
+    state.session_count = state.session_count - 1;
+
+    // Audit
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::RevokeCapability,
+        capability_id: session_id,
+        actor_identity: closer_cap.object_id,
+        success: true,
+        detail: String::from_bytes(reason),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "session_manager.close",
+        session_id: session_id.id_hash,
+        revoked_caps: session.capability_count,
+        reason_len: reason.len(),
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Grant Capability to Session
+// ─────────────────────────────────────────────────────────────
+
+fn session_grant_capability(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    capability_id: Identity,
+    grantor_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SessionError)
+    effect [deterministic, residual]
+    court "session_grant:v1"
+{
+    // Find session
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state == SessionState::Active
+        {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SessionError::SessionNotFound);
+    };
+
+    let session: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[slot_idx]);
+
+    // Check if session is active
+    if session.session_state != SessionState::Active {
+        return Result::Err(SessionError::SessionClosed);
+    };
+
+    // Check cap limit
+    if session.capability_count >= session.max_capabilities {
+        return Result::Err(SessionError::MaxCapabilityPerSession);
+    };
+
+    // Check capability is not already in session
+    for j in 0..session.capability_count {
+        if identity_equal(session.capabilities[j], capability_id) {
+            // Already present, not an error
+            return Result::Ok(void);
+        };
+    };
+
+    // Add capability to session
+    session.capabilities[session.capability_count] = capability_id;
+    session.capability_count = session.capability_count + 1;
+    session.last_active_timestamp = timestamp;
+    session.activity_counter = session.activity_counter + 1;
+
+    // Record residual
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x21,
+        event_data_hash: capability_id.id_hash,
+        cause_identity: grantor_cap.object_id,
+        prior_state_hash: session.capability_count - 1,
+        new_state_hash: session.capability_count,
+        delta_description: String::from_bytes(Slice(u8)::from_str("capability granted to session")),
+        generation_at_event: session.session_generation,
+        verified: false,
+    };
+    session.residual_log.push(residual);
+
+    residual emit {
+        op: "session_manager.grant_capability",
+        session_id: session_id.id_hash,
+        capability_id: capability_id.id_hash,
+        new_count: session.capability_count,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Revoke Capability from Session
+// ─────────────────────────────────────────────────────────────
+
+fn session_revoke_capability(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    capability_id: Identity,
+    revoker_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SessionError)
+    effect [deterministic, residual]
+    court "session_revoke_cap:v1"
+{
+    // Find session
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state == SessionState::Active
+        {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SessionError::SessionNotFound);
+    };
+
+    let session: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[slot_idx]);
+
+    // Find and remove capability from session's list
+    let mut found_cap: bool = false;
+    for j in 0..session.capability_count {
+        if identity_equal(session.capabilities[j], capability_id) {
+            // Remove by shifting remaining entries
+            for k in j..(session.capability_count - 1) {
+                session.capabilities[k] = session.capabilities[k + 1];
+            };
+            session.capability_count = session.capability_count - 1;
+            found_cap = true;
+            break;
+        };
+    };
+
+    if !found_cap {
+        return Result::Err(SessionError::CapabilityNotInSession);
+    };
+
+    session.last_active_timestamp = timestamp;
+
+    // Record residual
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x22,
+        event_data_hash: capability_id.id_hash,
+        cause_identity: revoker_cap.object_id,
+        prior_state_hash: session.capability_count + 1,
+        new_state_hash: session.capability_count,
+        delta_description: String::from_bytes(Slice(u8)::from_str("capability revoked from session")),
+        generation_at_event: session.session_generation,
+        verified: false,
+    };
+    session.residual_log.push(residual);
+
+    residual emit {
+        op: "session_manager.revoke_capability",
+        session_id: session_id.id_hash,
+        capability_id: capability_id.id_hash,
+        new_count: session.capability_count,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get Session Information
+// ─────────────────────────────────────────────────────────────
+
+fn session_get_info(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    querier_cap: Cap(CapabilityToken),
+) -> Result(SessionEntry, SessionError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id) {
+            return Result::Ok(entry);
+        };
+    };
+    return Result::Err(SessionError::SessionNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enumerate All Sessions
+// ─────────────────────────────────────────────────────────────
+
+fn session_enumerate_all(
+    state: Handle(SessionManagerState),
+    enumerator_cap: Cap(CapabilityToken),
+) -> Result(Array(SessionEntry, 128), SessionError)
+    effect [deterministic]
+{
+    return Result::Ok(state.sessions);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Check if Session Owns Capability
+// ─────────────────────────────────────────────────────────────
+
+fn session_owns_capability(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    capability_id: Identity,
+) -> bool
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state == SessionState::Active
+        {
+            for j in 0..entry.capability_count {
+                if identity_equal(entry.capabilities[j], capability_id) {
+                    return true;
+                };
+            };
+            return false;
+        };
+    };
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Suspend Session
+// ─────────────────────────────────────────────────────────────
+
+fn session_suspend(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    admin_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SessionError)
+    effect [deterministic, residual]
+{
+    let mut found: bool = false;
+    for i in 0..128 {
+        let entry: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[i]);
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state == SessionState::Active
+        {
+            entry.session_state = SessionState::Suspended;
+            entry.last_active_timestamp = timestamp;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SessionError::SessionNotFound);
+    };
+
+    residual emit {
+        op: "session_manager.suspend",
+        session_id: session_id.id_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Resume Session
+// ─────────────────────────────────────────────────────────────
+
+fn session_resume(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    admin_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SessionError)
+    effect [deterministic, residual]
+{
+    let mut found: bool = false;
+    for i in 0..128 {
+        let entry: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[i]);
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state == SessionState::Suspended
+        {
+            entry.session_state = SessionState::Active;
+            entry.last_active_timestamp = timestamp;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SessionError::SessionNotFound);
+    };
+
+    residual emit {
+        op: "session_manager.resume",
+        session_id: session_id.id_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Activity Update
+// ─────────────────────────────────────────────────────────────
+
+fn session_touch(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    timestamp: u64,
+) -> Result(void, SessionError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let entry: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[i]);
+        if identity_equal(entry.session_id, session_id)
+            && entry.session_state == SessionState::Active
+        {
+            entry.last_active_timestamp = timestamp;
+            entry.activity_counter = entry.activity_counter + 1;
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(SessionError::SessionNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Audit Session Residuals
+// ─────────────────────────────────────────────────────────────
+
+fn session_get_residuals(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    auditor_cap: Cap(CapabilityToken),
+) -> Result(RingBuf(ResidualRecord, 128), SessionError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id) {
+            return Result::Ok(entry.residual_log);
+        };
+    };
+    return Result::Err(SessionError::SessionNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn session_manager_self_test(
+    state: Handle(SessionManagerState),
+) -> Result(u64, SessionError)
+    effect [deterministic]
+    court "session_self_test:v1"
+{
+    let mut checks: u64 = 0;
+    let mut active_count: u64 = 0;
+    let mut consistent: bool = true;
+
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if entry.session_state == SessionState::Active {
+            active_count = active_count + 1;
+            // Verify capability count is valid
+            if entry.capability_count > entry.max_capabilities {
+                consistent = false;
+            };
+        };
+    };
+
+    if active_count == state.session_count {
+        checks = checks + 1;
+    };
+
+    if consistent {
+        checks = checks + 1;
+    };
+
+    if state.next_session_generation > 0 {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "session_manager.self_test",
+        checks_passed: checks,
+        active_sessions: active_count,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Resource Usage Tracking
+// ─────────────────────────────────────────────────────────────
+
+struct SessionResourceUsage {
+    session_id: Identity,
+    capability_used: u64,
+    ports_used: u64,
+    memory_pages_used: u64,
+    children_count: u64,
+    operation_count: u64,
+    cpu_time_used_ms: u64,
+    residual_count: u64,
+    active_operations: u64,
+    peak_capability_usage: u64,
+    peak_memory_usage: u64,
+    peak_ports_used: u64,
+}
+
+fn session_get_resource_usage(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    querier_cap: Cap(CapabilityToken),
+) -> Result(SessionResourceUsage, SessionError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id) {
+            let usage: SessionResourceUsage = SessionResourceUsage {
+                session_id: session_id,
+                capability_used: entry.capability_count,
+                ports_used: 0,
+                memory_pages_used: 0,
+                children_count: 0,
+                operation_count: entry.activity_counter,
+                cpu_time_used_ms: 0,
+                residual_count: entry.residual_log.len(),
+                active_operations: 0,
+                peak_capability_usage: entry.max_capabilities,
+                peak_memory_usage: entry.resource_limits.max_memory_pages,
+                peak_ports_used: entry.resource_limits.max_ports,
+            };
+            return Result::Ok(usage);
+        };
+    };
+    return Result::Err(SessionError::SessionNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Audit — Generate audit report for a session
+// ─────────────────────────────────────────────────────────────
+
+struct SessionAuditReport {
+    session: SessionEntry,
+    resource_usage: SessionResourceUsage,
+    audit_timestamp: u64,
+    anomaly_count: u64,
+    residual_integrity: bool,
+    capability_anomalies: Array(Identity, 16),
+    anomaly_detail: String(512),
+}
+
+fn session_generate_audit(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    auditor_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(SessionAuditReport, SessionError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id) {
+            let usage: SessionResourceUsage = SessionResourceUsage {
+                session_id: session_id,
+                capability_used: entry.capability_count,
+                ports_used: 0,
+                memory_pages_used: 0,
+                children_count: 0,
+                operation_count: entry.activity_counter,
+                cpu_time_used_ms: 0,
+                residual_count: entry.residual_log.len(),
+                active_operations: 0,
+                peak_capability_usage: entry.max_capabilities,
+                peak_memory_usage: entry.resource_limits.max_memory_pages,
+                peak_ports_used: entry.resource_limits.max_ports,
+            };
+
+            // Check for anomalies
+            let mut anomaly_count: u64 = 0;
+            let mut anomalies: Array(Identity, 16) = Array::zeroed();
+
+            if entry.error_counter > 10 {
+                let anom_id: Identity = identity_new(session_id.id_hash, timestamp, anomaly_count, 0);
+                anomalies[anomaly_count] = anom_id;
+                anomaly_count = anomaly_count + 1;
+            };
+
+            if entry.session_type == SessionType::AnonymousSession && entry.capability_count > 4 {
+                let anom_id: Identity = identity_new(session_id.id_hash, timestamp, anomaly_count, 1);
+                anomalies[anomaly_count] = anom_id;
+                anomaly_count = anomaly_count + 1;
+            };
+
+            let report: SessionAuditReport = SessionAuditReport {
+                session: entry,
+                resource_usage: usage,
+                audit_timestamp: timestamp,
+                anomaly_count: anomaly_count,
+                residual_integrity: true,
+                capability_anomalies: anomalies,
+                anomaly_detail: String::new(),
+            };
+
+            residual emit {
+                op: "session_manager.audit",
+                session_id: session_id.id_hash,
+                anomalies: anomaly_count,
+            };
+
+            return Result::Ok(report);
+        };
+    };
+    return Result::Err(SessionError::SessionNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Clone — Duplicate a session's capabilities
+// ─────────────────────────────────────────────────────────────
+
+fn session_clone(
+    state: Handle(SessionManagerState),
+    source_session_id: Identity,
+    new_type: SessionType,
+    new_owner: Identity,
+    metadata: SessionMetadata,
+    cloner_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(SessionEntry, SessionError)
+    effect [deterministic, residual]
+{
+    // Create new session
+    let new_session: SessionEntry = session_create(
+        state,
+        new_type,
+        new_owner,
+        cloner_cap,
+        metadata,
+        timestamp,
+    )?;
+
+    // Copy capabilities from source (if allowed)
+    for i in 0..128 {
+        let src: SessionEntry = state.sessions[i];
+        if identity_equal(src.session_id, source_session_id) {
+            for j in 0..src.capability_count {
+                session_grant_capability(
+                    state,
+                    new_session.session_id,
+                    src.capabilities[j],
+                    cloner_cap,
+                    timestamp,
+                );
+            };
+            break;
+        };
+    };
+
+    residual emit {
+        op: "session_manager.clone",
+        source: source_session_id.id_hash,
+        new_session: new_session.session_id.id_hash,
+    };
+
+    return Result::Ok(new_session);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Query by Type — Find sessions matching a type
+// ─────────────────────────────────────────────────────────────
+
+fn session_find_by_type(
+    state: Handle(SessionManagerState),
+    session_type: SessionType,
+    querier_cap: Cap(CapabilityToken),
+) -> Result(Array(SessionEntry, 128), SessionError)
+    effect [deterministic]
+{
+    let mut results: Array(SessionEntry, 128) = Array::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if entry.session_type == session_type
+            && entry.session_state != SessionState::Closed
+        {
+            results[count] = entry;
+            count = count + 1;
+        };
+    };
+
+    return Result::Ok(results);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Prune — Close stale/expired sessions
+// ─────────────────────────────────────────────────────────────
+
+fn session_prune(
+    state: Handle(SessionManagerState),
+    max_idle_ms: u64,
+    current_timestamp: u64,
+    admin_cap: Cap(CapabilityToken),
+) -> u64
+    effect [deterministic, residual]
+{
+    let mut pruned: u64 = 0;
+
+    for i in 0..128 {
+        let entry: Handle(SessionEntry) = Handle(SessionEntry)::from_ptr(&state.sessions[i]);
+        if entry.session_state == SessionState::Active {
+            let idle_time: u64 = current_timestamp - entry.last_active_timestamp;
+            if idle_time > max_idle_ms {
+                entry.session_state = SessionState::Closed;
+                entry.capability_count = 0;
+                state.session_count = state.session_count - 1;
+                pruned = pruned + 1;
+            };
+        };
+    };
+
+    residual emit {
+        op: "session_manager.prune",
+        pruned: pruned,
+        max_idle_ms: max_idle_ms,
+    };
+
+    return pruned;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Session Policy Check — Verify operation against session policy
+// ─────────────────────────────────────────────────────────────
+
+fn session_check_policy(
+    state: Handle(SessionManagerState),
+    session_id: Identity,
+    required_privilege: SessionType,
+) -> bool
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let entry: SessionEntry = state.sessions[i];
+        if identity_equal(entry.session_id, session_id) {
+            // Privileged sessions (Nucleus, Kernel) can do anything
+            if entry.is_privileged { return true; };
+            // Otherwise, session type must match or exceed required privilege
+            return entry.session_type as u64 >= required_privilege as u64;
+        };
+    };
+    return false;
+}

@@ -1,0 +1,1341 @@
+// fault_handler.phor — Fault Handler: Page Fault Analysis, GPF/UD/DF Analysis,
+//                      Register Dump, Stack Unwind, Fault Residual Generation,
+//                      Fault Classification, Recovery Attempts, Crash Report Generation
+// Phorensic OS — Debug Subsystem
+//
+// This module implements comprehensive fault handling for the Phorensic OS kernel.
+// It analyzes hardware faults (page faults, general protection faults, undefined
+// instruction faults, double faults), captures register and stack state, classifies
+// faults, attempts recovery where possible, and generates detailed crash reports
+// with forensic residuals.
+//
+// Operations:
+// 1. Page fault analysis — address, cause, access type, privilege level
+// 2. GPF/UD/DF analysis — error code parsing, segment/selector analysis
+// 3. Register dump — full CPU register state capture
+// 4. Stack unwind — frame pointer and metadata-based unwinding
+// 5. Fault residual generation — forensic audit trail with full context
+// 6. Fault classification — categorize by type, severity, recoverability
+// 7. Recovery attempts — skip, fixup, terminate, or panic
+// 8. Crash report generation — formatted human-readable report
+//
+// Boundedness: Stack frames 64 max. Fault handlers 32. All loops bounded.
+//
+// Effect declarations:
+//   [pure]    — fault classification, analysis
+//   [io]      — crash report generation, serial output
+//   [debug]   — hardware fault handling
+//   [memory]  — stack/memory reads
+//   [diag]    — residual recording
+//   [fault]   — fault handling/interception
+//   [panic]   — kernel panic invocation
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes for Fault Handler
+// ──────────────────────────────────────────────
+
+const FAULT_OCCURRED       : u64 = 0x14000u64;
+const FAULT_CLASSIFIED     : u64 = 0x14001u64;
+const FAULT_RECOVERED      : u64 = 0x14002u64;
+const FAULT_UNRECOVERABLE  : u64 = 0x14003u64;
+const FAULT_REPORT_GENERATED: u64 = 0x14004u64;
+const FAULT_ERROR          : u64 = 0x1400Fu64;
+
+// ──────────────────────────────────────────────
+// Fault Types
+// ──────────────────────────────────────────────
+
+/// Hardware fault vector numbers.
+pub sealdatatype FaultVector : u8 {
+    DivideError = 0u8,
+    Debug = 1u8,
+    NMI = 2u8,
+    Breakpoint = 3u8,
+    Overflow = 4u8,
+    BoundRange = 5u8,
+    InvalidOpcode = 6u8,
+    DeviceNotAvailable = 7u8,
+    DoubleFault = 8u8,
+    CoprocessorSegment = 9u8,
+    InvalidTSS = 10u8,
+    SegmentNotPresent = 11u8,
+    StackSegment = 12u8,
+    GeneralProtection = 13u8,
+    PageFault = 14u8,
+    Reserved = 15u8,
+    x87FPU = 16u8,
+    AlignmentCheck = 17u8,
+    MachineCheck = 18u8,
+    SIMD = 19u8,
+    Virtualization = 20u8,
+    ControlProtection = 21u8,
+    HVInjection = 28u8,
+    VMMComm = 29u8,
+    Security = 30u8,
+}
+
+/// Page fault access type.
+pub sealdatatype PageFaultType : u8 {
+    /// Non-present page.
+    NotPresent = 0u8,
+    /// Page-level protection violation.
+    ProtectionViolation = 1u8,
+    /// Reserved bit violation.
+    ReservedBit = 2u8,
+    /// Instruction fetch from non-executable page.
+    InstructionFetch = 3u8,
+    /// Protection key violation.
+    ProtectionKey = 4u8,
+    /// Shadow stack access violation.
+    ShadowStack = 5u8,
+    /// SGX access violation.
+    SGX = 6u8,
+}
+
+/// Fault severity level.
+pub sealdatatype FaultSeverity : u8 {
+    /// Minor fault, recoverable.
+    Minor = 0u8,
+    /// Moderate fault, may be recoverable.
+    Moderate = 1u8,
+    /// Severe fault, likely unrecoverable.
+    Severe = 2u8,
+    /// Critical fault, system must halt.
+    Critical = 3u8,
+}
+
+/// Fault recovery action.
+pub sealdatatype RecoveryAction : u8 {
+    /// No recovery possible.
+    None = 0u8,
+    /// Skip the faulting instruction.
+    SkipInstruction = 1u8,
+    /// Fix up the fault (e.g., allocate page).
+    Fixup = 2u8,
+    /// Terminate the faulting thread.
+    TerminateThread = 3u8,
+    /// Signal the faulting process.
+    SignalProcess = 4u8,
+    /// Full kernel panic.
+    Panic = 5u8,
+}
+
+/// A single stack frame from within a fault context.
+pub struct FaultStackFrame {
+    pub frame_number : u32,
+    pub instruction_pointer : u64,
+    pub stack_pointer : u64,
+    pub base_pointer : u64,
+    pub return_address : u64,
+    pub symbol_name : FixedString256,
+}
+
+/// Complete fault context captured from CPU.
+pub struct FaultContext {
+    /// Fault vector number.
+    pub vector : FaultVector,
+    /// Error code pushed by CPU (0 if none).
+    pub error_code : u64,
+    /// Faulting address (CR2 for page faults, or 0).
+    pub fault_address : u64,
+    /// Instruction pointer at fault.
+    pub instruction_pointer : u64,
+    /// Stack pointer at fault.
+    pub stack_pointer : u64,
+    /// All general-purpose registers.
+    pub rax : u64, pub rbx : u64, pub rcx : u64, pub rdx : u64,
+    pub rsi : u64, pub rdi : u64, pub rbp : u64, pub rsp : u64,
+    pub r8  : u64, pub r9  : u64, pub r10 : u64, pub r11 : u64,
+    pub r12 : u64, pub r13 : u64, pub r14 : u64, pub r15 : u64,
+    pub rflags : u64,
+    /// Segment selectors.
+    pub cs : u64, pub ss : u64, pub ds : u64, pub es : u64,
+    pub fs : u64, pub gs : u64,
+    /// Control register state.
+    pub cr0 : u64, pub cr2 : u64, pub cr3 : u64, pub cr4 : u64,
+    /// Page fault-specific data.
+    pub page_fault_type : PageFaultType,
+    pub page_fault_access_type : u8,  // bitmask: P/W/U/S/R/I
+    /// Whether the fault occurred in user mode.
+    pub user_mode : bool,
+    /// CPU ID.
+    pub cpu_id : u32,
+    /// Thread ID.
+    pub thread_id : u32,
+    /// Timestamp.
+    pub timestamp : u64,
+    /// Unwound stack trace.
+    pub stack_trace : Array64<FaultStackFrame>,
+}
+
+/// Fault classification result.
+pub struct FaultClassification {
+    /// The original fault vector.
+    pub vector : FaultVector,
+    /// Severity assessment.
+    pub severity : FaultSeverity,
+    /// Recoverability assessment.
+    pub recoverable : bool,
+    /// Recommended recovery action.
+    pub recommended_action : RecoveryAction,
+    /// Human-readable description of the fault.
+    pub description : FixedString256,
+    /// Root cause category.
+    pub cause_category : FixedString64,
+    /// Whether the fault is caused by a kernel bug vs user error.
+    pub is_kernel_bug : bool,
+}
+
+/// Fault handler residual.
+pub struct FaultResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub vector : FaultVector,
+    pub fault_address : u64,
+    pub instruction_pointer : u64,
+    pub severity : FaultSeverity,
+    pub timestamp : u64,
+}
+
+/// Main fault handler state.
+pub struct FaultHandler {
+    /// Current fault context (set when a fault occurs).
+    pub current_fault : Option<FaultContext>,
+    /// Current classification.
+    pub current_classification : Option<FaultClassification>,
+    /// Number of faults handled.
+    pub total_faults_handled : u32,
+    /// Number of successful recoveries.
+    pub total_recoveries : u32,
+    /// Number of unrecoverable faults.
+    pub total_unrecoverable : u32,
+    /// Whether fault handling is enabled.
+    pub enabled : bool,
+    /// Whether to attempt recovery.
+    pub recovery_enabled : bool,
+    /// Maximum stack frames to capture.
+    pub max_stack_frames : u32,
+    /// Residual log.
+    pub residual_log : Array128<FaultResidual>,
+}
+
+impl FaultHandler {
+    /// Create a new fault handler.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> FaultHandler [pure] {
+        FaultHandler {
+            current_fault: Option::None,
+            current_classification: Option::None,
+            total_faults_handled: 0u32,
+            total_recoveries: 0u32,
+            total_unrecoverable: 0u32,
+            enabled: true,
+            recovery_enabled: true,
+            max_stack_frames: 64u32,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a fault residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, vector : FaultVector,
+                       fault_addr : u64, ip : u64,
+                       severity : FaultSeverity) -> FaultHandler [diag] {
+        let residual : FaultResidual = FaultResidual {
+            code: code,
+            message: message,
+            action: action,
+            vector: vector,
+            fault_address: fault_addr,
+            instruction_pointer: ip,
+            severity: severity,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Page Fault Analysis
+    // ──────────────────────────────────────────
+
+    /// Analyze a page fault error code.
+    /// Effect: pure — deterministic analysis from error code bits.
+    pub fn analyze_page_fault(error_code : u64) -> PageFaultType [pure] {
+        let pf_type : PageFaultType;
+        // Bit 0: P (0 = not present, 1 = protection violation)
+        // Bit 1: W (0 = read, 1 = write)
+        // Bit 2: U (0 = supervisor, 1 = user)
+        // Bit 3: R (0 = not reserved bit violation, 1 = reserved bit)
+        // Bit 4: I (0 = not instruction fetch, 1 = instruction fetch)
+        // Bit 5: PK (0 = not protection key, 1 = protection key)
+        // Bit 6: SS (0 = not shadow stack, 1 = shadow stack)
+
+        if error_code & (1u64 << 6u64) != 0u64 {
+            pf_type = PageFaultType::ShadowStack;
+        } else if error_code & (1u64 << 5u64) != 0u64 {
+            pf_type = PageFaultType::ProtectionKey;
+        } else if error_code & (1u64 << 4u64) != 0u64 {
+            pf_type = PageFaultType::InstructionFetch;
+        } else if error_code & (1u64 << 3u64) != 0u64 {
+            pf_type = PageFaultType::ReservedBit;
+        } else if error_code & (1u64 << 0u64) == 0u64 {
+            pf_type = PageFaultType::NotPresent;
+        } else {
+            pf_type = PageFaultType::ProtectionViolation;
+        }
+
+        pf_type
+    }
+
+    /// Extract the page fault access type bitmask.
+    /// Effect: pure — bit extraction.
+    pub fn extract_page_fault_access(error_code : u64) -> u8 [pure] {
+        (error_code & 0x7Fu64) as u8
+    }
+
+    /// Check if a page fault was a user-mode access.
+    /// Effect: pure — bit check.
+    pub fn is_user_page_fault(error_code : u64) -> bool [pure] {
+        (error_code & (1u64 << 2u64)) != 0u64
+    }
+
+    // ──────────────────────────────────────────
+    // GPF/UD/DF Analysis
+    // ──────────────────────────────────────────
+
+    /// Analyze a general protection fault error code.
+    /// Effect: pure — decodes selector index and type.
+    pub fn analyze_gpf(error_code : u64) -> FixedString256 [pure] {
+        var description : FixedString256 = FixedString256::new();
+
+        if error_code == 0u64 {
+            description.push_str(FixedString256::from("GPF with no specific selector"));
+        } else {
+            let selector_index : u64 = error_code >> 3u64;
+            let table_indicator : u8 = (error_code & 0x4u64) as u8; // 0=GDT, 1=LDT
+            let ext : u8 = (error_code & 0x2u64) as u8; // external event
+            let table_name : FixedString256 = if table_indicator == 0u8 {
+                FixedString256::from("GDT")
+            } else {
+                FixedString256::from("LDT")
+            };
+
+            description.push_str(FixedString256::from("GPF: selector index "));
+            description.push_u64(selector_index);
+            description.push_str(FixedString256::from(" in "));
+            description.push_str(table_name);
+            if ext != 0u8 {
+                description.push_str(FixedString256::from(" (external)"));
+            }
+        }
+
+        description
+    }
+
+    /// Analyze an undefined instruction fault.
+    /// Effect: pure — instruction byte analysis.
+    pub fn analyze_ud(fault_ip : u64) -> FixedString256 [memory] {
+        var description : FixedString256 = FixedString256::new();
+
+        // Read first few bytes of the faulting instruction.
+        var bytes : Array16<u8> = Array16::new();
+        // loop: bounds[BOUND_SMALL] — bounded by 8 bytes.
+        for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+            let b : u8 = __builtin_read_byte(fault_ip + i as u64);
+            let _ = bytes.push(b);
+        }
+
+        description.push_str(FixedString256::from("Undefined instruction at 0x"));
+        description.push_u64_hex(fault_ip);
+        description.push_str(FixedString256::from(": "));
+        // loop: bounds[BOUND_SMALL] — bounded by 8 bytes.
+        for var i : u32 = 0u32; i < bytes.len(); i += 1u32 [bytes.len()] {
+            description.push_u8_hex(bytes.get(i));
+            description.push_str(FixedString256::from(" "));
+        }
+
+        description
+    }
+
+    /// Analyze a double fault.
+    /// Effect: pure — double fault analysis.
+    pub fn analyze_df(&self) -> FixedString256 [pure] {
+        var description : FixedString256 = FixedString256::new();
+        description.push_str(FixedString256::from("Double fault: an unrecoverable fault occurred while "));
+        description.push_str(FixedString256::from("handling another fault. The fault stack has been "));
+        description.push_str(FixedString256::from("corrupted. System must halt."));
+        description
+    }
+
+    // ──────────────────────────────────────────
+    // Register Dump
+    // ──────────────────────────────────────────
+
+    /// Capture the current register state into a fault context.
+    /// Effect: debug — reads CPU registers.
+    pub fn capture_registers(mut self, vector : FaultVector, error_code : u64,
+                             fault_address : u64, ip : u64, sp : u64) -> FaultHandler [debug] {
+        let context : FaultContext = FaultContext {
+            vector: vector,
+            error_code: error_code,
+            fault_address: fault_address,
+            instruction_pointer: ip,
+            stack_pointer: sp,
+            rax: __builtin_read_register(0u32),
+            rbx: __builtin_read_register(1u32),
+            rcx: __builtin_read_register(2u32),
+            rdx: __builtin_read_register(3u32),
+            rsi: __builtin_read_register(4u32),
+            rdi: __builtin_read_register(5u32),
+            rbp: __builtin_read_register(6u32),
+            rsp: __builtin_read_register(7u32),
+            r8: __builtin_read_register(8u32),
+            r9: __builtin_read_register(9u32),
+            r10: __builtin_read_register(10u32),
+            r11: __builtin_read_register(11u32),
+            r12: __builtin_read_register(12u32),
+            r13: __builtin_read_register(13u32),
+            r14: __builtin_read_register(14u32),
+            r15: __builtin_read_register(15u32),
+            rflags: __builtin_read_rflags(),
+            cs: __builtin_read_cs(),
+            ss: __builtin_read_ss(),
+            ds: __builtin_read_ds(),
+            es: __builtin_read_es(),
+            fs: __builtin_read_fs(),
+            gs: __builtin_read_gs(),
+            cr0: __builtin_read_cr0(),
+            cr2: fault_address,
+            cr3: __builtin_read_cr3(),
+            cr4: __builtin_read_cr4(),
+            page_fault_type: if vector == FaultVector::PageFault {
+                FaultHandler::analyze_page_fault(error_code)
+            } else {
+                PageFaultType::NotPresent
+            },
+            page_fault_access_type: if vector == FaultVector::PageFault {
+                FaultHandler::extract_page_fault_access(error_code)
+            } else {
+                0u8
+            },
+            user_mode: (__builtin_read_cs() & 0x3u64) != 0u64,
+            cpu_id: __builtin_current_cpu_id(),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+            stack_trace: Array64::new(),
+        };
+
+        self.current_fault = Option::Some(context);
+        self
+    }
+
+    /// Format the register dump as a string.
+    /// Effect: pure — string formatting.
+    pub fn format_register_dump(&self) -> FixedString1024 [pure] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        match self.current_fault {
+            Option::Some(ref ctx) => {
+                output.push_str(FixedString256::from("=== Register Dump ===\n"));
+                output.push_str(FixedString256::from("Fault Vector: "));
+                output.push_str(ctx.vector.name());
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("RAX: 0x"));
+                output.push_u64_hex(ctx.rax);
+                output.push_str(FixedString256::from("  RBX: 0x"));
+                output.push_u64_hex(ctx.rbx);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("RCX: 0x"));
+                output.push_u64_hex(ctx.rcx);
+                output.push_str(FixedString256::from("  RDX: 0x"));
+                output.push_u64_hex(ctx.rdx);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("RSI: 0x"));
+                output.push_u64_hex(ctx.rsi);
+                output.push_str(FixedString256::from("  RDI: 0x"));
+                output.push_u64_hex(ctx.rdi);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("RBP: 0x"));
+                output.push_u64_hex(ctx.rbp);
+                output.push_str(FixedString256::from("  RSP: 0x"));
+                output.push_u64_hex(ctx.rsp);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("R8:  0x"));
+                output.push_u64_hex(ctx.r8);
+                output.push_str(FixedString256::from("  R9:  0x"));
+                output.push_u64_hex(ctx.r9);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("R10: 0x"));
+                output.push_u64_hex(ctx.r10);
+                output.push_str(FixedString256::from("  R11: 0x"));
+                output.push_u64_hex(ctx.r11);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("R12: 0x"));
+                output.push_u64_hex(ctx.r12);
+                output.push_str(FixedString256::from("  R13: 0x"));
+                output.push_u64_hex(ctx.r13);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("R14: 0x"));
+                output.push_u64_hex(ctx.r14);
+                output.push_str(FixedString256::from("  R15: 0x"));
+                output.push_u64_hex(ctx.r15);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("RIP: 0x"));
+                output.push_u64_hex(ctx.instruction_pointer);
+                output.push_str(FixedString256::from("  RFLAGS: 0x"));
+                output.push_u64_hex(ctx.rflags);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("CS: 0x"));
+                output.push_u64_hex(ctx.cs);
+                output.push_str(FixedString256::from("  SS: 0x"));
+                output.push_u64_hex(ctx.ss);
+                output.push_str(FixedString256::from("\n"));
+
+                if ctx.vector == FaultVector::PageFault {
+                    output.push_str(FixedString256::from("CR2 (fault addr): 0x"));
+                    output.push_u64_hex(ctx.cr2);
+                    output.push_str(FixedString256::from("\n"));
+                    output.push_str(FixedString256::from("Page Fault Type: "));
+                    output.push_str(ctx.page_fault_type.name());
+                    output.push_str(FixedString256::from("\n"));
+                    output.push_str(FixedString256::from("Access Flags: P="));
+                    output.push_u8(if ctx.page_fault_access_type & 0x01u8 != 0u8 { '1' as u8 } else { '0' as u8 });
+                    output.push_str(FixedString256::from(" W="));
+                    output.push_u8(if ctx.page_fault_access_type & 0x02u8 != 0u8 { '1' as u8 } else { '0' as u8 });
+                    output.push_str(FixedString256::from(" U="));
+                    output.push_u8(if ctx.page_fault_access_type & 0x04u8 != 0u8 { '1' as u8 } else { '0' as u8 });
+                    output.push_str(FixedString256::from("\n"));
+                }
+
+                output.push_str(FixedString256::from("Error Code: 0x"));
+                output.push_u64_hex(ctx.error_code);
+                output.push_str(FixedString256::from("\n"));
+
+                output.push_str(FixedString256::from("CPU: "));
+                output.push_u32(ctx.cpu_id);
+                output.push_str(FixedString256::from("  Thread: "));
+                output.push_u32(ctx.thread_id);
+                output.push_str(FixedString256::from("  Mode: "));
+                if ctx.user_mode {
+                    output.push_str(FixedString256::from("User"));
+                } else {
+                    output.push_str(FixedString256::from("Supervisor"));
+                }
+                output.push_str(FixedString256::from("\n"));
+            },
+            Option::None => {
+                output.push_str(FixedString256::from("(no fault context available)\n"));
+            },
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Stack Unwind
+    // ──────────────────────────────────────────
+
+    /// Unwind the stack from the fault context.
+    /// Effect: memory — reads stack memory.
+    pub fn unwind_stack_from_fault(mut self) -> FaultHandler [memory] {
+        match self.current_fault {
+            Option::Some(ref mut ctx) => {
+                var rbp : u64 = ctx.rbp;
+                var rsp : u64 = ctx.rsp;
+                var rip : u64 = ctx.instruction_pointer;
+                var frame_count : u32 = 0u32;
+
+                ctx.stack_trace.clear();
+
+                // Add current frame.
+                let current_frame : FaultStackFrame = FaultStackFrame {
+                    frame_number: 0u32,
+                    instruction_pointer: rip,
+                    stack_pointer: rsp,
+                    base_pointer: rbp,
+                    return_address: rip,
+                    symbol_name: FixedString256::new(),
+                };
+                let _ = ctx.stack_trace.push(current_frame);
+                frame_count = 1u32;
+
+                // Walk the frame pointer chain.
+                // loop: bounds[BOUND_MEDIUM] — bounded by max_stack_frames (max 64).
+                loop: bounds[BOUND_MEDIUM] while rbp != 0u64 && frame_count < self.max_stack_frames {
+                    let saved_rbp : u64 = __builtin_read_u64(rbp);
+                    let return_addr : u64 = __builtin_read_u64(rbp + 8u64);
+
+                    if return_addr == 0u64 {
+                        break;
+                    }
+
+                    let frame : FaultStackFrame = FaultStackFrame {
+                        frame_number: frame_count,
+                        instruction_pointer: return_addr,
+                        stack_pointer: rbp + 16u64,
+                        base_pointer: saved_rbp,
+                        return_address: return_addr,
+                        symbol_name: FixedString256::new(),
+                    };
+                    let _ = ctx.stack_trace.push(frame);
+
+                    rbp = saved_rbp;
+                    frame_count += 1u32;
+                }
+            },
+            Option::None => {},
+        }
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Fault Classification
+    // ──────────────────────────────────────────
+
+    /// Classify a fault for severity and recovery options.
+    /// Effect: pure — deterministic classification.
+    pub fn classify_fault(mut self) -> FaultHandler [pure] {
+        match self.current_fault {
+            Option::Some(ref ctx) => {
+                let (severity, recoverable, action, description, category, kernel_bug) :
+                    (FaultSeverity, bool, RecoveryAction, FixedString256, FixedString64, bool) =
+                    match ctx.vector {
+                    FaultVector::PageFault => {
+                        if ctx.page_fault_type == PageFaultType::NotPresent {
+                            // Demand paging — recoverable by page allocation.
+                            (FaultSeverity::Minor, true, RecoveryAction::Fixup,
+                             FixedString256::from("Page not present — demand paging"),
+                             FixedString64::from("demand_paging"), false)
+                        } else if ctx.user_mode {
+                            // User-mode protection violation.
+                            (FaultSeverity::Moderate, true, RecoveryAction::SignalProcess,
+                             FixedString256::from("User-mode page protection violation"),
+                             FixedString64::from("user_page_fault"), false)
+                        } else {
+                            // Kernel-mode page fault — serious.
+                            (FaultSeverity::Severe, false, RecoveryAction::Panic,
+                             FixedString256::from("Kernel-mode page fault"),
+                             FixedString64::from("kernel_page_fault"), true)
+                        }
+                    },
+                    FaultVector::GeneralProtection => {
+                        let gpf_desc : FixedString256 = FaultHandler::analyze_gpf(ctx.error_code);
+                        if ctx.user_mode {
+                            (FaultSeverity::Moderate, true, RecoveryAction::TerminateThread,
+                             gpf_desc, FixedString64::from("user_gpf"), false)
+                        } else {
+                            (FaultSeverity::Severe, false, RecoveryAction::Panic,
+                             gpf_desc, FixedString64::from("kernel_gpf"), true)
+                        }
+                    },
+                    FaultVector::InvalidOpcode => {
+                        let ud_desc : FixedString256 = FixedString256::from("Invalid/undefined instruction");
+                        if ctx.user_mode {
+                            (FaultSeverity::Moderate, true, RecoveryAction::SignalProcess,
+                             ud_desc, FixedString64::from("user_ud"), false)
+                        } else {
+                            (FaultSeverity::Severe, false, RecoveryAction::Panic,
+                             ud_desc, FixedString64::from("kernel_ud"), true)
+                        }
+                    },
+                    FaultVector::DoubleFault => {
+                        (FaultSeverity::Critical, false, RecoveryAction::Panic,
+                         FixedString256::from("Double fault — unrecoverable"),
+                         FixedString64::from("double_fault"), true)
+                    },
+                    FaultVector::DivideError => {
+                        if ctx.user_mode {
+                            (FaultSeverity::Minor, true, RecoveryAction::SignalProcess,
+                             FixedString256::from("Division by zero"),
+                             FixedString64::from("div_zero"), false)
+                        } else {
+                            (FaultSeverity::Moderate, true, RecoveryAction::TerminateThread,
+                             FixedString256::from("Kernel division by zero"),
+                             FixedString64::from("kernel_div_zero"), true)
+                        }
+                    },
+                    FaultVector::StackSegment => {
+                        if ctx.user_mode {
+                            (FaultSeverity::Moderate, true, RecoveryAction::TerminateThread,
+                             FixedString256::from("Stack segment fault"),
+                             FixedString64::from("stack_fault"), false)
+                        } else {
+                            (FaultSeverity::Severe, false, RecoveryAction::Panic,
+                             FixedString256::from("Kernel stack segment fault"),
+                             FixedString64::from("kernel_stack_fault"), true)
+                        }
+                    },
+                    FaultVector::Debug => {
+                        (FaultSeverity::Minor, true, RecoveryAction::SkipInstruction,
+                         FixedString256::from("Debug trap"),
+                         FixedString64::from("debug_trap"), false)
+                    },
+                    FaultVector::Breakpoint => {
+                        (FaultSeverity::Minor, true, RecoveryAction::SkipInstruction,
+                         FixedString256::from("Breakpoint hit"),
+                         FixedString64::from("breakpoint"), false)
+                    },
+                    FaultVector::AlignmentCheck => {
+                        if ctx.user_mode {
+                            (FaultSeverity::Moderate, true, RecoveryAction::SignalProcess,
+                             FixedString256::from("Alignment check fault"),
+                             FixedString64::from("alignment"), false)
+                        } else {
+                            (FaultSeverity::Severe, false, RecoveryAction::Panic,
+                             FixedString256::from("Kernel alignment check"),
+                             FixedString64::from("kernel_alignment"), true)
+                        }
+                    },
+                    FaultVector::MachineCheck => {
+                        (FaultSeverity::Critical, false, RecoveryAction::Panic,
+                         FixedString256::from("Machine check — hardware error"),
+                         FixedString64::from("machine_check"), true)
+                    },
+                    FaultVector::Security => {
+                        (FaultSeverity::Critical, false, RecoveryAction::Panic,
+                         FixedString256::from("Security exception"),
+                         FixedString64::from("security"), true)
+                    },
+                    _ => {
+                        (FaultSeverity::Moderate, false, RecoveryAction::Panic,
+                         FixedString256::from("Unhandled fault vector"),
+                         FixedString64::from("unhandled"), true)
+                    },
+                };
+
+                self.current_classification = Option::Some(FaultClassification {
+                    vector: ctx.vector,
+                    severity: severity,
+                    recoverable: recoverable,
+                    recommended_action: action,
+                    description: description,
+                    cause_category: category,
+                    is_kernel_bug: kernel_bug,
+                });
+            },
+            Option::None => {},
+        }
+
+        self = self.record_residual(FAULT_CLASSIFIED,
+                                    FixedString256::from("fault classified"),
+                                    FixedString64::from("classify"),
+                                    match self.current_fault {
+                                        Option::Some(ref ctx) => ctx.vector,
+                                        Option::None => FaultVector::Reserved,
+                                    },
+                                    0u64, 0u64,
+                                    match self.current_classification {
+                                        Option::Some(ref c) => c.severity,
+                                        Option::None => FaultSeverity::Critical,
+                                    });
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Recovery Attempts
+    // ──────────────────────────────────────────
+
+    /// Attempt to recover from the current fault.
+    /// Effect: fault, memory, panic — recovery operations.
+    pub fn attempt_recovery(mut self) -> Result<FaultHandler, FixedString256>
+                            [fault, memory, panic, diag] {
+        if !self.recovery_enabled {
+            return Result::Err(FixedString256::from("recovery disabled"));
+        }
+
+        match self.current_classification {
+            Option::Some(ref classification) => {
+                if !classification.recoverable {
+                    self.total_unrecoverable += 1u32;
+                    self = self.record_residual(FAULT_UNRECOVERABLE,
+                                                FixedString256::from("fault unrecoverable"),
+                                                FixedString64::from("recovery_failed"),
+                                                classification.vector,
+                                                0u64, 0u64,
+                                                classification.severity);
+                    return Result::Err(FixedString256::from("fault is not recoverable"));
+                }
+
+                match classification.recommended_action {
+                    RecoveryAction::SkipInstruction => {
+                        // Advance RIP past the faulting instruction.
+                        match self.current_fault {
+                            Option::Some(ref mut ctx) => {
+                                // Skip 1 byte for INT3, variable length for others.
+                                // Simplified: skip minimum instruction length.
+                                ctx.instruction_pointer += 1u64;
+                                self.total_recoveries += 1u32;
+                            },
+                            Option::None => {},
+                        }
+                    },
+                    RecoveryAction::Fixup => {
+                        // For page faults: allocate the missing page.
+                        match self.current_fault {
+                            Option::Some(ref ctx) => {
+                                if ctx.vector == FaultVector::PageFault {
+                                    __builtin_allocate_page(ctx.fault_address);
+                                    self.total_recoveries += 1u32;
+                                }
+                            },
+                            Option::None => {},
+                        }
+                    },
+                    RecoveryAction::TerminateThread => {
+                        // Terminate the faulting thread.
+                        match self.current_fault {
+                            Option::Some(ref ctx) => {
+                                __builtin_terminate_thread(ctx.thread_id);
+                                self.total_recoveries += 1u32;
+                            },
+                            Option::None => {},
+                        }
+                    },
+                    RecoveryAction::SignalProcess => {
+                        // Send a fault signal to the process.
+                        match self.current_fault {
+                            Option::Some(ref ctx) => {
+                                __builtin_send_fault_signal(ctx.thread_id, ctx.vector as u32);
+                                self.total_recoveries += 1u32;
+                            },
+                            Option::None => {},
+                        }
+                    },
+                    RecoveryAction::Panic => {
+                        self = self.kernel_panic();
+                        self.total_unrecoverable += 1u32;
+                        return Result::Err(FixedString256::from("kernel panic triggered"));
+                    },
+                    RecoveryAction::None => {
+                        self.total_unrecoverable += 1u32;
+                        return Result::Err(FixedString256::from("no recovery action available"));
+                    },
+                }
+
+                self = self.record_residual(FAULT_RECOVERED,
+                                            FixedString256::from("fault recovered"),
+                                            FixedString64::from("recovery"),
+                                            classification.vector,
+                                            0u64, 0u64,
+                                            classification.severity);
+                Result::Ok(self)
+            },
+            Option::None => {
+                Result::Err(FixedString256::from("no fault classification available"))
+            },
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Crash Report Generation
+    // ──────────────────────────────────────────
+
+    /// Generate a complete crash report.
+    /// Effect: io, memory — formats and outputs report.
+    pub fn generate_crash_report(mut self) -> Result<FaultHandler, FixedString256>
+                                 [io, memory, diag] {
+        match self.current_fault {
+            Option::Some(ref ctx) => {
+                // Ensure stack unwind is done.
+                // (assume unwind_stack_from_fault was called)
+
+                // Record residual.
+                self = self.record_residual(FAULT_REPORT_GENERATED,
+                                            FixedString256::from("crash report generated"),
+                                            FixedString64::from("crash_report"),
+                                            ctx.vector,
+                                            ctx.fault_address,
+                                            ctx.instruction_pointer,
+                                            match self.current_classification {
+                                                Option::Some(ref c) => c.severity,
+                                                Option::None => FaultSeverity::Critical,
+                                            });
+                Result::Ok(self)
+            },
+            Option::None => {
+                Result::Err(FixedString256::from("no fault to generate report for"))
+            },
+        }
+    }
+
+    /// Format the crash report as a string.
+    /// Effect: io — string formatting.
+    pub fn format_crash_report(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("============================================\n"));
+        output.push_str(FixedString256::from("      PhorensicOS Kernel Fault Report\n"));
+        output.push_str(FixedString256::from("============================================\n\n"));
+
+        match self.current_fault {
+            Option::Some(ref ctx) => {
+                output.push_str(FixedString256::from("Fault Vector: "));
+                output.push_str(ctx.vector.name());
+                output.push_str(FixedString256::from(" (vector "));
+                output.push_u32(ctx.vector as u32);
+                output.push_str(FixedString256::from(")\n"));
+                output.push_str(FixedString256::from("Error Code: 0x"));
+                output.push_u64_hex(ctx.error_code);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("Fault Address: 0x"));
+                output.push_u64_hex(ctx.fault_address);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("Instruction Pointer: 0x"));
+                output.push_u64_hex(ctx.instruction_pointer);
+                output.push_str(FixedString256::from("\n\n"));
+
+                // Classification if available.
+                match self.current_classification {
+                    Option::Some(ref cls) => {
+                        output.push_str(FixedString256::from("Classification:\n"));
+                        output.push_str(FixedString256::from("  Description: "));
+                        output.push_str(cls.description);
+                        output.push_str(FixedString256::from("\n"));
+                        output.push_str(FixedString256::from("  Severity: "));
+                        output.push_str(cls.severity.name());
+                        output.push_str(FixedString256::from("\n"));
+                        output.push_str(FixedString256::from("  Recoverable: "));
+                        if cls.recoverable {
+                            output.push_str(FixedString256::from("Yes"));
+                        } else {
+                            output.push_str(FixedString256::from("No"));
+                        }
+                        output.push_str(FixedString256::from("\n"));
+                        output.push_str(FixedString256::from("  Recommended Action: "));
+                        output.push_str(cls.recommended_action.name());
+                        output.push_str(FixedString256::from("\n"));
+                        output.push_str(FixedString256::from("  Category: "));
+                        output.push_str(FixedString256::from_buffer(cls.cause_category));
+                        output.push_str(FixedString256::from("\n"));
+                        if cls.is_kernel_bug {
+                            output.push_str(FixedString256::from("  *** KERNEL BUG ***\n"));
+                        }
+                        output.push_str(FixedString256::from("\n"));
+                    },
+                    Option::None => {},
+                }
+
+                // Register dump.
+                output.push_str(self.format_register_dump());
+                output.push_str(FixedString256::from("\n"));
+
+                // Stack trace.
+                output.push_str(FixedString256::from("=== Stack Trace ===\n"));
+                // loop: bounds[BOUND_MEDIUM] — bounded by stack trace.
+                for var i : u32 = 0u32; i < ctx.stack_trace.len(); i += 1u32 [ctx.stack_trace.len()] {
+                    let frame : FaultStackFrame = ctx.stack_trace.get(i);
+                    output.push_str(FixedString256::from("  #"));
+                    output.push_u32(frame.frame_number);
+                    output.push_str(FixedString256::from(": 0x"));
+                    output.push_u64_hex(frame.instruction_pointer);
+                    if frame.symbol_name.len() > 0u32 {
+                        output.push_str(FixedString256::from(" "));
+                        output.push_str(frame.symbol_name);
+                    }
+                    output.push_str(FixedString256::from("\n"));
+                }
+                output.push_str(FixedString256::from("\n"));
+
+                // Statistics.
+                output.push_str(FixedString256::from("=== Fault Statistics ===\n"));
+                output.push_str(FixedString256::from("Total faults handled: "));
+                output.push_u32(self.total_faults_handled);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("Successful recoveries: "));
+                output.push_u32(self.total_recoveries);
+                output.push_str(FixedString256::from("\n"));
+                output.push_str(FixedString256::from("Unrecoverable faults: "));
+                output.push_u32(self.total_unrecoverable);
+                output.push_str(FixedString256::from("\n"));
+            },
+            Option::None => {
+                output.push_str(FixedString256::from("(no fault context available)\n"));
+            },
+        }
+
+        output.push_str(FixedString256::from("\n============================================\n"));
+        output.push_str(FixedString256::from("         End of Fault Report\n"));
+        output.push_str(FixedString256::from("============================================\n"));
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Panic Handler
+    // ──────────────────────────────────────────
+
+    /// Enter kernel panic state.
+    /// Effect: panic — halts the system.
+    pub fn kernel_panic(mut self) -> FaultHandler [panic, io, diag] {
+        // Generate final crash report.
+        let report : FixedString1024 = self.format_crash_report();
+
+        // Output report via serial.
+        __builtin_serial_write_string(report);
+
+        // Record final residual.
+        self = self.record_residual(FAULT_UNRECOVERABLE,
+                                    FixedString256::from("kernel panic"),
+                                    FixedString64::from("panic"),
+                                    match self.current_fault {
+                                        Option::Some(ref ctx) => ctx.vector,
+                                        Option::None => FaultVector::Reserved,
+                                    },
+                                    0u64, 0u64,
+                                    FaultSeverity::Critical);
+
+        // Halt the system.
+        __builtin_halt();
+
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Main Fault Handler Entry
+    // ──────────────────────────────────────────
+
+    /// Main entry point for handling a fault.
+    /// Effect: fault, debug, memory, panic, io, diag — full fault handling.
+    pub fn handle_fault(mut self, vector : FaultVector, error_code : u64,
+                        fault_address : u64, ip : u64,
+                        sp : u64) -> Result<FaultHandler, FixedString256>
+                        [fault, debug, memory, panic, io, diag] {
+        if !self.enabled {
+            return Result::Err(FixedString256::from("fault handler disabled"));
+        }
+
+        self.total_faults_handled += 1u32;
+
+        // Step 1: Capture registers.
+        self = self.capture_registers(vector, error_code, fault_address, ip, sp);
+
+        // Step 2: Record fault residual.
+        self = self.record_residual(FAULT_OCCURRED,
+                                    FixedString256::from("fault occurred"),
+                                    FixedString64::from("fault"),
+                                    vector, fault_address, ip,
+                                    FaultSeverity::Moderate);
+
+        // Step 3: Unwind stack.
+        self = self.unwind_stack_from_fault();
+
+        // Step 4: Classify the fault.
+        self = self.classify_fault();
+
+        // Step 5: Attempt recovery.
+        let recovery_result : Result<FaultHandler, FixedString256> = self.attempt_recovery();
+
+        match recovery_result {
+            Result::Ok(handler) => Result::Ok(handler),
+            Result::Err(msg) => {
+                // Generate crash report on failure.
+                self = self.generate_crash_report();
+                Result::Err(msg)
+            },
+        }
+    }
+}
+
+/// Implementation of FaultVector name method.
+impl FaultVector {
+    /// Get the name of this fault vector.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            FaultVector::DivideError => FixedString64::from("#DE"),
+            FaultVector::Debug => FixedString64::from("#DB"),
+            FaultVector::NMI => FixedString64::from("NMI"),
+            FaultVector::Breakpoint => FixedString64::from("#BP"),
+            FaultVector::Overflow => FixedString64::from("#OF"),
+            FaultVector::BoundRange => FixedString64::from("#BR"),
+            FaultVector::InvalidOpcode => FixedString64::from("#UD"),
+            FaultVector::DeviceNotAvailable => FixedString64::from("#NM"),
+            FaultVector::DoubleFault => FixedString64::from("#DF"),
+            FaultVector::CoprocessorSegment => FixedString64::from("#CS"),
+            FaultVector::InvalidTSS => FixedString64::from("#TS"),
+            FaultVector::SegmentNotPresent => FixedString64::from("#NP"),
+            FaultVector::StackSegment => FixedString64::from("#SS"),
+            FaultVector::GeneralProtection => FixedString64::from("#GP"),
+            FaultVector::PageFault => FixedString64::from("#PF"),
+            FaultVector::x87FPU => FixedString64::from("#MF"),
+            FaultVector::AlignmentCheck => FixedString64::from("#AC"),
+            FaultVector::MachineCheck => FixedString64::from("#MC"),
+            FaultVector::SIMD => FixedString64::from("#XM"),
+            FaultVector::Virtualization => FixedString64::from("#VE"),
+            FaultVector::ControlProtection => FixedString64::from("#CP"),
+            FaultVector::Security => FixedString64::from("#SX"),
+            _ => FixedString64::from("reserved"),
+        }
+    }
+}
+
+/// Implementation of PageFaultType name method.
+impl PageFaultType {
+    /// Get the name of this page fault type.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            PageFaultType::NotPresent => FixedString64::from("not-present"),
+            PageFaultType::ProtectionViolation => FixedString64::from("protection"),
+            PageFaultType::ReservedBit => FixedString64::from("reserved-bit"),
+            PageFaultType::InstructionFetch => FixedString64::from("NX-execute"),
+            PageFaultType::ProtectionKey => FixedString64::from("protection-key"),
+            PageFaultType::ShadowStack => FixedString64::from("shadow-stack"),
+            PageFaultType::SGX => FixedString64::from("SGX"),
+        }
+    }
+}
+
+/// Implementation of FaultSeverity name method.
+impl FaultSeverity {
+    /// Get the name of this severity level.
+    /// Effect: pure — deterministic string selection.
+    pub fn name(&self) -> FixedString64 [pure] {
+        match self {
+            FaultSeverity::Minor => FixedString64::from("minor"),
+            FaultSeverity::Moderate => FixedString64::from("moderate"),
+            FaultSeverity::Severe => FixedString64::from("severe"),
+            FaultSeverity::Critical => FixedString64::from("critical"),
+        }
+    }
+}
+
+    /// Implementation of RecoveryAction name method.
+    impl RecoveryAction {
+        /// Get the name of this recovery action.
+        /// Effect: pure — deterministic string selection.
+        pub fn name(&self) -> FixedString64 [pure] {
+            match self {
+                RecoveryAction::None => FixedString64::from("none"),
+                RecoveryAction::SkipInstruction => FixedString64::from("skip-instruction"),
+                RecoveryAction::Fixup => FixedString64::from("fixup"),
+                RecoveryAction::TerminateThread => FixedString64::from("terminate-thread"),
+                RecoveryAction::SignalProcess => FixedString64::from("signal-process"),
+                RecoveryAction::Panic => FixedString64::from("panic"),
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Fault Context Queries
+    // ──────────────────────────────────────────────
+
+    /// Get a string describing what kind of instruction caused the fault.
+    /// Effect: memory — reads faulting instruction bytes.
+    pub fn get_fault_instruction_summary(ctx : FaultContext) -> FixedString256 [memory] {
+        var result : FixedString256 = FixedString256::new();
+        let ip : u64 = ctx.instruction_pointer;
+        let first_byte : u8 = __builtin_read_byte(ip);
+
+        result.push_str(FixedString256::from("Faulting IP: 0x"));
+        result.push_u64_hex(ip);
+        result.push_str(FixedString256::from(", first byte: 0x"));
+        result.push_u8_hex(first_byte);
+
+        // Common opcode descriptions.
+        if first_byte == 0x0Fu8 {
+            result.push_str(FixedString256::from(" (two-byte opcode)"));
+        } else if first_byte >= 0x88u8 && first_byte <= 0x8Bu8 {
+            result.push_str(FixedString256::from(" (MOV memory access)"));
+        } else if first_byte == 0xE8u8 {
+            result.push_str(FixedString256::from(" (CALL)"));
+        } else if first_byte == 0xFFu8 {
+            result.push_str(FixedString256::from(" (indirect call/jump)"));
+        } else if first_byte == 0xCCu8 {
+            result.push_str(FixedString256::from(" (INT3)"));
+        } else if first_byte == 0xC3u8 {
+            result.push_str(FixedString256::from(" (RET)"));
+        }
+
+        result
+    }
+
+    /// Check if a fault is likely a kernel NULL pointer dereference.
+    /// Effect: pure — heuristic check.
+    pub fn is_null_pointer_fault(ctx : FaultContext) -> bool [pure] {
+        if ctx.vector == FaultVector::PageFault {
+            ctx.fault_address < 0x1000u64
+        } else {
+            false
+        }
+    }
+
+    /// Check if a fault was in interrupt context.
+    /// Effect: pure — context check.
+    pub fn is_interrupt_context(ctx : FaultContext) -> bool [pure] {
+        (ctx.rflags & 0x200u64) != 0u64 // IF flag
+    }
+
+    /// Check if the faulting access was a write.
+    /// Effect: pure — access type.
+    pub fn was_write_fault(ctx : FaultContext) -> bool [pure] {
+        if ctx.vector == FaultVector::PageFault {
+            (ctx.page_fault_access_type & 0x02u8) != 0u8
+        } else {
+            false
+        }
+    }
+
+    /// Determine the privilege level of the fault.
+    /// Effect: pure — CPL extraction.
+    pub fn fault_privilege_level(ctx : FaultContext) -> u8 [pure] {
+        (ctx.cs & 0x3u64) as u8
+    }
+
+    /// Try to read the instruction bytes at the faulting address.
+    /// Effect: memory — reads instruction bytes.
+    pub fn read_fault_instruction(ctx : FaultContext) -> Array16<u8> [memory] {
+        mut bytes : Array16<u8> = Array16::new();
+        for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+            let byte : u8 = __builtin_read_byte(ctx.instruction_pointer + i as u64);
+            let _ = bytes.push(byte);
+        }
+        bytes
+    }
+
+    /// Format fault instruction bytes as a hex string.
+    /// Effect: pure — formatting.
+    pub fn format_fault_bytes(bytes : Array16<u8>) -> FixedString256 [pure] {
+        mut result : FixedString256 = FixedString256::new();
+        for var i : u32 = 0u32; i < bytes.len(); i += 1u32 [bytes.len()] {
+            result.push_u8_hex(bytes.get(i));
+            result.push_str(FixedString256::from(" "));
+        }
+        result
+    }
+
+    /// Get a short description of the fault for logging.
+    /// Effect: pure — description.
+    pub fn fault_short_description(ctx : FaultContext) -> FixedString256 [pure] {
+        mut desc : FixedString256 = FixedString256::new();
+        desc.push_str(FixedString256::from("Fault "));
+        desc.push_str(ctx.vector.name());
+        if ctx.fault_address != 0u64 {
+            desc.push_str(FixedString256::from(" at 0x"));
+            desc.push_u64_hex(ctx.fault_address);
+        }
+        if ctx.user_mode {
+            desc.push_str(FixedString256::from(" (user)"));
+        } else {
+            desc.push_str(FixedString256::from(" (kernel)"));
+        }
+        desc
+    }
+
+    /// Check if the fault was due to a kernel stack overflow.
+    /// Effect: pure — heuristic check.
+    pub fn is_kernel_stack_overflow(ctx : FaultContext) -> bool [pure] {
+        if ctx.vector == FaultVector::PageFault {
+            let stack_top : u64 = 0xFFFF800000000000u64;
+            ctx.fault_address >= stack_top - 0x10000u64 && ctx.fault_address <= stack_top
+        } else {
+            false
+        }
+    }
+
+    /// Get the CPU vendor string for fault reporting.
+    /// Effect: pure — vendor string.
+    pub fn cpu_vendor_string() -> FixedString64 [pure] {
+        // Simplified: always return a common value.
+        FixedString64::from("GenuineIntel")
+    }
+
+    /// Get the number of fault handlers registered.
+    /// Effect: pure — count.
+    pub fn fault_handler_count(handler : FaultHandler) -> u32 [pure] {
+        handler.total_faults_handled
+    }
+
+    /// Print a fault summary to the debug console.
+    /// Effect: io — serial output.
+    pub fn print_fault_summary(handler : FaultHandler) [io] {
+        let report : FixedString1024 = handler.format_crash_report();
+        __builtin_serial_write_string(report);
+    }
+
+    /// Reset the fault handler statistics.
+    /// Effect: pure — reset.
+    pub fn reset_fault_stats(mut handler : FaultHandler) -> FaultHandler [pure] {
+        handler.total_faults_handled = 0u32;
+        handler.total_recoveries = 0u32;
+        handler.total_unrecoverable = 0u32;
+        handler.current_fault = Option::None;
+        handler.current_classification = Option::None;
+        handler
+    }
+
+    /// Check if a fault was a fatal page fault in kernel code.
+    /// Effect: pure — check.
+    pub fn is_fatal_kernel_pf(ctx : FaultContext) -> bool [pure] {
+        if ctx.vector != FaultVector::PageFault { return false; }
+        if ctx.user_mode { return false; }
+        true
+    }
+
+    /// Check if the fault address is in the NULL page region.
+    /// Effect: pure — check.
+    pub fn is_null_page_fault(ctx : FaultContext) -> bool [pure] {
+        ctx.fault_address < 0x10000u64
+    }
+
+    /// Check if the fault address is in the stack region.
+    /// Effect: pure — check.
+    pub fn is_stack_fault(ctx : FaultContext) -> bool [pure] {
+        let sp : u64 = ctx.rsp;
+        let diff : u64 = if ctx.fault_address > sp { ctx.fault_address - sp } else { sp - ctx.fault_address };
+        diff < 0x10000u64
+    }
+
+    /// Determine if recovery was successful from a fault.
+    /// Effect: pure — outcome check.
+    pub fn recovery_succeeded(handler : FaultHandler) -> bool [pure] {
+        match handler.current_classification {
+            Option::Some(ref cls) => cls.recoverable,
+            Option::None => false,
+        }
+    }
+
+    /// Get the failure message from a fault.
+    /// Effect: pure — message.
+    pub fn fault_failure_message(handler : FaultHandler) -> FixedString256 [pure] {
+        match handler.current_classification {
+            Option::Some(ref cls) => cls.description,
+            Option::None => FixedString256::from("unknown fault"),
+        }
+    }
+
+    /// Check if the current fault was handled by terminating the thread.
+    /// Effect: pure — check.
+    pub fn was_thread_terminated(handler : FaultHandler) -> bool [pure] {
+        match handler.current_classification {
+            Option::Some(ref cls) => cls.recommended_action == RecoveryAction::TerminateThread,
+            Option::None => false,
+        }
+    }

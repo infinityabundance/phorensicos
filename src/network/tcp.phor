@@ -1,0 +1,1557 @@
+// tcp.phor — TCP: connection state machine (11 states), sequence/ack numbers, window management,
+//          congestion control (slow start, congestion avoidance, fast retransmit), segment parsing,
+//          retransmission, timers
+// Implements RFC 9293 Transmission Control Protocol with residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/tcp.phor
+// Court: tcp:v1
+
+package network.tcp;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ipv4.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// TCP sub-range: 0xE600 - 0xE6FF
+
+type TcpError = enum {
+    TcpSegmentTooShort      = 0xE600,  // NE600: TCP segment shorter than 20 bytes
+    TcpInvalidOffset        = 0xE601,  // NE601: Invalid data offset field
+    TcpChecksumMismatch     = 0xE602,  // NE602: TCP checksum mismatch
+    TcpPortInUse            = 0xE603,  // NE603: Port already in use
+    TcpPortNotOpen          = 0xE604,  // NE604: Port not open
+    TcpPortTableFull        = 0xE605,  // NE605: TCP port table at capacity
+    TcpConnectionNotFound   = 0xE606,  // NE606: TCP connection not found
+    TcpConnectionTableFull  = 0xE607,  // NE607: TCP connection table at capacity
+    TcpConnectionReset      = 0xE608,  // NE608: Connection reset by peer
+    TcpConnectionRefused    = 0xE609,  // NE609: Connection refused
+    TcpConnectionTimeout    = 0xE60A,  // NE60A: Connection timed out
+    TcpConnectionAborted    = 0xE60B,  // NE60B: Connection aborted
+    TcpSendBufferFull       = 0xE60C,  // NE60C: Send buffer full
+    TcpRecvBufferFull       = 0xE60D,  // NE60D: Receive buffer full
+    TcpRecvBufferEmpty      = 0xE60E,  // NE60E: Receive buffer empty
+    TcpInvalidState         = 0xE60F,  // NE60F: Invalid state for operation
+    TcpSeqMismatch          = 0xE610,  // NE610: Sequence number mismatch
+    TcpAckMismatch          = 0xE611,  // NE611: Acknowledgment number mismatch
+    TcpWindowOverflow       = 0xE612,  // NE612: Window scale overflow
+    TcpSynRetransmit        = 0xE613,  // NE613: SYN retransmission timeout
+    TcpCapabilityError      = 0xE614,  // NE614: Insufficient capability
+    TcpRetransmitTimeout    = 0xE615,  // NE615: Retransmission timeout
+    TcpKeepaliveTimeout     = 0xE616,  // NE616: Keepalive timeout
+    TcpFinWaitTimeout       = 0xE617,  // NE617: FIN-WAIT timeout
+    TcpOptionUnknown        = 0xE618,  // NE618: Unknown TCP option
+    TcpBufferOverflow       = 0xE619,  // NE619: Buffer overflow
+    TcpMssExceeded           = 0xE61A,  // NE61A: Segment exceeds MSS
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const TCP_HDR_MIN_LEN       : u64 = 20;
+const TCP_HDR_MAX_LEN       : u64 = 60;
+const TCP_DEFAULT_WINDOW    : u32 = 65535;
+const TCP_MAX_WINDOW        : u32 = 65535;
+const TCP_MSS_MIN           : u16 = 536;
+const TCP_MSS_DEFAULT       : u16 = 1460;
+const TCP_MSS_MAX           : u16 = 65535;
+const TCP_INITIAL_CWND      : u32 = 10;
+const TCP_MAX_CWND          : u32 = 65535;
+const TCP_SSTHRESH_INIT     : u32 = 65535;
+const TCP_RTO_INIT_MS       : u64 = 1000;
+const TCP_RTO_MIN_MS        : u64 = 200;
+const TCP_RTO_MAX_MS        : u64 = 120000;
+const TCP_SYN_RTO_MS        : u64 = 1000;
+const TCP_SYN_MAX_RETRIES   : u64 = 6;
+const TCP_MAX_RETRIES       : u64 = 12;
+const TCP_KEEPALIVE_IDLE_MS : u64 = 7200000;
+const TCP_KEEPALIVE_INT_MS  : u64 = 75000;
+const TCP_KEEPALIVE_MAX     : u64 = 9;
+const TCP_FIN_WAIT2_MS      : u64 = 60000;
+const TCP_TIME_WAIT_MS      : u64 = 60000;
+const TCP_SEND_BUF_SIZE     : u64 = 65536;
+const TCP_RECV_BUF_SIZE     : u64 = 65536;
+const TCP_MAX_CONNECTIONS   : u64 = 256;
+const TCP_MAX_SEGMENTS      : u64 = 64;
+const TCP_MAX_OPTIONS       : u64 = 10;
+const TCP_MAX_LISTEN_BACKLOG: u64 = 128;
+
+// ─────────────────────────────────────────────────────────────
+// TCP Flags
+// ─────────────────────────────────────────────────────────────
+
+const TCP_FLAG_FIN : u8 = 0x01;
+const TCP_FLAG_SYN : u8 = 0x02;
+const TCP_FLAG_RST : u8 = 0x04;
+const TCP_FLAG_PSH : u8 = 0x08;
+const TCP_FLAG_ACK : u8 = 0x10;
+const TCP_FLAG_URG : u8 = 0x20;
+const TCP_FLAG_ECE : u8 = 0x40;
+const TCP_FLAG_CWR : u8 = 0x80;
+
+// ─────────────────────────────────────────────────────────────
+// TCP States (11-state machine)
+// ─────────────────────────────────────────────────────────────
+
+type TcpState = enum {
+    Closed          = 0,
+    Listen          = 1,
+    SynSent         = 2,
+    SynReceived     = 3,
+    Established     = 4,
+    FinWait1        = 5,
+    FinWait2        = 6,
+    CloseWait       = 7,
+    Closing         = 8,
+    LastAck         = 9,
+    TimeWait        = 10,
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Options
+// ─────────────────────────────────────────────────────────────
+
+type TcpOptionKind = enum {
+    OptEnd          = 0,
+    OptNop          = 1,
+    OptMss          = 2,
+    OptWScale       = 3,
+    OptSackPerm     = 4,
+    OptSack         = 5,
+    OptTimestamp    = 8,
+    OptMptcp        = 30,
+    OptFastOpen     = 34,
+}
+
+struct TcpOption {
+    kind: u8,
+    length: u8,
+    data: Array(u8, 8),
+    data_len: u64,
+}
+
+impl TcpOption {
+    fn mss(mss: u16) -> TcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 8) = Array::zeroed();
+        data[0] = ((mss >> 8) & 0xFF) as u8;
+        data[1] = (mss & 0xFF) as u8;
+        return TcpOption { kind: 2, length: 4, data: data, data_len: 2 };
+    }
+
+    fn window_scale(shift: u8) -> TcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 8) = Array::zeroed();
+        data[0] = shift;
+        return TcpOption { kind: 3, length: 3, data: data, data_len: 1 };
+    }
+
+    fn sack_permitted() -> TcpOption
+        effect [deterministic]
+    {
+        return TcpOption { kind: 4, length: 2, data: Array::zeroed(), data_len: 0 };
+    }
+
+    fn timestamp(ts_val: u32, ts_echo_reply: u32) -> TcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 8) = Array::zeroed();
+        data[0] = ((ts_val >> 24) & 0xFF) as u8;
+        data[1] = ((ts_val >> 16) & 0xFF) as u8;
+        data[2] = ((ts_val >> 8) & 0xFF) as u8;
+        data[3] = (ts_val & 0xFF) as u8;
+        data[4] = ((ts_echo_reply >> 24) & 0xFF) as u8;
+        data[5] = ((ts_echo_reply >> 16) & 0xFF) as u8;
+        data[6] = ((ts_echo_reply >> 8) & 0xFF) as u8;
+        data[7] = (ts_echo_reply & 0xFF) as u8;
+        return TcpOption { kind: 8, length: 10, data: data, data_len: 8 };
+    }
+
+    fn nop() -> TcpOption
+        effect [deterministic]
+    {
+        return TcpOption { kind: 1, length: 1, data: Array::zeroed(), data_len: 0 };
+    }
+
+    fn end() -> TcpOption
+        effect [deterministic]
+    {
+        return TcpOption { kind: 0, length: 1, data: Array::zeroed(), data_len: 0 };
+    }
+
+    fn parse(data: Array(u8, 1518), offset: u64, remaining: u64) -> Result(TcpOption, TcpError)
+        effect [deterministic]
+    {
+        if remaining < 1 {
+            return Result::Err(TcpError::TcpOptionUnknown);
+        };
+        let kind: u8 = data[offset];
+        if kind == 0 || kind == 1 {
+            return Result::Ok(TcpOption { kind: kind, length: 1, data: Array::zeroed(), data_len: 0 });
+        };
+        if remaining < 2 {
+            return Result::Err(TcpError::TcpOptionUnknown);
+        };
+        let length: u8 = data[offset + 1];
+        if length < 2 || (length as u64) > remaining {
+            return Result::Err(TcpError::TcpOptionUnknown);
+        };
+        let data_len: u64 = (length as u64) - 2;
+        let mut opt_data: Array(u8, 8) = Array::zeroed();
+        loop bound 8 {
+            if i >= data_len {
+                break;
+            };
+            opt_data[i] = data[offset + 2 + i];
+        };
+        return Result::Ok(TcpOption {
+            kind: kind,
+            length: length,
+            data: opt_data,
+            data_len: data_len,
+        });
+    }
+
+    fn parse_mss(data: Array(u8, 8)) -> u16
+        effect [deterministic]
+    {
+        return ((data[0] as u16) << 8) | (data[1] as u16);
+    }
+
+    fn parse_wscale(data: Array(u8, 8)) -> u8
+        effect [deterministic]
+    {
+        return data[0];
+    }
+
+    fn parse_ts(data: Array(u8, 8)) -> (u32, u32)
+        effect [deterministic]
+    {
+        let ts_val: u32 = ((data[0] as u32) << 24) | ((data[1] as u32) << 16) |
+                          ((data[2] as u32) << 8) | (data[3] as u32);
+        let ts_echo: u32 = ((data[4] as u32) << 24) | ((data[5] as u32) << 16) |
+                           ((data[6] as u32) << 8) | (data[7] as u32);
+        return (ts_val, ts_echo);
+    }
+
+    fn serialize(self, buf: ref mut Array(u8, 1518), offset: ref mut u64)
+        effect [deterministic]
+    {
+        buf[*offset] = self.kind;
+        if self.kind == 0 || self.kind == 1 {
+            *offset = *offset + 1;
+            return;
+        };
+        buf[*offset + 1] = self.length;
+        loop bound 8 {
+            if i >= self.data_len {
+                break;
+            };
+            buf[*offset + 2 + i] = self.data[i];
+        };
+        *offset = *offset + (self.length as u64);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Header
+// ─────────────────────────────────────────────────────────────
+
+struct TcpHeader {
+    source_port: u16,
+    dest_port: u16,
+    sequence_number: u32,
+    ack_number: u32,
+    data_offset: u8,     // 4 bits, upper nibble
+    flags: u8,
+    window_size: u16,
+    checksum: u16,
+    urgent_pointer: u16,
+    options: Array(TcpOption, TCP_MAX_OPTIONS),
+    option_count: u64,
+}
+
+impl TcpHeader {
+    fn new(src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, window: u16) -> TcpHeader
+        effect [deterministic]
+    {
+        return TcpHeader {
+            source_port: src_port,
+            dest_port: dst_port,
+            sequence_number: seq,
+            ack_number: ack,
+            data_offset: (TCP_HDR_MIN_LEN as u8) << 2,
+            flags: flags,
+            window_size: window,
+            checksum: 0,
+            urgent_pointer: 0,
+            options: Array::zeroed(),
+            option_count: 0,
+        };
+    }
+
+    fn header_length(self) -> u64
+        effect [deterministic]
+    {
+        return ((self.data_offset >> 2) & 0x3F) as u64;
+    }
+
+    fn set_header_length(self: ref mut, len: u64)
+        effect [deterministic]
+    {
+        self.data_offset = ((len as u8) << 2) & 0xFC;
+    }
+
+    fn add_option(self: ref mut, opt: TcpOption) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        if self.option_count >= TCP_MAX_OPTIONS {
+            return Result::Err(TcpError::TcpOptionUnknown);
+        };
+        let new_hdr_len: u64 = self.header_length() + (opt.length as u64);
+        if new_hdr_len > TCP_HDR_MAX_LEN {
+            return Result::Err(TcpError::TcpOptionUnknown);
+        };
+        self.options[self.option_count] = opt;
+        self.option_count = self.option_count + 1;
+        self.set_header_length(new_hdr_len);
+        return Result::Ok(void);
+    }
+
+    fn compute_checksum(self, src_ip: Array(u8, 4), dst_ip: Array(u8, 4),
+                        payload: Array(u8, TCP_SEND_BUF_SIZE), payload_len: u64) -> u16
+        effect [deterministic]
+        court "tcp_checksum:v1"
+    {
+        let mut sum: u32 = 0;
+        let segment_len: u64 = self.header_length() + payload_len;
+        // Pseudo-header
+        let src_hi: u16 = ((src_ip[0] as u16) << 8) | (src_ip[1] as u16);
+        let src_lo: u16 = ((src_ip[2] as u16) << 8) | (src_ip[3] as u16);
+        let dst_hi: u16 = ((dst_ip[0] as u16) << 8) | (dst_ip[1] as u16);
+        let dst_lo: u16 = ((dst_ip[2] as u16) << 8) | (dst_ip[3] as u16);
+        let zero: u16 = 0;
+        let proto: u16 = 6;
+        sum = sum + src_hi as u32;
+        sum = sum + src_lo as u32;
+        sum = sum + dst_hi as u32;
+        sum = sum + dst_lo as u32;
+        sum = sum + zero as u32;
+        sum = sum + proto as u32;
+        let len_hi: u16 = ((segment_len >> 16) & 0xFFFF) as u16;
+        let len_lo: u16 = (segment_len & 0xFFFF) as u16;
+        sum = sum + len_hi as u32;
+        sum = sum + len_lo as u32;
+        // TCP header
+        sum = sum + ((self.source_port as u32) << 8) | (self.source_port as u32 >> 8);
+        sum = sum + ((self.dest_port as u32) << 8) | (self.dest_port as u32 >> 8);
+        let seq_hi: u16 = ((self.sequence_number >> 16) & 0xFFFF) as u16;
+        let seq_lo: u16 = (self.sequence_number & 0xFFFF) as u16;
+        sum = sum + seq_hi as u32 + seq_lo as u32;
+        let ack_hi: u16 = ((self.ack_number >> 16) & 0xFFFF) as u16;
+        let ack_lo: u16 = (self.ack_number & 0xFFFF) as u16;
+        sum = sum + ack_hi as u32 + ack_lo as u32;
+        sum = sum + ((self.data_offset as u32) << 8) | (self.flags as u32);
+        sum = sum + ((self.window_size as u32) << 8) | (self.window_size as u32 >> 8);
+        sum = sum + 0; // checksum field zeroed
+        sum = sum + ((self.urgent_pointer as u32) << 8) | (self.urgent_pointer as u32 >> 8);
+        // Options (as 16-bit words)
+        let mut opt_offset: u64 = TCP_HDR_MIN_LEN;
+        loop bound TCP_MAX_OPTIONS {
+            if i >= self.option_count {
+                break;
+            };
+            let opt: TcpOption = self.options[i];
+            if opt.kind == 0 || opt.kind == 1 {
+                let byte0: u16 = opt.kind as u16;
+                sum = sum + (byte0 << 8) as u32;
+            } else {
+                let byte0: u16 = opt.kind as u16;
+                let byte1: u16 = opt.length as u16;
+                sum = sum + ((byte0 << 8) | byte1) as u32;
+            };
+        };
+        // Payload
+        let mut idx: u64 = 0;
+        loop bound (TCP_SEND_BUF_SIZE / 2) {
+            if (idx * 2) >= payload_len {
+                break;
+            };
+            let byte0: u16 = if idx * 2 < payload_len {
+                payload[idx * 2] as u16
+            } else { 0 };
+            let byte1: u16 = if (idx * 2 + 1) < payload_len {
+                payload[idx * 2 + 1] as u16
+            } else { 0 };
+            sum = sum + ((byte0 << 8) | byte1) as u32;
+        };
+        loop bound 4 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        };
+        return (!(sum as u16)) as u16;
+    }
+
+    fn parse(data: Array(u8, 1518), len: u64) -> Result(TcpHeader, TcpError)
+        effect [deterministic]
+        court "tcp_header_parse:v1"
+    {
+        if len < TCP_HDR_MIN_LEN {
+            return Result::Err(TcpError::TcpSegmentTooShort);
+        };
+        let src_port: u16 = ((data[0] as u16) << 8) | (data[1] as u16);
+        let dst_port: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        let seq_num: u32 = ((data[4] as u32) << 24) | ((data[5] as u32) << 16) |
+                           ((data[6] as u32) << 8) | (data[7] as u32);
+        let ack_num: u32 = ((data[8] as u32) << 24) | ((data[9] as u32) << 16) |
+                           ((data[10] as u32) << 8) | (data[11] as u32);
+        let data_offset: u8 = (data[12] >> 2) & 0x3F;
+        let hdr_len: u64 = data_offset as u64;
+        if hdr_len < TCP_HDR_MIN_LEN || hdr_len > TCP_HDR_MAX_LEN {
+            return Result::Err(TcpError::TcpInvalidOffset);
+        };
+        if hdr_len > len {
+            return Result::Err(TcpError::TcpSegmentTooShort);
+        };
+        let flags: u8 = data[13];
+        let window: u16 = ((data[14] as u16) << 8) | (data[15] as u16);
+        let checksum: u16 = ((data[16] as u16) << 8) | (data[17] as u16);
+        let urg_ptr: u16 = ((data[18] as u16) << 8) | (data[19] as u16);
+        // Parse options
+        let mut options: Array(TcpOption, TCP_MAX_OPTIONS) = Array::zeroed();
+        let mut opt_count: u64 = 0;
+        if hdr_len > TCP_HDR_MIN_LEN {
+            let mut opt_offset: u64 = TCP_HDR_MIN_LEN;
+            loop bound TCP_MAX_OPTIONS {
+                if opt_offset >= hdr_len {
+                    break;
+                };
+                let remaining: u64 = hdr_len - opt_offset;
+                let opt_res: Result(TcpOption, TcpError) = TcpOption::parse(data, opt_offset, remaining);
+                if opt_res.is_err() {
+                    break;
+                };
+                let opt: TcpOption = opt_res.unwrap();
+                if opt_count < TCP_MAX_OPTIONS {
+                    options[opt_count] = opt;
+                    opt_count = opt_count + 1;
+                };
+                if opt.kind == 0 {
+                    break;
+                } else if opt.kind == 1 {
+                    opt_offset = opt_offset + 1;
+                } else {
+                    opt_offset = opt_offset + (opt.length as u64);
+                };
+            };
+        };
+        return Result::Ok(TcpHeader {
+            source_port: src_port,
+            dest_port: dst_port,
+            sequence_number: seq_num,
+            ack_number: ack_num,
+            data_offset: (data_offset << 2) as u8,
+            flags: flags,
+            window_size: window,
+            checksum: checksum,
+            urgent_pointer: urg_ptr,
+            options: options,
+            option_count: opt_count,
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, 1518), TcpError)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, 1518) = Array::zeroed();
+        buf[0] = ((self.source_port >> 8) & 0xFF) as u8;
+        buf[1] = (self.source_port & 0xFF) as u8;
+        buf[2] = ((self.dest_port >> 8) & 0xFF) as u8;
+        buf[3] = (self.dest_port & 0xFF) as u8;
+        buf[4] = ((self.sequence_number >> 24) & 0xFF) as u8;
+        buf[5] = ((self.sequence_number >> 16) & 0xFF) as u8;
+        buf[6] = ((self.sequence_number >> 8) & 0xFF) as u8;
+        buf[7] = (self.sequence_number & 0xFF) as u8;
+        buf[8] = ((self.ack_number >> 24) & 0xFF) as u8;
+        buf[9] = ((self.ack_number >> 16) & 0xFF) as u8;
+        buf[10] = ((self.ack_number >> 8) & 0xFF) as u8;
+        buf[11] = (self.ack_number & 0xFF) as u8;
+        buf[12] = self.data_offset;
+        buf[13] = self.flags;
+        buf[14] = ((self.window_size >> 8) & 0xFF) as u8;
+        buf[15] = (self.window_size & 0xFF) as u8;
+        buf[16] = ((self.checksum >> 8) & 0xFF) as u8;
+        buf[17] = (self.checksum & 0xFF) as u8;
+        buf[18] = ((self.urgent_pointer >> 8) & 0xFF) as u8;
+        buf[19] = (self.urgent_pointer & 0xFF) as u8;
+        let mut offset: u64 = TCP_HDR_MIN_LEN;
+        loop bound TCP_MAX_OPTIONS {
+            if i >= self.option_count {
+                break;
+            };
+            self.options[i].serialize(buf, offset);
+            offset = offset + (self.options[i].length as u64);
+        };
+        // Pad to 32-bit boundary
+        loop bound 4 {
+            if offset >= self.header_length() {
+                break;
+            };
+            buf[offset] = 0;
+            offset = offset + 1;
+        };
+        return Result::Ok(buf);
+    }
+
+    fn is_flag_set(self, flag: u8) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & flag) != 0;
+    }
+
+    fn has_syn(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & TCP_FLAG_SYN) != 0;
+    }
+
+    fn has_ack(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & TCP_FLAG_ACK) != 0;
+    }
+
+    fn has_fin(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & TCP_FLAG_FIN) != 0;
+    }
+
+    fn has_rst(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & TCP_FLAG_RST) != 0;
+    }
+
+    fn has_psh(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & TCP_FLAG_PSH) != 0;
+    }
+
+    fn has_urg(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & TCP_FLAG_URG) != 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Segment (Header + Payload)
+// ─────────────────────────────────────────────────────────────
+
+struct TcpSegment {
+    header: TcpHeader,
+    payload: Array(u8, TCP_SEND_BUF_SIZE),
+    payload_length: u64,
+}
+
+impl TcpSegment {
+    fn new(header: TcpHeader, payload_data: Array(u8, TCP_SEND_BUF_SIZE), payload_len: u64) -> TcpSegment
+        effect [deterministic]
+    {
+        return TcpSegment {
+            header: header,
+            payload: payload_data,
+            payload_length: payload_len,
+        };
+    }
+
+    fn parse(raw: Array(u8, 1518), len: u64) -> Result(TcpSegment, TcpError)
+        effect [deterministic]
+    {
+        let hdr_res: Result(TcpHeader, TcpError) = TcpHeader::parse(raw, len);
+        if hdr_res.is_err() {
+            return Result::Err(hdr_res.unwrap_err());
+        };
+        let hdr: TcpHeader = hdr_res.unwrap();
+        let hdr_len: u64 = hdr.header_length();
+        let payload_len: u64 = if len > hdr_len { len - hdr_len } else { 0 };
+        let mut payload: Array(u8, TCP_SEND_BUF_SIZE) = Array::zeroed();
+        loop bound TCP_SEND_BUF_SIZE {
+            if i >= payload_len {
+                break;
+            };
+            payload[i] = raw[hdr_len + i];
+        };
+        return Result::Ok(TcpSegment {
+            header: hdr,
+            payload: payload,
+            payload_length: payload_len,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Connection Control Block (TCB)
+// ─────────────────────────────────────────────────────────────
+
+struct TcpSendBuffer {
+    data: Array(u8, TCP_SEND_BUF_SIZE),
+    size: u64,
+    unacked_start: u32,  // SND.UNA
+    next_seq: u32,       // SND.NXT
+    window: u32,         // SND.WND
+    wl1: u32,            // SEG.SEQ
+    wl2: u32,            // SEG.ACK
+}
+
+impl TcpSendBuffer {
+    fn new(iss: u32) -> TcpSendBuffer
+        effect [deterministic]
+    {
+        return TcpSendBuffer {
+            data: Array::zeroed(),
+            size: 0,
+            unacked_start: iss,
+            next_seq: iss,
+            window: TCP_DEFAULT_WINDOW,
+            wl1: 0,
+            wl2: 0,
+        };
+    }
+
+    fn available(self) -> u64
+        effect [deterministic]
+    {
+        return TCP_SEND_BUF_SIZE - self.size;
+    }
+
+    fn unacked_count(self) -> u32
+        effect [deterministic]
+    {
+        return self.next_seq - self.unacked_start;
+    }
+
+    fn can_send(self, mss: u16) -> bool
+        effect [deterministic]
+    {
+        return self.size < TCP_SEND_BUF_SIZE;
+    }
+}
+
+struct TcpRecvBuffer {
+    data: Array(u8, TCP_RECV_BUF_SIZE),
+    size: u64,
+    rcv_nxt: u32,        // RCV.NXT
+    rcv_wnd: u32,        // RCV.WND
+    irs: u32,            // Initial Receive Sequence Number
+}
+
+impl TcpRecvBuffer {
+    fn new(irs: u32, window: u32) -> TcpRecvBuffer
+        effect [deterministic]
+    {
+        return TcpRecvBuffer {
+            data: Array::zeroed(),
+            size: 0,
+            rcv_nxt: irs + 1,
+            rcv_wnd: window,
+            irs: irs,
+        };
+    }
+
+    fn available(self) -> u64
+        effect [deterministic]
+    {
+        return self.size;
+    }
+
+    fn space(self) -> u64
+        effect [deterministic]
+    {
+        return TCP_RECV_BUF_SIZE - self.size;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Congestion Control State
+// ─────────────────────────────────────────────────────────────
+
+type TcpCongestionState = enum {
+    SlowStart       = 0,
+    CongAvoidance   = 1,
+    FastRecovery    = 2,
+}
+
+struct TcpCongestionControl {
+    state: TcpCongestionState,
+    cwnd: u32,              // Congestion window (in segments)
+    ssthresh: u32,          // Slow start threshold
+    duplicate_acks: u64,    // Duplicate ACK counter
+    rtt_estimate: u64,      // Smoothed RTT (ms)
+    rtt_deviation: u64,     // RTT variance
+    rto: u64,               // Retransmission timeout (ms)
+    mss: u16,               // Maximum segment size
+}
+
+impl TcpCongestionControl {
+    fn new(mss: u16) -> TcpCongestionControl
+        effect [deterministic]
+    {
+        return TcpCongestionControl {
+            state: TcpCongestionState::SlowStart,
+            cwnd: TCP_INITIAL_CWND,
+            ssthresh: TCP_SSTHRESH_INIT,
+            duplicate_acks: 0,
+            rtt_estimate: 0,
+            rtt_deviation: 0,
+            rto: TCP_RTO_INIT_MS,
+            mss: mss,
+        };
+    }
+
+    fn ack_received(self: ref mut, dup: bool)
+        effect [deterministic]
+    {
+        if dup {
+            self.duplicate_acks = self.duplicate_acks + 1;
+            if self.duplicate_acks >= 3 {
+                // Fast retransmit
+                if self.state != TcpCongestionState::FastRecovery {
+                    self.ssthresh = if self.cwnd > 1 { self.cwnd / 2 } else { 1 };
+                    self.cwnd = self.ssthresh + 3;
+                    self.state = TcpCongestionState::FastRecovery;
+                };
+            };
+            return;
+        };
+        self.duplicate_acks = 0;
+        if self.state == TcpCongestionState::FastRecovery {
+            self.cwnd = self.ssthresh;
+            self.state = TcpCongestionState::CongAvoidance;
+            return;
+        };
+        if self.state == TcpCongestionState::SlowStart {
+            self.cwnd = self.cwnd + 1;
+            if self.cwnd >= self.ssthresh {
+                self.state = TcpCongestionState::CongAvoidance;
+            };
+        } else if self.state == TcpCongestionState::CongAvoidance {
+            let increment: u32 = (self.mss as u32) / self.cwnd;
+            if increment < 1 { increment = 1; };
+            self.cwnd = self.cwnd + increment;
+            if self.cwnd > TCP_MAX_CWND {
+                self.cwnd = TCP_MAX_CWND;
+            };
+        };
+    }
+
+    fn timeout(self: ref mut)
+        effect [deterministic]
+    {
+        self.ssthresh = if self.cwnd > 1 { self.cwnd / 2 } else { 1 };
+        self.cwnd = TCP_INITIAL_CWND;
+        self.state = TcpCongestionState::SlowStart;
+        self.duplicate_acks = 0;
+        // Exponential backoff
+        self.rto = self.rto * 2;
+        if self.rto > TCP_RTO_MAX_MS {
+            self.rto = TCP_RTO_MAX_MS;
+        };
+    }
+
+    fn update_rtt(self: ref mut, sample: u64)
+        effect [deterministic]
+    {
+        if self.rtt_estimate == 0 {
+            self.rtt_estimate = sample;
+            self.rtt_deviation = sample / 2;
+        } else {
+            let diff: u64 = if sample > self.rtt_estimate {
+                sample - self.rtt_estimate
+            } else {
+                self.rtt_estimate - sample
+            };
+            self.rtt_deviation = (self.rtt_deviation * 3 + diff) / 4;
+            self.rtt_estimate = (self.rtt_estimate * 7 + sample) / 8;
+        };
+        self.rto = self.rtt_estimate + (4 * self.rtt_deviation);
+        if self.rto < TCP_RTO_MIN_MS {
+            self.rto = TCP_RTO_MIN_MS;
+        };
+        if self.rto > TCP_RTO_MAX_MS {
+            self.rto = TCP_RTO_MAX_MS;
+        };
+    }
+
+    fn window(self) -> u32
+        effect [deterministic]
+    {
+        return self.cwnd * (self.mss as u32);
+    }
+
+    fn reset_dup_ack_counter(self: ref mut)
+        effect [deterministic]
+    {
+        self.duplicate_acks = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Connection
+// ─────────────────────────────────────────────────────────────
+
+struct TcpConnection {
+    state: TcpState,
+    local_addr: Ipv4Address,
+    local_port: u16,
+    remote_addr: Ipv4Address,
+    remote_port: u16,
+    send_buf: TcpSendBuffer,
+    recv_buf: TcpRecvBuffer,
+    congestion: TcpCongestionControl,
+    iss: u32,               // Initial Send Sequence
+    irs: u32,               // Initial Receive Sequence
+    ts_recent: u32,         // Timestamp value to echo
+    ts_recent_ack: u32,     // Last echoed timestamp
+    window_scale: u8,       // Our window scale factor
+    peer_window_scale: u8,  // Peer's window scale factor
+    sack_permitted: bool,
+    mss: u16,
+    retransmit_count: u64,
+    retransmit_time: u64,
+    keepalive_count: u64,
+    last_activity: u64,
+    creation_time: u64,
+    fin_wait2_timeout: u64,
+    time_wait_expiry: u64,
+    generation: u64,
+}
+
+impl TcpConnection {
+    fn new(local_addr: Ipv4Address, local_port: u16,
+            remote_addr: Ipv4Address, remote_port: u16,
+            iss: u32, irs: u32, mss: u16, now: u64) -> TcpConnection
+        effect [deterministic]
+    {
+        return TcpConnection {
+            state: TcpState::Closed,
+            local_addr: local_addr,
+            local_port: local_port,
+            remote_addr: remote_addr,
+            remote_port: remote_port,
+            send_buf: TcpSendBuffer::new(iss),
+            recv_buf: TcpRecvBuffer::new(irs, TCP_DEFAULT_WINDOW),
+            congestion: TcpCongestionControl::new(mss),
+            iss: iss,
+            irs: irs,
+            ts_recent: 0,
+            ts_recent_ack: 0,
+            window_scale: 0,
+            peer_window_scale: 0,
+            sack_permitted: false,
+            mss: mss,
+            retransmit_count: 0,
+            retransmit_time: 0,
+            keepalive_count: 0,
+            last_activity: now,
+            creation_time: now,
+            fin_wait2_timeout: 0,
+            time_wait_expiry: 0,
+            generation: 1,
+        };
+    }
+
+    fn transition(self: ref mut, new_state: TcpState)
+        effect [deterministic]
+    {
+        residual emit {
+            op: "tcp.state_transition",
+            old_state: self.state as u64,
+            new_state: new_state as u64,
+            local: (self.local_addr.to_u32(), self.local_port),
+            remote: (self.remote_addr.to_u32(), self.remote_port),
+        };
+
+        self.state = new_state;
+    }
+
+    fn is_connected(self) -> bool
+        effect [deterministic]
+    {
+        return self.state == TcpState::Established;
+    }
+
+    fn is_closing(self) -> bool
+        effect [deterministic]
+    {
+        return self.state == TcpState::FinWait1 ||
+               self.state == TcpState::FinWait2 ||
+               self.state == TcpState::Closing ||
+               self.state == TcpState::CloseWait ||
+               self.state == TcpState::LastAck ||
+               self.state == TcpState::TimeWait;
+    }
+
+    fn is_closed(self) -> bool
+        effect [deterministic]
+    {
+        return self.state == TcpState::Closed;
+    }
+
+    fn can_send(self) -> bool
+        effect [deterministic]
+    {
+        if self.state == TcpState::Established || self.state == TcpState::CloseWait {
+            let effective_wnd: u32 = if self.send_buf.window > self.congestion.window() {
+                self.congestion.window()
+            } else {
+                self.send_buf.window
+            };
+            let flight_size: u32 = self.send_buf.next_seq - self.send_buf.unacked_start;
+            return flight_size < effective_wnd;
+        };
+        return false;
+    }
+
+    fn send_segment(
+        self: ref mut,
+        flags: u8,
+        payload: Array(u8, TCP_SEND_BUF_SIZE),
+        payload_len: u64,
+        now: u64,
+    ) -> TcpSegment
+        effect [deterministic]
+    {
+        let header: TcpHeader = TcpHeader::new(
+            self.local_port,
+            self.remote_port,
+            self.send_buf.next_seq,
+            self.recv_buf.rcv_nxt,
+            flags,
+            (self.recv_buf.space() / 1024 / 1024) as u16,
+        );
+        // Add MSS option on SYN
+        if flags & TCP_FLAG_SYN != 0 {
+            header.add_option(TcpOption::mss(self.mss));
+        };
+        let seg: TcpSegment = TcpSegment::new(header, payload, payload_len);
+        self.last_activity = now;
+        return seg;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Connection Table
+// ─────────────────────────────────────────────────────────────
+
+struct TcpConnectionEntry {
+    conn: TcpConnection,
+    in_use: bool,
+}
+
+impl TcpConnectionEntry {
+    fn empty() -> TcpConnectionEntry
+        effect [deterministic]
+    {
+        return TcpConnectionEntry {
+            conn: TcpConnection::new(
+                Ipv4Address::any(), 0,
+                Ipv4Address::any(), 0,
+                0, 0, 0, 0,
+            ),
+            in_use: false,
+        };
+    }
+}
+
+struct TcpConnectionTable {
+    entries: Array(TcpConnectionEntry, TCP_MAX_CONNECTIONS),
+    entry_count: u64,
+}
+
+impl TcpConnectionTable {
+    fn new() -> TcpConnectionTable
+        effect [deterministic]
+    {
+        return TcpConnectionTable {
+            entries: Array::zeroed(),
+            entry_count: 0,
+        };
+    }
+
+    fn allocate(self: ref mut, conn: TcpConnection) -> Result(u64, TcpError)
+        effect [deterministic]
+    {
+        if self.entry_count >= TCP_MAX_CONNECTIONS {
+            return Result::Err(TcpError::TcpConnectionTableFull);
+        };
+        let idx: u64 = self.entry_count;
+        self.entries[self.entry_count] = TcpConnectionEntry {
+            conn: conn,
+            in_use: true,
+        };
+        self.entry_count = self.entry_count + 1;
+
+        residual emit {
+            op: "tcp.connection_alloc",
+            index: idx,
+            state: conn.state as u64,
+        };
+
+        return Result::Ok(idx);
+    }
+
+    fn free(self: ref mut, idx: u64)
+        effect [deterministic]
+    {
+        if idx < self.entry_count {
+            self.entries[idx] = self.entries[self.entry_count - 1];
+            self.entry_count = self.entry_count - 1;
+        };
+    }
+
+    fn get(self: ref mut, idx: u64) -> Result(ref mut TcpConnection, TcpError)
+        effect [deterministic]
+    {
+        if idx >= self.entry_count || !self.entries[idx].in_use {
+            return Result::Err(TcpError::TcpConnectionNotFound);
+        };
+        return Result::Ok(self.entries[idx].conn);
+    }
+
+    fn find(self, local_addr: Ipv4Address, local_port: u16,
+             remote_addr: Ipv4Address, remote_port: u16) -> Result(u64, TcpError)
+        effect [deterministic]
+    {
+        loop bound TCP_MAX_CONNECTIONS {
+            if i >= self.entry_count {
+                break;
+            };
+            if !self.entries[i].in_use {
+                continue;
+            };
+            let c: TcpConnection = self.entries[i].conn;
+            if c.local_port == local_port && c.remote_port == remote_port &&
+               c.local_addr.eq(local_addr) && c.remote_addr.eq(remote_addr) {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(TcpError::TcpConnectionNotFound);
+    }
+
+    fn find_listener(self, port: u16) -> Result(u64, TcpError)
+        effect [deterministic]
+    {
+        loop bound TCP_MAX_CONNECTIONS {
+            if i >= self.entry_count {
+                break;
+            };
+            if !self.entries[i].in_use {
+                continue;
+            };
+            if self.entries[i].conn.state == TcpState::Listen &&
+               self.entries[i].conn.local_port == port {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(TcpError::TcpPortNotOpen);
+    }
+
+    fn count_by_state(self, state: TcpState) -> u64
+        effect [deterministic]
+    {
+        let mut cnt: u64 = 0;
+        loop bound TCP_MAX_CONNECTIONS {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].in_use && self.entries[i].conn.state == state {
+                cnt = cnt + 1;
+            };
+        };
+        return cnt;
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Listen Entry (for passive opens)
+// ─────────────────────────────────────────────────────────────
+
+const TCP_LISTEN_BACKLOG: u64 = 128;
+
+struct TcpListenEntry {
+    port: u16,
+    local_addr: Ipv4Address,
+    backlog: u64,
+    established_count: u64,
+    generation: u64,
+}
+
+impl TcpListenEntry {
+    fn new(port: u16, addr: Ipv4Address, backlog: u64) -> TcpListenEntry
+        effect [deterministic]
+    {
+        return TcpListenEntry {
+            port: port,
+            local_addr: addr,
+            backlog: backlog,
+            established_count: 0,
+            generation: 1,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Main State
+// ─────────────────────────────────────────────────────────────
+
+struct TcpStateMachine {
+    connections: TcpConnectionTable,
+    listen_entries: Array(TcpListenEntry, 64),
+    listen_count: u64,
+    segments_sent: u64,
+    segments_recv: u64,
+    segments_retransmitted: u64,
+    connection_attempts: u64,
+    connection_resets: u64,
+    timeouts: u64,
+    generation: u64,
+}
+
+impl TcpStateMachine {
+    fn new() -> TcpStateMachine
+        effect [deterministic]
+    {
+        return TcpStateMachine {
+            connections: TcpConnectionTable::new(),
+            listen_entries: Array::zeroed(),
+            listen_count: 0,
+            segments_sent: 0,
+            segments_recv: 0,
+            segments_retransmitted: 0,
+            connection_attempts: 0,
+            connection_resets: 0,
+            timeouts: 0,
+            generation: 1,
+        };
+    }
+
+    fn create_listen(self: ref mut, port: u16, addr: Ipv4Address, backlog: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        if self.listen_count >= 64 {
+            return Result::Err(TcpError::TcpPortTableFull);
+        };
+        // Check for duplicate
+        loop bound 64 {
+            if i >= self.listen_count {
+                break;
+            };
+            if self.listen_entries[i].port == port {
+                return Result::Err(TcpError::TcpPortInUse);
+            };
+        };
+        self.listen_entries[self.listen_count] = TcpListenEntry::new(port, addr, backlog);
+        self.listen_count = self.listen_count + 1;
+
+        residual emit {
+            op: "tcp.listen",
+            port: port,
+            addr: addr.to_array(),
+            backlog: backlog,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn active_open(
+        self: ref mut,
+        local_port: u16,
+        remote_addr: Ipv4Address,
+        remote_port: u16,
+        local_addr: Ipv4Address,
+        now: u64,
+    ) -> Result(u64, TcpError)
+        effect [deterministic]
+        court "tcp_active_open:v1"
+    {
+        let iss: u32 = now as u32;
+        let irs: u32 = 0;
+        let conn: TcpConnection = TcpConnection::new(
+            local_addr, local_port,
+            remote_addr, remote_port,
+            iss, irs, TCP_MSS_DEFAULT, now,
+        );
+        let idx_res: Result(u64, TcpError) = self.connections.allocate(conn);
+        if idx_res.is_err() {
+            return Result::Err(idx_res.unwrap_err());
+        };
+        let idx: u64 = idx_res.unwrap();
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        c.transition(TcpState::SynSent);
+        c.send_buf.next_seq = iss + 1;
+        self.connection_attempts = self.connection_attempts + 1;
+        self.generation = self.generation + 1;
+
+        residual emit {
+            op: "tcp.active_open",
+            local_port: local_port,
+            remote: (remote_addr.to_u32(), remote_port),
+            iss: iss,
+        };
+
+        return Result::Ok(idx);
+    }
+
+    fn passive_open(self: ref mut, listener_idx: u64, remote_addr: Ipv4Address,
+                     remote_port: u16, irs: u32, now: u64) -> Result(u64, TcpError)
+        effect [deterministic]
+    {
+        if listener_idx >= self.listen_count {
+            return Result::Err(TcpError::TcpPortNotOpen);
+        };
+        let listen: TcpListenEntry = self.listen_entries[listener_idx];
+        let iss: u32 = (now + self.connection_attempts) as u32;
+        let conn: TcpConnection = TcpConnection::new(
+            listen.local_addr, listen.port,
+            remote_addr, remote_port,
+            iss, irs, TCP_MSS_DEFAULT, now,
+        );
+        let idx_res: Result(u64, TcpError) = self.connections.allocate(conn);
+        if idx_res.is_err() {
+            return Result::Err(idx_res.unwrap_err());
+        };
+        let idx: u64 = idx_res.unwrap();
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        c.transition(TcpState::SynReceived);
+        c.send_buf.next_seq = iss + 1;
+        c.recv_buf.rcv_nxt = irs + 1;
+        self.connection_attempts = self.connection_attempts + 1;
+        self.listen_entries[listener_idx].established_count =
+            self.listen_entries[listener_idx].established_count + 1;
+
+        residual emit {
+            op: "tcp.passive_open",
+            listener_idx: listener_idx,
+            remote: (remote_addr.to_u32(), remote_port),
+            iss: iss,
+            irs: irs,
+        };
+
+        return Result::Ok(idx);
+    }
+
+    fn process_rst(self: ref mut, conn_idx: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        c.transition(TcpState::Closed);
+        self.connection_resets = self.connection_resets + 1;
+
+        residual emit {
+            op: "tcp.rst_recv",
+            local: (c.local_addr.to_u32(), c.local_port),
+            remote: (c.remote_addr.to_u32(), c.remote_port),
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn process_ack(self: ref mut, conn_idx: u64, ack_num: u32) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        let is_dup: bool = ack_num == c.send_buf.unacked_start && ack_num != c.send_buf.next_seq;
+        c.congestion.ack_received(is_dup);
+        c.send_buf.unacked_start = ack_num;
+        return Result::Ok(void);
+    }
+
+    fn process_timeout(self: ref mut, conn_idx: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        c.retransmit_count = c.retransmit_count + 1;
+        c.congestion.timeout();
+        self.segments_retransmitted = self.segments_retransmitted + 1;
+        self.timeouts = self.timeouts + 1;
+
+        if c.retransmit_count >= TCP_MAX_RETRIES {
+            c.transition(TcpState::Closed);
+            return Result::Err(TcpError::TcpRetransmitTimeout);
+        };
+
+        residual emit {
+            op: "tcp.retransmit_timeout",
+            conn_idx: conn_idx,
+            retransmit_count: c.retransmit_count,
+            rto: c.congestion.rto,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn close(self: ref mut, conn_idx: u64, now: u64) -> Result(TcpState, TcpError)
+        effect [deterministic]
+        court "tcp_close:v1"
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        if c.state == TcpState::Established {
+            c.transition(TcpState::FinWait1);
+            return Result::Ok(TcpState::FinWait1);
+        } else if c.state == TcpState::CloseWait {
+            c.transition(TcpState::LastAck);
+            return Result::Ok(TcpState::LastAck);
+        } else {
+            return Result::Err(TcpError::TcpInvalidState);
+        };
+    }
+
+    fn abort(self: ref mut, conn_idx: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        c.transition(TcpState::Closed);
+        self.connection_resets = self.connection_resets + 1;
+
+        residual emit {
+            op: "tcp.abort",
+            conn_idx: conn_idx,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn process_fin(self: ref mut, conn_idx: u64, now: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        if c.state == TcpState::Established {
+            c.transition(TcpState::CloseWait);
+        } else if c.state == TcpState::FinWait1 {
+            if c.send_buf.unacked_start == c.send_buf.next_seq {
+                c.transition(TcpState::TimeWait);
+                c.time_wait_expiry = now + TCP_TIME_WAIT_MS;
+            } else {
+                c.transition(TcpState::Closing);
+            };
+        } else if c.state == TcpState::FinWait2 {
+            c.transition(TcpState::TimeWait);
+            c.time_wait_expiry = now + TCP_TIME_WAIT_MS;
+        };
+        return Result::Ok(void);
+    }
+
+    fn time_wait_expired(self: ref mut, conn_idx: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        let c_res: Result(ref mut TcpConnection, TcpError) = self.connections.get(conn_idx);
+        if c_res.is_err() {
+            return Result::Err(c_res.unwrap_err());
+        };
+        let c: ref mut TcpConnection = c_res.unwrap();
+        c.transition(TcpState::Closed);
+        return Result::Ok(void);
+    }
+
+    fn is_listening(self, port: u16) -> bool
+        effect [deterministic]
+    {
+        loop bound 64 {
+            if i >= self.listen_count {
+                break;
+            };
+            if self.listen_entries[i].port == port {
+                return true;
+            };
+        };
+        return false;
+    }
+
+    // Passive open: start listening
+    fn listen(self: ref mut, port: u16, addr: Ipv4Address, backlog: u64) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        return self.create_listen(port, addr, backlog);
+    }
+
+    fn accept(self: ref mut, port: u16) -> Result(u64, TcpError)
+        effect [deterministic]
+    {
+        // Find an established connection for this listening port
+        loop bound TCP_MAX_CONNECTIONS {
+            if i >= self.connections.entry_count {
+                break;
+            };
+            if !self.connections.entries[i].in_use {
+                continue;
+            };
+            let conn: TcpConnection = self.connections.entries[i].conn;
+            if conn.state == TcpState::Established && conn.local_port == port {
+                return Result::Ok(i);
+            };
+        };
+        return Result::Err(TcpError::TcpConnectionNotFound);
+    }
+
+    fn get_statistics(self) -> (u64, u64, u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.segments_sent,
+            self.segments_recv,
+            self.segments_retransmitted,
+            self.connection_attempts,
+            self.connection_resets,
+            self.timeouts,
+        );
+    }
+
+    fn count_state(self, state: TcpState) -> u64
+        effect [deterministic]
+    {
+        return self.connections.count_by_state(state);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// TCP Port Table
+// ─────────────────────────────────────────────────────────────
+
+struct TcpPortTable {
+    ports: Array(u16, 128),
+    count: u64,
+}
+
+impl TcpPortTable {
+    fn new() -> TcpPortTable
+        effect [deterministic]
+    {
+        return TcpPortTable { ports: Array::zeroed(), count: 0 };
+    }
+
+    fn is_bound(self, port: u16) -> bool
+        effect [deterministic]
+    {
+        loop bound 128 {
+            if i >= self.count { break; };
+            if self.ports[i] == port { return true; };
+        };
+        return false;
+    }
+
+    fn bind(self: ref mut, port: u16) -> Result(void, TcpError)
+        effect [deterministic]
+    {
+        if self.count >= 128 { return Result::Err(TcpError::TcpPortTableFull); };
+        if self.is_bound(port) { return Result::Err(TcpError::TcpPortInUse); };
+        self.ports[self.count] = port;
+        self.count = self.count + 1;
+        return Result::Ok(void);
+    }
+
+    fn unbind(self: ref mut, port: u16)
+        effect [deterministic]
+    {
+        loop bound 128 {
+            if i >= self.count { break; };
+            if self.ports[i] == port {
+                self.ports[i] = self.ports[self.count - 1];
+                self.count = self.count - 1;
+                return;
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn tcp_init() -> Result(TcpStateMachine, TcpError)
+    effect [deterministic]
+    court "tcp_init:v1"
+{
+    residual emit {
+        op: "tcp.init",
+        status: "ready",
+    };
+    return Result::Ok(TcpStateMachine::new());
+}
+
+fn tcp_state_to_string(state: TcpState) -> Array(u8, 16)
+    effect [deterministic]
+{
+    if state == TcpState::Closed { return Array::from_literal("CLOSED"); };
+    if state == TcpState::Listen { return Array::from_literal("LISTEN"); };
+    if state == TcpState::SynSent { return Array::from_literal("SYN_SENT"); };
+    if state == TcpState::SynReceived { return Array::from_literal("SYN_RCVD"); };
+    if state == TcpState::Established { return Array::from_literal("ESTABLISHED"); };
+    if state == TcpState::FinWait1 { return Array::from_literal("FIN_WAIT1"); };
+    if state == TcpState::FinWait2 { return Array::from_literal("FIN_WAIT2"); };
+    if state == TcpState::CloseWait { return Array::from_literal("CLOSE_WAIT"); };
+    if state == TcpState::Closing { return Array::from_literal("CLOSING"); };
+    if state == TcpState::LastAck { return Array::from_literal("LAST_ACK"); };
+    if state == TcpState::TimeWait { return Array::from_literal("TIME_WAIT"); };
+    return Array::from_literal("UNKNOWN");
+}
+
+fn tcp_next_sequence_number(current: u32, increment: u32) -> u32
+    effect [deterministic]
+{
+    return current + increment;
+}

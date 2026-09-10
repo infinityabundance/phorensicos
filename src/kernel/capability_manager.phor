@@ -1,0 +1,1334 @@
+// capability_manager.phor — Full capability manager
+// Create, transfer, revoke, check, enumerate capabilities with generation tracking
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/capability_manager.phor
+// Court: capability_manager:v2
+
+package kernel.capability_manager;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type CapManagerError = enum {
+    CapabilityNotFound     = 0x20,  // E0020: capability not found in manager
+    InsufficientRights     = 0x21,  // E0021: capability lacks required rights
+    StaleGeneration        = 0x22,  // E0022: capability generation tag is stale
+    CapabilityDuplicate    = 0x23,  // E0023: attempted to duplicate affine capability
+    CapabilityExhausted    = 0x24,  // E0024: max capabilities reached for object
+    InvalidCapabilityType  = 0x25,  // E0025: capability type mismatch
+    RevokedCapability      = 0x26,  // E0026: capability has been revoked
+    ObjectNotCapable       = 0x27,  // E0027: object does not support capability
+    GenerationCounterExhausted = 0x28, // E0028: no more generation slots available
+    TransferNotAllowed     = 0x29,  // E0029: capability does not allow transfer
+    DelegateNotAllowed     = 0x2A,  // E002A: capability does not allow delegation
+    CapabilityTableFull    = 0x2B,  // E002B: capability table at capacity
+    InvalidOwner           = 0x2C,  // E002C: session does not own the capability
+    CapabilityLeaked       = 0x2D,  // E002D: capability leak detected in audit
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Rights Bitfield
+// ─────────────────────────────────────────────────────────────
+
+struct CapabilityRights {
+    read: bool,
+    write: bool,
+    execute: bool,
+    delete: bool,
+    transfer: bool,
+    delegate: bool,
+    observe: bool,
+    audit: bool,
+    promote: bool,
+}
+
+impl CapabilityRights {
+    fn none() -> CapabilityRights
+        effect []
+    {
+        return CapabilityRights {
+            read: false, write: false, execute: false,
+            delete: false, transfer: false, delegate: false,
+            observe: false, audit: false, promote: false,
+        };
+    }
+
+    fn all() -> CapabilityRights
+        effect []
+    {
+        return CapabilityRights {
+            read: true, write: true, execute: true,
+            delete: true, transfer: true, delegate: true,
+            observe: true, audit: true, promote: true,
+        };
+    }
+
+    fn read_only() -> CapabilityRights
+        effect []
+    {
+        return CapabilityRights {
+            read: true, write: false, execute: false,
+            delete: false, transfer: false, delegate: false,
+            observe: false, audit: false, promote: false,
+        };
+    }
+
+    fn has_all(self, required: CapabilityRights) -> bool
+        effect []
+        court "cap_rights:v1"
+    {
+        // Check each required right individually
+        if required.read && !self.read { return false; };
+        if required.write && !self.write { return false; };
+        if required.execute && !self.execute { return false; };
+        if required.delete && !self.delete { return false; };
+        if required.transfer && !self.transfer { return false; };
+        if required.delegate && !self.delegate { return false; };
+        if required.observe && !self.observe { return false; };
+        if required.audit && !self.audit { return false; };
+        if required.promote && !self.promote { return false; };
+        return true;
+    }
+
+    fn intersect(self, other: CapabilityRights) -> CapabilityRights
+        effect []
+    {
+        return CapabilityRights {
+            read: self.read && other.read,
+            write: self.write && other.write,
+            execute: self.execute && other.execute,
+            delete: self.delete && other.delete,
+            transfer: self.transfer && other.transfer,
+            delegate: self.delegate && other.delegate,
+            observe: self.observe && other.observe,
+            audit: self.audit && other.audit,
+            promote: self.promote && other.promote,
+        };
+    }
+
+    fn union(self, other: CapabilityRights) -> CapabilityRights
+        effect []
+    {
+        return CapabilityRights {
+            read: self.read || other.read,
+            write: self.write || other.write,
+            execute: self.execute || other.execute,
+            delete: self.delete || other.delete,
+            transfer: self.transfer || other.transfer,
+            delegate: self.delegate || other.delegate,
+            observe: self.observe || other.observe,
+            audit: self.audit || other.audit,
+            promote: self.promote || other.promote,
+        };
+    }
+
+    fn to_bits(self) -> u16
+        effect []
+    {
+        let mut bits: u16 = 0;
+        if self.read { bits = bits | 0x0001; };
+        if self.write { bits = bits | 0x0002; };
+        if self.execute { bits = bits | 0x0004; };
+        if self.delete { bits = bits | 0x0008; };
+        if self.transfer { bits = bits | 0x0010; };
+        if self.delegate { bits = bits | 0x0020; };
+        if self.observe { bits = bits | 0x0040; };
+        if self.audit { bits = bits | 0x0080; };
+        if self.promote { bits = bits | 0x0100; };
+        return bits;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Entry
+// ─────────────────────────────────────────────────────────────
+
+struct CapabilityEntry {
+    capability_id: Identity,
+    object_identity: Identity,
+    object_type: ObjectType,
+    rights: CapabilityRights,
+    generation: u64,
+    creation_timestamp: u64,
+    expiry_timestamp: u64,
+    parent_capability: Option(Identity),
+    owner_session: Identity,
+    is_revoked: bool,
+    is_transferred: bool,
+    derivation_path: DerivationPath,
+    residual_history: RingBuf(ResidualRecord, 32),
+    trust_state: TrustState,
+}
+
+struct DerivationPath {
+    steps: Array(DerivationStep, 16),
+    step_count: u64,
+}
+
+struct DerivationStep {
+    from_capability: Identity,
+    operation: DerivationOperation,
+    timestamp: u64,
+    justification: String(128),
+}
+
+type DerivationOperation = enum {
+    Created     = 0,  // Root creation
+    Transferred = 1,  // Ownership transfer
+    Delegated   = 2,  // Derived sub-capability
+    Split       = 3,  // Rights split
+    Restricted  = 4,  // Rights restriction
+    Revoked     = 5,  // Revocation
+    Promoted    = 6,  // Trust promotion
+    Audited     = 7,  // Audit event
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Manager State
+// ─────────────────────────────────────────────────────────────
+
+struct CapabilityManagerState {
+    capability_table: Array(CapabilityEntry, 1024),
+    active_count: u64,
+    next_generation: u64,
+    generation_counter: u64,
+    root_capability: CapabilityEntry,
+    manager_identity: Identity,
+    initialization_timestamp: u64,
+    audit_trail: RingBuf(AuditRecord, 256),
+    revocation_list: Array(RevocationRecord, 128),
+    revocation_count: u64,
+    object_cap_index: Array(ObjectCapIndex, 256),
+    object_cap_count: u64,
+}
+
+struct AuditRecord {
+    timestamp: u64,
+    operation: AuditOperation,
+    capability_id: Identity,
+    actor_identity: Identity,
+    success: bool,
+    detail: String(128),
+}
+
+type AuditOperation = enum {
+    CreateCapability  = 0,
+    TransferCapability = 1,
+    RevokeCapability  = 2,
+    CheckCapability   = 3,
+    EnumerateCaps     = 4,
+    RestrictCapability = 5,
+    SplitCapability   = 6,
+    DelegateCapability = 7,
+    QueryCapability   = 8,
+    RevokeGeneration  = 9,
+    AuditInspect      = 10,
+}
+
+struct RevocationRecord {
+    timestamp: u64,
+    generation_revoked: u64,
+    affected_capabilities: u64,
+    reason: String(128),
+    residual_hash: u64,
+    completed: bool,
+}
+
+struct ObjectCapIndex {
+    object_identity: Identity,
+    capability_ids: Array(Identity, 16),
+    count: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Manager Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn capability_manager_init(
+    root_creator: Identity,
+    timestamp: u64,
+    start_generation: u64,
+) -> CapabilityManagerState
+    effect [deterministic]
+    court "cap_manager_init:v1"
+{
+    let root_identity: Identity = identity_new(
+        root_creator.id_hash,
+        timestamp,
+        0,
+        0xCA_ME_00,  // Capability Manager magic
+    );
+
+    let root_rights: CapabilityRights = CapabilityRights {
+        read: true, write: true, execute: true,
+        delete: true, transfer: true, delegate: true,
+        observe: true, audit: true, promote: true,
+    };
+
+    let root_entry: CapabilityEntry = CapabilityEntry {
+        capability_id: root_identity,
+        object_identity: root_identity,
+        object_type: ObjectType::CapabilityObject,
+        rights: root_rights,
+        generation: start_generation,
+        creation_timestamp: timestamp,
+        expiry_timestamp: 0,
+        parent_capability: Option::None,
+        owner_session: root_identity,
+        is_revoked: false,
+        is_transferred: false,
+        derivation_path: DerivationPath {
+            steps: Array::zeroed(),
+            step_count: 1,
+        },
+        residual_history: RingBuf::new(),
+        trust_state: TrustState::Promoted,
+    };
+
+    // Populate the first derivation step
+    root_entry.derivation_path.steps[0] = DerivationStep {
+        from_capability: root_identity,
+        operation: DerivationOperation::Created,
+        timestamp: timestamp,
+        justification: String::from_bytes(Slice(u8)::from_str("root capability seeded at boot")),
+    };
+
+    let mut table: Array(CapabilityEntry, 1024) = Array::zeroed();
+    table[0] = root_entry;
+
+    let state: CapabilityManagerState = CapabilityManagerState {
+        capability_table: table,
+        active_count: 1,
+        next_generation: start_generation + 1,
+        generation_counter: start_generation,
+        root_capability: root_entry,
+        manager_identity: root_identity,
+        initialization_timestamp: timestamp,
+        audit_trail: RingBuf::new(),
+        revocation_list: Array::zeroed(),
+        revocation_count: 0,
+        object_cap_index: Array::zeroed(),
+        object_cap_count: 0,
+    };
+
+    residual emit {
+        op: "capability_manager.init",
+        root_identity: root_identity.id_hash,
+        start_generation: start_generation,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Creation
+// ─────────────────────────────────────────────────────────────
+
+fn capability_create(
+    state: Handle(CapabilityManagerState),
+    object_id: Identity,
+    object_type: ObjectType,
+    rights: CapabilityRights,
+    owner_session: Identity,
+    creator_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(CapabilityEntry, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_create:v2"
+{
+    // Validate creator capability
+    if creator_cap.generation == 0 {
+        return Result::Err(CapManagerError::InvalidCapabilityType);
+    };
+
+    // Check if capability table has room
+    if state.active_count >= 1024 {
+        return Result::Err(CapManagerError::CapabilityTableFull);
+    };
+
+    // Find empty slot
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..1024 {
+        if state.capability_table[i].generation == 0 && !state.capability_table[i].is_revoked {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(CapManagerError::CapabilityTableFull);
+    };
+
+    // Create new capability identity
+    let cap_id: Identity = identity_new(
+        object_id.id_hash,
+        timestamp,
+        state.generation_counter,
+        slot_idx,
+    );
+
+    let generation: u64 = state.next_generation;
+    state.next_generation = state.next_generation + 1;
+
+    let entry: CapabilityEntry = CapabilityEntry {
+        capability_id: cap_id,
+        object_identity: object_id,
+        object_type: object_type,
+        rights: rights,
+        generation: generation,
+        creation_timestamp: timestamp,
+        expiry_timestamp: 0,
+        parent_capability: Option::Some(creator_cap.object_id),
+        owner_session: owner_session,
+        is_revoked: false,
+        is_transferred: false,
+        derivation_path: DerivationPath {
+            steps: Array::zeroed(),
+            step_count: 1,
+        },
+        residual_history: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+    };
+
+    entry.derivation_path.steps[0] = DerivationStep {
+        from_capability: creator_cap.object_id,
+        operation: DerivationOperation::Created,
+        timestamp: timestamp,
+        justification: String::from_bytes(Slice(u8)::from_str("capability created by authorized session")),
+    };
+
+    state.capability_table[slot_idx] = entry;
+    state.active_count = state.active_count + 1;
+
+    // Index by object
+    let mut obj_found: bool = false;
+    for j in 0..state.object_cap_count {
+        if identity_equal(state.object_cap_index[j].object_identity, object_id) {
+            let idx: u64 = state.object_cap_index[j].count;
+            if idx < 16 {
+                state.object_cap_index[j].capability_ids[idx] = cap_id;
+                state.object_cap_index[j].count = idx + 1;
+            };
+            obj_found = true;
+            break;
+        };
+    };
+
+    if !obj_found && state.object_cap_count < 256 {
+        let obj_idx: u64 = state.object_cap_count;
+        state.object_cap_index[obj_idx] = ObjectCapIndex {
+            object_identity: object_id,
+            capability_ids: Array::zeroed(),
+            count: 0,
+        };
+        state.object_cap_index[obj_idx].capability_ids[0] = cap_id;
+        state.object_cap_index[obj_idx].count = 1;
+        state.object_cap_count = state.object_cap_count + 1;
+    };
+
+    // Audit trail
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::CreateCapability,
+        capability_id: cap_id,
+        actor_identity: owner_session,
+        success: true,
+        detail: String::from_bytes(Slice(u8)::from_str("capability created successfully")),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "capability_manager.create",
+        capability_id: cap_id.id_hash,
+        object_id: object_id.id_hash,
+        generation: generation,
+        rights: rights.to_bits() as u64,
+        slot: slot_idx,
+    };
+
+    return Result::Ok(entry);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Transfer
+// ─────────────────────────────────────────────────────────────
+
+fn capability_transfer(
+    state: Handle(CapabilityManagerState),
+    cap_id: Identity,
+    new_owner: Identity,
+    transfer_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(CapabilityEntry, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_transfer:v2"
+{
+    // Find capability entry
+    let mut entry_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..1024 {
+        if identity_equal(state.capability_table[i].capability_id, cap_id)
+            && !state.capability_table[i].is_revoked
+        {
+            entry_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(CapManagerError::CapabilityNotFound);
+    };
+
+    let entry: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[entry_idx]);
+
+    // Check generation
+    if entry.generation == 0 || entry.generation > state.generation_counter {
+        return Result::Err(CapManagerError::StaleGeneration);
+    };
+
+    // Check transfer right
+    if !entry.rights.transfer {
+        return Result::Err(CapManagerError::TransferNotAllowed);
+    };
+
+    // Check if already transferred (affine)
+    if entry.is_transferred {
+        return Result::Err(CapManagerError::CapabilityDuplicate);
+    };
+
+    // Perform transfer
+    entry.owner_session = new_owner;
+    entry.is_transferred = true;
+
+    // Record derivation step
+    let step_idx: u64 = entry.derivation_path.step_count;
+    if step_idx < 16 {
+        entry.derivation_path.steps[step_idx] = DerivationStep {
+            from_capability: entry.parent_capability.unwrap_or(Identity {
+                id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+            }),
+            operation: DerivationOperation::Transferred,
+            timestamp: timestamp,
+            justification: String::from_bytes(Slice(u8)::from_str("capability transferred to new owner")),
+        };
+        entry.derivation_path.step_count = step_idx + 1;
+    };
+
+    // Record residual
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x10,
+        event_data_hash: cap_id.id_hash,
+        cause_identity: entry.owner_session,
+        prior_state_hash: 0,
+        new_state_hash: new_owner.id_hash,
+        delta_description: String::from_bytes(Slice(u8)::from_str("ownership transferred")),
+        generation_at_event: entry.generation,
+        verified: false,
+    };
+    entry.residual_history.push(residual);
+
+    // Audit trail
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::TransferCapability,
+        capability_id: cap_id,
+        actor_identity: new_owner,
+        success: true,
+        detail: String::from_bytes(Slice(u8)::from_str("capability ownership transferred")),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "capability_manager.transfer",
+        capability_id: cap_id.id_hash,
+        new_owner: new_owner.id_hash,
+        generation: entry.generation,
+    };
+
+    return Result::Ok(state.capability_table[entry_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Revocation
+// ─────────────────────────────────────────────────────────────
+
+fn capability_revoke(
+    state: Handle(CapabilityManagerState),
+    cap_id: Identity,
+    revoker_cap: Cap(CapabilityToken),
+    reason: Slice(u8),
+    timestamp: u64,
+) -> Result(void, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_revoke:v1"
+{
+    // Find capability
+    let mut entry_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..1024 {
+        if identity_equal(state.capability_table[i].capability_id, cap_id)
+            && !state.capability_table[i].is_revoked
+        {
+            entry_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(CapManagerError::CapabilityNotFound);
+    };
+
+    let entry: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[entry_idx]);
+
+    // Mark as revoked
+    entry.is_revoked = true;
+    entry.rights = CapabilityRights::none();
+
+    // Record derivation step
+    let step_idx: u64 = entry.derivation_path.step_count;
+    if step_idx < 16 {
+        entry.derivation_path.steps[step_idx] = DerivationStep {
+            from_capability: entry.parent_capability.unwrap_or(Identity {
+                id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+            }),
+            operation: DerivationOperation::Revoked,
+            timestamp: timestamp,
+            justification: String::from_bytes(reason),
+        };
+        entry.derivation_path.step_count = step_idx + 1;
+    };
+
+    // Also revoke all capabilities derived from this one
+    let mut revoked_count: u64 = 0;
+    for j in 0..1024 {
+        let derived: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[j]);
+        if !derived.is_revoked {
+            match derived.parent_capability {
+                Option::Some(parent) => {
+                    if identity_equal(parent, cap_id) {
+                        derived.is_revoked = true;
+                        derived.rights = CapabilityRights::none();
+                        revoked_count = revoked_count + 1;
+                    };
+                },
+                Option::None => {},
+            };
+        };
+    };
+
+    state.active_count = state.active_count - 1;
+
+    // Record revocation in global list
+    if state.revocation_count < 128 {
+        state.revocation_list[state.revocation_count] = RevocationRecord {
+            timestamp: timestamp,
+            generation_revoked: entry.generation,
+            affected_capabilities: revoked_count + 1,
+            reason: String::from_bytes(reason),
+            residual_hash: entry.generation,
+            completed: true,
+        };
+        state.revocation_count = state.revocation_count + 1;
+    };
+
+    // Audit trail
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::RevokeCapability,
+        capability_id: cap_id,
+        actor_identity: revoker_cap.object_id,
+        success: true,
+        detail: String::from_bytes(reason),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "capability_manager.revoke",
+        capability_id: cap_id.id_hash,
+        generation: entry.generation,
+        revoked_derived: revoked_count,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Check
+// ─────────────────────────────────────────────────────────────
+
+fn capability_check(
+    state: Handle(CapabilityManagerState),
+    cap: Cap(CapabilityToken),
+    required_rights: CapabilityRights,
+    timestamp: u64,
+) -> Result(CapabilityEntry, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_check:v1"
+{
+    // Find the capability entry by capability_id
+    let mut entry_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..1024 {
+        if identity_equal(state.capability_table[i].capability_id, cap.token_identity)
+            && !state.capability_table[i].is_revoked
+        {
+            entry_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(CapManagerError::CapabilityNotFound);
+    };
+
+    let entry: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[entry_idx]);
+
+    // Check generation
+    if entry.generation == 0 || entry.generation > state.generation_counter {
+        return Result::Err(CapManagerError::StaleGeneration);
+    };
+
+    // Check if revoked
+    if entry.is_revoked {
+        return Result::Err(CapManagerError::RevokedCapability);
+    };
+
+    // Check rights
+    if !entry.rights.has_all(required_rights) {
+        return Result::Err(CapManagerError::InsufficientRights);
+    };
+
+    // Record successful check in residuals
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x11,
+        event_data_hash: entry.rights.to_bits() as u64,
+        cause_identity: cap.token_identity,
+        prior_state_hash: 0,
+        new_state_hash: cap.token_generation,
+        delta_description: String::from_bytes(Slice(u8)::from_str("capability check passed")),
+        generation_at_event: entry.generation,
+        verified: true,
+    };
+    entry.residual_history.push(residual);
+
+    return Result::Ok(state.capability_table[entry_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enumerate Capabilities for an Object
+// ─────────────────────────────────────────────────────────────
+
+fn enumerate_object_capabilities(
+    state: Handle(CapabilityManagerState),
+    object_id: Identity,
+    enumeator_cap: Cap(CapabilityToken),
+) -> Result(Array(CapabilityEntry, 16), CapManagerError)
+    effect [deterministic]
+    court "cap_enumerate:v1"
+{
+    // Find object in index
+    let mut obj_idx: u64 = 0;
+    let mut found_obj: bool = false;
+    for i in 0..state.object_cap_count {
+        if identity_equal(state.object_cap_index[i].object_identity, object_id) {
+            obj_idx = i;
+            found_obj = true;
+            break;
+        };
+    };
+
+    if !found_obj {
+        // Return empty array
+        return Result::Ok(Array::zeroed());
+    };
+
+    let mut result: Array(CapabilityEntry, 16) = Array::zeroed();
+    let mut count: u64 = 0;
+    let cap_ids: Slice(Identity) = Slice(Identity)::from_array_ptr(
+        state.object_cap_index[obj_idx].capability_ids,
+        state.object_cap_index[obj_idx].count,
+    );
+
+    for j in 0..state.object_cap_index[obj_idx].count {
+        if count >= 16 { break; };
+        let cap_id: Identity = cap_ids[j];
+        // Find the actual entry
+        for k in 0..1024 {
+            if identity_equal(state.capability_table[k].capability_id, cap_id)
+                && !state.capability_table[k].is_revoked
+            {
+                result[count] = state.capability_table[k];
+                count = count + 1;
+                break;
+            };
+        };
+    };
+
+    return Result::Ok(result);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Revoke by Generation
+// ─────────────────────────────────────────────────────────────
+
+fn revoke_generation(
+    state: Handle(CapabilityManagerState),
+    generation: u64,
+    revoker_cap: Cap(CapabilityToken),
+    reason: Slice(u8),
+    timestamp: u64,
+) -> Result(u64, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_revoke_gen:v1"
+{
+    let mut revoked_count: u64 = 0;
+
+    for i in 0..1024 {
+        let entry: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[i]);
+        if entry.generation == generation && !entry.is_revoked {
+            entry.is_revoked = true;
+            entry.rights = CapabilityRights::none();
+
+            // Record derivation step
+            let step_idx: u64 = entry.derivation_path.step_count;
+            if step_idx < 16 {
+                entry.derivation_path.steps[step_idx] = DerivationStep {
+                    from_capability: entry.parent_capability.unwrap_or(Identity {
+                        id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+                    }),
+                    operation: DerivationOperation::Revoked,
+                    timestamp: timestamp,
+                    justification: String::from_bytes(reason),
+                };
+                entry.derivation_path.step_count = step_idx + 1;
+            };
+
+            state.active_count = state.active_count - 1;
+            revoked_count = revoked_count + 1;
+        };
+    };
+
+    // Record revocation in global list
+    if state.revocation_count < 128 {
+        state.revocation_list[state.revocation_count] = RevocationRecord {
+            timestamp: timestamp,
+            generation_revoked: generation,
+            affected_capabilities: revoked_count,
+            reason: String::from_bytes(reason),
+            residual_hash: generation,
+            completed: true,
+        };
+        state.revocation_count = state.revocation_count + 1;
+    };
+
+    // Audit
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::RevokeGeneration,
+        capability_id: Identity {
+            id_hash: generation, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+        },
+        actor_identity: revoker_cap.object_id,
+        success: true,
+        detail: String::from_bytes(reason),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "capability_manager.revoke_generation",
+        generation: generation,
+        revoked_count: revoked_count,
+    };
+
+    return Result::Ok(revoked_count);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Restriction (create sub-capability with fewer rights)
+// ─────────────────────────────────────────────────────────────
+
+fn capability_restrict(
+    state: Handle(CapabilityManagerState),
+    source_cap_id: Identity,
+    restricted_rights: CapabilityRights,
+    restrictor_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(CapabilityEntry, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_restrict:v1"
+{
+    // Find source capability
+    let mut src_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..1024 {
+        if identity_equal(state.capability_table[i].capability_id, source_cap_id)
+            && !state.capability_table[i].is_revoked
+        {
+            src_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(CapManagerError::CapabilityNotFound);
+    };
+
+    let src: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[src_idx]);
+
+    // Check delegate right
+    if !src.rights.delegate {
+        return Result::Err(CapManagerError::DelegateNotAllowed);
+    };
+
+    // Restricted rights must be subset
+    let new_rights: CapabilityRights = src.rights.intersect(restricted_rights);
+
+    // Create new capability entry
+    if state.active_count >= 1024 {
+        return Result::Err(CapManagerError::CapabilityTableFull);
+    };
+
+    let mut slot_idx: u64 = 0;
+    let mut slot_found: bool = false;
+    for i in 0..1024 {
+        if state.capability_table[i].generation == 0 && !state.capability_table[i].is_revoked {
+            slot_idx = i;
+            slot_found = true;
+            break;
+        };
+    };
+
+    if !slot_found {
+        return Result::Err(CapManagerError::CapabilityTableFull);
+    };
+
+    let cap_id: Identity = identity_new(
+        src.object_identity.id_hash,
+        timestamp,
+        state.generation_counter,
+        slot_idx,
+    );
+
+    let generation: u64 = state.next_generation;
+    state.next_generation = state.next_generation + 1;
+
+    let entry: CapabilityEntry = CapabilityEntry {
+        capability_id: cap_id,
+        object_identity: src.object_identity,
+        object_type: src.object_type,
+        rights: new_rights,
+        generation: generation,
+        creation_timestamp: timestamp,
+        expiry_timestamp: src.expiry_timestamp,
+        parent_capability: Option::Some(source_cap_id),
+        owner_session: src.owner_session,
+        is_revoked: false,
+        is_transferred: false,
+        derivation_path: DerivationPath {
+            steps: Array::zeroed(),
+            step_count: 1,
+        },
+        residual_history: RingBuf::new(),
+        trust_state: src.trust_state,
+    };
+
+    entry.derivation_path.steps[0] = DerivationStep {
+        from_capability: source_cap_id,
+        operation: DerivationOperation::Restricted,
+        timestamp: timestamp,
+        justification: String::from_bytes(Slice(u8)::from_str("restricted sub-capability created")),
+    };
+
+    state.capability_table[slot_idx] = entry;
+    state.active_count = state.active_count + 1;
+
+    // Audit
+    let audit: AuditRecord = AuditRecord {
+        timestamp: timestamp,
+        operation: AuditOperation::RestrictCapability,
+        capability_id: cap_id,
+        actor_identity: src.owner_session,
+        success: true,
+        detail: String::from_bytes(Slice(u8)::from_str("restricted capability derived")),
+    };
+    state.audit_trail.push(audit);
+
+    residual emit {
+        op: "capability_manager.restrict",
+        source_id: source_cap_id.id_hash,
+        new_id: cap_id.id_hash,
+        generation: generation,
+        rights_bits: new_rights.to_bits() as u64,
+    };
+
+    return Result::Ok(entry);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Query
+// ─────────────────────────────────────────────────────────────
+
+fn capability_query(
+    state: Handle(CapabilityManagerState),
+    cap_id: Identity,
+    querier_cap: Cap(CapabilityToken),
+) -> Result(CapabilityEntry, CapManagerError)
+    effect [deterministic]
+{
+    for i in 0..1024 {
+        let entry: CapabilityEntry = state.capability_table[i];
+        if identity_equal(entry.capability_id, cap_id)
+            && !entry.is_revoked
+        {
+            return Result::Ok(entry);
+        };
+    };
+
+    return Result::Err(CapManagerError::CapabilityNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Audit — Enumerate All Active
+// ─────────────────────────────────────────────────────────────
+
+fn capability_audit_all(
+    state: Handle(CapabilityManagerState),
+    auditor_cap: Cap(CapabilityToken),
+) -> Result(Array(CapabilityEntry, 1024), CapManagerError)
+    effect [deterministic]
+    court "cap_audit:v1"
+{
+    // Only capabilities with audit right can enumerate all
+    // In a real system, this would be checked against a global audit capability
+
+    let result: Array(CapabilityEntry, 1024) = state.capability_table;
+    return Result::Ok(result);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Counter Management
+// ─────────────────────────────────────────────────────────────
+
+fn capability_get_generation(
+    state: Handle(CapabilityManagerState),
+) -> u64
+    effect [deterministic]
+{
+    return state.generation_counter;
+}
+
+fn capability_bump_generation(
+    state: Handle(CapabilityManagerState),
+    cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> u64
+    effect [deterministic, residual]
+{
+    state.generation_counter = state.generation_counter + 1;
+
+    residual emit {
+        op: "capability_manager.bump_generation",
+        new_generation: state.generation_counter,
+        timestamp: timestamp,
+    };
+
+    return state.generation_counter;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Validity Check (quick check)
+// ─────────────────────────────────────────────────────────────
+
+fn capability_is_valid(
+    state: Handle(CapabilityManagerState),
+    cap: Cap(CapabilityToken),
+) -> bool
+    effect [deterministic]
+{
+    if cap.token_generation == 0 {
+        return false;
+    };
+
+    if cap.token_generation > state.generation_counter {
+        return false;
+    };
+
+    for i in 0..1024 {
+        let entry: CapabilityEntry = state.capability_table[i];
+        if identity_equal(entry.capability_id, cap.token_identity) {
+            if entry.is_revoked {
+                return false;
+            };
+            if entry.generation != cap.token_generation {
+                return false;
+            };
+            return true;
+        };
+    };
+
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Exists Check
+// ─────────────────────────────────────────────────────────────
+
+fn capability_exists(
+    state: Handle(CapabilityManagerState),
+    cap_id: Identity,
+) -> bool
+    effect [deterministic]
+{
+    for i in 0..1024 {
+        let entry: CapabilityEntry = state.capability_table[i];
+        if identity_equal(entry.capability_id, cap_id)
+            && !entry.is_revoked
+            && entry.generation <= state.generation_counter
+        {
+            return true;
+        };
+    };
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Transfer (high-level)
+// ─────────────────────────────────────────────────────────────
+
+fn capability_transfer_to_session(
+    state: Handle(CapabilityManagerState),
+    cap_id: Identity,
+    target_session: Identity,
+    caller_identity: Identity,
+    timestamp: u64,
+) -> Result(CapabilityEntry, CapManagerError)
+    effect [deterministic, residual]
+    court "cap_transfer_session:v1"
+{
+    // Find the capability
+    let mut entry_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..1024 {
+        let e: CapabilityEntry = state.capability_table[i];
+        if identity_equal(e.capability_id, cap_id) && !e.is_revoked {
+            entry_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(CapManagerError::CapabilityNotFound);
+    };
+
+    let entry: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[entry_idx]);
+
+    // Verify ownership
+    if !identity_equal(entry.owner_session, caller_identity) {
+        return Result::Err(CapManagerError::InvalidOwner);
+    };
+
+    // Check transfer right
+    if !entry.rights.transfer {
+        return Result::Err(CapManagerError::TransferNotAllowed);
+    };
+
+    // Transfer
+    entry.owner_session = target_session;
+
+    // Record residual
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x12,
+        event_data_hash: cap_id.id_hash,
+        cause_identity: caller_identity,
+        prior_state_hash: 0,
+        new_state_hash: target_session.id_hash,
+        delta_description: String::from_bytes(Slice(u8)::from_str("capability transferred to session")),
+        generation_at_event: entry.generation,
+        verified: false,
+    };
+    entry.residual_history.push(residual);
+
+    residual emit {
+        op: "capability_manager.transfer_to_session",
+        capability_id: cap_id.id_hash,
+        target_session: target_session.id_hash,
+        caller: caller_identity.id_hash,
+    };
+
+    return Result::Ok(state.capability_table[entry_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Identity Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn identity_null() -> Identity
+    effect []
+{
+    return Identity {
+        id_hash: 0, creation_timestamp: 0,
+        creation_epoch: 0, nonce: 0, creator: 0,
+    };
+}
+
+fn identity_is_null(id: Identity) -> bool
+    effect []
+{
+    return id.id_hash == 0
+        && id.creation_timestamp == 0
+        && id.creation_epoch == 0
+        && id.nonce == 0
+        && id.creator == 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Manager Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn capability_manager_self_test(
+    state: Handle(CapabilityManagerState),
+) -> Result(u64, CapManagerError)
+    effect [deterministic]
+    court "cap_self_test:v1"
+{
+    let mut checks_passed: u64 = 0;
+    let total_slots: u64 = 1024;
+
+    // Check 1: root capability exists
+    if state.active_count > 0 {
+        checks_passed = checks_passed + 1;
+    };
+
+    // Check 2: root is not revoked
+    if !state.root_capability.is_revoked {
+        checks_passed = checks_passed + 1;
+    };
+
+    // Check 3: generation counter is consistent
+    if state.next_generation > state.generation_counter {
+        checks_passed = checks_passed + 1;
+    };
+
+    // Check 4: no active capabilities beyond generation counter
+    let mut gen_consistent: u64 = 0;
+    for i in 0..total_slots {
+        let entry: CapabilityEntry = state.capability_table[i];
+        if entry.generation != 0 && !entry.is_revoked {
+            if entry.generation <= state.generation_counter {
+                gen_consistent = gen_consistent + 1;
+            };
+        };
+    };
+
+    if gen_consistent == state.active_count {
+        checks_passed = checks_passed + 1;
+    };
+
+    // Check 5: revocation list consistency
+    let mut revok_consistent: u64 = 0;
+    for i in 0..state.revocation_count {
+        if state.revocation_list[i].completed {
+            revok_consistent = revok_consistent + 1;
+        };
+    };
+
+    if revok_consistent == state.revocation_count {
+        checks_passed = checks_passed + 1;
+    };
+
+    residual emit {
+        op: "capability_manager.self_test",
+        checks_passed: checks_passed,
+        total_checks: 5,
+        active_count: state.active_count,
+    };
+
+    return Result::Ok(checks_passed);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Capability Manager Cleanup (for revoked/expired entries)
+// ─────────────────────────────────────────────────────────────
+
+fn capability_manager_cleanup(
+    state: Handle(CapabilityManagerState),
+    timestamp: u64,
+) -> u64
+    effect [deterministic, residual]
+{
+    let mut cleaned: u64 = 0;
+
+    for i in 0..1024 {
+        let entry: Handle(CapabilityEntry) = Handle(CapabilityEntry)::from_ptr(&state.capability_table[i]);
+
+        // Cleanup expired entries
+        if entry.expiry_timestamp != 0 && entry.expiry_timestamp <= timestamp && !entry.is_revoked {
+            entry.is_revoked = true;
+            entry.rights = CapabilityRights::none();
+            state.active_count = state.active_count - 1;
+            cleaned = cleaned + 1;
+        };
+    };
+
+    residual emit {
+        op: "capability_manager.cleanup",
+        cleaned_count: cleaned,
+        remaining: state.active_count,
+    };
+
+    return cleaned;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Handle Extensions
+// ─────────────────────────────────────────────────────────────
+
+impl Handle(T) {
+    fn from_ptr(ptr: *(T)) -> Handle(T)
+        effect []
+    {
+        return Handle(T) {
+            ptr: ptr,
+            generation: 1,
+            id_hash: 0,
+        };
+    }
+}
+
+impl Handle(CapabilityEntry) {
+    fn has_right(self, right_fn: fn(CapabilityRights) -> bool) -> bool
+        effect []
+    {
+        return right_fn(self.rights);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Slice from array ptr
+// ─────────────────────────────────────────────────────────────
+
+impl Slice(T) {
+    fn from_array_ptr(arr: Array(T, N), len: u64) -> Slice(T)
+        effect []
+    {
+        return Slice(T) {
+            data: arr.base_ptr(),
+            length: len,
+        };
+    }
+}

@@ -1,0 +1,940 @@
+// file: residual_database.phor
+// purpose: Residual database for forensic indexing, temporal queries,
+//          pattern matching, causal link analysis, evidence extraction,
+//          and court-compatible export of residual data.
+// evidence: RESIDUAL-DB-ARCH-001 through RESIDUAL-DB-ARCH-250
+// residual: All residual indexing operations are themselves recorded
+//           for meta-forensic verifiability in court proceedings.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+use core::serialization::*
+use store_database::*
+
+// ──────────────────────────────────────────────
+// Residual DB Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_RESIDUAL_DB_BASE : Word64 = DIAG_STORE_BASE | 0x1000
+
+const RESIDUAL_MAX_RECORDS       : u32 = 2048
+const RESIDUAL_INDEX_SLOTS       : u32 = 64
+const RESIDUAL_TAG_CAP           : u32 = 16
+const RESIDUAL_PATTERN_CAP       : u32 = 64
+const RESIDUAL_CAUSAL_DEPTH      : u32 = 32
+const RESIDUAL_QUERY_RESULTS     : u32 = 256
+const RESIDUAL_EVIDENCE_LOG      : u32 = 512
+const RESIDUAL_EXPORT_CAP        : u32 = 1024
+const RESIDUAL_NAME_CAP          : u32 = 32
+const RESIDUAL_HASH_SIZE         : u32 = 32
+
+// ──────────────────────────────────────────────
+// Residual Record (core data type)
+// ──────────────────────────────────────────────
+pub type ResidualRecord : struct {
+    id: Word32,
+    timestamp: Word64,
+    source: FixedString[RESIDUAL_NAME_CAP],
+    event_type: FixedString[RESIDUAL_NAME_CAP],
+    data_hash: FixedArray[Byte, RESIDUAL_HASH_SIZE],
+    payload: FixedArray[Byte, 512],
+    payload_length: u32,
+    tags: FixedArray[FixedString[RESIDUAL_NAME_CAP], RESIDUAL_TAG_CAP],
+    tag_count: u32,
+    sequence_num: Word64,
+    causal_parent: Word32,
+    confidence: u8,
+    is_verified: bool,
+}
+
+impl ResidualRecord {
+    pub fn new(rid: Word32, ts: Word64, src: FixedString[RESIDUAL_NAME_CAP], evt: FixedString[RESIDUAL_NAME_CAP]) -> ResidualRecord
+        effects: [deterministic]
+    {
+        ResidualRecord {
+            id: rid,
+            timestamp: ts,
+            source: src,
+            event_type: evt,
+            data_hash: FixedArray::new(),
+            payload: FixedArray::new(),
+            payload_length: 0,
+            tags: FixedArray::new(),
+            tag_count: 0,
+            sequence_num: Word64::zero(),
+            causal_parent: Word32::zero(),
+            confidence: 100,
+            is_verified: false,
+        }
+    }
+
+    pub fn set_payload(self: ref mut, data: FixedArray[Byte, 512], len: u32) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if len > 512 {
+            return Result::Err(bounds_capacity_exceeded(512))
+        }
+        for i in 0..len {
+            let b: Byte = match data.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            let _ = self.payload.set(i, b)
+        }
+        self.payload_length = len
+        Result::Ok(())
+    }
+
+    pub fn add_tag(self: ref mut, tag: FixedString[RESIDUAL_NAME_CAP]) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.tag_count >= RESIDUAL_TAG_CAP {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_TAG_CAP))
+        }
+        let r: Result<(), BoundsError> = self.tags.set(self.tag_count, tag)
+        if r.is_ok() {
+            self.tag_count = self.tag_count + 1
+        }
+        r
+    }
+
+    pub fn set_causal_parent(self: ref mut, parent: Word32)
+        effects: [deterministic]
+    {
+        self.causal_parent = parent
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            residual_op: "residual.recorded",
+            record_id: self.id.to_u32() as u64,
+            timestamp: self.timestamp.to_u64(),
+            source: self.source,
+            event_type: self.event_type,
+            sequence: self.sequence_num.to_u64(),
+            confidence: self.confidence as u64,
+            verified: if self.is_verified { 1 } else { 0 },
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Residual Index Entry
+// ──────────────────────────────────────────────
+pub type IndexEntry : struct {
+    index_key: FixedString[RESIDUAL_NAME_CAP],
+    record_ids: FixedArray[Word32, RESIDUAL_INDEX_SLOTS],
+    record_count: u32,
+    last_access: Word64,
+}
+
+impl IndexEntry {
+    pub fn new(key: FixedString[RESIDUAL_NAME_CAP]) -> IndexEntry
+        effects: [deterministic]
+    {
+        IndexEntry {
+            index_key: key,
+            record_ids: FixedArray::new(),
+            record_count: 0,
+            last_access: Word64::zero(),
+        }
+    }
+
+    pub fn add_record(self: ref mut, rid: Word32) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.record_count >= RESIDUAL_INDEX_SLOTS {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_INDEX_SLOTS))
+        }
+        let r: Result<(), BoundsError> = self.record_ids.set(self.record_count, rid)
+        if r.is_ok() {
+            self.record_count = self.record_count + 1
+        }
+        r
+    }
+
+    pub fn match_key(self, search: FixedString[RESIDUAL_NAME_CAP]) -> bool
+        effects: [deterministic]
+    {
+        self.index_key == search
+    }
+}
+
+// ──────────────────────────────────────────────
+// Residual Index
+// ──────────────────────────────────────────────
+pub type ResidualIndex : struct {
+    entries: FixedArray[IndexEntry, RESIDUAL_INDEX_SLOTS],
+    entry_count: u32,
+}
+
+impl ResidualIndex {
+    pub fn new() -> ResidualIndex
+        effects: [deterministic]
+    {
+        ResidualIndex {
+            entries: FixedArray::new(),
+            entry_count: 0,
+        }
+    }
+
+    pub fn index_record(self: ref mut, record: ref ResidualRecord) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        // Index by event type
+        let event_key: FixedString[RESIDUAL_NAME_CAP] = record.event_type
+        self.add_to_index(event_key, record.id)
+
+        // Index by source
+        let source_key: FixedString[RESIDUAL_NAME_CAP] = record.source
+        self.add_to_index(source_key, record.id)
+
+        // Index by tags
+        for i in 0..record.tag_count {
+            let tag: FixedString[RESIDUAL_NAME_CAP] = match record.tags.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            self.add_to_index(tag, record.id)
+        }
+        Result::Ok(())
+    }
+
+    fn add_to_index(self: ref mut, key: FixedString[RESIDUAL_NAME_CAP], rid: Word32) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        for i in 0..self.entry_count {
+            let entry: ref mut IndexEntry = match self.entries.ref_at_mut(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if entry.match_key(key) {
+                return entry.add_record(rid)
+            }
+        }
+        // Create new index entry
+        if self.entry_count >= RESIDUAL_INDEX_SLOTS {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_INDEX_SLOTS))
+        }
+        let mut new_entry: IndexEntry = IndexEntry::new(key)
+        let _ = new_entry.add_record(rid)
+        let r: Result<(), BoundsError> = self.entries.set(self.entry_count, new_entry)
+        if r.is_ok() {
+            self.entry_count = self.entry_count + 1
+        }
+        r
+    }
+
+    pub fn lookup(self, key: FixedString[RESIDUAL_NAME_CAP]) -> FixedArray[Word32, RESIDUAL_INDEX_SLOTS]
+        effects: [deterministic]
+    {
+        let mut results: FixedArray[Word32, RESIDUAL_INDEX_SLOTS] = FixedArray::new()
+        for i in 0..self.entry_count {
+            let entry: IndexEntry = match self.entries.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if entry.match_key(key) {
+                for j in 0..entry.record_count {
+                    let rid: Word32 = match entry.record_ids.get(j) {
+                        Result::Ok(v) => v,
+                        Result::Err(_) => continue,
+                    }
+                    let _ = results.set(j, rid)
+                }
+            }
+        }
+        results
+    }
+
+    pub fn clear(self: ref mut)
+        effects: [deterministic]
+    {
+        self.entry_count = 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Temporal Query Engine
+// ──────────────────────────────────────────────
+pub type TemporalQuery : struct {
+    start_time: Word64,
+    end_time: Word64,
+    event_type: FixedString[RESIDUAL_NAME_CAP],
+    source_filter: FixedString[RESIDUAL_NAME_CAP],
+    tag_filter: FixedString[RESIDUAL_NAME_CAP],
+    max_results: u32,
+}
+
+impl TemporalQuery {
+    pub fn new(start: Word64, end: Word64) -> TemporalQuery
+        effects: [deterministic]
+    {
+        TemporalQuery {
+            start_time: start,
+            end_time: end,
+            event_type: FixedString::new(),
+            source_filter: FixedString::new(),
+            tag_filter: FixedString::new(),
+            max_results: RESIDUAL_QUERY_RESULTS,
+        }
+    }
+
+    pub fn with_event_type(self: ref mut, evt: FixedString[RESIDUAL_NAME_CAP])
+        effects: [deterministic]
+    {
+        self.event_type = evt
+    }
+
+    pub fn with_source(self: ref mut, src: FixedString[RESIDUAL_NAME_CAP])
+        effects: [deterministic]
+    {
+        self.source_filter = src
+    }
+
+    pub fn with_tag(self: ref mut, tag: FixedString[RESIDUAL_NAME_CAP])
+        effects: [deterministic]
+    {
+        self.tag_filter = tag
+    }
+
+    pub fn matches(self, record: ref ResidualRecord) -> bool
+        effects: [deterministic]
+    {
+        if record.timestamp.lt(self.start_time) || record.timestamp.gt(self.end_time) {
+            return false
+        }
+        if !self.event_type.is_empty() {
+            if !record.event_type.eq(self.event_type) {
+                return false
+            }
+        }
+        if !self.source_filter.is_empty() {
+            if !record.source.eq(self.source_filter) {
+                return false
+            }
+        }
+        if !self.tag_filter.is_empty() {
+            let mut found_tag: bool = false
+            for i in 0..record.tag_count {
+                let tag: FixedString[RESIDUAL_NAME_CAP] = match record.tags.get(i) {
+                    Result::Ok(t) => t,
+                    Result::Err(_) => continue,
+                }
+                if tag.eq(self.tag_filter) {
+                    found_tag = true
+                }
+            }
+            if !found_tag {
+                return false
+            }
+        }
+        true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Causal Link
+// ──────────────────────────────────────────────
+pub type CausalLink : struct {
+    parent_id: Word32,
+    child_id: Word32,
+    relationship: FixedString[RESIDUAL_NAME_CAP],
+    strength: u8,
+    timestamp_diff: Word64,
+}
+
+impl CausalLink {
+    pub fn new(parent: Word32, child: Word32, rel: FixedString[RESIDUAL_NAME_CAP], strength_val: u8, td: Word64) -> CausalLink
+        effects: [deterministic]
+    {
+        CausalLink {
+            parent_id: parent,
+            child_id: child,
+            relationship: rel,
+            strength: strength_val,
+            timestamp_diff: td,
+        }
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            residual_op: "causal.link",
+            parent: self.parent_id.to_u32() as u64,
+            child: self.child_id.to_u32() as u64,
+            strength: self.strength as u64,
+            time_diff: self.timestamp_diff.to_u64(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Causal Link Analyzer
+// ──────────────────────────────────────────────
+pub type CausalAnalyzer : struct {
+    links: FixedArray[CausalLink, RESIDUAL_CAUSAL_DEPTH],
+    link_count: u32,
+    max_chain_depth: u32,
+}
+
+impl CausalAnalyzer {
+    pub fn new() -> CausalAnalyzer
+        effects: [deterministic]
+    {
+        CausalAnalyzer {
+            links: FixedArray::new(),
+            link_count: 0,
+            max_chain_depth: 0,
+        }
+    }
+
+    pub fn analyze(self: ref mut, records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS], record_count: u32)
+        effects: [deterministic, residual]
+    {
+        self.link_count = 0
+        for i in 0..record_count {
+            let record: ResidualRecord = match records.get(i) {
+                Result::Ok(r) => r,
+                Result::Err(_) => continue,
+            }
+            if record.causal_parent.to_u32() != 0 {
+                let parent: Word32 = record.causal_parent
+                let diff: Word64 = record.timestamp.sub(
+                    self.find_timestamp(records, record_count, parent))
+                let link: CausalLink = CausalLink::new(
+                    parent, record.id,
+                    FixedString[RESIDUAL_NAME_CAP]::from_slice("caused_by"),
+                    80, diff)
+                if self.link_count < RESIDUAL_CAUSAL_DEPTH {
+                    let _ = self.links.set(self.link_count, link)
+                    self.link_count = self.link_count + 1
+                    link.record()
+                }
+            }
+        }
+    }
+
+    fn find_timestamp(self, records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS], count: u32, rid: Word32) -> Word64
+        effects: [deterministic]
+    {
+        for i in 0..count {
+            let r: ResidualRecord = match records.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if r.id.eq(rid) {
+                return r.timestamp
+            }
+        }
+        Word64::zero()
+    }
+
+    pub fn get_chain(self, root_id: Word32, records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS], count: u32) -> FixedArray[Word32, RESIDUAL_CAUSAL_DEPTH>
+        effects: [deterministic]
+    {
+        let mut chain: FixedArray[Word32, RESIDUAL_CAUSAL_DEPTH] = FixedArray::new()
+        let mut chain_len: u32 = 0
+        let mut current: Word32 = root_id
+        for _ in 0..RESIDUAL_CAUSAL_DEPTH {
+            if chain_len < RESIDUAL_CAUSAL_DEPTH {
+                let _ = chain.set(chain_len, current)
+                chain_len = chain_len + 1
+            }
+            // Find next in chain
+            let mut found_child: bool = false
+            for i in 0..count {
+                let r: ResidualRecord = match records.get(i) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => continue,
+                }
+                if r.causal_parent.eq(current) {
+                    current = r.id
+                    found_child = true
+                }
+            }
+            if !found_child {
+                break
+            }
+        }
+        chain
+    }
+}
+
+// ──────────────────────────────────────────────
+// Pattern Matcher
+// ──────────────────────────────────────────────
+pub type PatternDefinition : struct {
+    name: FixedString[RESIDUAL_NAME_CAP],
+    event_sequence: FixedArray[FixedString[RESIDUAL_NAME_CAP], RESIDUAL_PATTERN_CAP],
+    sequence_length: u32,
+    time_window: Word64,
+    min_confidence: u8,
+}
+
+impl PatternDefinition {
+    pub fn new(pname: FixedString[RESIDUAL_NAME_CAP], window: Word64, confidence: u8) -> PatternDefinition
+        effects: [deterministic]
+    {
+        PatternDefinition {
+            name: pname,
+            event_sequence: FixedArray::new(),
+            sequence_length: 0,
+            time_window: window,
+            min_confidence: confidence,
+        }
+    }
+
+    pub fn add_event(self: ref mut, evt: FixedString[RESIDUAL_NAME_CAP]) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.sequence_length >= RESIDUAL_PATTERN_CAP {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_PATTERN_CAP))
+        }
+        let r: Result<(), BoundsError> = self.event_sequence.set(self.sequence_length, evt)
+        if r.is_ok() {
+            self.sequence_length = self.sequence_length + 1
+        }
+        r
+    }
+}
+
+pub type PatternMatch : struct {
+    pattern_name: FixedString[RESIDUAL_NAME_CAP],
+    matched_ids: FixedArray[Word32, RESIDUAL_PATTERN_CAP],
+    match_count: u32,
+    confidence: u8,
+    time_span: Word64,
+}
+
+impl PatternMatch {
+    pub fn new(pname: FixedString[RESIDUAL_NAME_CAP], conf: u8) -> PatternMatch
+        effects: [deterministic]
+    {
+        PatternMatch {
+            pattern_name: pname,
+            matched_ids: FixedArray::new(),
+            match_count: 0,
+            confidence: conf,
+            time_span: Word64::zero(),
+        }
+    }
+
+    pub fn add_match(self: ref mut, rid: Word32) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.match_count >= RESIDUAL_PATTERN_CAP {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_PATTERN_CAP))
+        }
+        let r: Result<(), BoundsError> = self.matched_ids.set(self.match_count, rid)
+        if r.is_ok() {
+            self.match_count = self.match_count + 1
+        }
+        r
+    }
+}
+
+pub type PatternMatcher : struct {
+    patterns: FixedArray[PatternDefinition, RESIDUAL_PATTERN_CAP],
+    pattern_count: u32,
+}
+
+impl PatternMatcher {
+    pub fn new() -> PatternMatcher
+        effects: [deterministic]
+    {
+        PatternMatcher {
+            patterns: FixedArray::new(),
+            pattern_count: 0,
+        }
+    }
+
+    pub fn register_pattern(self: ref mut, pattern: PatternDefinition) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.pattern_count >= RESIDUAL_PATTERN_CAP {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_PATTERN_CAP))
+        }
+        let r: Result<(), BoundsError> = self.patterns.set(self.pattern_count, pattern)
+        if r.is_ok() {
+            self.pattern_count = self.pattern_count + 1
+        }
+        r
+    }
+
+    pub fn match_all(self, records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS], count: u32) -> FixedArray[PatternMatch, RESIDUAL_PATTERN_CAP]
+        effects: [deterministic]
+    {
+        let mut matches: FixedArray[PatternMatch, RESIDUAL_PATTERN_CAP] = FixedArray::new()
+        let mut match_count: u32 = 0
+        for i in 0..self.pattern_count {
+            let pattern: PatternDefinition = match self.patterns.get(i) {
+                Result::Ok(p) => p,
+                Result::Err(_) => continue,
+            }
+            let pm: PatternMatch = self.match_pattern(pattern, records, count)
+            if pm.match_count > 0 {
+                if match_count < RESIDUAL_PATTERN_CAP {
+                    let _ = matches.set(match_count, pm)
+                    match_count = match_count + 1
+                }
+            }
+        }
+        matches
+    }
+
+    fn match_pattern(self, pattern: PatternDefinition, records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS], count: u32) -> PatternMatch
+        effects: [deterministic]
+    {
+        let mut pm: PatternMatch = PatternMatch::new(pattern.name, pattern.min_confidence)
+        let seq_len: u32 = pattern.sequence_length
+        if seq_len == 0 {
+            return pm
+        }
+        // Sliding window matching
+        for start in 0..count {
+            let mut seq_idx: u32 = 0
+            let mut matched: bool = true
+            for offset in 0..seq_len {
+                let idx: u32 = start + offset
+                if idx >= count {
+                    matched = false
+                } else {
+                    let r: ResidualRecord = match records.get(idx) {
+                        Result::Ok(v) => v,
+                        Result::Err(_) => {
+                            matched = false
+                        }
+                    }
+                    let expected: FixedString[RESIDUAL_NAME_CAP] = match pattern.event_sequence.get(offset) {
+                        Result::Ok(e) => e,
+                        Result::Err(_) => {
+                            matched = false
+                        }
+                    }
+                    if !r.event_type.eq(expected) {
+                        matched = false
+                    }
+                }
+            }
+            if matched {
+                for offset in 0..seq_len {
+                    let idx: u32 = start + offset
+                    if idx < count {
+                        let r: ResidualRecord = match records.get(idx) {
+                            Result::Ok(v) => v,
+                            Result::Err(_) => continue,
+                        }
+                        let _ = pm.add_match(r.id)
+                    }
+                }
+            }
+        }
+        pm
+    }
+}
+
+// ──────────────────────────────────────────────
+// Evidence Extraction
+// ──────────────────────────────────────────────
+pub type EvidenceExtractor : struct {
+    extract_count: Word64,
+    last_extract: Word64,
+    export_format: u8,
+}
+
+impl EvidenceExtractor {
+    pub fn new() -> EvidenceExtractor
+        effects: [deterministic]
+    {
+        EvidenceExtractor {
+            extract_count: Word64::zero(),
+            last_extract: Word64::zero(),
+            export_format: 0,
+        }
+    }
+
+    pub fn extract(self: ref mut, records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS], count: u32, query: TemporalQuery) -> FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS]
+        effects: [deterministic, residual]
+    {
+        let mut results: FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS] = FixedArray::new()
+        let mut result_count: u32 = 0
+        for i in 0..count {
+            let record: ResidualRecord = match records.get(i) {
+                Result::Ok(r) => r,
+                Result::Err(_) => continue,
+            }
+            if query.matches(&record) {
+                if result_count < RESIDUAL_QUERY_RESULTS {
+                    let _ = results.set(result_count, record)
+                    result_count = result_count + 1
+                }
+            }
+        }
+        self.extract_count = self.extract_count.increment_or_max()
+        self.last_extract = query.end_time
+
+        residual emit {
+            residual_op: "evidence.extracted",
+            records_found: result_count as u64,
+            time_range_start: query.start_time.to_u64(),
+            time_range_end: query.end_time.to_u64(),
+        }
+        results
+    }
+
+    pub fn export_court_format(self: ref mut, records: FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS], count: u32) -> FixedString[4096]
+        effects: [deterministic]
+    {
+        let mut output: FixedString[4096] = FixedString::new()
+        output.append(FixedString[32]::from_slice("RESIDUAL EVIDENCE EXPORT\n"))
+        output.append(FixedString[32]::from_slice("========================\n"))
+        output.append(FixedString[16]::from_slice("Records: "))
+        output.append_u64(count as u64)
+        output.append(FixedString[4]::from_slice("\n\n"))
+        for i in 0..count {
+            let r: ResidualRecord = match records.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            output.append(FixedString[8]::from_slice("--- Record "))
+            output.append_u64(r.id.to_u32() as u64)
+            output.append(FixedString[4]::from_slice(" ---\n"))
+            output.append(FixedString[8]::from_slice("Time: "))
+            output.append_u64(r.timestamp.to_u64())
+            output.append(FixedString[8]::from_slice("\nSource: "))
+            output.append(r.source)
+            output.append(FixedString[8]::from_slice("\nEvent: "))
+            output.append(r.event_type)
+            output.append(FixedString[8]::from_slice("\nSeq: "))
+            output.append_u64(r.sequence_num.to_u64())
+            output.append(FixedString[8]::from_slice("\nConfidence: "))
+            output.append_u64(r.confidence as u64)
+            output.append(FixedString[4]::from_slice("\n\n"))
+        }
+        output
+    }
+}
+
+// ──────────────────────────────────────────────
+// Residual Database (Main)
+// ──────────────────────────────────────────────
+pub type ResidualDatabase : struct {
+    records: FixedArray[ResidualRecord, RESIDUAL_MAX_RECORDS],
+    record_count: u32,
+    next_id: Word32,
+    index: ResidualIndex,
+    causal_analyzer: CausalAnalyzer,
+    pattern_matcher: PatternMatcher,
+    evidence_extractor: EvidenceExtractor,
+    residuals: FixedArray[ResidualRecord, RESIDUAL_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl ResidualDatabase {
+    pub fn new() -> ResidualDatabase
+        effects: [deterministic, residual]
+    {
+        let db: ResidualDatabase = ResidualDatabase {
+            records: FixedArray::new(),
+            record_count: 0,
+            next_id: Word32::from_u32(1),
+            index: ResidualIndex::new(),
+            causal_analyzer: CausalAnalyzer::new(),
+            pattern_matcher: PatternMatcher::new(),
+            evidence_extractor: EvidenceExtractor::new(),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+        residual emit {
+            residual_op: "residual_db.init",
+            max_records: RESIDUAL_MAX_RECORDS as u64,
+            max_index_slots: RESIDUAL_INDEX_SLOTS as u64,
+        }
+        db
+    }
+
+    pub fn record_event(self: ref mut, source: FixedString[RESIDUAL_NAME_CAP], event_type: FixedString[RESIDUAL_NAME_CAP], ts: Word64) -> Result[Word32, BoundsError>
+        effects: [deterministic, residual]
+    {
+        if self.record_count >= RESIDUAL_MAX_RECORDS {
+            return Result::Err(bounds_capacity_exceeded(RESIDUAL_MAX_RECORDS))
+        }
+        let rid: Word32 = self.next_id
+        self.next_id = Word32::from_u32(self.next_id.to_u32() + 1)
+        let mut record: ResidualRecord = ResidualRecord::new(rid, ts, source, event_type)
+        record.sequence_num = Word64::from_u64(self.record_count as u64 + 1)
+
+        let r: Result<(), BoundsError> = self.records.set(self.record_count, record)
+        if r.is_err() {
+            return Result::Err(r.err())
+        }
+        let _ = self.index.index_record(&record)
+        self.record_count = self.record_count + 1
+
+        residual emit {
+            residual_op: "event.recorded",
+            record_id: rid.to_u32() as u64,
+            source: source,
+            event_type: event_type,
+            timestamp: ts.to_u64(),
+            total_records: self.record_count as u64,
+        }
+        Result::Ok(rid)
+    }
+
+    pub fn query_temporal(self, start: Word64, end: Word64, event_type: FixedString[RESIDUAL_NAME_CAP]) -> FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS]
+        effects: [deterministic]
+    {
+        let mut query: TemporalQuery = TemporalQuery::new(start, end)
+        if !event_type.is_empty() {
+            query.with_event_type(event_type)
+        }
+        let mut results: FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS] = FixedArray::new()
+        let mut count: u32 = 0
+        for i in 0..self.record_count {
+            let record: ResidualRecord = match self.records.get(i) {
+                Result::Ok(r) => r,
+                Result::Err(_) => continue,
+            }
+            if query.matches(&record) {
+                if count < RESIDUAL_QUERY_RESULTS {
+                    let _ = results.set(count, record)
+                    count = count + 1
+                }
+            }
+        }
+        results
+    }
+
+    pub fn analyze_causal_links(self: ref mut)
+        effects: [deterministic, residual]
+    {
+        self.causal_analyzer.analyze(self.records, self.record_count)
+    }
+
+    pub fn register_pattern(self: ref mut, pattern: PatternDefinition) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        self.pattern_matcher.register_pattern(pattern)
+    }
+
+    pub fn match_patterns(self) -> FixedArray[PatternMatch, RESIDUAL_PATTERN_CAP]
+        effects: [deterministic]
+    {
+        self.pattern_matcher.match_all(self.records, self.record_count)
+    }
+
+    pub fn extract_evidence(self: ref mut, start: Word64, end: Word64, event_type: FixedString[RESIDUAL_NAME_CAP]) -> FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS]
+        effects: [deterministic, residual]
+    {
+        let mut query: TemporalQuery = TemporalQuery::new(start, end)
+        if !event_type.is_empty() {
+            query.with_event_type(event_type)
+        }
+        self.evidence_extractor.extract(self.records, self.record_count, query)
+    }
+
+    pub fn export_evidence(self: ref mut, record_set: FixedArray[ResidualRecord, RESIDUAL_QUERY_RESULTS], count: u32) -> FixedString[4096]
+        effects: [deterministic]
+    {
+        self.evidence_extractor.export_court_format(record_set, count)
+    }
+
+    pub fn lookup_by_source(self, source: FixedString[RESIDUAL_NAME_CAP]) -> FixedArray[Word32, RESIDUAL_INDEX_SLOTS]
+        effects: [deterministic]
+    {
+        self.index.lookup(source)
+    }
+
+    pub fn get_record(self, rid: Word32) -> Result[ResidualRecord, BoundsError>
+        effects: [deterministic]
+    {
+        for i in 0..self.record_count {
+            let r: ResidualRecord = match self.records.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if r.id.eq(rid) {
+                return Result::Ok(r)
+            }
+        }
+        Result::Err(bounds_index_out_of_range(0, self.record_count))
+    }
+
+    pub fn record_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.record_count
+    }
+
+    pub fn verify_integrity(self) -> bool
+        effects: [deterministic]
+    {
+        if self.record_count > RESIDUAL_MAX_RECORDS {
+            return false
+        }
+        for i in 0..self.record_count {
+            let r: ResidualRecord = match self.records.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => return false,
+            }
+            if r.id.to_u32() == 0 {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn get_report(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[512] = FixedString::new()
+        report.append(FixedString[32]::from_slice("Residual Database Report\n"))
+        report.append(FixedString[32]::from_slice("========================\n"))
+        report.append(FixedString[16]::from_slice("Total records: "))
+        report.append_u64(self.record_count as u64)
+        report.append(FixedString[16]::from_slice("\nIndex entries: "))
+        report.append_u64(self.index.entry_count as u64)
+        report.append(FixedString[16]::from_slice("\nCausal links: "))
+        report.append_u64(self.causal_analyzer.link_count as u64)
+        report.append(FixedString[16]::from_slice("\nPatterns: "))
+        report.append_u64(self.pattern_matcher.pattern_count as u64)
+        report.append(FixedString[16]::from_slice("\nExtractions: "))
+        report.append_u64(self.evidence_extractor.extract_count.to_u64())
+        report
+    }
+
+    pub fn flush_residuals(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            residual_op: "residual_db.flushed",
+            total_records: self.record_count as u64,
+            total_index_entries: self.index.entry_count as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_residual_database() -> ResidualDatabase
+    effects: [deterministic, residual]
+{
+    let db: ResidualDatabase = ResidualDatabase::new()
+    residual emit {
+        residual_op: "residual.subsystem.init",
+        max_records: RESIDUAL_MAX_RECORDS as u64,
+        max_index: RESIDUAL_INDEX_SLOTS as u64,
+        causal_depth: RESIDUAL_CAUSAL_DEPTH as u64,
+    }
+    db
+}

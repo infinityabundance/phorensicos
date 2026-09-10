@@ -1,0 +1,888 @@
+// file: provenance_db.phor
+// purpose: Provenance database for provenance graph storage,
+//          ancestry queries, dependency resolution, causal tracing,
+//          and provenance verification. All operations are
+//          fully deterministic for court admissibility.
+// evidence: PROV-DB-ARCH-001 through PROV-DB-ARCH-240
+// residual: All provenance operations emit residuals for
+//           meta-verification in forensic proceedings.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+use core::serialization::*
+
+// ──────────────────────────────────────────────
+// Provenance DB Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_PROV_DB_BASE : Word64 = DIAG_STORE_BASE | 0x2000
+
+const PROV_MAX_NODES          : u32 = 1024
+const PROV_MAX_EDGES          : u32 = 2048
+const PROV_ANCESTRY_DEPTH     : u32 = 64
+const PROV_DEP_RESULTS        : u32 = 128
+const PROV_TRACE_DEPTH        : u32 = 64
+const PROV_NAME_CAP           : u32 = 64
+const PROV_HASH_SIZE          : u32 = 32
+const PROV_METADATA_CAP       : u32 = 16
+const PROV_RESIDUAL_LOG       : u32 = 64
+const PROV_VERIFICATION_DEPTH : u32 = 32
+
+// ──────────────────────────────────────────────
+// Provenance Node Type Enum
+// ──────────────────────────────────────────────
+pub type ProvNodeType : u8 = enum {
+    ProvNode_Artifact     = 0x00,
+    ProvNode_Process      = 0x01,
+    ProvNode_Agent        = 0x02,
+    ProvNode_Collection   = 0x03,
+    ProvNode_Activity     = 0x04,
+    ProvNode_Entity       = 0x05,
+}
+
+// ──────────────────────────────────────────────
+// Provenance Edge Type Enum
+// ──────────────────────────────────────────────
+pub type ProvEdgeType : u8 = enum {
+    ProvEdge_GeneratedBy  = 0x00,
+    ProvEdge_Used         = 0x01,
+    ProvEdge_DerivedFrom  = 0x02,
+    ProvEdge_WasAttributedTo = 0x03,
+    ProvEdge_WasAssociatedWith = 0x04,
+    ProvEdge_WasInformedBy = 0x05,
+    ProvEdge_ActedOnBehalfOf = 0x06,
+    ProvEdge_WasTriggeredBy = 0x07,
+    ProvEdge_HasMember     = 0x08,
+}
+
+// ──────────────────────────────────────────────
+// Node ID Type
+// ──────────────────────────────────────────────
+pub type NodeId : u32 = struct {
+    value: Word32,
+}
+
+impl NodeId {
+    pub fn new(val: Word32) -> NodeId
+        effects: [deterministic]
+    {
+        NodeId { value: val }
+    }
+
+    pub fn from_u32(val: u32) -> NodeId
+        effects: [deterministic]
+    {
+        NodeId { value: Word32::from_u32(val) }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value.to_u32()
+    }
+
+    pub fn eq(self, other: NodeId) -> bool
+        effects: [deterministic]
+    {
+        self.value.eq(other.value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Provenance Node
+// ──────────────────────────────────────────────
+pub type ProvNode : struct {
+    id: NodeId,
+    node_type: ProvNodeType,
+    name: FixedString[PROV_NAME_CAP],
+    hash: FixedArray[Byte, PROV_HASH_SIZE],
+    metadata_keys: FixedArray[FixedString[PROV_NAME_CAP], PROV_METADATA_CAP],
+    metadata_vals: FixedArray[FixedString[PROV_NAME_CAP], PROV_METADATA_CAP],
+    metadata_count: u32,
+    timestamp: Word64,
+    version: Word32,
+}
+
+impl ProvNode {
+    pub fn new(nid: NodeId, ntype: ProvNodeType, nm: FixedString[PROV_NAME_CAP], ts: Word64) -> ProvNode
+        effects: [deterministic]
+    {
+        ProvNode {
+            id: nid,
+            node_type: ntype,
+            name: nm,
+            hash: FixedArray::new(),
+            metadata_keys: FixedArray::new(),
+            metadata_vals: FixedArray::new(),
+            metadata_count: 0,
+            timestamp: ts,
+            version: Word32::from_u32(1),
+        }
+    }
+
+    pub fn add_metadata(self: ref mut, key: FixedString[PROV_NAME_CAP], val: FixedString[PROV_NAME_CAP]) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.metadata_count >= PROV_METADATA_CAP {
+            return Result::Err(bounds_capacity_exceeded(PROV_METADATA_CAP))
+        }
+        let rk: Result<(), BoundsError> = self.metadata_keys.set(self.metadata_count, key)
+        let rv: Result<(), BoundsError> = self.metadata_vals.set(self.metadata_count, val)
+        if rk.is_ok() && rv.is_ok() {
+            self.metadata_count = self.metadata_count + 1
+            Result::Ok(())
+        } else {
+            Result::Err(bounds_capacity_exceeded(PROV_METADATA_CAP))
+        }
+    }
+
+    pub fn get_metadata(self, key: FixedString[PROV_NAME_CAP]) -> FixedString[PROV_NAME_CAP]
+        effects: [deterministic]
+    {
+        for i in 0..self.metadata_count {
+            let k: FixedString[PROV_NAME_CAP] = match self.metadata_keys.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if k.eq(key) {
+                let v: FixedString[PROV_NAME_CAP] = match self.metadata_vals.get(i) {
+                    Result::Ok(val) => val,
+                    Result::Err(_) => continue,
+                }
+                return v
+            }
+        }
+        FixedString::new()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Provenance Edge
+// ──────────────────────────────────────────────
+pub type ProvEdge : struct {
+    id: Word32,
+    source: NodeId,
+    target: NodeId,
+    edge_type: ProvEdgeType,
+    label: FixedString[PROV_NAME_CAP],
+    timestamp: Word64,
+    confidence: u8,
+}
+
+impl ProvEdge {
+    pub fn new(eid: Word32, src: NodeId, tgt: NodeId, etype: ProvEdgeType, ts: Word64) -> ProvEdge
+        effects: [deterministic]
+    {
+        ProvEdge {
+            id: eid,
+            source: src,
+            target: tgt,
+            edge_type: etype,
+            label: FixedString::new(),
+            timestamp: ts,
+            confidence: 100,
+        }
+    }
+
+    pub fn with_label(eid: Word32, src: NodeId, tgt: NodeId, etype: ProvEdgeType, lbl: FixedString[PROV_NAME_CAP], ts: Word64) -> ProvEdge
+        effects: [deterministic]
+    {
+        let mut edge: ProvEdge = ProvEdge::new(eid, src, tgt, etype, ts)
+        edge.label = lbl
+        edge
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            provenance_op: "edge.created",
+            edge_id: self.id.to_u32() as u64,
+            source: self.source.value() as u64,
+            target: self.target.value() as u64,
+            edge_type: self.edge_type as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Provenance Graph
+// ──────────────────────────────────────────────
+pub type ProvenanceGraph : struct {
+    nodes: FixedArray[ProvNode, PROV_MAX_NODES],
+    node_count: u32,
+    edges: FixedArray[ProvEdge, PROV_MAX_EDGES],
+    edge_count: u32,
+    next_node_id: u32,
+    next_edge_id: u32,
+}
+
+impl ProvenanceGraph {
+    pub fn new() -> ProvenanceGraph
+        effects: [deterministic]
+    {
+        ProvenanceGraph {
+            nodes: FixedArray::new(),
+            node_count: 0,
+            edges: FixedArray::new(),
+            edge_count: 0,
+            next_node_id: 1,
+            next_edge_id: 1,
+        }
+    }
+
+    pub fn add_node(self: ref mut, ntype: ProvNodeType, name: FixedString[PROV_NAME_CAP], ts: Word64) -> Result[NodeId, BoundsError>
+        effects: [deterministic, residual]
+    {
+        if self.node_count >= PROV_MAX_NODES {
+            return Result::Err(bounds_capacity_exceeded(PROV_MAX_NODES))
+        }
+        let nid: NodeId = NodeId::from_u32(self.next_node_id)
+        self.next_node_id = self.next_node_id + 1
+        let node: ProvNode = ProvNode::new(nid, ntype, name, ts)
+        let r: Result<(), BoundsError> = self.nodes.set(self.node_count, node)
+        if r.is_err() {
+            return Result::Err(r.err())
+        }
+        self.node_count = self.node_count + 1
+
+        residual emit {
+            provenance_op: "node.created",
+            node_id: nid.value() as u64,
+            node_type: ntype as u64,
+            name: name,
+            timestamp: ts.to_u64(),
+        }
+        Result::Ok(nid)
+    }
+
+    pub fn add_edge(self: ref mut, src: NodeId, tgt: NodeId, etype: ProvEdgeType, ts: Word64) -> Result[Word32, BoundsError>
+        effects: [deterministic, residual]
+    {
+        if self.edge_count >= PROV_MAX_EDGES {
+            return Result::Err(bounds_capacity_exceeded(PROV_MAX_EDGES))
+        }
+        // Validate nodes exist
+        if !self.node_exists(src) || !self.node_exists(tgt) {
+            return Result::Err(bounds_index_out_of_range(0, self.node_count))
+        }
+        let eid: Word32 = Word32::from_u32(self.next_edge_id)
+        self.next_edge_id = self.next_edge_id + 1
+        let edge: ProvEdge = ProvEdge::new(eid, src, tgt, etype, ts)
+        let r: Result<(), BoundsError> = self.edges.set(self.edge_count, edge)
+        if r.is_err() {
+            return Result::Err(r.err())
+        }
+        self.edge_count = self.edge_count + 1
+
+        residual emit {
+            provenance_op: "edge.created",
+            edge_id: eid.to_u32() as u64,
+            source: src.value() as u64,
+            target: tgt.value() as u64,
+            edge_type: etype as u64,
+        }
+        Result::Ok(eid)
+    }
+
+    pub fn node_exists(self, nid: NodeId) -> bool
+        effects: [deterministic]
+    {
+        for i in 0..self.node_count {
+            let n: ProvNode = match self.nodes.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if n.id.eq(nid) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn get_node(self, nid: NodeId) -> Result<ProvNode, BoundsError>
+        effects: [deterministic]
+    {
+        for i in 0..self.node_count {
+            let n: ProvNode = match self.nodes.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if n.id.eq(nid) {
+                return Result::Ok(n)
+            }
+        }
+        Result::Err(bounds_index_out_of_range(0, self.node_count))
+    }
+
+    pub fn get_edges_from(self, nid: NodeId) -> FixedArray[ProvEdge, PROV_MAX_EDGES]
+        effects: [deterministic]
+    {
+        let mut result: FixedArray[ProvEdge, PROV_MAX_EDGES] = FixedArray::new()
+        let mut count: u32 = 0
+        for i in 0..self.edge_count {
+            let edge: ProvEdge = match self.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if edge.source.eq(nid) {
+                let _ = result.set(count, edge)
+                count = count + 1
+            }
+        }
+        result
+    }
+
+    pub fn get_edges_to(self, nid: NodeId) -> FixedArray[ProvEdge, PROV_MAX_EDGES]
+        effects: [deterministic]
+    {
+        let mut result: FixedArray[ProvEdge, PROV_MAX_EDGES] = FixedArray::new()
+        let mut count: u32 = 0
+        for i in 0..self.edge_count {
+            let edge: ProvEdge = match self.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if edge.target.eq(nid) {
+                let _ = result.set(count, edge)
+                count = count + 1
+            }
+        }
+        result
+    }
+
+    pub fn get_ancestors(self, nid: NodeId, depth: u32) -> FixedArray[NodeId, PROV_ANCESTRY_DEPTH>
+        effects: [deterministic]
+    {
+        let mut ancestors: FixedArray[NodeId, PROV_ANCESTRY_DEPTH] = FixedArray::new()
+        let mut count: u32 = 0
+        let mut visited: FixedArray[u32, PROV_ANCESTRY_DEPTH] = FixedArray::new()
+        let mut visit_count: u32 = 0
+        let max_depth: u32 = if depth > PROV_ANCESTRY_DEPTH { PROV_ANCESTRY_DEPTH } else { depth }
+
+        // BFS ancestor traversal
+        let mut queue: FixedArray[NodeId, PROV_ANCESTRY_DEPTH] = FixedArray::new()
+        let mut q_head: u32 = 0
+        let mut q_tail: u32 = 0
+        let _ = queue.set(q_tail, nid)
+        q_tail = q_tail + 1
+
+        while q_head < q_tail && count < max_depth proven {
+            let current: NodeId = match queue.get(q_head) {
+                Result::Ok(v) => v,
+                Result::Err(_) => break,
+            }
+            q_head = q_head + 1
+
+            // Mark as visited
+            if visit_count < PROV_ANCESTRY_DEPTH {
+                let _ = visited.set(visit_count, current.value())
+                visit_count = visit_count + 1
+            }
+
+            // Find all incoming edges
+            for i in 0..self.edge_count {
+                let edge: ProvEdge = match self.edges.get(i) {
+                    Result::Ok(e) => e,
+                    Result::Err(_) => continue,
+                }
+                if edge.target.eq(current) {
+                    let src: NodeId = edge.source
+                    // Check not visited
+                    let mut already: bool = false
+                    for j in 0..visit_count {
+                        let v: u32 = match visited.get(j) {
+                            Result::Ok(val) => val,
+                            Result::Err(_) => 0,
+                        }
+                        if v == src.value() {
+                            already = true
+                        }
+                    }
+                    if !already {
+                        let _ = ancestors.set(count, src)
+                        count = count + 1
+                        if q_tail < PROV_ANCESTRY_DEPTH {
+                            let _ = queue.set(q_tail, src)
+                            q_tail = q_tail + 1
+                        }
+                    }
+                }
+            }
+        }
+        ancestors
+    }
+
+    pub fn get_descendants(self, nid: NodeId, depth: u32) -> FixedArray[NodeId, PROV_ANCESTRY_DEPTH>
+        effects: [deterministic]
+    {
+        let mut descendants: FixedArray[NodeId, PROV_ANCESTRY_DEPTH] = FixedArray::new()
+        let mut count: u32 = 0
+        let max_depth: u32 = if depth > PROV_ANCESTRY_DEPTH { PROV_ANCESTRY_DEPTH } else { depth }
+
+        let mut queue: FixedArray[NodeId, PROV_ANCESTRY_DEPTH] = FixedArray::new()
+        let mut q_head: u32 = 0
+        let mut q_tail: u32 = 0
+        let _ = queue.set(q_tail, nid)
+        q_tail = q_tail + 1
+
+        while q_head < q_tail && count < max_depth proven {
+            let current: NodeId = match queue.get(q_head) {
+                Result::Ok(v) => v,
+                Result::Err(_) => break,
+            }
+            q_head = q_head + 1
+
+            for i in 0..self.edge_count {
+                let edge: ProvEdge = match self.edges.get(i) {
+                    Result::Ok(e) => e,
+                    Result::Err(_) => continue,
+                }
+                if edge.source.eq(current) {
+                    let tgt: NodeId = edge.target
+                    let _ = descendants.set(count, tgt)
+                    count = count + 1
+                    if q_tail < PROV_ANCESTRY_DEPTH {
+                        let _ = queue.set(q_tail, tgt)
+                        q_tail = q_tail + 1
+                    }
+                }
+            }
+        }
+        descendants
+    }
+
+    pub fn resolve_dependencies(self, nid: NodeId) -> FixedArray[NodeId, PROV_DEP_RESULTS]
+        effects: [deterministic]
+    {
+        let mut deps: FixedArray[NodeId, PROV_DEP_RESULTS] = FixedArray::new()
+        let mut count: u32 = 0
+        for i in 0..self.edge_count {
+            let edge: ProvEdge = match self.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if edge.target.eq(nid) {
+                if count < PROV_DEP_RESULTS {
+                    let _ = deps.set(count, edge.source)
+                    count = count + 1
+                }
+            }
+        }
+        deps
+    }
+
+    pub fn trace_path(self, from: NodeId, to: NodeId) -> FixedArray[ProvEdge, PROV_TRACE_DEPTH>
+        effects: [deterministic]
+    {
+        let mut path: FixedArray[ProvEdge, PROV_TRACE_DEPTH] = FixedArray::new()
+        let mut path_count: u32 = 0
+
+        // Simple DFS path finding
+        let mut visited: FixedArray[u32, PROV_TRACE_DEPTH] = FixedArray::new()
+        let mut visit_count: u32 = 0
+        let mut stack: FixedArray[NodeId, PROV_TRACE_DEPTH] = FixedArray::new()
+        let mut stack_depth: u32 = 0
+        let _ = stack.set(stack_depth, from)
+        stack_depth = stack_depth + 1
+
+        while stack_depth > 0 proven {
+            let current: NodeId = match stack.get(stack_depth - 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => break,
+            }
+            stack_depth = stack_depth - 1
+
+            // Mark visited
+            if visit_count < PROV_TRACE_DEPTH {
+                let _ = visited.set(visit_count, current.value())
+                visit_count = visit_count + 1
+            }
+
+            if current.eq(to) {
+                break // Found path
+            }
+
+            // Explore outgoing edges
+            for i in 0..self.edge_count {
+                let edge: ProvEdge = match self.edges.get(i) {
+                    Result::Ok(e) => e,
+                    Result::Err(_) => continue,
+                }
+                if edge.source.eq(current) {
+                    // Check not visited
+                    let mut found: bool = false
+                    for j in 0..visit_count {
+                        let v: u32 = match visited.get(j) {
+                            Result::Ok(val) => val,
+                            Result::Err(_) => 0,
+                        }
+                        if v == edge.target.value() {
+                            found = true
+                        }
+                    }
+                    if !found {
+                        let _ = path.set(path_count, edge)
+                        path_count = path_count + 1
+                        if stack_depth < PROV_TRACE_DEPTH {
+                            let _ = stack.set(stack_depth, edge.target)
+                            stack_depth = stack_depth + 1
+                        }
+                    }
+                }
+            }
+        }
+        path
+    }
+}
+
+// ──────────────────────────────────────────────
+// DAG-Based Dependency Resolver
+// ──────────────────────────────────────────────
+pub type DependencyResolver : struct {
+    resolution_count: Word64,
+    max_depth: u32,
+}
+
+impl DependencyResolver {
+    pub fn new() -> DependencyResolver
+        effects: [deterministic]
+    {
+        DependencyResolver {
+            resolution_count: Word64::zero(),
+            max_depth: PROV_ANCESTRY_DEPTH,
+        }
+    }
+
+    pub fn resolve(self, graph: ref ProvenanceGraph, nid: NodeId) -> FixedArray[NodeId, PROV_DEP_RESULTS]
+        effects: [deterministic]
+    {
+        let mut resolved: FixedArray[NodeId, PROV_DEP_RESULTS] = FixedArray::new()
+        let mut count: u32 = 0
+        let mut visited: FixedArray[u32, PROV_DEP_RESULTS] = FixedArray::new()
+        let mut visit_count: u32 = 0
+
+        let mut queue: FixedArray[NodeId, PROV_DEP_RESULTS] = FixedArray::new()
+        let mut q_head: u32 = 0
+        let mut q_tail: u32 = 0
+        let _ = queue.set(q_tail, nid)
+        q_tail = q_tail + 1
+
+        while q_head < q_tail && count < PROV_DEP_RESULTS proven {
+            let current: NodeId = match queue.get(q_head) {
+                Result::Ok(v) => v,
+                Result::Err(_) => break,
+            }
+            q_head = q_head + 1
+
+            if visit_count < PROV_DEP_RESULTS {
+                let _ = visited.set(visit_count, current.value())
+                visit_count = visit_count + 1
+            }
+
+            let deps: FixedArray[NodeId, PROV_DEP_RESULTS> = graph.resolve_dependencies(current)
+            for i in 0..PROV_DEP_RESULTS {
+                let dep: NodeId = match deps.get(i) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => continue,
+                }
+                if dep.value() == 0 {
+                    continue
+                }
+                // Check not visited
+                let mut already: bool = false
+                for j in 0..visit_count {
+                    let v: u32 = match visited.get(j) {
+                        Result::Ok(val) => val,
+                        Result::Err(_) => 0,
+                    }
+                    if v == dep.value() {
+                        already = true
+                    }
+                }
+                if !already {
+                    let _ = resolved.set(count, dep)
+                    count = count + 1
+                    if q_tail < PROV_DEP_RESULTS {
+                        let _ = queue.set(q_tail, dep)
+                        q_tail = q_tail + 1
+                    }
+                }
+            }
+        }
+        resolved
+    }
+}
+
+// ──────────────────────────────────────────────
+// Provenance Verification
+// ──────────────────────────────────────────────
+pub type ProvVerificationResult : struct {
+    is_valid: bool,
+    verified_nodes: u32,
+    verified_edges: u32,
+    violations: FixedArray[FixedString[PROV_NAME_CAP], PROV_VERIFICATION_DEPTH],
+    violation_count: u32,
+    confidence: u8,
+}
+
+impl ProvVerificationResult {
+    pub fn new() -> ProvVerificationResult
+        effects: [deterministic]
+    {
+        ProvVerificationResult {
+            is_valid: false,
+            verified_nodes: 0,
+            verified_edges: 0,
+            violations: FixedArray::new(),
+            violation_count: 0,
+            confidence: 0,
+        }
+    }
+
+    pub fn add_violation(self: ref mut, v: FixedString[PROV_NAME_CAP])
+        effects: [deterministic]
+    {
+        if self.violation_count < PROV_VERIFICATION_DEPTH {
+            let _ = self.violations.set(self.violation_count, v)
+            self.violation_count = self.violation_count + 1
+        }
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            provenance_op: "verification.complete",
+            is_valid: if self.is_valid { 1 } else { 0 },
+            verified_nodes: self.verified_nodes as u64,
+            verified_edges: self.verified_edges as u64,
+            violations: self.violation_count as u64,
+            confidence: self.confidence as u64,
+        }
+    }
+}
+
+pub type ProvenanceVerifier : struct {
+    verifications: Word64,
+    last_verified: Word64,
+}
+
+impl ProvenanceVerifier {
+    pub fn new() -> ProvenanceVerifier
+        effects: [deterministic]
+    {
+        ProvenanceVerifier {
+            verifications: Word64::zero(),
+            last_verified: Word64::zero(),
+        }
+    }
+
+    pub fn verify(self: ref mut, graph: ref ProvenanceGraph) -> ProvVerificationResult
+        effects: [deterministic, residual]
+    {
+        let mut result: ProvVerificationResult = ProvVerificationResult::new()
+        result.is_valid = true
+        result.verified_nodes = graph.node_count
+        result.verified_edges = graph.edge_count
+
+        // Check 1: All edge endpoints reference valid nodes
+        for i in 0..graph.edge_count {
+            let edge: ProvEdge = match graph.edges.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if !graph.node_exists(edge.source) {
+                result.is_valid = false
+                result.add_violation(FixedString[PROV_NAME_CAP]::from_slice("Edge references non-existent source"))
+            }
+            if !graph.node_exists(edge.target) {
+                result.is_valid = false
+                result.add_violation(FixedString[PROV_NAME_CAP]::from_slice("Edge references non-existent target"))
+            }
+        }
+
+        // Check 2: No duplicate node IDs
+        for i in 0..graph.node_count {
+            let n1: ProvNode = match graph.nodes.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            for j in (i + 1)..graph.node_count {
+                let n2: ProvNode = match graph.nodes.get(j) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => continue,
+                }
+                if n1.id.eq(n2.id) {
+                    result.is_valid = false
+                    result.add_violation(FixedString[PROV_NAME_CAP]::from_slice("Duplicate node ID"))
+                }
+            }
+        }
+
+        result.confidence = if result.is_valid { 100 } else { 50 }
+        self.verifications = self.verifications.increment_or_max()
+
+        result.record()
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// Provenance Database (Main)
+// ──────────────────────────────────────────────
+pub type ProvenanceDatabase : struct {
+    graph: ProvenanceGraph,
+    resolver: DependencyResolver,
+    verifier: ProvenanceVerifier,
+}
+
+impl ProvenanceDatabase {
+    pub fn new() -> ProvenanceDatabase
+        effects: [deterministic, residual]
+    {
+        let db: ProvenanceDatabase = ProvenanceDatabase {
+            graph: ProvenanceGraph::new(),
+            resolver: DependencyResolver::new(),
+            verifier: ProvenanceVerifier::new(),
+        }
+        residual emit {
+            provenance_op: "provenance_db.init",
+            max_nodes: PROV_MAX_NODES as u64,
+            max_edges: PROV_MAX_EDGES as u64,
+        }
+        db
+    }
+
+    pub fn record_artifact(db: ref mut ProvenanceDatabase, name: FixedString[PROV_NAME_CAP], ts: Word64) -> Result[NodeId, BoundsError>
+        effects: [deterministic, residual]
+    {
+        db.graph.add_node(ProvNodeType::ProvNode_Artifact, name, ts)
+    }
+
+    pub fn record_process(db: ref mut ProvenanceDatabase, name: FixedString[PROV_NAME_CAP], ts: Word64) -> Result[NodeId, BoundsError>
+        effects: [deterministic, residual]
+    {
+        db.graph.add_node(ProvNodeType::ProvNode_Process, name, ts)
+    }
+
+    pub fn record_agent(db: ref mut ProvenanceDatabase, name: FixedString[PROV_NAME_CAP], ts: Word64) -> Result[NodeId, BoundsError>
+        effects: [deterministic, residual]
+    {
+        db.graph.add_node(ProvNodeType::ProvNode_Agent, name, ts)
+    }
+
+    pub fn record_generation(db: ref mut ProvenanceDatabase, process: NodeId, artifact: NodeId, ts: Word64) -> Result[Word32, BoundsError>
+        effects: [deterministic, residual]
+    {
+        db.graph.add_edge(process, artifact, ProvEdgeType::ProvEdge_GeneratedBy, ts)
+    }
+
+    pub fn record_usage(db: ref mut ProvenanceDatabase, process: NodeId, artifact: NodeId, ts: Word64) -> Result[Word32, BoundsError>
+        effects: [deterministic, residual]
+    {
+        db.graph.add_edge(artifact, process, ProvEdgeType::ProvEdge_Used, ts)
+    }
+
+    pub fn record_derivation(db: ref mut ProvenanceDatabase, derived: NodeId, original: NodeId, ts: Word64) -> Result[Word32, BoundsError>
+        effects: [deterministic, residual]
+    {
+        db.graph.add_edge(original, derived, ProvEdgeType::ProvEdge_DerivedFrom, ts)
+    }
+
+    pub fn query_ancestry(db: ref ProvenanceDatabase, nid: NodeId, depth: u32) -> FixedArray[NodeId, PROV_ANCESTRY_DEPTH>
+        effects: [deterministic]
+    {
+        db.graph.get_ancestors(nid, depth)
+    }
+
+    pub fn query_descendants(db: ref ProvenanceDatabase, nid: NodeId, depth: u32) -> FixedArray[NodeId, PROV_ANCESTRY_DEPTH>
+        effects: [deterministic]
+    {
+        db.graph.get_descendants(nid, depth)
+    }
+
+    pub fn resolve_dependencies(db: ref ProvenanceDatabase, nid: NodeId) -> FixedArray[NodeId, PROV_DEP_RESULTS>
+        effects: [deterministic]
+    {
+        db.resolver.resolve(&db.graph, nid)
+    }
+
+    pub fn trace_causal_path(db: ref ProvenanceDatabase, from: NodeId, to: NodeId) -> FixedArray[ProvEdge, PROV_TRACE_DEPTH>
+        effects: [deterministic]
+    {
+        db.graph.trace_path(from, to)
+    }
+
+    pub fn verify_provenance(db: ref mut ProvenanceDatabase) -> ProvVerificationResult
+        effects: [deterministic, residual]
+    {
+        db.verifier.verify(&db.graph)
+    }
+
+    pub fn get_node_info(db: ref ProvenanceDatabase, nid: NodeId) -> Result[ProvNode, BoundsError>
+        effects: [deterministic]
+    {
+        db.graph.get_node(nid)
+    }
+
+    pub fn get_graph_stats(db: ref ProvenanceDatabase) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut stats: FixedString[512] = FixedString::new()
+        stats.append(FixedString[32]::from_slice("Provenance Database\n"))
+        stats.append(FixedString[32]::from_slice("====================\n"))
+        stats.append(FixedString[16]::from_slice("Nodes: "))
+        stats.append_u64(db.graph.node_count as u64)
+        stats.append(FixedString[16]::from_slice("\nEdges: "))
+        stats.append_u64(db.graph.edge_count as u64)
+        stats.append(FixedString[16]::from_slice("\nVerifications: "))
+        stats.append_u64(db.verifier.verifications.to_u64())
+
+        let mut artifact_count: u32 = 0
+        let mut process_count: u32 = 0
+        for i in 0..db.graph.node_count {
+            let n: ProvNode = match db.graph.nodes.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if n.node_type == ProvNodeType::ProvNode_Artifact { artifact_count = artifact_count + 1 }
+            if n.node_type == ProvNodeType::ProvNode_Process { process_count = process_count + 1 }
+        }
+        stats.append(FixedString[16]::from_slice("\nArtifacts: "))
+        stats.append_u64(artifact_count as u64)
+        stats.append(FixedString[16]::from_slice("\nProcesses: "))
+        stats.append_u64(process_count as u64)
+        stats
+    }
+
+    pub fn flush_residuals(db: ref mut ProvenanceDatabase)
+        effects: [residual]
+    {
+        residual emit {
+            provenance_op: "provenance_db.flushed",
+            total_nodes: db.graph.node_count as u64,
+            total_edges: db.graph.edge_count as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_provenance_database() -> ProvenanceDatabase
+    effects: [deterministic, residual]
+{
+    let db: ProvenanceDatabase = ProvenanceDatabase::new()
+    residual emit {
+        provenance_op: "provenance.subsystem.init",
+        max_nodes: PROV_MAX_NODES as u64,
+        max_edges: PROV_MAX_EDGES as u64,
+        ancestry_depth: PROV_ANCESTRY_DEPTH as u64,
+    }
+    db
+}

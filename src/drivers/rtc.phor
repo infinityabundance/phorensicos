@@ -1,0 +1,817 @@
+// rtc.phor — Real-time clock driver
+// CMOS RTC access, time/date read, alarm configuration, HPET/APIC coordination
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/rtc.phor
+// Court: rtc_driver:v2
+
+package drivers.rtc;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type RtcError = enum {
+    RtcNotInitialized         = 0x600,  // E0600: RTC driver not initialized
+    RtcRegisterInvalid        = 0x601,  // E0601: invalid RTC register
+    RtcUpdateInProgress       = 0x602,  // E0602: RTC update in progress
+    RtcAlarmNotSupported      = 0x603,  // E0603: alarm not supported
+    RtcAlarmConfigError       = 0x604,  // E0604: invalid alarm configuration
+    RtcCapabilityError        = 0x605,  // E0605: insufficient capability
+    RtcInvalidTime            = 0x606,  // E0606: invalid time value read
+    RtcBatteryLow             = 0x607,  // E0607: RTC battery is low
+    RtcCenturyRegisterMissing = 0x608,  // E0608: century register not available
+    RtcHpetCoordinationError  = 0x609,  // E0609: HPET coordination error
+    RtcApicCoordinationError  = 0x60A,  // E060A: APIC timer coordination error
+    RtcPeriodicIrqError       = 0x60B,  // E060B: periodic interrupt configuration error
+}
+
+// ─────────────────────────────────────────────────────────────
+// CMOS Register Definitions
+// ─────────────────────────────────────────────────────────────
+
+struct CmosRegisters {
+    address_port: u16,
+    data_port: u16,
+    nmi_disabled: bool,
+}
+
+impl CmosRegisters {
+    fn addr_port_default() -> u16 { return 0x70; }
+    fn data_port_default() -> u16 { return 0x71; }
+
+    fn read(self, reg: u8) -> u8
+        effect [machine:ioport, deterministic]
+        court "cmos_read:v2"
+    {
+        return trusted reason "CMOS register read at standard ports 0x70/0x71, MC146818A datasheet §3.2" {
+            let addr: u8 = if self.nmi_disabled { reg | 0x80 } else { reg & 0x7F };
+            // outb(self.address_port, addr)
+            // return inb(self.data_port)
+            return 0;
+        };
+    }
+
+    fn write(self, reg: u8, value: u8) -> void
+        effect [machine:ioport, deterministic]
+        court "cmos_write:v2"
+    {
+        trusted reason "CMOS register write at standard ports" {
+            let addr: u8 = if self.nmi_disabled { reg | 0x80 } else { reg & 0x7F };
+            // outb(self.address_port, addr)
+            // outb(self.data_port, value)
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Time Structure
+// ─────────────────────────────────────────────────────────────
+
+struct RtcTime {
+    seconds: u8,
+    minutes: u8,
+    hours: u8,
+    day_of_week: u8,
+    day_of_month: u8,
+    month: u8,
+    year: u16,
+    century: u8,
+    is_pm: bool,
+    is_24h: bool,
+    is_bcd: bool,
+    subsecond: u16,
+    subsecond_fraction: u16,
+    valid: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Alarm Structure
+// ─────────────────────────────────────────────────────────────
+
+struct RtcAlarm {
+    seconds: u8,
+    minutes: u8,
+    hours: u8,
+    day_of_month: u8,
+    month: u8,
+    day_of_week: u8,
+    enabled: bool,
+    recurring: bool,
+    match_mode: RtcAlarmMatchMode,
+}
+
+type RtcAlarmMatchMode = enum {
+    Disabled          = 0,  // No alarm
+    SecondsMatch      = 1,  // Match seconds only
+    MinutesMatch      = 2,  // Match minutes:seconds
+    HoursMatch        = 3,  // Match hours:minutes:seconds
+    DateMatch         = 4,  // Match date-time
+    Daily             = 5,  // Daily recurring alarm
+    Weekly            = 6,  // Weekly recurring alarm
+    Monthly           = 7,  // Monthly recurring alarm
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Status Registers A, B, C, D
+// ─────────────────────────────────────────────────────────────
+
+struct RtcStatusRegisters {
+    reg_a: u8,  // Status Register A: UIP, DV, RS
+    reg_b: u8,  // Status Register B: SET, PIE, AIE, UIE, SQWE, DM, 24/12, DSE
+    reg_c: u8,  // Status Register C: IRQF, PF, AF, UF
+    reg_d: u8,  // Status Register D: VRT
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Capability
+// ─────────────────────────────────────────────────────────────
+
+struct RtcCapability {
+    object_id: Identity,
+    generation: u64,
+    can_read: bool,
+    can_set_time: bool,
+    can_set_alarm: bool,
+    can_use_freq: bool,
+    can_use_periodic_irq: bool,
+    has_battery: bool,
+    has_century: bool,
+    bcd_mode: bool,
+    max_alarm_modes: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct RtcDriverState {
+    driver_identity: Identity,
+    cmos: CmosRegisters,
+    current_time: RtcTime,
+    current_alarm: RtcAlarm,
+    status_regs: RtcStatusRegisters,
+    capability: RtcCapability,
+    hpet_base: u64,
+    apic_base: u64,
+    rtc_irq_vector: u8,
+    periodic_frequency_hz: u64,
+    tick_count: u64,
+    last_read_timestamp: u64,
+    initialized: bool,
+    initialization_timestamp: u64,
+    day_of_month: u8,
+    month: u8,
+    year: u16,
+    century: u8,
+    use_bcd: bool,
+    use_24h: bool,
+    driver_residuals: RingBuf(ResidualRecord, 128),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// BCD <-> Binary conversion
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_bcd_to_bin(bcd: u8) -> u8
+    effect [deterministic]
+    court "rtc_bcd2bin:v1"
+{
+    return ((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F);
+}
+
+fn rtc_bin_to_bcd(bin_val: u8) -> u8
+    effect [deterministic]
+    court "rtc_bin2bcd:v1"
+{
+    return ((bin_val / 10) << 4) | (bin_val % 10);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read Status Registers
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_read_status_regs(
+    cmos: Handle(CmosRegisters),
+) -> RtcStatusRegisters
+    effect [machine:ioport, deterministic]
+    court "rtc_read_status:v1"
+{
+    return RtcStatusRegisters {
+        reg_a: cmos.read(0x0A),
+        reg_b: cmos.read(0x0B),
+        reg_c: cmos.read(0x0C),
+        reg_d: cmos.read(0x0D),
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Wait for RTC Update to Complete
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_wait_update_complete(
+    cmos: Handle(CmosRegisters),
+) -> Result(void, RtcError)
+    effect [machine:ioport, deterministic]
+    court "rtc_wait_update:v1"
+{
+    loop bound 2000 {
+        let reg_a: u8 = cmos.read(0x0A);
+        if (reg_a & 0x80) == 0 {  // UIP bit clear
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(RtcError::RtcUpdateInProgress);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read Current RTC Time
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_read_time(
+    state: Handle(RtcDriverState),
+    reader_cap: RtcCapability,
+    timestamp: u64,
+) -> Result(RtcTime, RtcError)
+    effect [machine:ioport, deterministic, residual]
+    court "rtc_read_time:v2"
+{
+    if !state.initialized {
+        return Result::Err(RtcError::RtcNotInitialized);
+    };
+
+    if !reader_cap.can_read {
+        return Result::Err(RtcError::RtcCapabilityError);
+    };
+
+    let cmos: Handle(CmosRegisters) = Handle(CmosRegisters)::from_ptr(&state.cmos);
+
+    // Wait for RTC update to complete
+    let wait_result: Result(void, RtcError) = rtc_wait_update_complete(cmos);
+    match wait_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    // Read all time registers in a burst (read twice for consistency)
+    let mut seconds: u8;
+    let mut minutes: u8;
+    let mut hours: u8;
+    let mut day_of_week: u8;
+    let mut day_of_month: u8;
+    let mut month: u8;
+    let mut year: u8;
+    let mut century: u8;
+    let mut reg_a: u8;
+    let mut reg_b: u8;
+
+    loop bound 3 {
+        let s1: u8 = cmos.read(0x00);
+        let m1: u8 = cmos.read(0x02);
+        let h1: u8 = cmos.read(0x04);
+        let dw: u8 = cmos.read(0x06);
+        let dm: u8 = cmos.read(0x07);
+        let mo: u8 = cmos.read(0x08);
+        let y1: u8 = cmos.read(0x09);
+        let c: u8 = cmos.read(0x32);
+
+        let s2: u8 = cmos.read(0x00);
+
+        if s1 == s2 {
+            seconds = s1; minutes = m1; hours = h1;
+            day_of_week = dw; day_of_month = dm;
+            month = mo; year = y1; century = c;
+            break;
+        };
+    };
+
+    // Read control registers
+    reg_a = cmos.read(0x0A);
+    reg_b = cmos.read(0x0B);
+
+    let is_bcd: bool = (reg_b & 0x04) == 0;  // DM bit: 0=BCD, 1=Binary
+    let is_24h: bool = (reg_b & 0x02) == 0;   // 24/12 bit: 0=24h, 1=12h
+
+    // Convert time values
+    let bin_seconds: u8 = if is_bcd { rtc_bcd_to_bin(seconds) } else { seconds };
+    let bin_minutes: u8 = if is_bcd { rtc_bcd_to_bin(minutes) } else { minutes };
+    let mut bin_hours: u8 = if is_bcd { rtc_bcd_to_bin(hours) } else { hours };
+    let bin_day_of_week: u8 = day_of_week;
+    let bin_day: u8 = if is_bcd { rtc_bcd_to_bin(day_of_month) } else { day_of_month };
+    let bin_month: u8 = if is_bcd { rtc_bcd_to_bin(month) } else { month };
+    let bin_year: u16 = if is_bcd { rtc_bcd_to_bin(year) as u16 } else { year as u16 };
+    let bin_century: u8 = if is_bcd { rtc_bcd_to_bin(century) } else { century };
+
+    // Convert 12-hour to 24-hour if needed
+    let mut is_pm: bool = false;
+    if !is_24h {
+        is_pm = (bin_hours & 0x80) != 0;
+        bin_hours = bin_hours & 0x7F;
+        if is_pm && bin_hours != 12 {
+            bin_hours = bin_hours + 12;
+        } else if !is_pm && bin_hours == 12 {
+            bin_hours = 0;
+        };
+    };
+
+    // Read subsecond from RTC if available
+    let subsecond: u16 = 0;
+    let subsecond_fraction: u16 = 0;
+
+    let time_obj: RtcTime = RtcTime {
+        seconds: bin_seconds,
+        minutes: bin_minutes,
+        hours: bin_hours,
+        day_of_week: bin_day_of_week,
+        day_of_month: bin_day,
+        month: bin_month,
+        year: 2000 + bin_year,  // Assuming year 2000+ base, adjust with century
+        century: bin_century,
+        is_pm: is_pm,
+        is_24h: is_24h,
+        is_bcd: is_bcd,
+        subsecond: subsecond,
+        subsecond_fraction: subsecond_fraction,
+        valid: true,
+    };
+
+    state.current_time = time_obj;
+    state.status_regs = RtcStatusRegisters { reg_a: reg_a, reg_b: reg_b, reg_c: 0, reg_d: 0 };
+    state.last_read_timestamp = timestamp;
+
+    residual emit {
+        op: "rtc.read_time",
+        seconds: bin_seconds as u64,
+        minutes: bin_minutes as u64,
+        hours: bin_hours as u64,
+        day: bin_day as u64,
+        month: bin_month as u64,
+        year: (2000 + bin_century * 100 + bin_year) as u64,
+        is_24h: if is_24h { 1 } else { 0 },
+        is_bcd: if is_bcd { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(time_obj);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set RTC Time
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_set_time(
+    state: Handle(RtcDriverState),
+    new_time: RtcTime,
+    setter_cap: RtcCapability,
+    timestamp: u64,
+) -> Result(void, RtcError)
+    effect [machine:ioport, deterministic, residual]
+    court "rtc_set_time:v1"
+{
+    if !state.initialized {
+        return Result::Err(RtcError::RtcNotInitialized);
+    };
+
+    if !setter_cap.can_set_time {
+        return Result::Err(RtcError::RtcCapabilityError);
+    };
+
+    let cmos: Handle(CmosRegisters) = Handle(CmosRegisters)::from_ptr(&state.cmos);
+
+    // Read register B to determine current mode
+    let reg_b_orig: u8 = cmos.read(0x0B);
+    let use_bcd: bool = (reg_b_orig & 0x04) == 0;
+
+    // Set SET bit to inhibit updates
+    cmos.write(0x0B, reg_b_orig | 0x80);
+
+    // Write time registers
+    let s: u8 = if use_bcd { rtc_bin_to_bcd(new_time.seconds) } else { new_time.seconds };
+    let m: u8 = if use_bcd { rtc_bin_to_bcd(new_time.minutes) } else { new_time.minutes };
+    let h: u8 = if use_bcd { rtc_bin_to_bcd(new_time.hours) } else { new_time.hours };
+    let dw: u8 = new_time.day_of_week;
+    let dm: u8 = if use_bcd { rtc_bin_to_bcd(new_time.day_of_month) } else { new_time.day_of_month };
+    let mo: u8 = if use_bcd { rtc_bin_to_bcd(new_time.month) } else { new_time.month };
+    let y: u8 = if use_bcd { rtc_bin_to_bcd((new_time.year % 100) as u8) } else { (new_time.year % 100) as u8 };
+    let c: u8 = if use_bcd { rtc_bin_to_bcd(new_time.century) } else { new_time.century };
+
+    cmos.write(0x00, s);
+    cmos.write(0x02, m);
+    cmos.write(0x04, h);
+    cmos.write(0x06, dw);
+    cmos.write(0x07, dm);
+    cmos.write(0x08, mo);
+    cmos.write(0x09, y);
+    cmos.write(0x32, c);
+
+    // Clear SET bit
+    cmos.write(0x0B, reg_b_orig);
+
+    residual emit {
+        op: "rtc.set_time",
+        seconds: new_time.seconds as u64,
+        minutes: new_time.minutes as u64,
+        hours: new_time.hours as u64,
+        day: new_time.day_of_month as u64,
+        month: new_time.month as u64,
+        year: new_time.year as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Configure Alarm
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_set_alarm(
+    state: Handle(RtcDriverState),
+    alarm: RtcAlarm,
+    setter_cap: RtcCapability,
+    timestamp: u64,
+) -> Result(void, RtcError)
+    effect [machine:ioport, deterministic, residual]
+    court "rtc_set_alarm:v1"
+{
+    if !state.initialized {
+        return Result::Err(RtcError::RtcNotInitialized);
+    };
+
+    if !setter_cap.can_set_alarm {
+        return Result::Err(RtcError::RtcCapabilityError);
+    };
+
+    if !setter_cap.has_battery {
+        return Result::Err(RtcError::RtcAlarmNotSupported);
+    };
+
+    let cmos: Handle(CmosRegisters) = Handle(CmosRegisters)::from_ptr(&state.cmos);
+
+    // Read current register B
+    let reg_b: u8 = cmos.read(0x0B);
+    let use_bcd: bool = (reg_b & 0x04) == 0;
+
+    // Convert alarm time to BCD if needed
+    let alarm_seconds: u8 = if use_bcd { rtc_bin_to_bcd(alarm.seconds) } else { alarm.seconds };
+    let alarm_minutes: u8 = if use_bcd { rtc_bin_to_bcd(alarm.minutes) } else { alarm.minutes };
+    let alarm_hours: u8 = if use_bcd { rtc_bin_to_bcd(alarm.hours) } else { alarm.hours };
+    let alarm_dom: u8 = if use_bcd { rtc_bin_to_bcd(alarm.day_of_month) } else { alarm.day_of_month };
+
+    // Write alarm registers
+    cmos.write(0x01, alarm_seconds);
+    cmos.write(0x03, alarm_minutes);
+    cmos.write(0x05, alarm_hours);
+    cmos.write(0x07, alarm_dom);
+
+    // Enable alarm interrupt in register B
+    let new_reg_b: u8 = reg_b | 0x20;  // Set AIE bit
+    cmos.write(0x0B, new_reg_b);
+
+    state.current_alarm = alarm;
+
+    residual emit {
+        op: "rtc.set_alarm",
+        alarm_hours: alarm.hours as u64,
+        alarm_minutes: alarm.minutes as u64,
+        alarm_seconds: alarm.seconds as u64,
+        recurring: if alarm.recurring { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Disable Alarm
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_disable_alarm(
+    state: Handle(RtcDriverState),
+    setter_cap: RtcCapability,
+    timestamp: u64,
+) -> Result(void, RtcError)
+    effect [machine:ioport, deterministic, residual]
+    court "rtc_disable_alarm:v1"
+{
+    if !state.initialized {
+        return Result::Err(RtcError::RtcNotInitialized);
+    };
+
+    if !setter_cap.can_set_alarm {
+        return Result::Err(RtcError::RtcCapabilityError);
+    };
+
+    let cmos: Handle(CmosRegisters) = Handle(CmosRegisters)::from_ptr(&state.cmos);
+    let reg_b: u8 = cmos.read(0x0B);
+    cmos.write(0x0B, reg_b & !0x20);  // Clear AIE bit
+
+    // Set alarm registers to "don't care" (0xC0-0xFF values)
+    cmos.write(0x01, 0xC0);
+    cmos.write(0x03, 0xC0);
+    cmos.write(0x05, 0xC0);
+
+    state.current_alarm.enabled = false;
+
+    residual emit {
+        op: "rtc.disable_alarm",
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Configure Periodic Interrupt Rate
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_set_periodic_rate(
+    state: Handle(RtcDriverState),
+    rate_hz: u64,
+    setter_cap: RtcCapability,
+    timestamp: u64,
+) -> Result(void, RtcError)
+    effect [machine:ioport, deterministic, residual]
+    court "rtc_set_periodic:v1"
+{
+    if !state.initialized {
+        return Result::Err(RtcError::RtcNotInitialized);
+    };
+
+    if !setter_cap.can_use_periodic_irq {
+        return Result::Err(RtcError::RtcCapabilityError);
+    };
+
+    let cmos: Handle(CmosRegisters) = Handle(CmosRegisters)::from_ptr(&state.cmos);
+
+    // Determine RS bits for rate selection
+    // RS bits: 0000=off, 0001=256Hz, 0010=128Hz, ..., 1111=2Hz
+    let rs: u8;
+    if rate_hz == 0 {
+        rs = 0;
+    } else if rate_hz >= 32768 {
+        rs = 0x0F;  // 8.192 KHz
+    } else if rate_hz >= 16384 {
+        rs = 0x0E;  // 4.096 KHz
+    } else if rate_hz >= 8192 {
+        rs = 0x0D;  // 2.048 KHz
+    } else if rate_hz >= 4096 {
+        rs = 0x0C;  // 1.024 KHz
+    } else if rate_hz >= 2048 {
+        rs = 0x0B;  // 512 Hz
+    } else if rate_hz >= 1024 {
+        rs = 0x0A;  // 256 Hz
+    } else if rate_hz >= 512 {
+        rs = 0x09;  // 128 Hz
+    } else if rate_hz >= 256 {
+        rs = 0x08;  // 64 Hz
+    } else if rate_hz >= 128 {
+        rs = 0x07;  // 32 Hz
+    } else if rate_hz >= 64 {
+        rs = 0x06;  // 16 Hz
+    } else if rate_hz >= 32 {
+        rs = 0x05;  // 8 Hz
+    } else if rate_hz >= 16 {
+        rs = 0x04;  // 4 Hz
+    } else if rate_hz >= 8 {
+        rs = 0x03;  // 2 Hz
+    } else if rate_hz >= 4 {
+        rs = 0x02;  // 1 Hz
+    } else {
+        rs = 0x01;
+    };
+
+    // Read register A and set RS bits
+    let reg_a: u8 = cmos.read(0x0A);
+    let new_reg_a: u8 = (reg_a & 0xF0) | rs;
+    cmos.write(0x0A, new_reg_a);
+
+    // Enable periodic interrupt
+    let reg_b: u8 = cmos.read(0x0B);
+    if rate_hz > 0 {
+        cmos.write(0x0B, reg_b | 0x40);  // Set PIE
+    } else {
+        cmos.write(0x0B, reg_b & !0x40);  // Clear PIE
+    };
+
+    state.periodic_frequency_hz = rate_hz;
+
+    residual emit {
+        op: "rtc.set_periodic_rate",
+        rate_hz: rate_hz,
+        rs_bits: rs as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Acknowledge RTC Interrupt
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_ack_interrupt(
+    state: Handle(RtcDriverState),
+    timestamp: u64,
+) -> u8
+    effect [machine:ioport, deterministic]
+    court "rtc_ack_irq:v1"
+{
+    let cmos: Handle(CmosRegisters) = Handle(CmosRegisters)::from_ptr(&state.cmos);
+    // Reading Register C clears the interrupt flags
+    let reg_c: u8 = cmos.read(0x0C);
+    state.tick_count = state.tick_count + 1;
+    return reg_c;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Coordinate with HPET Timer
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_coordinate_hpet(
+    state: Handle(RtcDriverState),
+    hpet_base: u64,
+    hpet_femto_period: u32,
+) -> Result(void, RtcError)
+    effect [memory:mmio, deterministic, residual]
+    court "rtc_coord_hpet:v1"
+{
+    state.hpet_base = hpet_base;
+
+    // Verify HPET is running by reading the main counter
+    let hpet_counter_reg: u64 = hpet_base + 0x0F0;
+    let counter_val: u64 = trusted reason "HPET main counter read for RTC coordination, HPET Spec §2.4" {
+        let ptr: *(u64) = hpet_counter_reg as *(u64);
+        return *ptr;
+    };
+
+    residual emit {
+        op: "rtc.coordinate_hpet",
+        hpet_base: hpet_base,
+        counter_value: counter_val,
+        femto_period: hpet_femto_period as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Coordinate with APIC Timer
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_coordinate_apic(
+    state: Handle(RtcDriverState),
+    apic_base: u64,
+) -> Result(void, RtcError)
+    effect [memory:mmio, deterministic, residual]
+    court "rtc_coord_apic:v1"
+{
+    state.apic_base = apic_base;
+
+    residual emit {
+        op: "rtc.coordinate_apic",
+        apic_base: apic_base,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_driver_init(
+    driver_identity: Identity,
+    cap: RtcCapability,
+    timestamp: u64,
+) -> RtcDriverState
+    effect [machine:ioport, deterministic, residual]
+    court "rtc_driver_init:v2"
+{
+    let cmos: CmosRegisters = CmosRegisters {
+        address_port: CmosRegisters::addr_port_default(),
+        data_port: CmosRegisters::data_port_default(),
+        nmi_disabled: false,
+    };
+
+    // Read initial register B to determine RTC mode
+    let reg_b: u8 = cmos.read(0x0B);
+    let use_bcd: bool = (reg_b & 0x04) == 0;
+    let use_24h: bool = (reg_b & 0x02) == 0;
+
+    // Read register D for battery status
+    let reg_d: u8 = cmos.read(0x0D);
+    let battery_ok: bool = (reg_d & 0x80) != 0;
+
+    let state: RtcDriverState = RtcDriverState {
+        driver_identity: driver_identity,
+        cmos: cmos,
+        current_time: RtcTime {
+            seconds: 0, minutes: 0, hours: 0, day_of_week: 1,
+            day_of_month: 1, month: 1, year: 2024, century: 20,
+            is_pm: false, is_24h: true, is_bcd: use_bcd,
+            subsecond: 0, subsecond_fraction: 0, valid: false,
+        },
+        current_alarm: RtcAlarm {
+            seconds: 0, minutes: 0, hours: 0, day_of_month: 0,
+            month: 0, day_of_week: 0, enabled: false, recurring: false,
+            match_mode: RtcAlarmMatchMode::Disabled,
+        },
+        status_regs: RtcStatusRegisters { reg_a: 0, reg_b: reg_b, reg_c: 0, reg_d: reg_d },
+        capability: cap,
+        hpet_base: 0,
+        apic_base: 0,
+        rtc_irq_vector: 0x08,  // IRQ8
+        periodic_frequency_hz: 0,
+        tick_count: 0,
+        last_read_timestamp: timestamp,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        day_of_month: 1,
+        month: 1,
+        year: 2024,
+        century: 20,
+        use_bcd: use_bcd,
+        use_24h: use_24h,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "rtc_driver.init",
+        driver_identity: driver_identity.id_hash,
+        battery_ok: if battery_ok { 1 } else { 0 },
+        use_bcd: if use_bcd { 1 } else { 0 },
+        use_24h: if use_24h { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get Time as Unix Timestamp
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_time_to_unix(time: RtcTime) -> u64
+    effect [deterministic]
+    court "rtc_to_unix:v1"
+{
+    let y: u64 = time.year as u64;
+    let m: u64 = time.month as u64;
+    let d: u64 = time.day_of_month as u64;
+    let hr: u64 = time.hours as u64;
+    let min: u64 = time.minutes as u64;
+    let sec: u64 = time.seconds as u64;
+
+    // Simplified days calculation (valid for dates after 2000)
+    let days_since_epoch: u64 = (y - 2000) * 365 + ((y - 2000) + 3) / 4;
+    let month_days: Array(u64, 12) = Array(u64, 12) {
+        data: [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+    };
+
+    let mut md: u64 = 0;
+    for i in 0..(m - 1) {
+        md = md + month_days[i];
+        if i >= 11 { break; };
+    };
+
+    // Add leap day if past February in leap year
+    let is_leap: bool = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+    if m > 2 && is_leap {
+        md = md + 1;
+    };
+
+    let total_days: u64 = days_since_epoch + md + d - 1;
+    let unix_time_2000: u64 = 946684800;  // Unix timestamp for 2000-01-01 00:00:00
+    return unix_time_2000 + total_days * 86400 + hr * 3600 + min * 60 + sec;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Record RTC Residuals
+// ─────────────────────────────────────────────────────────────
+
+fn rtc_record_residuals(
+    state: Handle(RtcDriverState),
+    timestamp: u64,
+) -> void
+    effect [residual]
+    court "rtc_record_residuals:v1"
+{
+    residual emit {
+        op: "rtc_driver.state_summary",
+        initialized: if state.initialized { 1 } else { 0 },
+        tick_count: state.tick_count,
+        periodic_hz: state.periodic_frequency_hz,
+        batt_ok: if (state.status_regs.reg_d & 0x80) != 0 { 1 } else { 0 },
+        alarm_enabled: if state.current_alarm.enabled { 1 } else { 0 },
+        hpet_present: if state.hpet_base != 0 { 1 } else { 0 },
+        apic_present: if state.apic_base != 0 { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+}

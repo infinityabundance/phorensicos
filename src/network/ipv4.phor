@@ -1,0 +1,1514 @@
+// ipv4.phor — IPv4: packet parsing/assembly, header fields, fragmentation/reassembly, checksum, TTL, options
+// Implements RFC 791 Internet Protocol with full residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/ipv4.phor
+// Court: ipv4:v1
+
+package network.ipv4;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ethernet.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// IPv4 sub-range: 0xE200 - 0xE2FF
+
+type Ipv4Error = enum {
+    Ipv4PacketTooShort      = 0xE200,  // NE200: IPv4 packet shorter than minimum header
+    Ipv4VersionMismatch     = 0xE201,  // NE201: IP version is not 4
+    Ipv4HeaderChecksumFail  = 0xE202,  // NE202: Header checksum mismatch
+    Ipv4InvalidIhl          = 0xE203,  // NE203: IHL field is invalid (< 5 or > 15)
+    Ipv4InvalidTotalLength  = 0xE204,  // NE204: Total length field is invalid
+    Ipv4UnknownProtocol     = 0xE205,  // NE205: Unknown upper-layer protocol
+    Ipv4TtlExpired          = 0xE206,  // NE206: Time-to-live expired
+    Ipv4FragNotSupported    = 0xE207,  // NE207: Fragmentation not supported
+    Ipv4FragOverlap         = 0xE208,  // NE208: Fragment overlap detected
+    Ipv4FragTooMany         = 0xE209,  // NE209: Too many fragments for reassembly
+    Ipv4FragTimeout         = 0xE20A,  // NE20A: Fragment reassembly timeout
+    Ipv4FragBufFull         = 0xE20B,  // NE20B: Fragment reassembly buffer full
+    Ipv4OptionUnknown       = 0xE20C,  // NE20C: Unknown or unsupported IP option
+    Ipv4OptionTooLong       = 0xE20D,  // NE20D: IP option exceeds total length
+    Ipv4AddrInvalid         = 0xE20E,  // NE20E: Invalid IPv4 address
+    Ipv4AddrUnspecified     = 0xE20F,  // NE20F: Source address is unspecified (0.0.0.0)
+    Ipv4AddrBroadcast       = 0xE210,  // NE210: Broadcast address not allowed as source
+    Ipv4AddrLoopback        = 0xE211,  // NE211: Loopback address used as source
+    Ipv4BufOverflow         = 0xE212,  // NE212: Buffer capacity exceeded
+    Ipv4RoutingFailed        = 0xE213,  // NE213: No route to destination
+    Ipv4CapabilityError     = 0xE214,  // NE214: Insufficient capability for IPv4 operation
+    Ipv4DontFragment        = 0xE215,  // NE215: Cannot fragment (DF flag set)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const IPV4_VERSION             : u8 = 4;
+const IPV4_MIN_IHL             : u8 = 5;
+const IPV4_MAX_IHL             : u8 = 15;
+const IPV4_MIN_HDR_LEN         : u64 = 20;
+const IPV4_MAX_HDR_LEN         : u64 = 60;
+const IPV4_DEFAULT_TTL         : u8 = 64;
+const IPV4_MAX_PACKET          : u64 = 65535;
+const IPV4_MAX_PAYLOAD         : u64 = 65515;
+const IPV4_MTU_ETHERNET        : u64 = 1500;
+const IPV4_FRAG_TIMEOUT_MS     : u64 = 30000;
+const IPV4_MAX_FRAGMENTS       : u64 = 64;
+const IPV4_REASSEMBLY_BUF_SIZE : u64 = 64;
+const IPV4_MAX_OPTIONS_LEN     : u64 = 40;
+
+// ─────────────────────────────────────────────────────────────
+// Protocol Numbers
+// ─────────────────────────────────────────────────────────────
+
+type Ipv4Protocol = enum {
+    ProtoIcmp      = 1,
+    ProtoIgmp      = 2,
+    ProtoTcp       = 6,
+    ProtoUdp       = 17,
+    ProtoGre       = 47,
+    ProtoEsp       = 50,
+    ProtoAh        = 51,
+    ProtoIcmpV6    = 58,
+    ProtoOspf      = 89,
+    ProtoSctp      = 132,
+}
+
+// ─────────────────────────────────────────────────────────────
+// IP Flags
+// ─────────────────────────────────────────────────────────────
+
+const IP_FLAG_RESERVED : u8 = 0x80;
+const IP_FLAG_DF       : u8 = 0x40;
+const IP_FLAG_MF       : u8 = 0x20;
+
+// ─────────────────────────────────────────────────────────────
+// IPv4 Address
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv4Address {
+    octets: Array(u8, 4),
+}
+
+impl Ipv4Address {
+    fn from_bytes(octets: Array(u8, 4)) -> Ipv4Address
+        effect [deterministic]
+    {
+        return Ipv4Address { octets: octets };
+    }
+
+    fn from_u32(value: u32) -> Ipv4Address
+        effect [deterministic]
+    {
+        let mut octets: Array(u8, 4) = Array::zeroed();
+        octets[0] = ((value >> 24) & 0xFF) as u8;
+        octets[1] = ((value >> 16) & 0xFF) as u8;
+        octets[2] = ((value >> 8) & 0xFF) as u8;
+        octets[3] = (value & 0xFF) as u8;
+        return Ipv4Address { octets: octets };
+    }
+
+    fn to_u32(self) -> u32
+        effect [deterministic]
+    {
+        return ((self.octets[0] as u32) << 24) |
+               ((self.octets[1] as u32) << 16) |
+               ((self.octets[2] as u32) << 8) |
+               (self.octets[3] as u32);
+    }
+
+    fn any() -> Ipv4Address
+        effect [deterministic]
+    {
+        let octets: Array(u8, 4) = Array::zeroed();
+        return Ipv4Address { octets: octets };
+    }
+
+    fn broadcast() -> Ipv4Address
+        effect [deterministic]
+    {
+        let octets: Array(u8, 4) = Array::from_literal([255, 255, 255, 255]);
+        return Ipv4Address { octets: octets };
+    }
+
+    fn loopback() -> Ipv4Address
+        effect [deterministic]
+    {
+        let octets: Array(u8, 4) = Array::from_literal([127, 0, 0, 1]);
+        return Ipv4Address { octets: octets };
+    }
+
+    fn is_unspecified(self) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.octets[i] != 0 {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_loopback(self) -> bool
+        effect [deterministic]
+    {
+        return self.octets[0] == 127;
+    }
+
+    fn is_broadcast(self) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.octets[i] != 255 {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn is_multicast(self) -> bool
+        effect [deterministic]
+    {
+        return (self.octets[0] & 0xF0) == 224;
+    }
+
+    fn is_link_local(self) -> bool
+        effect [deterministic]
+    {
+        return self.octets[0] == 169 && self.octets[1] == 254;
+    }
+
+    fn is_private(self) -> bool
+        effect [deterministic]
+    {
+        // 10.0.0.0/8
+        if self.octets[0] == 10 {
+            return true;
+        };
+        // 172.16.0.0/12
+        if self.octets[0] == 172 && (self.octets[1] >= 16 && self.octets[1] <= 31) {
+            return true;
+        };
+        // 192.168.0.0/16
+        if self.octets[0] == 192 && self.octets[1] == 168 {
+            return true;
+        };
+        return false;
+    }
+
+    fn is_subnet_broadcast(self, prefix_len: u8) -> bool
+        effect [deterministic]
+    {
+        let mask: u32 = if prefix_len == 0 {
+            0
+        } else {
+            let shift: u32 = 32 - (prefix_len as u32);
+            if shift >= 32 {
+                0
+            } else {
+                !((1u32 << shift) - 1)
+            };
+        };
+        let host_bits: u32 = !mask;
+        return (self.to_u32() & host_bits) == host_bits;
+    }
+
+    fn to_array(self) -> Array(u8, 4)
+        effect [deterministic]
+    {
+        return self.octets;
+    }
+
+    fn to_string(self) -> Array(u8, 16)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, 16) = Array::zeroed();
+        let mut pos: u64 = 0;
+        loop bound 4 {
+            let val: u32 = self.octets[i] as u32;
+            let digits: Array(u8, 3) = self.uint32_to_digits(val);
+            loop bound 3 {
+                if digits[j] == 0 && j > 0 {
+                    break;
+                };
+                buf[pos] = digits[j];
+                pos = pos + 1;
+            };
+            if i < 3 {
+                buf[pos] = '.';
+                pos = pos + 1;
+            };
+        };
+        return buf;
+    }
+
+    fn uint32_to_digits(val: u32) -> Array(u8, 3)
+        effect [deterministic]
+    {
+        let mut result: Array(u8, 3) = Array::zeroed();
+        if val == 0 {
+            result[2] = '0';
+            return result;
+        };
+        let mut v: u32 = val;
+        let mut idx: u64 = 2;
+        loop bound 3 {
+            if v == 0 {
+                break;
+            };
+            result[idx] = ('0' as u8) + ((v % 10) as u8);
+            v = v / 10;
+            if idx > 0 {
+                idx = idx - 1;
+            } else {
+                break;
+            };
+        };
+        return result;
+    }
+
+    fn eq(self, other: Ipv4Address) -> bool
+        effect [deterministic]
+    {
+        loop bound 4 {
+            if self.octets[i] != other.octets[i] {
+                return false;
+            };
+        };
+        return true;
+    }
+
+    fn from_string(s: Array(u8, 16), len: u64) -> Result(Ipv4Address, Ipv4Error)
+        effect [deterministic]
+    {
+        if len < 7 || len > 15 {
+            return Result::Err(Ipv4Error::Ipv4AddrInvalid);
+        };
+        let mut octets: Array(u8, 4) = Array::zeroed();
+        let mut octet_idx: u64 = 0;
+        let mut current: u32 = 0;
+        loop bound 16 {
+            if i >= len {
+                break;
+            };
+            let c: u8 = s[i];
+            if c >= '0' && c <= '9' {
+                current = current * 10 + ((c - '0') as u32);
+                if current > 255 {
+                    return Result::Err(Ipv4Error::Ipv4AddrInvalid);
+                };
+            } else if c == '.' {
+                if octet_idx >= 3 {
+                    return Result::Err(Ipv4Error::Ipv4AddrInvalid);
+                };
+                octets[octet_idx] = current as u8;
+                octet_idx = octet_idx + 1;
+                current = 0;
+            } else {
+                return Result::Err(Ipv4Error::Ipv4AddrInvalid);
+            };
+        };
+        if octet_idx != 3 {
+            return Result::Err(Ipv4Error::Ipv4AddrInvalid);
+        };
+        octets[3] = current as u8;
+        return Result::Ok(Ipv4Address { octets: octets });
+    }
+
+    fn write_to_buf(self, buf: ref mut Array(u8, IPV4_MAX_PACKET), offset: u64) -> Result(void, Ipv4Error)
+        effect [deterministic]
+    {
+        if (offset + 4) > IPV4_MAX_PACKET {
+            return Result::Err(Ipv4Error::Ipv4BufOverflow);
+        };
+        loop bound 4 {
+            buf[offset + i] = self.octets[i];
+        };
+        return Result::Ok(void);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv4 Option Types
+// ─────────────────────────────────────────────────────────────
+
+type Ipv4OptionKind = enum {
+    OptEnd           = 0,
+    OptNop           = 1,
+    OptLsr           = 3,   // Loose Source Route
+    OptTs            = 7,   // Timestamp
+    OptSsr           = 9,   // Strict Source Route
+    OptRouterAlert   = 20,  // Router Alert
+}
+
+struct Ipv4Option {
+    kind: u8,
+    length: u8,
+    data: Array(u8, IPV4_MAX_OPTIONS_LEN),
+    data_len: u64,
+}
+
+impl Ipv4Option {
+    fn end() -> Ipv4Option
+        effect [deterministic]
+    {
+        return Ipv4Option {
+            kind: 0,
+            length: 1,
+            data: Array::zeroed(),
+            data_len: 0,
+        };
+    }
+
+    fn nop() -> Ipv4Option
+        effect [deterministic]
+    {
+        return Ipv4Option {
+            kind: 1,
+            length: 1,
+            data: Array::zeroed(),
+            data_len: 0,
+        };
+    }
+
+    fn router_alert() -> Ipv4Option
+        effect [deterministic]
+    {
+        let mut data: Array(u8, IPV4_MAX_OPTIONS_LEN) = Array::zeroed();
+        data[0] = 0;
+        data[1] = 0;
+        return Ipv4Option {
+            kind: 20,
+            length: 4,
+            data: data,
+            data_len: 2,
+        };
+    }
+
+    fn serialize(self, buf: ref mut Array(u8, IPV4_MTU_ETHERNET), offset: ref mut u64) -> Result(void, Ipv4Error)
+        effect [deterministic]
+    {
+        if self.kind == 0 || self.kind == 1 {
+            buf[*offset] = self.kind;
+            *offset = *offset + 1;
+            return Result::Ok(void);
+        };
+        if (*offset + (self.length as u64)) > IPV4_MTU_ETHERNET {
+            return Result::Err(Ipv4Error::Ipv4BufOverflow);
+        };
+        buf[*offset] = self.kind;
+        buf[*offset + 1] = self.length;
+        loop bound IPV4_MAX_OPTIONS_LEN {
+            if i >= self.data_len {
+                break;
+            };
+            buf[*offset + 2 + i] = self.data[i];
+        };
+        *offset = *offset + (self.length as u64);
+        return Result::Ok(void);
+    }
+
+    fn parse(data: Array(u8, IPV4_MTU_ETHERNET), offset: u64, remaining: u64) -> Result(Ipv4Option, Ipv4Error)
+        effect [deterministic]
+    {
+        if remaining < 1 {
+            return Result::Err(Ipv4Error::Ipv4OptionTooLong);
+        };
+        let kind: u8 = data[offset];
+        if kind == 0 {
+            return Result::Ok(Ipv4Option::end());
+        };
+        if kind == 1 {
+            return Result::Ok(Ipv4Option::nop());
+        };
+        if remaining < 2 {
+            return Result::Err(Ipv4Error::Ipv4OptionTooLong);
+        };
+        let length: u8 = data[offset + 1];
+        if length < 2 || (length as u64) > remaining {
+            return Result::Err(Ipv4Error::Ipv4OptionTooLong);
+        };
+        let data_len: u64 = (length as u64) - 2;
+        let mut opt_data: Array(u8, IPV4_MAX_OPTIONS_LEN) = Array::zeroed();
+        loop bound IPV4_MAX_OPTIONS_LEN {
+            if i >= data_len {
+                break;
+            };
+            opt_data[i] = data[offset + 2 + i];
+        };
+        return Result::Ok(Ipv4Option {
+            kind: kind,
+            length: length,
+            data: opt_data,
+            data_len: data_len,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv4 Header
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv4Header {
+    version_ihl: u8,       // Version (4 bits) + IHL (4 bits)
+    dscp_ecn: u8,          // DSCP (6 bits) + ECN (2 bits)
+    total_length: u16,
+    identification: u16,
+    flags_fragment: u16,   // Flags (3 bits) + Fragment Offset (13 bits)
+    ttl: u8,
+    protocol: u8,
+    header_checksum: u16,
+    source_addr: Ipv4Address,
+    dest_addr: Ipv4Address,
+    options: Array(Ipv4Option, 10),
+    option_count: u64,
+}
+
+impl Ipv4Header {
+    fn new(src: Ipv4Address, dst: Ipv4Address, proto: u8, payload_len: u64) -> Ipv4Header
+        effect [deterministic]
+    {
+        let total: u16 = (IPV4_MIN_HDR_LEN + payload_len) as u16;
+        return Ipv4Header {
+            version_ihl: (IPV4_VERSION << 4) | IPV4_MIN_IHL,
+            dscp_ecn: 0,
+            total_length: total,
+            identification: 0,
+            flags_fragment: 0,
+            ttl: IPV4_DEFAULT_TTL,
+            protocol: proto,
+            header_checksum: 0,
+            source_addr: src,
+            dest_addr: dst,
+            options: Array::zeroed(),
+            option_count: 0,
+        };
+    }
+
+    fn header_length(self) -> u64
+        effect [deterministic]
+    {
+        return (self.ihl() as u64) * 4;
+    }
+
+    fn version(self) -> u8
+        effect [deterministic]
+    {
+        return (self.version_ihl >> 4) & 0x0F;
+    }
+
+    fn ihl(self) -> u8
+        effect [deterministic]
+    {
+        return self.version_ihl & 0x0F;
+    }
+
+    fn dscp(self) -> u8
+        effect [deterministic]
+    {
+        return (self.dscp_ecn >> 2) & 0x3F;
+    }
+
+    fn ecn(self) -> u8
+        effect [deterministic]
+    {
+        return self.dscp_ecn & 0x03;
+    }
+
+    fn flags(self) -> u8
+        effect [deterministic]
+    {
+        return ((self.flags_fragment >> 13) & 0x07) as u8;
+    }
+
+    fn fragment_offset(self) -> u16
+        effect [deterministic]
+    {
+        return self.flags_fragment & 0x1FFF;
+    }
+
+    fn is_df_set(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags() & IP_FLAG_DF) != 0;
+    }
+
+    fn is_mf_set(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags() & IP_FLAG_MF) != 0;
+    }
+
+    fn payload_length(self) -> u64
+        effect [deterministic]
+    {
+        let total: u64 = self.total_length as u64;
+        let hdr: u64 = self.header_length();
+        if total >= hdr {
+            return total - hdr;
+        } else {
+            return 0;
+        };
+    }
+
+    fn set_total_length(self: ref mut, len: u16)
+        effect [deterministic]
+    {
+        self.total_length = len;
+    }
+
+    fn set_identification(self: ref mut, id: u16)
+        effect [deterministic]
+    {
+        self.identification = id;
+    }
+
+    fn set_flags_offset(self: ref mut, flags_off: u16)
+        effect [deterministic]
+    {
+        self.flags_fragment = flags_off;
+    }
+
+    fn set_ttl(self: ref mut, ttl: u8)
+        effect [deterministic]
+    {
+        self.ttl = ttl;
+    }
+
+    fn decrement_ttl(self: ref mut) -> Result(void, Ipv4Error)
+        effect [deterministic]
+    {
+        if self.ttl <= 1 {
+            return Result::Err(Ipv4Error::Ipv4TtlExpired);
+        };
+        self.ttl = self.ttl - 1;
+        return Result::Ok(void);
+    }
+
+    fn add_option(self: ref mut, opt: Ipv4Option) -> Result(void, Ipv4Error)
+        effect [deterministic]
+    {
+        if self.option_count >= 10 {
+            return Result::Err(Ipv4Error::Ipv4OptionTooLong);
+        };
+        let new_hdr_len: u64 = self.header_length() + (opt.length as u64);
+        if new_hdr_len > IPV4_MAX_HDR_LEN {
+            return Result::Err(Ipv4Error::Ipv4OptionTooLong);
+        };
+        self.options[self.option_count] = opt;
+        self.option_count = self.option_count + 1;
+        // Update IHL
+        let new_ihl: u8 = (new_hdr_len / 4) as u8;
+        self.version_ihl = (self.version() << 4) | new_ihl;
+        return Result::Ok(void);
+    }
+
+    fn compute_checksum(self) -> u16
+        effect [deterministic]
+        court "ipv4_checksum:v1"
+    {
+        let mut sum: u32 = 0;
+        // Checksum is computed over the header
+        let hdr_words: u64 = self.header_length() / 2;
+        let mut buf: Array(u8, IPV4_MAX_HDR_LEN) = Array::zeroed();
+        let mut offset: u64 = 0;
+        buf[offset] = self.version_ihl;
+        offset = offset + 1;
+        buf[offset] = self.dscp_ecn;
+        offset = offset + 1;
+        buf[offset] = ((self.total_length >> 8) & 0xFF) as u8;
+        offset = offset + 1;
+        buf[offset] = (self.total_length & 0xFF) as u8;
+        offset = offset + 1;
+        buf[offset] = ((self.identification >> 8) & 0xFF) as u8;
+        offset = offset + 1;
+        buf[offset] = (self.identification & 0xFF) as u8;
+        offset = offset + 1;
+        buf[offset] = ((self.flags_fragment >> 8) & 0xFF) as u8;
+        offset = offset + 1;
+        buf[offset] = (self.flags_fragment & 0xFF) as u8;
+        offset = offset + 1;
+        buf[offset] = self.ttl;
+        offset = offset + 1;
+        buf[offset] = self.protocol;
+        offset = offset + 1;
+        buf[offset] = 0; // checksum high - zeroed for computation
+        offset = offset + 1;
+        buf[offset] = 0; // checksum low - zeroed for computation
+        offset = offset + 1;
+        // Source address
+        loop bound 4 {
+            buf[offset] = self.source_addr.octets[i];
+            offset = offset + 1;
+        };
+        // Destination address
+        loop bound 4 {
+            buf[offset] = self.dest_addr.octets[i];
+            offset = offset + 1;
+        };
+        // Options
+        loop bound 10 {
+            if i >= self.option_count {
+                break;
+            };
+            let opt_res: Result(void, Ipv4Error) = self.options[i].serialize(buf, offset);
+            if opt_res.is_ok() {
+                offset = offset + (self.options[i].length as u64);
+            };
+        };
+        loop bound IPV4_MAX_HDR_LEN {
+            if (i / 2) >= hdr_words {
+                break;
+            };
+            let word_idx: u64 = i;
+            let hi: u16 = buf[word_idx] as u16;
+            let lo: u16 = buf[word_idx + 1] as u16;
+            sum = sum + ((hi << 8) | lo) as u32;
+            i = i + 2;
+        };
+        // Fold to 16 bits
+        loop bound 4 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        };
+        return (!(sum as u16)) as u16;
+    }
+
+    fn verify_checksum(self) -> bool
+        effect [deterministic]
+    {
+        let computed: u16 = self.compute_checksum();
+        return computed == self.header_checksum;
+    }
+
+    fn compute_and_set_checksum(self: ref mut)
+        effect [deterministic]
+    {
+        self.header_checksum = self.compute_checksum();
+    }
+
+    fn parse(data: Array(u8, IPV4_MTU_ETHERNET), len: u64) -> Result(Ipv4Header, Ipv4Error)
+        effect [deterministic]
+        court "ipv4_header_parse:v1"
+    {
+        if len < IPV4_MIN_HDR_LEN {
+            return Result::Err(Ipv4Error::Ipv4PacketTooShort);
+        };
+        let version_ihl: u8 = data[0];
+        let version: u8 = (version_ihl >> 4) & 0x0F;
+        if version != IPV4_VERSION {
+            return Result::Err(Ipv4Error::Ipv4VersionMismatch);
+        };
+        let ihl: u8 = version_ihl & 0x0F;
+        if ihl < IPV4_MIN_IHL || ihl > IPV4_MAX_IHL {
+            return Result::Err(Ipv4Error::Ipv4InvalidIhl);
+        };
+        let hdr_len: u64 = (ihl as u64) * 4;
+        if hdr_len > len {
+            return Result::Err(Ipv4Error::Ipv4PacketTooShort);
+        };
+        let total_len: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        if (total_len as u64) > len || (total_len as u64) < hdr_len {
+            return Result::Err(Ipv4Error::Ipv4InvalidTotalLength);
+        };
+        let dscp_ecn: u8 = data[1];
+        let identification: u16 = ((data[4] as u16) << 8) | (data[5] as u16);
+        let flags_fragment: u16 = ((data[6] as u16) << 8) | (data[7] as u16);
+        let ttl: u8 = data[8];
+        let protocol: u8 = data[9];
+        let header_checksum: u16 = ((data[10] as u16) << 8) | (data[11] as u16);
+        let mut src_octets: Array(u8, 4) = Array::zeroed();
+        let mut dst_octets: Array(u8, 4) = Array::zeroed();
+        loop bound 4 {
+            src_octets[i] = data[12 + i];
+            dst_octets[i] = data[16 + i];
+        };
+        let src: Ipv4Address = Ipv4Address::from_bytes(src_octets);
+        let dst: Ipv4Address = Ipv4Address::from_bytes(dst_octets);
+        // Parse options
+        let mut options: Array(Ipv4Option, 10) = Array::zeroed();
+        let mut opt_count: u64 = 0;
+        if hdr_len > IPV4_MIN_HDR_LEN {
+            let mut opt_offset: u64 = IPV4_MIN_HDR_LEN;
+            loop bound 10 {
+                if opt_offset >= hdr_len {
+                    break;
+                };
+                let remaining: u64 = hdr_len - opt_offset;
+                let opt_res: Result(Ipv4Option, Ipv4Error) = Ipv4Option::parse(data, opt_offset, remaining);
+                if opt_res.is_err() {
+                    break;
+                };
+                let opt: Ipv4Option = opt_res.unwrap();
+                if opt.kind == 0 {
+                    break; // End of options list
+                };
+                if opt_count < 10 {
+                    options[opt_count] = opt;
+                    opt_count = opt_count + 1;
+                };
+                if opt.kind == 1 {
+                    opt_offset = opt_offset + 1;
+                } else {
+                    opt_offset = opt_offset + (opt.length as u64);
+                };
+            };
+        };
+
+        let header: Ipv4Header = Ipv4Header {
+            version_ihl: version_ihl,
+            dscp_ecn: dscp_ecn,
+            total_length: total_len,
+            identification: identification,
+            flags_fragment: flags_fragment,
+            ttl: ttl,
+            protocol: protocol,
+            header_checksum: header_checksum,
+            source_addr: src,
+            dest_addr: dst,
+            options: options,
+            option_count: opt_count,
+        };
+        // Verify checksum
+        if !header.verify_checksum() {
+            return Result::Err(Ipv4Error::Ipv4HeaderChecksumFail);
+        };
+        return Result::Ok(header);
+    }
+
+    fn serialize(self) -> Result(Array(u8, IPV4_MTU_ETHERNET), Ipv4Error)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, IPV4_MTU_ETHERNET) = Array::zeroed();
+        buf[0] = self.version_ihl;
+        buf[1] = self.dscp_ecn;
+        buf[2] = ((self.total_length >> 8) & 0xFF) as u8;
+        buf[3] = (self.total_length & 0xFF) as u8;
+        buf[4] = ((self.identification >> 8) & 0xFF) as u8;
+        buf[5] = (self.identification & 0xFF) as u8;
+        buf[6] = ((self.flags_fragment >> 8) & 0xFF) as u8;
+        buf[7] = (self.flags_fragment & 0xFF) as u8;
+        buf[8] = self.ttl;
+        buf[9] = self.protocol;
+        let checksum: u16 = self.compute_checksum();
+        buf[10] = ((checksum >> 8) & 0xFF) as u8;
+        buf[11] = (checksum & 0xFF) as u8;
+        loop bound 4 {
+            buf[12 + i] = self.source_addr.octets[i];
+            buf[16 + i] = self.dest_addr.octets[i];
+        };
+        let mut offset: u64 = IPV4_MIN_HDR_LEN;
+        loop bound 10 {
+            if i >= self.option_count {
+                break;
+            };
+            let opt_res: Result(void, Ipv4Error) = self.options[i].serialize(buf, offset);
+            if opt_res.is_err() {
+                return Result::Err(opt_res.unwrap_err());
+            };
+            offset = offset + (self.options[i].length as u64);
+        };
+        // Pad to 32-bit boundary
+        loop bound 4 {
+            if offset >= (self.ihl() as u64) * 4 {
+                break;
+            };
+            buf[offset] = 0;
+            offset = offset + 1;
+        };
+        return Result::Ok(buf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv4 Packet (Header + Payload)
+// ─────────────────────────────────────────────────────────────
+
+struct Ipv4Packet {
+    header: Ipv4Header,
+    payload: Array(u8, IPV4_MAX_PAYLOAD),
+    payload_length: u64,
+}
+
+impl Ipv4Packet {
+    fn new(header: Ipv4Header, payload_data: Array(u8, IPV4_MAX_PAYLOAD), payload_len: u64) -> Ipv4Packet
+        effect [deterministic]
+    {
+        return Ipv4Packet {
+            header: header,
+            payload: payload_data,
+            payload_length: payload_len,
+        };
+    }
+
+    fn parse(data: Array(u8, IPV4_MTU_ETHERNET), len: u64) -> Result(Ipv4Packet, Ipv4Error)
+        effect [deterministic]
+    {
+        let hdr_res: Result(Ipv4Header, Ipv4Error) = Ipv4Header::parse(data, len);
+        if hdr_res.is_err() {
+            return Result::Err(hdr_res.unwrap_err());
+        };
+        let header: Ipv4Header = hdr_res.unwrap();
+        let hdr_len: u64 = header.header_length();
+        let payload_len: u64 = header.payload_length();
+        let mut payload: Array(u8, IPV4_MAX_PAYLOAD) = Array::zeroed();
+        loop bound IPV4_MAX_PAYLOAD {
+            if i >= payload_len {
+                break;
+            };
+            payload[i] = data[hdr_len + i];
+        };
+        return Result::Ok(Ipv4Packet {
+            header: header,
+            payload: payload,
+            payload_length: payload_len,
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, IPV4_MTU_ETHERNET), Ipv4Error)
+        effect [deterministic]
+    {
+        let hdr_buf_res: Result(Array(u8, IPV4_MTU_ETHERNET), Ipv4Error) = self.header.serialize();
+        if hdr_buf_res.is_err() {
+            return Result::Err(hdr_buf_res.unwrap_err());
+        };
+        let mut buf: Array(u8, IPV4_MTU_ETHERNET) = hdr_buf_res.unwrap();
+        let hdr_len: u64 = self.header.header_length();
+        loop bound IPV4_MAX_PAYLOAD {
+            if i >= self.payload_length {
+                break;
+            };
+            buf[hdr_len + i] = self.payload[i];
+        };
+        return Result::Ok(buf);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IP Fragment
+// ─────────────────────────────────────────────────────────────
+
+struct IpFragment {
+    data: Array(u8, IPV4_MTU_ETHERNET),
+    data_len: u64,
+    offset: u16,
+    more_fragments: bool,
+    timestamp: u64,
+}
+
+impl IpFragment {
+    fn new(data_slice: Array(u8, IPV4_MTU_ETHERNET), slice_len: u64,
+           off: u16, mf: bool, now: u64) -> IpFragment
+        effect [deterministic]
+    {
+        let mut data: Array(u8, IPV4_MTU_ETHERNET) = Array::zeroed();
+        loop bound IPV4_MTU_ETHERNET {
+            if i >= slice_len {
+                break;
+            };
+            data[i] = data_slice[i];
+        };
+        return IpFragment {
+            data: data,
+            data_len: slice_len,
+            offset: off,
+            more_fragments: mf,
+            timestamp: now,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fragment Reassembly Buffer
+// ─────────────────────────────────────────────────────────────
+
+struct ReassemblyEntry {
+    fragments: Array(IpFragment, IPV4_MAX_FRAGMENTS),
+    fragment_count: u64,
+    total_length: u64,
+    identification: u16,
+    source: Ipv4Address,
+    dest: Ipv4Address,
+    protocol: u8,
+    first_timestamp: u64,
+    last_timestamp: u64,
+    active: bool,
+}
+
+impl ReassemblyEntry {
+    fn empty() -> ReassemblyEntry
+        effect [deterministic]
+    {
+        return ReassemblyEntry {
+            fragments: Array::zeroed(),
+            fragment_count: 0,
+            total_length: 0,
+            identification: 0,
+            source: Ipv4Address::any(),
+            dest: Ipv4Address::any(),
+            protocol: 0,
+            first_timestamp: 0,
+            last_timestamp: 0,
+            active: false,
+        };
+    }
+
+    fn add_fragment(self: ref mut, frag: IpFragment) -> Result(void, Ipv4Error)
+        effect [deterministic]
+        court "reassembly_add_fragment:v1"
+    {
+        if !self.active {
+            return Result::Err(Ipv4Error::Ipv4FragTimeout);
+        };
+        if self.fragment_count >= IPV4_MAX_FRAGMENTS {
+            return Result::Err(Ipv4Error::Ipv4FragTooMany);
+        };
+        // Check for overlap with existing fragments
+        loop bound IPV4_MAX_FRAGMENTS {
+            if i >= self.fragment_count {
+                break;
+            };
+            let existing: IpFragment = self.fragments[i];
+            let frag_end: u16 = frag.offset + ((frag.data_len / 8) as u16);
+            let exist_end: u16 = existing.offset + ((existing.data_len / 8) as u16);
+            if frag.offset < exist_end && frag_end > existing.offset {
+                return Result::Err(Ipv4Error::Ipv4FragOverlap);
+            };
+        };
+        self.fragments[self.fragment_count] = frag;
+        self.fragment_count = self.fragment_count + 1;
+        self.last_timestamp = frag.timestamp;
+        return Result::Ok(void);
+    }
+
+    fn is_complete(self) -> bool
+        effect [deterministic]
+    {
+        if self.fragment_count == 0 {
+            return false;
+        };
+        // Check if we have offset 0 fragment and a fragment with MF=0
+        let mut has_first: bool = false;
+        let mut has_last: bool = false;
+        let mut highest_offset: u16 = 0;
+        loop bound IPV4_MAX_FRAGMENTS {
+            if i >= self.fragment_count {
+                break;
+            };
+            let frag: IpFragment = self.fragments[i];
+            if frag.offset == 0 {
+                has_first = true;
+            };
+            if !frag.more_fragments {
+                has_last = true;
+                highest_offset = frag.offset + ((frag.data_len / 8) as u16);
+            };
+        };
+        if !has_first || !has_last {
+            return false;
+        };
+        // Check for gaps
+        let mut covered: u16 = 0;
+        loop bound IPV4_MAX_FRAGMENTS {
+            if i >= self.fragment_count {
+                break;
+            };
+            let frag: IpFragment = self.fragments[i];
+            if frag.offset > covered {
+                return false; // Gap detected
+            };
+            let frag_end: u16 = frag.offset + ((frag.data_len / 8) as u16);
+            if frag_end > covered {
+                covered = frag_end;
+            };
+        };
+        return covered >= highest_offset;
+    }
+
+    fn reassemble(self) -> Result(Array(u8, IPV4_MAX_PAYLOAD), Ipv4Error)
+        effect [deterministic]
+        court "reassembly_reassemble:v1"
+    {
+        if !self.is_complete() {
+            return Result::Err(Ipv4Error::Ipv4FragOverlap);
+        };
+        let mut result: Array(u8, IPV4_MAX_PAYLOAD) = Array::zeroed();
+        let mut data_offset: u64 = 0;
+        // Sort fragments by offset (simple insertion sort since bounded)
+        let mut sorted: Array(IpFragment, IPV4_MAX_FRAGMENTS) = Array::zeroed();
+        let mut sorted_count: u64 = 0;
+        loop bound IPV4_MAX_FRAGMENTS {
+            if i >= self.fragment_count {
+                break;
+            };
+            let mut inserted: bool = false;
+            loop bound IPV4_MAX_FRAGMENTS {
+                if j >= sorted_count {
+                    break;
+                };
+                if self.fragments[i].offset < sorted[j].offset {
+                    // Shift right
+                    let mut k: u64 = sorted_count;
+                    loop bound IPV4_MAX_FRAGMENTS {
+                        if k <= j {
+                            break;
+                        };
+                        sorted[k] = sorted[k - 1];
+                        k = k - 1;
+                    };
+                    sorted[j] = self.fragments[i];
+                    inserted = true;
+                    break;
+                };
+            };
+            if !inserted {
+                sorted[sorted_count] = self.fragments[i];
+            };
+            sorted_count = sorted_count + 1;
+        };
+        // Copy data
+        loop bound IPV4_MAX_FRAGMENTS {
+            if i >= sorted_count {
+                break;
+            };
+            let frag: IpFragment = sorted[i];
+            let byte_offset: u64 = (frag.offset as u64) * 8;
+            loop bound IPV4_MTU_ETHERNET {
+                if j >= frag.data_len {
+                    break;
+                };
+                if (byte_offset + j) < IPV4_MAX_PAYLOAD {
+                    result[byte_offset + j] = frag.data[j];
+                };
+            };
+            data_offset = byte_offset + frag.data_len;
+        };
+        self.total_length = data_offset;
+        return Result::Ok(result);
+    }
+
+    fn is_expired(self, now: u64, timeout_ms: u64) -> bool
+        effect [deterministic]
+    {
+        return (now - self.first_timestamp) >= timeout_ms;
+    }
+}
+
+struct ReassemblyBuffer {
+    entries: Array(ReassemblyEntry, IPV4_REASSEMBLY_BUF_SIZE),
+    entry_count: u64,
+}
+
+impl ReassemblyBuffer {
+    fn new() -> ReassemblyBuffer
+        effect [deterministic]
+    {
+        return ReassemblyBuffer {
+            entries: Array::zeroed(),
+            entry_count: 0,
+        };
+    }
+
+    fn find_or_create(
+        self: ref mut,
+        id: u16,
+        src: Ipv4Address,
+        dst: Ipv4Address,
+        proto: u8,
+        now: u64,
+    ) -> Result(ref mut ReassemblyEntry, Ipv4Error)
+        effect [deterministic]
+    {
+        // Look for existing entry
+        loop bound IPV4_REASSEMBLY_BUF_SIZE {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].active &&
+               self.entries[i].identification == id &&
+               self.entries[i].source.eq(src) &&
+               self.entries[i].dest.eq(dst) &&
+               self.entries[i].protocol == proto {
+                return Result::Ok(self.entries[i]);
+            };
+        };
+        // Create new entry
+        if self.entry_count >= IPV4_REASSEMBLY_BUF_SIZE {
+            // Try to evict expired entry
+            loop bound IPV4_REASSEMBLY_BUF_SIZE {
+                if i >= self.entry_count {
+                    break;
+                };
+                if self.entries[i].is_expired(now, IPV4_FRAG_TIMEOUT_MS) {
+                    self.entries[i] = ReassemblyEntry::empty();
+                    self.entries[i].active = true;
+                    self.entries[i].identification = id;
+                    self.entries[i].source = src;
+                    self.entries[i].dest = dst;
+                    self.entries[i].protocol = proto;
+                    self.entries[i].first_timestamp = now;
+                    self.entries[i].last_timestamp = now;
+                    return Result::Ok(self.entries[i]);
+                };
+            };
+            return Result::Err(Ipv4Error::Ipv4FragBufFull);
+        };
+        let idx: u64 = self.entry_count;
+        self.entries[idx] = ReassemblyEntry::empty();
+        self.entries[idx].active = true;
+        self.entries[idx].identification = id;
+        self.entries[idx].source = src;
+        self.entries[idx].dest = dst;
+        self.entries[idx].protocol = proto;
+        self.entries[idx].first_timestamp = now;
+        self.entries[idx].last_timestamp = now;
+        self.entry_count = self.entry_count + 1;
+        return Result::Ok(self.entries[idx]);
+    }
+
+    fn purge_expired(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        let mut i: u64 = 0;
+        loop bound IPV4_REASSEMBLY_BUF_SIZE {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].active && self.entries[i].is_expired(now, IPV4_FRAG_TIMEOUT_MS) {
+                self.entries[i] = self.entries[self.entry_count - 1];
+                self.entry_count = self.entry_count - 1;
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+
+    fn remove(self: ref mut, idx: u64)
+        effect [deterministic]
+    {
+        if idx < self.entry_count {
+            self.entries[idx] = self.entries[self.entry_count - 1];
+            self.entry_count = self.entry_count - 1;
+        };
+    }
+
+    fn entry_count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv4 Fragmentation Functions
+// ─────────────────────────────────────────────────────────────
+
+fn ipv4_fragment_packet(
+    packet: Ipv4Packet,
+    mtu: u64,
+    identification: u16,
+) -> Result(Array(Ipv4Packet, 64), Ipv4Error)
+    effect [deterministic]
+    court "ipv4_fragment:v1"
+{
+    if packet.header.is_df_set() && mtu < (packet.header.header_length() + packet.payload_length) {
+        return Result::Err(Ipv4Error::Ipv4DontFragment);
+    };
+    let hdr_len: u64 = packet.header.header_length();
+    let max_payload_per_frag: u64 = ((mtu - hdr_len) / 8) * 8;
+    if max_payload_per_frag == 0 {
+        return Result::Err(Ipv4Error::Ipv4FragNotSupported);
+    };
+    let mut fragments: Array(Ipv4Packet, 64) = Array::zeroed();
+    let mut frag_count: u64 = 0;
+    let mut offset: u64 = 0;
+    loop bound 64 {
+        if offset >= packet.payload_length {
+            break;
+        };
+        let remaining: u64 = packet.payload_length - offset;
+        let frag_size: u64 = if remaining > max_payload_per_frag {
+            max_payload_per_frag
+        } else {
+            remaining
+        };
+        let more_frags: bool = (offset + frag_size) < packet.payload_length;
+        let mut frag_hdr: Ipv4Header = packet.header;
+        frag_hdr.set_identification(identification);
+        let flags_off: u16 = if more_frags {
+            ((IP_FLAG_MF as u16) << 13) | ((offset / 8) as u16)
+        } else {
+            (offset / 8) as u16
+        };
+        frag_hdr.set_flags_offset(flags_off);
+        let frag_total: u16 = (hdr_len + frag_size) as u16;
+        frag_hdr.set_total_length(frag_total);
+        frag_hdr.compute_and_set_checksum();
+        let mut frag_payload: Array(u8, IPV4_MAX_PAYLOAD) = Array::zeroed();
+        loop bound IPV4_MAX_PAYLOAD {
+            if j >= frag_size {
+                break;
+            };
+            frag_payload[j] = packet.payload[offset + j];
+        };
+        fragments[frag_count] = Ipv4Packet::new(frag_hdr, frag_payload, frag_size);
+        frag_count = frag_count + 1;
+        offset = offset + frag_size;
+    };
+    return Result::Ok(fragments);
+}
+
+fn ipv4_reassemble(
+    reassembly: ref mut ReassemblyBuffer,
+    header: Ipv4Header,
+    fragment_data: Array(u8, IPV4_MTU_ETHERNET),
+    frag_len: u64,
+    now: u64,
+) -> Result(Option(Ipv4Packet), Ipv4Error)
+    effect [deterministic]
+    court "ipv4_reassemble:v1"
+{
+    let mf: bool = header.is_mf_set();
+    let frag_offset: u16 = header.fragment_offset();
+    // If no fragmentation, return packet directly
+    if !mf && frag_offset == 0 {
+        let payload_len: u64 = header.payload_length();
+        let mut payload: Array(u8, IPV4_MAX_PAYLOAD) = Array::zeroed();
+        let hdr_len: u64 = header.header_length();
+        loop bound IPV4_MAX_PAYLOAD {
+            if i >= payload_len {
+                break;
+            };
+            payload[i] = fragment_data[hdr_len + i];
+        };
+        return Result::Ok(Option::Some(Ipv4Packet::new(header, payload, payload_len)));
+    };
+    // Find or create reassembly entry
+    let entry_res: Result(ref mut ReassemblyEntry, Ipv4Error) = reassembly.find_or_create(
+        header.identification,
+        header.source_addr,
+        header.dest_addr,
+        header.protocol,
+        now,
+    );
+    if entry_res.is_err() {
+        return Result::Err(entry_res.unwrap_err());
+    };
+    let entry: ref mut ReassemblyEntry = entry_res.unwrap();
+    let hdr_len: u64 = header.header_length();
+    let payload_len: u64 = header.payload_length();
+    let mut frag_payload: Array(u8, IPV4_MTU_ETHERNET) = Array::zeroed();
+    loop bound IPV4_MTU_ETHERNET {
+        if i >= payload_len {
+            break;
+        };
+        frag_payload[i] = fragment_data[hdr_len + i];
+    };
+    let fragment: IpFragment = IpFragment::new(
+        frag_payload, payload_len,
+        frag_offset, mf, now,
+    );
+    let add_res: Result(void, Ipv4Error) = entry.add_fragment(fragment);
+    if add_res.is_err() {
+        return Result::Err(add_res.unwrap_err());
+    };
+    if entry.is_complete() {
+        let result_res: Result(Array(u8, IPV4_MAX_PAYLOAD), Ipv4Error) = entry.reassemble();
+        if result_res.is_err() {
+            return Result::Err(result_res.unwrap_err());
+        };
+        let reassembled: Array(u8, IPV4_MAX_PAYLOAD) = result_res.unwrap();
+        let total_len: u64 = entry.total_length;
+        let mut final_header: Ipv4Header = header;
+        final_header.set_flags_offset(0);
+        final_header.set_total_length((hdr_len + total_len) as u16);
+        final_header.compute_and_set_checksum();
+        return Result::Ok(Option::Some(Ipv4Packet::new(final_header, reassembled, total_len)));
+    };
+    return Result::Ok(Option::None);
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPv4 Route Entry
+// ─────────────────────────────────────────────────────────────
+
+const IPV4_MAX_ROUTES: u64 = 64;
+
+struct Ipv4RouteEntry {
+    destination: Ipv4Address,
+    prefix_length: u8,
+    gateway: Ipv4Address,
+    interface_index: u64,
+    metric: u32,
+    is_local: bool,
+}
+
+impl Ipv4RouteEntry {
+    fn new(dst: Ipv4Address, prefix: u8, gw: Ipv4Address, iface: u64, met: u32, local: bool) -> Ipv4RouteEntry
+        effect [deterministic]
+    {
+        return Ipv4RouteEntry {
+            destination: dst,
+            prefix_length: prefix,
+            gateway: gw,
+            interface_index: iface,
+            metric: met,
+            is_local: local,
+        };
+    }
+
+    fn matches(self, addr: Ipv4Address) -> bool
+        effect [deterministic]
+    {
+        let mask: u32 = if self.prefix_length == 0 {
+            0
+        } else {
+            let shift: u32 = 32 - (self.prefix_length as u32);
+            if shift >= 32 {
+                0
+            } else {
+                !((1u32 << shift) - 1)
+            };
+        };
+        return (addr.to_u32() & mask) == (self.destination.to_u32() & mask);
+    }
+}
+
+struct Ipv4RoutingTable {
+    entries: Array(Ipv4RouteEntry, IPV4_MAX_ROUTES),
+    entry_count: u64,
+}
+
+impl Ipv4RoutingTable {
+    fn new() -> Ipv4RoutingTable
+        effect [deterministic]
+    {
+        return Ipv4RoutingTable {
+            entries: Array::zeroed(),
+            entry_count: 0,
+        };
+    }
+
+    fn add_route(self: ref mut, route: Ipv4RouteEntry) -> Result(void, Ipv4Error)
+        effect [deterministic]
+    {
+        if self.entry_count >= IPV4_MAX_ROUTES {
+            return Result::Err(Ipv4Error::Ipv4RoutingFailed);
+        };
+        self.entries[self.entry_count] = route;
+        self.entry_count = self.entry_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn lookup(self, dest: Ipv4Address) -> Result(Ipv4RouteEntry, Ipv4Error)
+        effect [deterministic]
+    {
+        let mut best_match: Option(Ipv4RouteEntry) = Option::None;
+        let mut best_prefix: u8 = 0;
+        loop bound IPV4_MAX_ROUTES {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].matches(dest) {
+                if self.entries[i].prefix_length > best_prefix {
+                    best_match = Option::Some(self.entries[i]);
+                    best_prefix = self.entries[i].prefix_length;
+                };
+            };
+        };
+        if best_match.is_none() {
+            return Result::Err(Ipv4Error::Ipv4RoutingFailed);
+        };
+        return Result::Ok(best_match.unwrap());
+    }
+
+    fn remove_route(self: ref mut, idx: u64) -> Result(void, Ipv4Error)
+        effect [deterministic]
+    {
+        if idx >= self.entry_count {
+            return Result::Err(Ipv4Error::Ipv4RoutingFailed);
+        };
+        self.entries[idx] = self.entries[self.entry_count - 1];
+        self.entry_count = self.entry_count - 1;
+        return Result::Ok(void);
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn ipv4_init() -> Result(void, Ipv4Error)
+    effect [deterministic]
+    court "ipv4_init:v1"
+{
+    residual emit {
+        op: "ipv4.init",
+        status: "ready",
+    };
+    return Result::Ok(void);
+}
+
+fn ipv4_is_reserved_addr(addr: Ipv4Address) -> bool
+    effect [deterministic]
+{
+    if addr.is_unspecified() {
+        return true;
+    };
+    if addr.is_loopback() {
+        return true;
+    };
+    if addr.is_broadcast() {
+        return true;
+    };
+    // 240.0.0.0/4 reserved
+    if (addr.octets[0] & 0xF0) == 0xF0 {
+        return true;
+    };
+    return false;
+}
+
+fn ipv4_make_netmask(prefix_len: u8) -> u32
+    effect [deterministic]
+{
+    if prefix_len >= 32 {
+        return 0xFFFFFFFF;
+    };
+    if prefix_len == 0 {
+        return 0;
+    };
+    let shift: u32 = 32 - (prefix_len as u32);
+    return !((1u32 << shift) - 1);
+}
+
+fn ipv4_network_addr(addr: Ipv4Address, prefix_len: u8) -> Ipv4Address
+    effect [deterministic]
+{
+    let mask: u32 = ipv4_make_netmask(prefix_len);
+    let masked: u32 = addr.to_u32() & mask;
+    return Ipv4Address::from_u32(masked);
+}
+
+fn ipv4_is_same_subnet(a: Ipv4Address, b: Ipv4Address, prefix_len: u8) -> bool
+    effect [deterministic]
+{
+    let net_a: Ipv4Address = ipv4_network_addr(a, prefix_len);
+    let net_b: Ipv4Address = ipv4_network_addr(b, prefix_len);
+    return net_a.eq(net_b);
+}

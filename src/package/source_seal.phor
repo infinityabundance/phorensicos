@@ -1,0 +1,1072 @@
+// source_seal.phor — Source↔binary seal: chain assembly, signature, verification
+// Phorensic Package: source-to-binary seal system
+// Spec: SEALED_PACKAGE_FORMAT.md — Binary Evidence, Source↔Binary Seal
+// Grammar: PHORENSIC_GRAMMAR.md §42
+
+package package.source_seal;
+
+use forensic_store.store_object::{
+    Hash256, hash256_zero, hash256_equal,
+    Identity, identity_equal, identity_is_valid,
+    Signature,
+};
+use forensic_store.store_key::{
+    StoreKey, store_key_equal, store_key_zero,
+};
+use package.container::{
+    PackageContainer, SourceToBinarySeal, ByteComparisonReceipt,
+    ProvenanceMapEntry, BinaryEvidence, Signature,
+};
+
+// ============================================================================
+// Seal Chain Types
+// ============================================================================
+
+/// A single link in the source↔binary seal chain.
+/// The chain documents each transformation from source to binary.
+struct SealChainLink
+    layout packed
+{
+    /// Link type
+    link_type: SealLinkType,
+    /// Input hash for this link
+    input_hash: Hash256,
+    /// Output hash for this link
+    output_hash: Hash256,
+    /// Transformation description
+    transform_name: Array[u8, 64],
+    transform_name_len: u32,
+    /// Tool/compiler version used
+    tool_version: Array[u8, 32],
+    tool_version_len: u32,
+    /// Rule or pass identifier
+    rule_id: Array[u8, 64],
+    rule_id_len: u32,
+    /// Timestamp
+    timestamp: u64,
+}
+
+type SealLinkType = enum {
+    /// Source file → parsed AST
+    Parse = 0,
+    /// AST → expanded AST (macro expansion)
+    Expand = 1,
+    /// Expanded AST → lowered IR
+    Lower = 2,
+    /// IR → optimized IR
+    Optimize = 3,
+    /// IR → machine code
+    Codegen = 4,
+    /// Object files → linked binary
+    Link = 5,
+    /// Final binary → seal signature
+    Seal = 6,
+    /// Source archive → source hash
+    SourceArchive = 7,
+    /// Source hash → binary hash correspondence
+    Correspondence = 8,
+}
+
+// ============================================================================
+// Seal Chain — Bounded Container
+// ============================================================================
+
+/// A bounded chain of seal links (max 32).
+struct SealChain
+    layout packed
+{
+    links: Array[SealChainLink, 32],
+    link_count: u32,
+    /// Source hash at the start of the chain
+    source_hash: Hash256,
+    /// Binary hash at the end of the chain
+    binary_hash: Hash256,
+    /// Whether the chain is complete
+    complete: bool,
+    /// Whether the chain has been verified
+    verified: bool,
+}
+
+/// Create a new empty seal chain.
+fn seal_chain_new(
+    source_hash: Hash256,
+    binary_hash: Hash256,
+) -> SealChain
+    effect [compute, residual]
+{
+    residual emit {
+        op: "seal_chain.create",
+        source_prefix: source_hash.bytes[0] as u64,
+        binary_prefix: binary_hash.bytes[0] as u64,
+    };
+
+    return SealChain {
+        links: Array[SealChainLink, 32]::zeroed(),
+        link_count: 0,
+        source_hash: source_hash,
+        binary_hash: binary_hash,
+        complete: false,
+        verified: false,
+    };
+}
+
+/// Append a link to the seal chain.
+fn seal_chain_append(
+    chain: SealChain,
+    link: SealChainLink,
+) -> SealChain
+    effect [compute, residual]
+{
+    if chain.link_count >= 32 {
+        residual emit {
+            op: "seal_chain.full",
+            count: chain.link_count,
+        };
+        return chain;
+    }
+
+    let mut new_chain: SealChain = chain;
+    new_chain.links[chain.link_count] = link;
+    new_chain.link_count = chain.link_count + 1;
+
+    residual emit {
+        op: "seal_chain.append",
+        link_type: link.link_type as u64,
+        index: chain.link_count,
+    };
+
+    return new_chain;
+}
+
+/// Mark the seal chain as complete.
+fn seal_chain_complete(chain: SealChain) -> SealChain
+    effect [compute, residual]
+{
+    residual emit {
+        op: "seal_chain.complete",
+        link_count: chain.link_count,
+    };
+
+    return SealChain {
+        links: chain.links,
+        link_count: chain.link_count,
+        source_hash: chain.source_hash,
+        binary_hash: chain.binary_hash,
+        complete: true,
+        verified: false,
+    };
+}
+
+// ============================================================================
+// Seal Chain Verification
+// ============================================================================
+
+/// Verify the integrity of a seal chain — each link's output must match
+/// the next link's input, and the chain must span source to binary.
+fn seal_chain_verify(chain: SealChain) -> bool
+    effect [compute, residual]
+{
+    if !chain.complete {
+        residual emit {
+            op: "seal_chain.verify.fail",
+            reason: "chain_not_complete",
+        };
+        return false;
+    }
+
+    if chain.link_count < 2 {
+        residual emit {
+            op: "seal_chain.verify.fail",
+            reason: "chain_too_short",
+            count: chain.link_count,
+        };
+        return false;
+    }
+
+    // First link input must match source hash
+    if !hash256_equal(chain.links[0].input_hash, chain.source_hash) {
+        residual emit {
+            op: "seal_chain.verify.fail",
+            reason: "first_link_input_not_source_hash",
+        };
+        return false;
+    }
+
+    // Last link output must match binary hash
+    let last_idx: u64 = (chain.link_count - 1) as u64;
+    if !hash256_equal(chain.links[last_idx].output_hash, chain.binary_hash) {
+        residual emit {
+            op: "seal_chain.verify.fail",
+            reason: "last_link_output_not_binary_hash",
+        };
+        return false;
+    }
+
+    // Each link's output must match the next link's input
+    for i in 0..(chain.link_count - 1) as u64 {
+        if !hash256_equal(chain.links[i].output_hash, chain.links[i + 1].input_hash) {
+            residual emit {
+                op: "seal_chain.verify.fail",
+                reason: "chain_discontinuity",
+                link_index: i,
+            };
+            return false;
+        }
+    }
+
+    // Seal link must be present
+    let mut has_seal_link: bool = false;
+    for i in 0..chain.link_count as u64 {
+        if chain.links[i].link_type == SealLinkType::Seal {
+            has_seal_link = true;
+        }
+    }
+    if !has_seal_link {
+        residual emit {
+            op: "seal_chain.verify.fail",
+            reason: "missing_seal_link",
+        };
+        return false;
+    }
+
+    residual emit {
+        op: "seal_chain.verify.pass",
+        link_count: chain.link_count,
+    };
+
+    return true;
+}
+
+// ============================================================================
+// Seal Signature Assembly
+// ============================================================================
+
+/// Assemble the seal payload: source_hash || binary_hash.
+fn assemble_seal_payload(
+    source_hash: Hash256,
+    binary_hash: Hash256,
+) -> Array[u8, 64]
+    effect [compute]
+{
+    let payload: Array[u8, 64] = Array[u8, 64]::zeroed();
+    for i in 0..32 {
+        payload[i] = source_hash.bytes[i];
+        payload[i + 32] = binary_hash.bytes[i];
+    }
+    return payload;
+}
+
+/// Create a source-to-binary seal structure.
+fn create_source_binary_seal(
+    source_hash: Hash256,
+    binary_hash: Hash256,
+    signer: Identity,
+    signing_key: Hash256,
+    timestamp: u64,
+) -> SourceToBinarySeal
+    effect [compute, residual]
+{
+    // Build the seal payload
+    let payload: Array[u8, 64] = assemble_seal_payload(source_hash, binary_hash);
+
+    // Create a signature (placeholder — real crypto would use a signing primitive)
+    let sig: Signature = Signature {
+        algorithm: Array[u8, 32]::from_literal("phorensic-ed25519"),
+        algorithm_len: 17,
+        sig_bytes: Array[u8, 512]::zeroed(),
+        sig_bytes_len: 64,
+        signer_key: signing_key,
+        signer_identity: signer,
+        signed_at: timestamp,
+        verified: true,
+    };
+
+    // Copy payload into sig bytes as a placeholder
+    for i in 0..64 {
+        sig.sig_bytes[i] = payload[i];
+    }
+
+    residual emit {
+        op: "source_binary_seal.create",
+        source_prefix: source_hash.bytes[0] as u64,
+        binary_prefix: binary_hash.bytes[0] as u64,
+        signer_fp: signing_key.bytes[0] as u64,
+    };
+
+    return SourceToBinarySeal {
+        source_hash: source_hash,
+        binary_hash: binary_hash,
+        seal_type: Array[u8, 32]::from_literal("full-source-to-binary"),
+        seal_type_len: 21,
+        seal_scheme: Array[u8, 32]::from_literal("phorensic-seal-v1"),
+        seal_scheme_len: 17,
+        seal_signature: sig,
+        seal_present: true,
+    };
+}
+
+// ============================================================================
+// Seal Verification
+// ============================================================================
+
+/// Verify a source-to-binary seal.
+fn verify_source_binary_seal(
+    seal: SourceToBinarySeal,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+) -> bool
+    effect [compute, residual]
+{
+    if !seal.seal_present {
+        residual emit {
+            op: "verify_source_binary_seal.fail",
+            reason: "seal_not_present",
+        };
+        return false;
+    }
+
+    // Check source hash is non-zero
+    if hash256_is_zero(seal.source_hash) {
+        residual emit {
+            op: "verify_source_binary_seal.fail",
+            reason: "zero_source_hash",
+        };
+        return false;
+    }
+
+    // Check binary hash is non-zero
+    if hash256_is_zero(seal.binary_hash) {
+        residual emit {
+            op: "verify_source_binary_seal.fail",
+            reason: "zero_binary_hash",
+        };
+        return false;
+    }
+
+    // Check seal type
+    let expected_type: Array[u8, 32] = Array[u8, 32]::from_literal("full-source-to-binary");
+    if seal.seal_type_len != 21 {
+        residual emit {
+            op: "verify_source_binary_seal.fail",
+            reason: "invalid_seal_type_length",
+        };
+        return false;
+    }
+
+    // Verify that the signer key is in the trusted keyring
+    let mut key_trusted: bool = false;
+    for i in 0..trusted_key_count as u64 {
+        if hash256_equal(seal.seal_signature.signer_key, trusted_keys[i]) {
+            key_trusted = true;
+        }
+    }
+    if !key_trusted {
+        residual emit {
+            op: "verify_source_binary_seal.fail",
+            reason: "signer_key_not_trusted",
+        };
+        return false;
+    }
+
+    // Verify the seal payload: source_hash || binary_hash
+    let payload: Array[u8, 64] = assemble_seal_payload(seal.source_hash, seal.binary_hash);
+    let mut payload_matches: bool = true;
+    for i in 0..64 {
+        if payload[i] != seal.seal_signature.sig_bytes[i] {
+            payload_matches = false;
+        }
+    }
+    if !payload_matches {
+        residual emit {
+            op: "verify_source_binary_seal.fail",
+            reason: "payload_mismatch",
+        };
+        return false;
+    }
+
+    residual emit {
+        op: "verify_source_binary_seal.pass",
+        source_prefix: seal.source_hash.bytes[0] as u64,
+        binary_prefix: seal.binary_hash.bytes[0] as u64,
+    };
+
+    return true;
+}
+
+// ============================================================================
+// Byte Comparison Receipt Construction
+// ============================================================================
+
+/// Create a byte comparison receipt with provenance map.
+fn create_byte_comparison_receipt(
+    total_bytes: u64,
+) -> ByteComparisonReceipt
+    effect [compute, residual]
+{
+    residual emit {
+        op: "byte_comparison_receipt.create",
+        total_bytes: total_bytes,
+    };
+
+    return ByteComparisonReceipt {
+        provenance_map: Array[ProvenanceMapEntry, 4096]::zeroed(),
+        provenance_count: 0,
+        total_bytes: total_bytes,
+        traced_bytes: 0,
+    };
+}
+
+/// Add a provenance map entry.
+fn byte_comparison_add_entry(
+    receipt: ByteComparisonReceipt,
+    entry: ProvenanceMapEntry,
+) -> ByteComparisonReceipt
+    effect [compute, residual]
+{
+    if receipt.provenance_count >= 4096 {
+        return receipt;
+    }
+
+    let mut new_receipt: ByteComparisonReceipt = receipt;
+    new_receipt.provenance_map[receipt.provenance_count] = entry;
+    new_receipt.provenance_count = receipt.provenance_count + 1;
+    new_receipt.traced_bytes = new_receipt.traced_bytes + 1;
+
+    return new_receipt;
+}
+
+/// Verify that a byte comparison receipt shows full provenance.
+fn verify_byte_comparison(receipt: ByteComparisonReceipt) -> bool
+    effect [compute, residual]
+{
+    if receipt.total_bytes == 0 {
+        residual emit {
+            op: "verify_byte_comparison.fail",
+            reason: "zero_total_bytes",
+        };
+        return false;
+    }
+
+    if receipt.traced_bytes == 0 {
+        residual emit {
+            op: "verify_byte_comparison.fail",
+            reason: "no_bytes_traced",
+        };
+        return false;
+    }
+
+    // Check that all provenance entries have non-empty source locations
+    let mut all_valid: bool = true;
+    for i in 0..receipt.provenance_count as u64 {
+        let entry: ProvenanceMapEntry = receipt.provenance_map[i];
+        if entry.source_location_len == 0 {
+            all_valid = false;
+        }
+        if entry.pass_name_len == 0 {
+            all_valid = false;
+        }
+    }
+
+    if !all_valid {
+        residual emit {
+            op: "verify_byte_comparison.fail",
+            reason: "incomplete_provenance_entries",
+        };
+        return false;
+    }
+
+    residual emit {
+        op: "verify_byte_comparison.pass",
+        total_bytes: receipt.total_bytes,
+        traced: receipt.traced_bytes,
+        entries: receipt.provenance_count,
+    };
+
+    return true;
+}
+
+// ============================================================================
+// Full Seal Assembly on PackageContainer
+// ============================================================================
+
+/// Assemble and attach the full source↔binary seal to a container.
+fn seal_package(
+    pkg: PackageContainer,
+    seal: SourceToBinarySeal,
+) -> PackageContainer
+    effect [compute, residual]
+{
+    let new_binary: BinaryEvidence = BinaryEvidence {
+        executable_image: pkg.binary_evidence.executable_image,
+        executable_image_len: pkg.binary_evidence.executable_image_len,
+        binary_hash: pkg.binary_evidence.binary_hash,
+        binary_signature: pkg.binary_evidence.binary_signature,
+        binary_sig_present: pkg.binary_evidence.binary_sig_present,
+        source_to_binary_seal: seal,
+        byte_comparison_receipt: pkg.binary_evidence.byte_comparison_receipt,
+    };
+
+    // Update header hashes
+    let new_header = pkg.header;
+    new_header.source_hash = seal.source_hash;
+    new_header.binary_hash = seal.binary_hash;
+
+    residual emit {
+        op: "seal_package.attach",
+        name_prefix: pkg.header.package_name[0] as u64,
+        source_prefix: seal.source_hash.bytes[0] as u64,
+        binary_prefix: seal.binary_hash.bytes[0] as u64,
+    };
+
+    return PackageContainer {
+        header: new_header,
+        source_evidence: pkg.source_evidence,
+        build_evidence: pkg.build_evidence,
+        expansion_evidence: pkg.expansion_evidence,
+        compilation_evidence: pkg.compilation_evidence,
+        binary_evidence: new_binary,
+        replay_evidence: pkg.replay_evidence,
+        court_evidence: pkg.court_evidence,
+        signatures: pkg.signatures,
+        container_key: pkg.container_key,
+        verified: pkg.verified,
+        verification_hash: pkg.verification_hash,
+        sealed: true,
+        container_version: pkg.container_version,
+        reserved: pkg.reserved,
+    };
+}
+
+// ============================================================================
+// Sealed Binary Identification
+// ============================================================================
+
+/// Create a ProvenanceMapEntry for a byte in the binary.
+fn create_provenance_entry(
+    byte_offset: u64,
+    source_location: Array[u8, 256],
+    source_location_len: u32,
+    pass_name: Array[u8, 64],
+    pass_name_len: u32,
+    rule_id: Array[u8, 64],
+    rule_id_len: u32,
+) -> ProvenanceMapEntry
+    effect [compute]
+{
+    return ProvenanceMapEntry {
+        byte_offset: byte_offset,
+        source_location: source_location,
+        source_location_len: source_location_len,
+        pass_name: pass_name,
+        pass_name_len: pass_name_len,
+        rule_id: rule_id,
+        rule_id_len: rule_id_len,
+    };
+}
+
+// ============================================================================
+// Helper: Hash256 zero check
+// ============================================================================
+
+fn hash256_is_zero(h: Hash256) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if h.bytes[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Reproducibility Guarantee Check
+// ============================================================================
+
+/// Check that the same source + same inputs produces the same sealed result.
+/// This is the reproducibility guarantee: store_key(same evidence set)
+fn check_reproducibility(
+    source_hash: Hash256,
+    binary_hash: Hash256,
+    seal: SourceToBinarySeal,
+) -> bool
+    effect [compute, residual]
+{
+    let ok: bool = hash256_equal(seal.source_hash, source_hash) &&
+                   hash256_equal(seal.binary_hash, binary_hash);
+
+    residual emit {
+        op: "check_reproducibility",
+        ok: ok as u64,
+    };
+
+    return ok;
+}
+
+// ============================================================================
+// Seal Chain Evidence Recording
+// ============================================================================
+
+/// Record a residual for each link in the seal chain.
+fn seal_chain_emit_residuals(
+    chain: SealChain,
+    history: ResidualHistory,
+) -> ResidualHistory
+    effect [compute, residual]
+{
+    let mut hist: ResidualHistory = history;
+    for i in 0..chain.link_count as u64 {
+        let link: SealChainLink = chain.links[i];
+        let rec: ResidualRecord = ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("seal_chain_link"),
+            op_name_len: 16,
+            op_type: 8,
+            timestamp: link.timestamp,
+            generation: 0,
+            actor: Identity::default(),
+            object_hash: hash256_zero(),
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        };
+        hist = residual_history_append(hist, rec);
+    }
+    return hist;
+}
+
+// ============================================================================
+// Seal Verification Result
+// ============================================================================
+
+/// Detailed result of seal verification.
+struct SealVerificationResult
+    layout packed
+{
+    /// Whether the seal is valid overall
+    valid: bool,
+    /// Whether the chain is continuous
+    chain_continuous: bool,
+    /// Whether the chain is complete
+    chain_complete: bool,
+    /// Whether the seal signature is valid
+    signature_valid: bool,
+    /// Whether the signer key is trusted
+    signer_trusted: bool,
+    /// Number of links verified
+    links_verified: u32,
+    /// First failure reason
+    failure_reason: Array[u8, 256],
+    failure_reason_len: u32,
+}
+
+/// Perform detailed seal verification with structured result.
+fn verify_seal_detailed(
+    seal: SourceToBinarySeal,
+    chain: SealChain,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+) -> SealVerificationResult
+    effect [compute, residual]
+{
+    let mut result: SealVerificationResult = SealVerificationResult {
+        valid: true,
+        chain_continuous: false,
+        chain_complete: false,
+        signature_valid: false,
+        signer_trusted: false,
+        links_verified: 0,
+        failure_reason: Array[u8, 256]::zeroed(),
+        failure_reason_len: 0,
+    };
+
+    // Verify chain
+    let chain_ok: bool = seal_chain_verify(chain);
+    result.chain_complete = chain.complete;
+    result.chain_continuous = chain_ok;
+    result.links_verified = chain.link_count;
+
+    if !chain_ok {
+        result.valid = false;
+        let msg: Array[u8, 256] = Array[u8, 256]::from_literal("Seal chain verification failed");
+        for i in 0..32 { result.failure_reason[i] = msg[i]; }
+        result.failure_reason_len = 32;
+    }
+
+    // Verify seal signature
+    let seal_ok: bool = verify_source_binary_seal(seal, trusted_keys, trusted_key_count);
+    result.signature_valid = seal_ok;
+
+    // Check signer trust
+    for i in 0..trusted_key_count as u64 {
+        if hash256_equal(seal.seal_signature.signer_key, trusted_keys[i]) {
+            result.signer_trusted = true;
+        }
+    }
+    if !result.signer_trusted {
+        result.valid = false;
+    }
+
+    if !seal_ok {
+        result.valid = false;
+        let msg: Array[u8, 256] = Array[u8, 256]::from_literal("Seal signature verification failed");
+        for i in 0..35 { result.failure_reason[i] = msg[i]; }
+        result.failure_reason_len = 35;
+    }
+
+    residual emit {
+        op: "verify_seal_detailed",
+        valid: result.valid as u64,
+        links: result.links_verified,
+    };
+
+    return result;
+}
+
+// ============================================================================
+// Default Identity helper
+// ============================================================================
+
+impl Identity {
+    fn default() -> Identity {
+        return Identity {
+            name: Array[u8, 128]::zeroed(), name_len: 0,
+            key_fingerprint: hash256_zero(),
+            dialect_scope: Array[u8, 64]::zeroed(), dialect_scope_len: 0,
+            version: 0, established_at_gen: 0,
+        };
+    }
+}
+
+// ============================================================================
+// Seal Chain Evidence Hash Chain
+// ============================================================================
+
+/// Compute a cumulative hash over the entire seal chain.
+fn seal_chain_compute_hash(chain: SealChain) -> Hash256
+    effect [compute]
+{
+    let mut hash: Hash256 = hash256_zero();
+
+    // Start with source hash
+    for i in 0..32 {
+        hash.bytes[i] = chain.source_hash.bytes[i];
+    }
+
+    // Accumulate each link's output hash
+    for i in 0..chain.link_count as u64 {
+        let link: SealChainLink = chain.links[i];
+        for j in 0..32 {
+            hash.bytes[j] = hash.bytes[j] ^ link.output_hash.bytes[j];
+            hash.bytes[j] = hash.bytes[j] ^ link.input_hash.bytes[j];
+        }
+    }
+
+    // XOR in binary hash
+    for i in 0..32 {
+        hash.bytes[i] = hash.bytes[i] ^ chain.binary_hash.bytes[i];
+    }
+
+    return hash;
+}
+
+// ============================================================================
+// Seal Chain from Compilation Evidence
+// ============================================================================
+
+/// Build a seal chain from the compilation evidence in a package container.
+fn build_seal_chain_from_compilation(
+    pkg: PackageContainer,
+    source_hash: Hash256,
+    binary_hash: Hash256,
+    timestamp: u64,
+) -> SealChain
+    effect [compute, residual]
+{
+    let chain: SealChain = seal_chain_new(source_hash, binary_hash);
+    let mut c: SealChain = chain;
+
+    // Add parse link
+    let parse: StageReceipt = pkg.compilation_evidence.parse_receipt;
+    if parse.stage_name_len > 0 {
+        let link: SealChainLink = SealChainLink {
+            link_type: SealLinkType::Parse,
+            input_hash: parse.input_hash,
+            output_hash: parse.output_hash,
+            transform_name: Array[u8, 64]::from_literal("parse"),
+            transform_name_len: 5,
+            tool_version: parse.stage_version,
+            tool_version_len: parse.stage_version_len,
+            rule_id: Array[u8, 64]::zeroed(),
+            rule_id_len: 0,
+            timestamp: parse.timestamp,
+        };
+        c = seal_chain_append(c, link);
+    }
+
+    // Add expand link
+    let expand: StageReceipt = pkg.compilation_evidence.expansion_receipt;
+    if expand.stage_name_len > 0 {
+        let link: SealChainLink = SealChainLink {
+            link_type: SealLinkType::Expand,
+            input_hash: expand.input_hash,
+            output_hash: expand.output_hash,
+            transform_name: Array[u8, 64]::from_literal("expand"),
+            transform_name_len: 6,
+            tool_version: expand.stage_version,
+            tool_version_len: expand.stage_version_len,
+            rule_id: Array[u8, 64]::zeroed(),
+            rule_id_len: 0,
+            timestamp: expand.timestamp,
+        };
+        c = seal_chain_append(c, link);
+    }
+
+    // Add lower link
+    let lower: StageReceipt = pkg.compilation_evidence.lowering_receipt;
+    if lower.stage_name_len > 0 {
+        let link: SealChainLink = SealChainLink {
+            link_type: SealLinkType::Lower,
+            input_hash: lower.input_hash,
+            output_hash: lower.output_hash,
+            transform_name: Array[u8, 64]::from_literal("lower"),
+            transform_name_len: 5,
+            tool_version: lower.stage_version,
+            tool_version_len: lower.stage_version_len,
+            rule_id: Array[u8, 64]::zeroed(),
+            rule_id_len: 0,
+            timestamp: lower.timestamp,
+        };
+        c = seal_chain_append(c, link);
+    }
+
+    // Add codegen link
+    let codegen: StageReceipt = pkg.compilation_evidence.codegen_receipt;
+    if codegen.stage_name_len > 0 {
+        let link: SealChainLink = SealChainLink {
+            link_type: SealLinkType::Codegen,
+            input_hash: codegen.input_hash,
+            output_hash: codegen.output_hash,
+            transform_name: Array[u8, 64]::from_literal("codegen"),
+            transform_name_len: 7,
+            tool_version: codegen.stage_version,
+            tool_version_len: codegen.stage_version_len,
+            rule_id: Array[u8, 64]::zeroed(),
+            rule_id_len: 0,
+            timestamp: codegen.timestamp,
+        };
+        c = seal_chain_append(c, link);
+    }
+
+    // Add link link
+    let link_stage: StageReceipt = pkg.compilation_evidence.link_receipt;
+    if link_stage.stage_name_len > 0 {
+        let link: SealChainLink = SealChainLink {
+            link_type: SealLinkType::Link,
+            input_hash: link_stage.input_hash,
+            output_hash: link_stage.output_hash,
+            transform_name: Array[u8, 64]::from_literal("link"),
+            transform_name_len: 4,
+            tool_version: link_stage.stage_version,
+            tool_version_len: link_stage.stage_version_len,
+            rule_id: Array[u8, 64]::zeroed(),
+            rule_id_len: 0,
+            timestamp: link_stage.timestamp,
+        };
+        c = seal_chain_append(c, link);
+    }
+
+    // Add seal link
+    let seal_link: SealChainLink = SealChainLink {
+        link_type: SealLinkType::Seal,
+        input_hash: binary_hash,
+        output_hash: binary_hash,
+        transform_name: Array[u8, 64]::from_literal("seal"),
+        transform_name_len: 4,
+        tool_version: Array[u8, 32]::from_literal("phorensic-seal-v1"),
+        tool_version_len: 17,
+        rule_id: Array[u8, 64]::from_literal("source-binary-seal"),
+        rule_id_len: 18,
+        timestamp: timestamp,
+    };
+    c = seal_chain_append(c, seal_link);
+
+    c = seal_chain_complete(c);
+
+    residual emit {
+        op: "build_seal_chain_from_compilation",
+        link_count: c.link_count,
+    };
+
+    return c;
+}
+
+// ============================================================================
+// Residual History Append (local re-export for convenience)
+// ============================================================================
+
+fn residual_history_append(
+    history: ResidualHistory,
+    record: ResidualRecord,
+) -> ResidualHistory
+    effect [compute, residual]
+{
+    let new_history: ResidualHistory = ResidualHistory {
+        records: history.records,
+        count: history.count,
+        head: history.head,
+        tail: history.tail,
+        total_emitted: history.total_emitted + 1,
+        owner_hash: history.owner_hash,
+    };
+
+    new_history.records[history.tail as u64] = record;
+    let next_tail: u32 = (history.tail + 1) % 1024;
+    new_history.tail = next_tail;
+
+    if new_history.count < 1024 {
+        new_history.count = new_history.count + 1;
+    } else {
+        new_history.head = (history.head + 1) % 1024;
+    }
+
+    return new_history;
+}
+
+// ============================================================================
+// ResidualRecord Type (local re-export)
+// ============================================================================
+
+struct ResidualRecord
+    layout packed
+{
+    op_name: Array[u8, 128],
+    op_name_len: u32,
+    op_type: u8,
+    timestamp: u64,
+    generation: u64,
+    actor: Identity,
+    object_hash: Hash256,
+    severity: u8,
+    field_keys: Array[Array[u8, 64], 16],
+    field_values: Array[Array[u8, 256], 16],
+    field_key_lens: Array[u32, 16],
+    field_value_lens: Array[u32, 16],
+    field_count: u32,
+    parent_residual_hash: Hash256,
+    event_id: u64,
+    causal_category: u8,
+    reserved: Array[u64, 8],
+}
+
+struct ResidualHistory
+    layout packed
+{
+    records: Array[ResidualRecord, 1024],
+    count: u32,
+    head: u32,
+    tail: u32,
+    total_emitted: u64,
+    owner_hash: Hash256,
+}
+
+// ============================================================================
+// Seal Consistency Assertions
+// ============================================================================
+
+/// Assert that a source hash matches across all seal components.
+fn assert_seal_source_consistency(
+    chain: SealChain,
+    seal: SourceToBinarySeal,
+    package_source_hash: Hash256,
+) -> bool
+    effect [compute, residual]
+{
+    let c1: bool = hash256_equal(chain.source_hash, seal.source_hash);
+    let c2: bool = hash256_equal(seal.source_hash, package_source_hash);
+    let c3: bool = hash256_equal(chain.source_hash, package_source_hash);
+    let ok: bool = c1 && c2 && c3;
+
+    residual emit {
+        op: "assert_seal_source_consistency",
+        ok: ok as u64,
+    };
+
+    return ok;
+}
+
+/// Assert that a binary hash matches across all seal components.
+fn assert_seal_binary_consistency(
+    chain: SealChain,
+    seal: SourceToBinarySeal,
+    package_binary_hash: Hash256,
+) -> bool
+    effect [compute, residual]
+{
+    let c1: bool = hash256_equal(chain.binary_hash, seal.binary_hash);
+    let c2: bool = hash256_equal(seal.binary_hash, package_binary_hash);
+    let c3: bool = hash256_equal(chain.binary_hash, package_binary_hash);
+    let ok: bool = c1 && c2 && c3;
+
+    residual emit {
+        op: "assert_seal_binary_consistency",
+        ok: ok as u64,
+    };
+
+    return ok;
+}
+
+// ============================================================================
+// Seal Migration
+// ============================================================================
+
+/// Migrate a seal from one key to another when the keyring is rotated.
+fn migrate_seal_signer(
+    seal: SourceToBinarySeal,
+    new_signer_key: Hash256,
+    new_signer_identity: Identity,
+    timestamp: u64,
+) -> SourceToBinarySeal
+    effect [compute, residual]
+{
+    // Preserve the source and binary hashes, re-sign with new key
+    let payload: Array[u8, 64] = assemble_seal_payload(seal.source_hash, seal.binary_hash);
+
+    let new_sig: Signature = Signature {
+        algorithm: Array[u8, 32]::from_literal("phorensic-ed25519"),
+        algorithm_len: 17,
+        sig_bytes: Array[u8, 512]::zeroed(),
+        sig_bytes_len: 64,
+        signer_key: new_signer_key,
+        signer_identity: new_signer_identity,
+        signed_at: timestamp,
+        verified: true,
+    };
+
+    for i in 0..64 {
+        new_sig.sig_bytes[i] = payload[i];
+    }
+
+    residual emit {
+        op: "migrate_seal_signer",
+        old_key_prefix: seal.seal_signature.signer_key.bytes[0] as u64,
+        new_key_prefix: new_signer_key.bytes[0] as u64,
+    };
+
+    return SourceToBinarySeal {
+        source_hash: seal.source_hash,
+        binary_hash: seal.binary_hash,
+        seal_type: seal.seal_type,
+        seal_type_len: seal.seal_type_len,
+        seal_scheme: seal.seal_scheme,
+        seal_scheme_len: seal.seal_scheme_len,
+        seal_signature: new_sig,
+        seal_present: true,
+    };
+}

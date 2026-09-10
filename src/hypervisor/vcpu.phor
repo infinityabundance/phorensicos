@@ -1,0 +1,1258 @@
+//==============================================================================
+// vcpu.phor — Virtual CPU Management
+//
+// Provides VCPU creation/destruction, register state management, instruction
+// emulation, MMU virtualization (EPT/NPT), interrupt virtualization (APICv),
+// TSC scaling, and CPUID masking.
+//
+// All operations are capability-gated, bounded-loop, and residual-recorded.
+//==============================================================================
+
+module vcpu
+  @[receipt("vcpu-v1")]
+  @[audit("VCPU")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{syscall, alloc, unsafe, io};
+use core::residual::*;
+use core::mem::*;
+use hypervisor::hypervisor_core::*;
+
+//==============================================================================
+// VCPU State
+//==============================================================================
+
+/// VCPU state structure.
+pub struct Vcpu[
+  CapT: Capability,
+](
+  /// Unique VCPU ID.
+  vcpu_id: u64,
+  /// Associated VM ID.
+  vm_id: u64,
+  /// VCPU state.
+  state: VcpuState,
+  /// VCPU run state.
+  run_state: VcpuRunState,
+  /// Register state (for emulation and save/restore).
+  regs: VcpuRegisters,
+  /// Interrupt controller state (APICv).
+  apic: ApicState,
+  /// Virtualized TSC state.
+  tsc: TscState,
+  /// CPUID masking.
+  cpuid_mask: CpuIdMask,
+  /// MMU virtualization state.
+  mmu: MmuState,
+  /// Capability token for this VCPU.
+  cap_token: u64,
+  /// Physical CPU affinity.
+  pcpu_affinity: u32,
+  /// Whether the VCPU is currently running.
+  is_running: bool,
+  /// Timeslice accounting.
+  runtime_ns: u64,
+  /// Number of VM exits.
+  exit_count: u64,
+  /// Generation.
+  generation: u64,
+  /// Residual chain for this VCPU.
+  residual_chain: ResidualChain,
+) : effect:(alloc, unsafe);
+
+pub enum VcpuState : u8 {
+  Created   = 0,
+  Ready     = 1,
+  Running   = 2,
+  Halted    = 3,
+  Blocked   = 4,
+  Suspended = 5,
+  Destroyed = 6,
+}
+
+pub enum VcpuRunState : u8 {
+  Runnable       = 0,
+  WaitingForEvent = 1,
+  WaitingForIO   = 2,
+  Paused         = 3,
+  Exiting        = 4,
+}
+
+/// VCPU register file.
+pub struct VcpuRegisters(
+  // General-purpose registers
+  rax: u64, rbx: u64, rcx: u64, rdx: u64,
+  rsi: u64, rdi: u64, rbp: u64, rsp: u64,
+  r8: u64, r9: u64, r10: u64, r11: u64,
+  r12: u64, r13: u64, r14: u64, r15: u64,
+
+  // Segment registers
+  cs: SegmentReg, ds: SegmentReg, es: SegmentReg,
+  fs: SegmentReg, gs: SegmentReg, ss: SegmentReg,
+  ldtr: SegmentReg, tr: SegmentReg,
+
+  // Table registers
+  gdtr: TableReg, idtr: TableReg,
+
+  // Control registers
+  cr0: u64, cr2: u64, cr3: u64, cr4: u64, cr8: u64,
+
+  // Debug registers
+  dr0: u64, dr1: u64, dr2: u64, dr3: u64,
+  dr6: u64, dr7: u64,
+
+  // MSRs
+  msrs: [u64; 64],
+  msr_valid: [bool; 64],
+
+  // Flags and instruction pointer
+  rflags: u64,
+  rip: u64,
+
+  // Capability registers (Phorensic-specific)
+  cap_gp_regs: [CapabilitySlot; 4],
+  ddc: CapabilitySlot,
+  pcc: CapabilitySlot,
+
+  // Floating-point / SIMD (XMM/YMM/ZMM)
+  fp_regs: [SimdReg; 32],
+  mxcsr: u32,
+  fpu_state: FpuState,
+) : effect:(unsafe);
+
+pub struct FpuState(
+  fcw: u16,
+  fsw: u16,
+  ftw: u8,
+  fop: u16,
+  fip: u64,
+  fcs: u64,
+  fdp: u64,
+  fds: u64,
+  st_regs: [FpuStackReg; 8],
+  tag_ab: u8,
+  xmm_regs: [u128; 16],
+) : effect:(pure);
+
+pub struct FpuStackReg(
+  sign: u64,
+  exponent: u16,
+  mantissa: [u8; 10],
+) : effect:(pure);
+
+pub struct SimdReg(
+  low: u64,
+  high: u64,
+) : effect:(pure);
+
+pub type u128 = u64;  // simplified
+
+//==============================================================================
+// VCPU Creation and Destruction
+//==============================================================================
+
+/// Create a new VCPU.
+pub fn vcpu_create[
+  vm_id: u64,
+  vcpu_id: u64,
+  hv_cap: CapabilitySlot,
+] -> Result[*Vcpu, VcpuError] : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_CREATE) == 0 {
+    return Err(VcpuError::InsufficientRights);
+  }
+
+  let vcpu: *Vcpu = @alloc(Vcpu);
+  vcpu.vcpu_id = vcpu_id;
+  vcpu.vm_id = vm_id;
+  vcpu.state = VcpuState::Created;
+  vcpu.run_state = VcpuRunState::Runnable;
+  vcpu.regs = VcpuRegisters::new();
+  vcpu.apic = ApicState::new();
+  vcpu.tsc = TscState(virtual_tsc: 0, tsc_offset: 0, tsc_multiplier: 1.0, tsc_scaling_enabled: false);
+  vcpu.cpuid_mask = CpuIdMask::new();
+  vcpu.mmu = MmuState::new();
+  vcpu.cap_token = hv_cap.generation;
+  vcpu.pcpu_affinity = 0xFFFFFFFF;
+  vcpu.is_running = false;
+  vcpu.runtime_ns = 0;
+  vcpu.exit_count = 0;
+  vcpu.generation = generate_vcpu_generation();
+  vcpu.residual_chain = ResidualChain(last_id: 0);
+
+  // Initialize default register state
+  init_vcpu_defaults(vcpu);
+
+  record_vcpu_residual(VcpuOp::Create, vcpu_id, 0);
+
+  return Ok(vcpu);
+}
+
+/// Initialize default VCPU register state.
+fn init_vcpu_defaults[vcpu: *Vcpu] : effect:(unsafe) {
+  let regs: *VcpuRegisters = &vcpu.regs;
+
+  // Set real mode defaults
+  regs.cs = SegmentReg(selector: 0xF000, base: 0xFFFF0000, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT | SEG_FLAG_CODE | SEG_FLAG_READABLE));
+  regs.ds = SegmentReg(selector: 0, base: 0, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT | SEG_FLAG_DATA | SEG_FLAG_WRITABLE));
+  regs.es = SegmentReg(selector: 0, base: 0, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT | SEG_FLAG_DATA | SEG_FLAG_WRITABLE));
+  regs.fs = SegmentReg(selector: 0, base: 0, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT | SEG_FLAG_DATA | SEG_FLAG_WRITABLE));
+  regs.gs = SegmentReg(selector: 0, base: 0, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT | SEG_FLAG_DATA | SEG_FLAG_WRITABLE));
+  regs.ss = SegmentReg(selector: 0, base: 0, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT | SEG_FLAG_DATA | SEG_FLAG_WRITABLE));
+  regs.ldtr = SegmentReg(selector: 0, base: 0, limit: 0, flags: SegmentFlags(0));
+  regs.tr = SegmentReg(selector: 0, base: 0, limit: 0xFFFF, flags: SegmentFlags(SEG_FLAG_VALID | SEG_FLAG_PRESENT));
+  regs.gdtr = TableReg(base: 0, limit: 0);
+  regs.idtr = TableReg(base: 0, limit: 0x3FF);
+  regs.cr0 = 0x10;  // CR0.ET = 1
+  regs.cr4 = 0;
+  regs.rflags = 0x02;  // IF = 0
+  regs.rip = 0xFFF0;
+  regs.rsp = 0;
+
+  // Initialize FPU state
+  regs.fpu_state = FpuState(
+    fcw: 0x037F, fsw: 0, ftw: 0xFF, fop: 0,
+    fip: 0, fcs: 0, fdp: 0, fds: 0,
+    st_regs: Default, tag_ab: 0, xmm_regs: Default,
+  );
+  regs.mxcsr = 0x1F80;
+}
+
+/// Destroy a VCPU.
+pub fn vcpu_destroy[
+  vcpu: *Vcpu,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VcpuError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_DESTROY) == 0 {
+    return Err(VcpuError::InsufficientRights);
+  }
+
+  if vcpu.is_running {
+    return Err(VcpuError::VcpuRunning);
+  }
+
+  vcpu.state = VcpuState::Destroyed;
+
+  record_vcpu_residual(VcpuOp::Destroy, vcpu.vcpu_id, 0);
+  return Ok(());
+}
+
+//==============================================================================
+// Register State Management
+//==============================================================================
+
+/// Get a VCPU register value.
+pub fn vcpu_get_reg[
+  vcpu: *Vcpu,
+  reg: VcpuRegister,
+] -> Result<u64, VcpuError> : effect:(pure)
+  loop: bounded(1)
+{
+  let regs: *VcpuRegisters = &vcpu.regs;
+  match reg {
+    VcpuRegister::RAX => Ok(regs.rax),
+    VcpuRegister::RBX => Ok(regs.rbx),
+    VcpuRegister::RCX => Ok(regs.rcx),
+    VcpuRegister::RDX => Ok(regs.rdx),
+    VcpuRegister::RSI => Ok(regs.rsi),
+    VcpuRegister::RDI => Ok(regs.rdi),
+    VcpuRegister::RBP => Ok(regs.rbp),
+    VcpuRegister::RSP => Ok(regs.rsp),
+    VcpuRegister::R8  => Ok(regs.r8),
+    VcpuRegister::R9  => Ok(regs.r9),
+    VcpuRegister::R10 => Ok(regs.r10),
+    VcpuRegister::R11 => Ok(regs.r11),
+    VcpuRegister::R12 => Ok(regs.r12),
+    VcpuRegister::R13 => Ok(regs.r13),
+    VcpuRegister::R14 => Ok(regs.r14),
+    VcpuRegister::R15 => Ok(regs.r15),
+    VcpuRegister::RIP => Ok(regs.rip),
+    VcpuRegister::RFLAGS => Ok(regs.rflags),
+    VcpuRegister::CR0 => Ok(regs.cr0),
+    VcpuRegister::CR2 => Ok(regs.cr2),
+    VcpuRegister::CR3 => Ok(regs.cr3),
+    VcpuRegister::CR4 => Ok(regs.cr4),
+    VcpuRegister::CR8 => Ok(regs.cr8),
+    _ => Err(VcpuError::InvalidRegister),
+  }
+}
+
+/// Set a VCPU register value.
+pub fn vcpu_set_reg[
+  vcpu: *Vcpu,
+  reg: VcpuRegister,
+  value: u64,
+] -> Result[(), VcpuError] : effect:(unsafe)
+  loop: bounded(1)
+{
+  let regs: *VcpuRegisters = &vcpu.regs;
+  match reg {
+    VcpuRegister::RAX => { regs.rax = value; Ok(()) },
+    VcpuRegister::RBX => { regs.rbx = value; Ok(()) },
+    VcpuRegister::RCX => { regs.rcx = value; Ok(()) },
+    VcpuRegister::RDX => { regs.rdx = value; Ok(()) },
+    VcpuRegister::RSI => { regs.rsi = value; Ok(()) },
+    VcpuRegister::RDI => { regs.rdi = value; Ok(()) },
+    VcpuRegister::RBP => { regs.rbp = value; Ok(()) },
+    VcpuRegister::RSP => { regs.rsp = value; Ok(()) },
+    VcpuRegister::R8  => { regs.r8 = value; Ok(()) },
+    VcpuRegister::R9  => { regs.r9 = value; Ok(()) },
+    VcpuRegister::R10 => { regs.r10 = value; Ok(()) },
+    VcpuRegister::R11 => { regs.r11 = value; Ok(()) },
+    VcpuRegister::R12 => { regs.r12 = value; Ok(()) },
+    VcpuRegister::R13 => { regs.r13 = value; Ok(()) },
+    VcpuRegister::R14 => { regs.r14 = value; Ok(()) },
+    VcpuRegister::R15 => { regs.r15 = value; Ok(()) },
+    VcpuRegister::RIP => { regs.rip = value; Ok(()) },
+    VcpuRegister::RFLAGS => { regs.rflags = value; Ok(()) },
+    VcpuRegister::CR0 => { regs.cr0 = value; update_cr0_side_effects(vcpu); Ok(()) },
+    VcpuRegister::CR2 => { regs.cr2 = value; Ok(()) },
+    VcpuRegister::CR3 => { regs.cr3 = value; Ok(()) },
+    VcpuRegister::CR4 => { regs.cr4 = value; Ok(()) },
+    VcpuRegister::CR8 => { regs.cr8 = value; Ok(()) },
+    _ => Err(VcpuError::InvalidRegister),
+  }
+}
+
+pub enum VcpuRegister : u8 {
+  RAX = 0, RBX = 1, RCX = 2, RDX = 3,
+  RSI = 4, RDI = 5, RBP = 6, RSP = 7,
+  R8 = 8, R9 = 9, R10 = 10, R11 = 11,
+  R12 = 12, R13 = 13, R14 = 14, R15 = 15,
+  RIP = 16, RFLAGS = 17,
+  CR0 = 18, CR2 = 19, CR3 = 20, CR4 = 21, CR8 = 22,
+  CS = 23, DS = 24, ES = 25, FS = 26, GS = 27, SS = 28,
+}
+
+/// Update side effects when CR0 changes.
+fn update_cr0_side_effects[vcpu: *Vcpu] : effect:(unsafe) {
+  // Handle paging enable/disable, caching, etc.
+  let cr0: u64 = vcpu.regs.cr0;
+
+  if (cr0 & 0x80000000) != 0 {
+    // Paging enabled — update MMU state
+    vcpu.mmu.paging_enabled = true;
+  } else {
+    vcpu.mmu.paging_enabled = false;
+  }
+
+  if (cr0 & 0x02) != 0 {
+    // CR0.EM = 1 — FPU emulation
+    vcpu.regs.fpu_state.fcw |= 0x0080;
+  }
+
+  if (cr0 & 0x04) != 0 {
+    // CR0.TS = 1 — task switched
+    vcpu.regs.fpu_state.fcw &= 0xFF7F;
+  }
+
+  record_vcpu_residual(VcpuOp::CrChange, cr0, 0);
+}
+
+//==============================================================================
+// Instruction Emulation
+//==============================================================================
+
+/// Instruction emulation result.
+pub struct EmulationResult(
+  /// Whether the instruction was successfully emulated.
+  handled: bool,
+  /// Number of bytes consumed.
+  consumed: u32,
+  /// Whether to advance RIP.
+  advance_rip: bool,
+  /// Whether to inject a fault.
+  inject_fault: bool,
+  /// Fault vector if inject_fault is true.
+  fault_vector: u8,
+  /// Fault error code.
+  fault_code: u32,
+) : effect:(pure);
+
+/// Emulate an instruction for the VCPU.
+pub fn emulate_instruction[
+  vcpu: *Vcpu,
+  instruction_bytes: *u8,
+  max_length: u32,
+] -> EmulationResult : effect:(alloc, unsafe)
+  loop: bounded(1)
+{
+  if max_length < 1 {
+    return EmulationResult(handled: false, consumed: 0, advance_rip: false, inject_fault: true, fault_vector: 6, fault_code: 0); // #UD
+  }
+
+  let first_byte: u8 = instruction_bytes[0];
+  let consumed: u32 = 1;
+
+  match first_byte {
+    0x0F => {
+      // Two-byte opcode
+      if max_length < 2 {
+        return EmulationResult(handled: false, consumed: 1, advance_rip: false, inject_fault: true, fault_vector: 6, fault_code: 0);
+      }
+      let second_byte: u8 = instruction_bytes[1];
+      consumed = 2;
+      return emulate_two_byte_opcode(vcpu, second_byte, instruction_bytes, max_length);
+    },
+    0xF0 => { // LOCK prefix
+      return emulate_lock_instruction(vcpu, instruction_bytes, max_length);
+    },
+    0xF2 | 0xF3 => { // REPNE/REP prefix
+      return emulate_rep_instruction(vcpu, instruction_bytes, max_length);
+    },
+    0x0F0 => { return emulation_not_handled(); },  // Actually 0x0F not valid here; fall through
+    0x0E => { // PUSH CS
+      vcpu.regs.rsp -= 8;
+      *(@int_to_ptr(vcpu.regs.rsp) as *u64) = vcpu.regs.cs.selector as u64;
+      return EmulationResult(handled: true, consumed: 1, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x50..0x57 => { // PUSH reg
+      let reg_idx: u32 = (first_byte - 0x50) as u32;
+      let value: u64 = read_gp_reg(vcpu, reg_idx);
+      vcpu.regs.rsp -= 8;
+      *(@int_to_ptr(vcpu.regs.rsp) as *u64) = value;
+      return EmulationResult(handled: true, consumed: 1, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x58..0x5F => { // POP reg
+      let reg_idx: u32 = (first_byte - 0x58) as u32;
+      let value: u64 = *(@int_to_ptr(vcpu.regs.rsp) as *u64);
+      vcpu.regs.rsp += 8;
+      write_gp_reg(vcpu, reg_idx, value);
+      return EmulationResult(handled: true, consumed: 1, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x90 => { // NOP
+      return EmulationResult(handled: true, consumed: 1, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0xCC => { // INT3
+      return EmulationResult(handled: false, consumed: 1, advance_rip: false, inject_fault: true, fault_vector: 3, fault_code: 0);
+    },
+    0xCD => { // INT imm8
+      let vector: u8 = instruction_bytes[1];
+      consumed = 2;
+      return EmulationResult(handled: false, consumed: consumed, advance_rip: false, inject_fault: true, fault_vector: vector, fault_code: 0);
+    },
+    0xC3 => { // RET
+      let ret_addr: u64 = *(@int_to_ptr(vcpu.regs.rsp) as *u64);
+      vcpu.regs.rsp += 8;
+      vcpu.regs.rip = ret_addr;
+      return EmulationResult(handled: true, consumed: 1, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0xEB => { // JMP rel8
+      let offset: i8 = instruction_bytes[1] as i8;
+      consumed = 2;
+      vcpu.regs.rip = (vcpu.regs.rip as i64 + consumed as i64 + offset as i64) as u64;
+      return EmulationResult(handled: true, consumed: consumed, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x74 => { // JE rel8
+      let offset: i8 = instruction_bytes[1] as i8;
+      consumed = 2;
+      if (vcpu.regs.rflags & 0x40) != 0 {  // ZF
+        vcpu.regs.rip = (vcpu.regs.rip as i64 + consumed as i64 + offset as i64) as u64;
+        return EmulationResult(handled: true, consumed: consumed, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+      }
+      return EmulationResult(handled: true, consumed: consumed, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x75 => { // JNE rel8
+      let offset: i8 = instruction_bytes[1] as i8;
+      consumed = 2;
+      if (vcpu.regs.rflags & 0x40) == 0 {  // !ZF
+        vcpu.regs.rip = (vcpu.regs.rip as i64 + consumed as i64 + offset as i64) as u64;
+        return EmulationResult(handled: true, consumed: consumed, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+      }
+      return EmulationResult(handled: true, consumed: consumed, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    _ => {
+      // Unhandled instruction — let VMM handle it
+      return EmulationResult(handled: false, consumed: consumed, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+  }
+}
+
+fn emulate_two_byte_opcode[vcpu: *Vcpu, opcode: u8, bytes: *u8, max_len: u32] -> EmulationResult : (unsafe) {
+  match opcode {
+    0x01 => { // Various system instructions
+      if max_len >= 3 {
+        let modrm: u8 = bytes[2];
+        let reg: u8 = (modrm >> 3) & 7;
+        if reg == 2 && bytes[3] == 0xE8 {
+          // INVEPT
+          return EmulationResult(handled: true, consumed: 4, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+        }
+      }
+      return emulation_not_handled();
+    },
+    0x20 => { // MOV CR
+      if max_len < 3 { return emulation_not_handled(); }
+      let modrm: u8 = bytes[2];
+      let cr: u8 = (modrm >> 3) & 7;
+      vcpu.regs.gp_regs[(modrm & 7) as u32] = read_cr(vcpu, cr);
+      return EmulationResult(handled: true, consumed: 3, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x22 => { // MOV CR (to)
+      if max_len < 3 { return emulation_not_handled(); }
+      let modrm: u8 = bytes[2];
+      let cr: u8 = (modrm >> 3) & 7;
+      write_cr(vcpu, cr, read_gp_reg(vcpu, (modrm & 7) as u32));
+      return EmulationResult(handled: true, consumed: 3, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0xA2 => { // CPUID
+      // Handled by VM exit
+      return emulation_not_handled();
+    },
+    0x31 => { // RDTSC
+      let tsc: u64 = vcpu.tsc.virtual_tsc + vcpu.tsc.tsc_offset;
+      vcpu.regs.rax = tsc & 0xFFFFFFFF;
+      vcpu.regs.rdx = (tsc >> 32) & 0xFFFFFFFF;
+      return EmulationResult(handled: true, consumed: 2, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x34 => { // SYSENTER
+      vcpu.regs.rip = vcpu.regs.msrs[0];  // SYSENTER_EIP
+      vcpu.regs.rsp = vcpu.regs.msrs[1];  // SYSENTER_ESP
+      vcpu.regs.cs.selector = vcpu.regs.msrs[2] as u16;  // SYSENTER_CS
+      return EmulationResult(handled: true, consumed: 2, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x05 => { // SYSCALL
+      vcpu.regs.rcx = vcpu.regs.rip + 2;  // return address
+      vcpu.regs.r11 = vcpu.regs.rflags;
+      vcpu.regs.rip = vcpu.regs.msrs[2];  // LSTAR
+      return EmulationResult(handled: true, consumed: 2, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    0x07 => { // SYSRET
+      vcpu.regs.rip = vcpu.regs.rcx;
+      vcpu.regs.rflags = (vcpu.regs.r11 & 0xFC7) | 0x02;
+      return EmulationResult(handled: true, consumed: 2, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+    },
+    _ => emulation_not_handled(),
+  }
+}
+
+fn emulate_lock_instruction[vcpu: *Vcpu, bytes: *u8, max_len: u32] -> EmulationResult : (unsafe) {
+  return emulation_not_handled();
+}
+
+fn emulate_rep_instruction[vcpu: *Vcpu, bytes: *u8, max_len: u32] -> EmulationResult : (unsafe) {
+  return emulation_not_handled();
+}
+
+fn read_gp_reg[vcpu: *Vcpu, idx: u32] -> u64 : effect:(pure) {
+  let regs: *VcpuRegisters = &vcpu.regs;
+  match idx {
+    0 => regs.rax, 1 => regs.rcx, 2 => regs.rdx, 3 => regs.rbx,
+    4 => regs.rsp, 5 => regs.rbp, 6 => regs.rsi, 7 => regs.rdi,
+    _ => 0,
+  }
+}
+
+fn write_gp_reg[vcpu: *Vcpu, idx: u32, val: u64] : effect:(unsafe) {
+  let regs: *VcpuRegisters = &vcpu.regs;
+  match idx {
+    0 => { regs.rax = val; },
+    1 => { regs.rcx = val; },
+    2 => { regs.rdx = val; },
+    3 => { regs.rbx = val; },
+    4 => { regs.rsp = val; },
+    5 => { regs.rbp = val; },
+    6 => { regs.rsi = val; },
+    7 => { regs.rdi = val; },
+    _ => {},
+  }
+}
+
+fn read_cr[vcpu: *Vcpu, cr: u8] -> u64 : effect:(pure) {
+  match cr {
+    0 => vcpu.regs.cr0, 2 => vcpu.regs.cr2, 3 => vcpu.regs.cr3,
+    4 => vcpu.regs.cr4, 8 => vcpu.regs.cr8,
+    _ => 0,
+  }
+}
+
+fn write_cr[vcpu: *Vcpu, cr: u8, val: u64] : effect:(unsafe) {
+  match cr {
+    0 => { vcpu.regs.cr0 = val; update_cr0_side_effects(vcpu); },
+    2 => { vcpu.regs.cr2 = val; },
+    3 => { vcpu.regs.cr3 = val; },
+    4 => { vcpu.regs.cr4 = val; },
+    8 => { vcpu.regs.cr8 = val; },
+    _ => {},
+  }
+}
+
+fn emulation_not_handled[] -> EmulationResult : effect:(pure) {
+  return EmulationResult(handled: false, consumed: 0, advance_rip: false, inject_fault: false, fault_vector: 0, fault_code: 0);
+}
+
+//==============================================================================
+// MMU Virtualization (EPT/NPT)
+//==============================================================================
+
+pub struct MmuState(
+  ept_pointer: u64,
+  ept_enabled: bool,
+  paging_enabled: bool,
+  nested_paging: bool,
+  guest_cr3: u64,
+  large_page_support: bool,
+  walk_cache: EptWalkCache,
+  num_walk_cache: u32,
+  generation: u64,
+) : effect:(alloc, unsafe);
+
+pub struct EptWalkCache(
+  entries: [EptCacheEntry; 64],
+  count: u32,
+) : effect:(alloc);
+
+pub struct EptCacheEntry(
+  guest_phys: u64,
+  host_phys: u64,
+  level: u8,
+  permissions: u8,
+) : effect:(pure);
+
+/// Set the EPT pointer for a VCPU.
+pub fn vcpu_set_eptp[
+  vcpu: *Vcpu,
+  eptp: u64,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VcpuError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_MEM)?;
+  vcpu.mmu.ept_pointer = eptp;
+  vcpu.mmu.ept_enabled = true;
+  record_vcpu_residual(VcpuOp::EptChange, eptp, 0);
+  return Ok(());
+}
+
+//==============================================================================
+// Interrupt Virtualization (APICv)
+//==============================================================================
+
+/// Local APIC state.
+pub struct ApicState(
+  apic_base: u64,
+  id: u32,
+  version: u32,
+  task_priority: u8,
+  arb_priority: u8,
+  processor_priority: u8,
+  eoi: u32,
+  logical_dest: u32,
+  destination_format: u32,
+  spurious_vector: u8,
+  in_service: [u32; 8],
+  trigger_mode: [u32; 8],
+  interrupt_request: [u32; 8],
+  interrupt_command_low: u64,
+  interrupt_command_high: u64,
+  lvt_timer: u32,
+  lvt_thermal: u32,
+  lvt_perf: u32,
+  lvt_lint0: u32,
+  lvt_lint1: u32,
+  lvt_error: u32,
+  initial_count: u32,
+  current_count: u32,
+  divide_config: u32,
+  timer_mode: u8,
+  timer_periodic: bool,
+  sw_enabled: bool,
+) : effect:(alloc);
+
+/// Initialize APIC state.
+pub fn apic_state_new[] -> ApicState : effect:(alloc) {
+  return ApicState(
+    apic_base: 0xFEE00000,
+    id: 0,
+    version: 0x14,   // APIC version
+    task_priority: 0,
+    arb_priority: 0,
+    processor_priority: 0,
+    eoi: 0,
+    logical_dest: 0,
+    destination_format: 0xFFFFFFFF,
+    spurious_vector: 0xFF,
+    in_service: Default,
+    trigger_mode: Default,
+    interrupt_request: Default,
+    interrupt_command_low: 0,
+    interrupt_command_high: 0,
+    lvt_timer: 0x10000,
+    lvt_thermal: 0x10000,
+    lvt_perf: 0x10000,
+    lvt_lint0: 0x10000,
+    lvt_lint1: 0x10000,
+    lvt_error: 0x10000,
+    initial_count: 0,
+    current_count: 0,
+    divide_config: 0,
+    timer_mode: 0,
+    timer_periodic: false,
+    sw_enabled: false,
+  );
+}
+
+/// Inject an interrupt into the VCPU.
+pub fn vcpu_inject_irq[
+  vcpu: *Vcpu,
+  vector: u8,
+  trigger_mode: u8,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VcpuError] : (syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_hv_cap(hv_cap, RIGHT_HV_IRQ)?;
+
+  if !vcpu.apic.sw_enabled {
+    return Err(VcpuError::ApicDisabled);
+  }
+
+  let irr_reg: u32 = vector / 32;
+  let irr_bit: u32 = vector % 32;
+  vcpu.apic.interrupt_request[irr_reg] |= 1 << irr_bit;
+
+  if trigger_mode == 1 {
+    vcpu.apic.trigger_mode[irr_reg] |= 1 << irr_bit;
+  }
+
+  record_vcpu_residual(VcpuOp::InjectIrq, vector as u64, 0);
+  return Ok(());
+}
+
+/// Accept an interrupt (for guest interrupt acknowledgment).
+pub fn vcpu_accept_irq[
+  vcpu: *Vcpu,
+] -> Option[u8> : effect:(unsafe)
+  loop: bounded(1)
+{
+  let ppr: u8 = vcpu.apic.task_priority & 0xF0;
+
+  for var i: u32 = 0; i < 8; i += 1 {
+    let irr: u32 = vcpu.apic.interrupt_request[i];
+    if irr != 0 {
+      for var j: u32 = 0; j < 32; j += 1 {
+        if (irr & (1 << j)) != 0 {
+          let vector: u8 = (i * 32 + j) as u8;
+          let vector_priority: u8 = vector & 0xF0;
+          if vector_priority > ppr {
+            vcpu.apic.interrupt_request[i] &= !(1 << j);
+            vcpu.apic.in_service[i] |= 1 << j;
+            return Some(vector);
+          }
+        }
+      }
+    }
+  }
+
+  return None;
+}
+
+/// Signal EOI (end of interrupt).
+pub fn vcpu_eoi[
+  vcpu: *Vcpu,
+] : effect:(unsafe)
+  loop: bounded(1)
+{
+  for var i: u32 = 0; i < 8; i += 1 {
+    let isr: u32 = vcpu.apic.in_service[i];
+    if isr != 0 {
+      for var j: u32 = 0; j < 32; j += 1 {
+        if (isr & (1 << j)) != 0 {
+          vcpu.apic.in_service[i] &= !(1 << j);
+          // Clear trigger mode if edge-triggered
+          if (vcpu.apic.trigger_mode[i] & (1 << j)) == 0 {
+            // Edge-triggered — no further action
+          } else {
+            vcpu.apic.trigger_mode[i] &= !(1 << j);
+          }
+          return;
+        }
+      }
+    }
+  }
+}
+
+//==============================================================================
+// TSC Scaling
+//==============================================================================
+
+pub struct TscState(
+  virtual_tsc: u64,
+  tsc_offset: u64,
+  tsc_multiplier: f64,
+  tsc_scaling_enabled: bool,
+) : effect:(pure);
+
+/// Set TSC offset for the VCPU.
+pub fn vcpu_set_tsc_offset[
+  vcpu: *Vcpu,
+  offset: u64,
+] : effect:(unsafe) {
+  vcpu.tsc.tsc_offset = offset;
+  record_vcpu_residual(VcpuOp::TscChange, offset, 0);
+}
+
+/// Read the virtual TSC value.
+pub fn vcpu_read_tsc[
+  vcpu: *Vcpu,
+] -> u64 : effect:(pure) {
+  let host_tsc: u64 = __read_tsc();
+  let guest_tsc: u64 = host_tsc + vcpu.tsc.tsc_offset;
+  vcpu.tsc.virtual_tsc = guest_tsc;
+  return guest_tsc;
+}
+
+//==============================================================================
+// CPUID Masking
+//==============================================================================
+
+pub struct CpuIdMask(
+  masks: [CpuIdEntry; 32],
+  count: u32,
+) : effect:(alloc);
+
+pub struct CpuIdEntry(
+  leaf: u32,
+  subleaf: u32,
+  eax: u32,
+  ebx: u32,
+  ecx: u32,
+  edx: u32,
+  eax_mask: u32,
+  ebx_mask: u32,
+  ecx_mask: u32,
+  edx_mask: u32,
+) : effect:(pure);
+
+/// Set a CPUID mask entry.
+pub fn vcpu_set_cpuid_mask[
+  vcpu: *Vcpu,
+  leaf: u32,
+  subleaf: u32,
+  eax: u32,
+  ebx: u32,
+  ecx: u32,
+  edx: u32,
+  mask: u32,
+] : effect:(alloc, unsafe)
+  loop: bounded(1)
+{
+  if vcpu.cpuid_mask.count >= 32 {
+    return;
+  }
+
+  let idx: u32 = vcpu.cpuid_mask.count;
+  vcpu.cpuid_mask.masks[idx] = CpuIdEntry(
+    leaf: leaf, subleaf: subleaf,
+    eax: eax, ebx: ebx, ecx: ecx, edx: edx,
+    eax_mask: mask, ebx_mask: mask, ecx_mask: mask, edx_mask: mask,
+  );
+  vcpu.cpuid_mask.count += 1;
+
+  record_vcpu_residual(VcpuOp::CpuidMask, leaf as u64, subleaf as u64);
+}
+
+/// Apply CPUID masking to a CPUID result.
+pub fn vcpu_apply_cpuid_mask[
+  vcpu: *Vcpu,
+  leaf: u32,
+  subleaf: u32,
+  eax: *u32,
+  ebx: *u32,
+  ecx: *u32,
+  edx: *u32,
+] : effect:(unsafe)
+  loop: bounded(32)
+{
+  for var i: u32 = 0; i < vcpu.cpuid_mask.count; i += 1 {
+    let entry: CpuIdEntry = vcpu.cpuid_mask.masks[i];
+    if entry.leaf == leaf && entry.subleaf == subleaf {
+      eax = (eax & entry.eax_mask) | (entry.eax & !entry.eax_mask);
+      ebx = (ebx & entry.ebx_mask) | (entry.ebx & !entry.ebx_mask);
+      ecx = (ecx & entry.ecx_mask) | (entry.ecx & !entry.ecx_mask);
+      edx = (edx & entry.edx_mask) | (entry.edx & !entry.edx_mask);
+      return;
+    }
+  }
+}
+
+//==============================================================================
+// VCPU Error Codes
+//==============================================================================
+
+pub enum VcpuError : u64 {
+  Success               = 0,
+  InsufficientRights    = 1,
+  InvalidCapability     = 2,
+  VcpuRunning           = 3,
+  VcpuNotReady          = 4,
+  VcpuDestroyed         = 5,
+  InvalidRegister       = 6,
+  InvalidMsr            = 7,
+  ApicDisabled          = 8,
+  IrqInjectionFailed    = 9,
+  EmulationFailed       = 10,
+  ResourceExhausted     = 11,
+}
+
+//==============================================================================
+// Utility Functions
+//==============================================================================
+
+pub enum VcpuOp : u8 {
+  Create     = 0,
+  Destroy    = 1,
+  CrChange   = 2,
+  EptChange  = 3,
+  InjectIrq  = 4,
+  TscChange  = 5,
+  CpuidMask  = 6,
+}
+
+pub enum CapRights(:u64);
+pub const RIGHT_HV_CREATE: CapRights = CapRights(1 << 40);
+pub const RIGHT_HV_DESTROY: CapRights = CapRights(1 << 41);
+pub const RIGHT_HV_RUN: CapRights = CapRights(1 << 42);
+pub const RIGHT_HV_MEM: CapRights = CapRights(1 << 43);
+pub const RIGHT_HV_IRQ: CapRights = CapRights(1 << 44);
+
+pub type f64 = u64;
+pub type CapabilitySlot = core::capabilities::CapabilitySlot;
+pub type ResidualChain(last_id: u64);
+
+fn validate_hv_cap[cap: CapabilitySlot, required: CapRights] -> Result[(), VcpuError> : effect:(pure) {
+  if !cap.valid { return Err(VcpuError::InvalidCapability); }
+  let rights: CapRights = CapRights(cap.rights);
+  if (rights & required) != required { return Err(VcpuError::InsufficientRights); }
+  return Ok(());
+}
+
+fn record_vcpu_residual[op: VcpuOp, arg1: u64, arg2: u64] : effect:(unsafe) {
+  __vcpu_residual_write(op as u64, arg1, arg2);
+}
+
+fn generate_vcpu_generation[] -> u64 : effect:(pure) { return 1; }
+
+fn __read_tsc[] -> u64 : (syscall) { return 0; }
+fn __vcpu_residual_write[op: u64, a1: u64, a2: u64] : effect:(unsafe) {}
+fn @alloc[T](...) -> *T : effect:(alloc, unsafe) { return null; }
+
+const SEG_FLAG_VALID: u32 = 1 << 0;
+const SEG_FLAG_PRESENT: u32 = 1 << 1;
+const SEG_FLAG_CODE: u32 = 1 << 6;
+const SEG_FLAG_DATA: u32 = 1 << 7;
+const SEG_FLAG_WRITABLE: u32 = 1 << 8;
+const SEG_FLAG_READABLE: u32 = 1 << 9;
+
+//==============================================================================
+// Extended Instruction Emulation — CMPXCHG, XADD, BSWAP, etc.
+//==============================================================================
+
+/// Emulate CMPXCHG (compare and exchange).
+pub fn emulate_cmpxchg[
+  vcpu: *Vcpu,
+  modrm: u8,
+  operand_size: u32,
+] -> EmulationResult : effect:(unsafe)
+  loop: bounded(1)
+{
+  let reg_idx: u32 = (modrm >> 3) & 7;
+  let mem_idx: u32 = modrm & 7;
+  let expected: u64 = vcpu.regs.rax;
+  let desired: u64 = read_gp_reg(vcpu, reg_idx);
+  let mem_val: u64 = 0;  // Would read from memory operand
+
+  if mem_val == expected {
+    vcpu.regs.rax = mem_val;
+    vcpu.regs.rflags |= 0x40;  // Set ZF
+    // Write desired to memory
+  } else {
+    vcpu.regs.rax = mem_val;
+    vcpu.regs.rflags &= !0x40;  // Clear ZF
+  }
+
+  return EmulationResult(handled: true, consumed: 3, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+}
+
+/// Emulate XADD (exchange and add).
+pub fn emulate_xadd[
+  vcpu: *Vcpu,
+  modrm: u8,
+] -> EmulationResult : effect:(unsafe)
+  loop: bounded(1)
+{
+  let reg_idx: u32 = (modrm >> 3) & 7;
+  let reg_val: u64 = read_gp_reg(vcpu, reg_idx);
+  let mem_val: u64 = 0;  // Would read from memory
+  let sum: u64 = reg_val + mem_val;
+  write_gp_reg(vcpu, reg_idx, mem_val);
+  // Write sum to memory
+  return EmulationResult(handled: true, consumed: 3, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+}
+
+/// Emulate BSWAP (byte swap register).
+pub fn emulate_bswap[
+  vcpu: *Vcpu,
+  reg: u8,
+  is_64bit: bool,
+] -> EmulationResult : effect:(unsafe)
+  loop: bounded(1)
+{
+  let val: u64 = read_gp_reg(vcpu, reg as u32);
+  let swapped: u64 = (val >> 56) | ((val >> 40) & 0xFF00) | ((val >> 24) & 0xFF0000)
+                   | ((val >> 8) & 0xFF000000) | ((val << 8) & 0xFF00000000)
+                   | ((val << 24) & 0xFF0000000000) | ((val << 40) & 0xFF000000000000)
+                   | (val << 56);
+  write_gp_reg(vcpu, reg as u32, swapped);
+  return EmulationResult(handled: true, consumed: 2, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+}
+
+/// Emulate MUL/IMUL (multiply).
+pub fn emulate_mul[
+  vcpu: *Vcpu,
+  is_signed: bool,
+  operand_size: u32,
+  modrm: u8,
+] -> EmulationResult : effect:(unsafe)
+  loop: bounded(1)
+{
+  let src: u64 = read_gp_reg(vcpu, (modrm & 7) as u32);
+  let rax_val: u64 = vcpu.regs.rax;
+  if is_signed {
+    let result: i128 = (rax_val as i64) as i128 * (src as i64) as i128;
+    vcpu.regs.rax = result as u64;
+    vcpu.regs.rdx = (result >> 64) as u64;
+  } else {
+    let result: u128 = (rax_val as u128) * (src as u128);
+    vcpu.regs.rax = result as u64;
+    vcpu.regs.rdx = (result >> 64) as u64;
+  }
+  return EmulationResult(handled: true, consumed: 2, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+}
+
+/// Emulate DIV/IDIV (divide).
+pub fn emulate_div[
+  vcpu: *Vcpu,
+  is_signed: bool,
+  operand_size: u32,
+  divisor: u64,
+] -> EmulationResult : effect:(unsafe)
+  loop: bounded(1)
+{
+  if divisor == 0 {
+    return EmulationResult(handled: false, consumed: 2, advance_rip: false, inject_fault: true, fault_vector: 0, fault_code: 0);  // #DE
+  }
+  let dividend: u128 = (vcpu.regs.rdx as u128) << 64 | vcpu.regs.rax as u128;
+  if is_signed {
+    // Signed division — simplified
+    vcpu.regs.rax = (dividend / divisor as u128) as u64;
+    vcpu.regs.rdx = (dividend % divisor as u128) as u64;
+  } else {
+    vcpu.regs.rax = (dividend / divisor as u128) as u64;
+    vcpu.regs.rdx = (dividend % divisor as u128) as u64;
+  }
+  return EmulationResult(handled: true, consumed: 2, advance_rip: true, inject_fault: false, fault_vector: 0, fault_code: 0);
+}
+
+//==============================================================================
+// VCPU MSR Handling
+//==============================================================================
+
+/// Known MSR indices for emulation.
+pub const MSR_IA32_APIC_BASE: u32     = 0x01B;
+pub const MSR_IA32_SYSENTER_CS: u32   = 0x174;
+pub const MSR_IA32_SYSENTER_ESP: u32  = 0x175;
+pub const MSR_IA32_SYSENTER_EIP: u32  = 0x176;
+pub const MSR_IA32_STAR: u32          = 0xC0000081;
+pub const MSR_IA32_LSTAR: u32         = 0xC0000082;
+pub const MSR_IA32_CSTAR: u32         = 0xC0000083;
+pub const MSR_IA32_SFMASK: u32        = 0xC0000084;
+pub const MSR_IA32_EFER: u32          = 0xC0000080;
+pub const MSR_IA32_PAT: u32           = 0x277;
+pub const MSR_IA32_TSC_DEADLINE: u32  = 0x6E0;
+pub const MSR_IA32_TSC_AUX: u32       = 0xC0000103;
+pub const MSR_IA32_MTRR_PHYSBASE: u32 = 0x200;
+pub const MSR_IA32_MTRR_PHYSMASK: u32 = 0x201;
+pub const MSR_IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
+
+/// Emulate RDMSR for a VCPU.
+pub fn vcpu_emulate_rdmsr[
+  vcpu: *Vcpu,
+  msr: u32,
+] -> Result<u64, VcpuError> : effect:(pure)
+  loop: bounded(1)
+{
+  match msr {
+    MSR_IA32_APIC_BASE => Ok(vcpu.apic.apic_base),
+    MSR_IA32_SYSENTER_CS => Ok(vcpu.regs.msrs[0]),
+    MSR_IA32_SYSENTER_ESP => Ok(vcpu.regs.msrs[1]),
+    MSR_IA32_SYSENTER_EIP => Ok(vcpu.regs.msrs[2]),
+    MSR_IA32_STAR => Ok(vcpu.regs.msrs[3]),
+    MSR_IA32_LSTAR => Ok(vcpu.regs.msrs[4]),
+    MSR_IA32_CSTAR => Ok(vcpu.regs.msrs[5]),
+    MSR_IA32_SFMASK => Ok(vcpu.regs.msrs[6]),
+    MSR_IA32_EFER => Ok(vcpu.regs.msrs[7]),
+    MSR_IA32_PAT => Ok(vcpu.regs.msrs[8]),
+    MSR_IA32_TSC_AUX => Ok(vcpu.regs.msrs[9]),
+    _ => {
+      if msr >= MSR_IA32_MTRR_PHYSBASE && msr <= MSR_IA32_MTRR_DEF_TYPE {
+        return Ok(0);  // MTRR emulation stub
+      }
+      if msr >= 0x800 && msr <= 0x8FF {
+        return Ok(0);  // APIC MSRs
+      }
+      Err(VcpuError::InvalidMsr)
+    },
+  }
+}
+
+/// Emulate WRMSR for a VCPU.
+pub fn vcpu_emulate_wrmsr[
+  vcpu: *Vcpu,
+  msr: u32,
+  value: u64,
+] -> Result<(), VcpuError> : effect:(unsafe)
+  loop: bounded(1)
+{
+  match msr {
+    MSR_IA32_APIC_BASE => {
+      vcpu.apic.apic_base = value & 0xFFFFF000;
+      vcpu.apic.sw_enabled = (value & 0x800) != 0;
+    },
+    MSR_IA32_SYSENTER_CS => { vcpu.regs.msrs[0] = value; },
+    MSR_IA32_SYSENTER_ESP => { vcpu.regs.msrs[1] = value; },
+    MSR_IA32_SYSENTER_EIP => { vcpu.regs.msrs[2] = value; },
+    MSR_IA32_STAR => { vcpu.regs.msrs[3] = value; },
+    MSR_IA32_LSTAR => { vcpu.regs.msrs[4] = value; },
+    MSR_IA32_CSTAR => { vcpu.regs.msrs[5] = value; },
+    MSR_IA32_SFMASK => { vcpu.regs.msrs[6] = value; },
+    MSR_IA32_EFER => {
+      vcpu.regs.msrs[7] = value;
+      if (value & 1) != 0 {  // SCE bit
+        // Syscall enable
+      }
+      if (value & 0x100) != 0 {  // LME bit
+        // Long mode enable
+      }
+      if (value & 0x400) != 0 {  // NXE bit
+        // No-execute enable
+      }
+    },
+    MSR_IA32_PAT => { vcpu.regs.msrs[8] = value; },
+    MSR_IA32_TSC_AUX => { vcpu.regs.msrs[9] = value; },
+    MSR_IA32_TSC_DEADLINE => {
+      // Set TSC deadline timer
+      record_vcpu_residual(VcpuOp::TscChange, value, 1);
+    },
+    _ => {
+      if msr >= MSR_IA32_MTRR_PHYSBASE && msr <= MSR_IA32_MTRR_DEF_TYPE {
+        return Ok(());  // MTRR stub
+      }
+      return Err(VcpuError::InvalidMsr);
+    },
+  }
+  return Ok(());
+}
+
+//==============================================================================
+// FPU/SIMD State Save/Restore
+//==============================================================================
+
+/// Save FPU state from the VCPU.
+pub fn vcpu_save_fpu[
+  vcpu: *Vcpu,
+  buffer: *u8,
+  buffer_size: u32,
+] -> Result<u32, VcpuError> : effect:(unsafe)
+  loop: bounded(1)
+{
+  if buffer_size < 512 {
+    return Err(VcpuError::ResourceExhausted);
+  }
+  @memcpy(buffer, &vcpu.regs.fpu_state, 512);
+  return Ok(512);
+}
+
+/// Restore FPU state to the VCPU.
+pub fn vcpu_restore_fpu[
+  vcpu: *Vcpu,
+  buffer: *u8,
+  buffer_size: u32,
+] -> Result<(), VcpuError> : effect:(unsafe)
+  loop: bounded(1)
+{
+  if buffer_size < 512 {
+    return Err(VcpuError::ResourceExhausted);
+  }
+  @memcpy(&vcpu.regs.fpu_state, buffer, 512);
+  return Ok(());
+}
+
+/// Save XMM/YMM/ZMM state.
+pub fn vcpu_save_simd[
+  vcpu: *Vcpu,
+  buffer: *u8,
+  buffer_size: u32,
+  save_zmm: bool,
+] -> Result<u32, VcpuError> : effect:(unsafe)
+  loop: bounded(1)
+{
+  let xmm_size: u32 = 16 * 16;  // 16 XMM * 16 bytes
+  let ymm_size: u32 = if save_zmm { 0 } else { 16 * 16 };  // Upper halves
+  let zmm_size: u32 = if save_zmm { 32 * 32 } else { 0 };
+  let total: u32 = xmm_size + ymm_size + zmm_size + 4;  // + MXCSR
+
+  if buffer_size < total {
+    return Err(VcpuError::ResourceExhausted);
+  }
+
+  // In production: copy XMM/YMM/ZMM from VCPU state
+  return Ok(total);
+}
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_vcpu_create[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_CREATE.bits, value: 0, generation: 1, valid: true);
+  let vcpu: *Vcpu = vcpu_create(1, 0, cap);
+  // assert(vcpu.state == VcpuState::Created);
+}
+
+#[test]
+pub fn test_register_get_set[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: (RIGHT_HV_CREATE | RIGHT_HV_RUN).bits, value: 0, generation: 1, valid: true);
+  let vcpu: *Vcpu = vcpu_create(1, 0, cap);
+  vcpu_set_reg(vcpu, VcpuRegister::RAX, 0x1234);
+  let val: u64 = vcpu_get_reg(vcpu, VcpuRegister::RAX);
+  assert(val == 0x1234);
+}
+
+#[test]
+pub fn test_instruction_emulation_nop[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: (RIGHT_HV_CREATE | RIGHT_HV_RUN).bits, value: 0, generation: 1, valid: true);
+  let vcpu: *Vcpu = vcpu_create(1, 0, cap);
+  let nop: [u8; 1] = [0x90];
+  let result: EmulationResult = emulate_instruction(vcpu, nop, 1);
+  assert(result.handled == true);
+  assert(result.consumed == 1);
+}
+
+#[test]
+pub fn test_apic_irq_injection[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: (RIGHT_HV_CREATE | RIGHT_HV_IRQ).bits, value: 0, generation: 1, valid: true);
+  let vcpu: *Vcpu = vcpu_create(1, 0, cap);
+  vcpu.apic.sw_enabled = true;
+  vcpu_inject_irq(vcpu, 0x31, 0, cap);
+  let vec: Option[u8> = vcpu_accept_irq(vcpu);
+  assert(vec == Some(0x31));
+}

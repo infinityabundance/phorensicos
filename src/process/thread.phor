@@ -1,0 +1,1089 @@
+// file: thread.phor
+// purpose: Thread management: thread creation, scheduling contexts, TLS,
+//          thread-local storage, thread cleanup, thread pools. All operations
+//          use bounded loops and record residuals for thread state changes.
+// evidence: PROC-THR-ARCH-001 through PROC-THR-ARCH-240
+// residual: Every thread creation, switch, and exit records a residual.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use process::process::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-DIAG-001 through PROC-THR-DIAG-010
+
+const DIAG_THR_BASE         : Word64 = Word64::from_u64(0xB100)
+const DIAG_THR_OK           : Word64 = DIAG_THR_BASE | 0x000
+const DIAG_THR_NO_MEM       : Word64 = DIAG_THR_BASE | 0x001
+const DIAG_THR_INVALID_ID   : Word64 = DIAG_THR_BASE | 0x002
+const DIAG_THR_NOT_FOUND    : Word64 = DIAG_THR_BASE | 0x003
+const DIAG_THR_CREATE_FAIL  : Word64 = DIAG_THR_BASE | 0x004
+const DIAG_THR_BOUNDS       : Word64 = DIAG_THR_BASE | 0x005
+const DIAG_THR_TLS_FAIL     : Word64 = DIAG_THR_BASE | 0x006
+const DIAG_THR_POOL_FULL    : Word64 = DIAG_THR_BASE | 0x007
+const DIAG_THR_STACK_OVF    : Word64 = DIAG_THR_BASE | 0x008
+
+// ──────────────────────────────────────────────
+// Thread Constants
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-CONST-001 through PROC-THR-CONST-020
+
+const MAX_THREADS              : u32 = 512
+const MAX_TLS_REGIONS          : u32 = 64
+const MAX_THREAD_POOLS         : u32 = 8
+const MAX_THREADS_PER_POOL     : u32 = 32
+const THREAD_STACK_SIZE_MIN    : u64 = 4096
+const THREAD_STACK_SIZE_DEFAULT: u64 = 262144  // 256KB
+const THREAD_STACK_SIZE_MAX    : u64 = 8388608  // 8MB
+const THREAD_NAME_MAX_LEN      : u32 = 48
+const TLS_BLOCK_SIZE           : u32 = 64
+const TLS_MAX_BLOCKS           : u32 = 128
+const TLS_REGION_SIZE          : u64 = 4096
+const THREAD_PRIORITY_MIN      : u8 = 0
+const THREAD_PRIORITY_DEFAULT  : u8 = 16
+const THREAD_PRIORITY_MAX      : u8 = 31
+
+// Thread State
+const THR_STATE_INIT       : u8 = 0
+const THR_STATE_READY      : u8 = 1
+const THR_STATE_RUNNING    : u8 = 2
+const THR_STATE_BLOCKED    : u8 = 3
+const THR_STATE_SLEEPING   : u8 = 4
+const THR_STATE_SUSPENDED  : u8 = 5
+const THR_STATE_TERMINATED : u8 = 6
+
+// Thread Flags
+const THR_FLAG_MAIN         : u32 = 0x01
+const THR_FLAG_DETACHED     : u32 = 0x02
+const THR_FLAG_JOINABLE     : u32 = 0x04
+const THR_FLAG_IDLE         : u32 = 0x08
+const THR_FLAG_REALTIME     : u32 = 0x10
+const THR_FLAG_IO_BOUND     : u32 = 0x20
+const THR_FLAG_CPU_BOUND    : u32 = 0x40
+const THR_FLAG_POOL_THREAD  : u32 = 0x80
+
+// ──────────────────────────────────────────────
+// Thread ID
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-TID-001 through PROC-THR-TID-010
+
+pub type Tid : u32 = struct {
+    value: u32,
+}
+
+impl Tid {
+    pub fn new(value: u32) -> Tid
+        effects: [deterministic]
+    {
+        Tid { value: value % MAX_THREADS }
+    }
+
+    pub fn zero() -> Tid
+        effects: [deterministic]
+    {
+        Tid { value: 0 }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        self.value > 0 && self.value < MAX_THREADS
+    }
+
+    pub fn eq(self, other: Tid) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scheduling Context (CPU register save area)
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-CTX-001 through PROC-THR-CTX-020
+
+pub type SchedulingContext : struct {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    rsp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+    cr3: u64,
+    fs_base: u64,
+    gs_base: u64,
+}
+
+impl SchedulingContext {
+    pub fn new() -> SchedulingContext
+        effects: [deterministic]
+    {
+        SchedulingContext {
+            rax: 0, rbx: 0, rcx: 0, rdx: 0,
+            rsi: 0, rdi: 0, rbp: 0, rsp: 0,
+            r8: 0, r9: 0, r10: 0, r11: 0,
+            r12: 0, r13: 0, r14: 0, r15: 0,
+            rip: 0, rflags: 0, cr3: 0,
+            fs_base: 0, gs_base: 0,
+        }
+    }
+
+    pub fn setup(self: ref mut, entry: u64, stack_top: u64, arg: u64)
+        effects: [deterministic]
+    {
+        self.rip = entry
+        self.rsp = stack_top
+        self.rdi = arg  // First argument in System V AMD64 ABI
+        self.rflags = 0x202  // IF flag set (interrupts enabled)
+    }
+
+    pub fn save(self: ref mut)
+        effects: [deterministic]
+    {
+        // trust: assembly context save
+        trusted("save scheduling context: assembly register save") {
+            __builtin_save_context(&self)
+        }
+    }
+
+    pub fn restore(self)
+        effects: [deterministic]
+    {
+        // trust: assembly context restore
+        trusted("restore scheduling context: assembly register restore") {
+            __builtin_restore_context(&self)
+        }
+    }
+
+    pub fn set_entry(self: ref mut, entry: u64)
+        effects: [deterministic]
+    {
+        self.rip = entry
+    }
+
+    pub fn set_stack(self: ref mut, stack_top: u64)
+        effects: [deterministic]
+    {
+        self.rsp = stack_top
+    }
+
+    pub fn set_tls_base(self: ref mut, fs_base: u64, gs_base: u64)
+        effects: [deterministic]
+    {
+        self.fs_base = fs_base
+        self.gs_base = gs_base
+    }
+}
+
+// ──────────────────────────────────────────────
+// TLS Block Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-TLS-001 through PROC-THR-TLS-020
+
+pub type TlsBlock : struct {
+    block_id: u32,
+    size: u32,
+    alignment: u32,
+    data_offset: u64,
+    is_used: bool,
+    owning_thread: Tid,
+}
+
+impl TlsBlock {
+    pub fn new(block_id: u32, size: u32, alignment: u32) -> TlsBlock
+        effects: [deterministic]
+    {
+        TlsBlock {
+            block_id: block_id,
+            size: size,
+            alignment: alignment,
+            data_offset: 0,
+            is_used: false,
+            owning_thread: Tid::zero(),
+        }
+    }
+
+    pub fn allocate(self: ref mut, offset: u64, thread: Tid)
+        effects: [deterministic]
+    {
+        self.data_offset = offset
+        self.is_used = true
+        self.owning_thread = thread
+    }
+
+    pub fn release(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_used = false
+        self.data_offset = 0
+        self.owning_thread = Tid::zero()
+    }
+}
+
+// ──────────────────────────────────────────────
+// TLS Region
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-TLSREG-001 through PROC-THR-TLSREG-020
+
+pub type TlsRegion : struct {
+    base_addr: u64,
+    size: u64,
+    blocks: FixedArray[TLS_MAX_BLOCKS, TlsBlock],
+    num_blocks: u32,
+    used_size: u64,
+    generation: Word32,
+}
+
+impl TlsRegion {
+    pub fn new(base_addr: u64) -> TlsRegion
+        effects: [deterministic]
+    {
+        TlsRegion {
+            base_addr: base_addr,
+            size: TLS_REGION_SIZE,
+            blocks: FixedArray::new(),
+            num_blocks: 0,
+            used_size: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn alloc_block(self: ref mut, size: u32, alignment: u32, thread: Tid)
+        -> Result[u32, ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_blocks >= TLS_MAX_BLOCKS {
+            return Result::Err(proc_error(
+                DIAG_THR_TLS_FAIL,
+                FixedString[128]::from_slice("Max TLS blocks reached")))
+        }
+        let aligned_offset: u64 = (self.used_size + (alignment as u64) - 1) &
+                                   !((alignment as u64) - 1)
+        let total_needed: u64 = aligned_offset + (size as u64)
+        if total_needed > self.size {
+            return Result::Err(proc_error(
+                DIAG_THR_TLS_FAIL,
+                FixedString[128]::from_slice("TLS region exhausted")))
+        }
+        let block_id: u32 = self.num_blocks
+        let mut block: TlsBlock = TlsBlock::new(block_id, size, alignment)
+        block.allocate(aligned_offset, thread)
+        self.blocks.push(block);
+        self.num_blocks = self.num_blocks + 1
+        self.used_size = total_needed
+        self.generation.bump()
+        Result::Ok(block_id)
+    }
+
+    pub fn free_block(self: ref mut, block_id: u32)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if block_id >= self.num_blocks {
+            return Result::Err(proc_error(
+                DIAG_THR_TLS_FAIL,
+                FixedString[128]::from_slice("Invalid TLS block ID")))
+        }
+        let block: ref mut TlsBlock = self.blocks.get_mut(block_id)
+        block.release();
+        Result::Ok(())
+    }
+
+    pub fn get_block(self, block_id: u32) -> Result[ref TlsBlock, ProcessError>
+        effects: [deterministic]
+    {
+        if block_id >= self.num_blocks {
+            return Result::Err(proc_error(
+                DIAG_THR_TLS_FAIL,
+                FixedString[128]::from_slice("Invalid TLS block ID")))
+        }
+        // trust: block_id bounds-checked
+        trusted("TLS block access: block_id within range") {
+            Result::Ok(self.blocks.get(block_id))
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Thread Control Block
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-TCB-001 through PROC-THR-TCB-045
+
+pub type ThreadControlBlock : struct {
+    tid: Tid,
+    pid: Pid,
+    state: u8,
+    flags: u32,
+    priority: u8,
+    name: FixedString[THREAD_NAME_MAX_LEN],
+    context: SchedulingContext,
+    stack_base: u64,
+    stack_size: u64,
+    tls_region: TlsRegion,
+    cpu_time_used: Word64,
+    start_time: Word64,
+    wakeup_time: Word64,  // For sleeping threads
+    block_reason: u8,
+    join_tid: Tid,
+    cleanup_handler: u64,
+    generation: Word32,
+}
+
+impl ThreadControlBlock {
+    pub fn new(tid: Tid, pid: Pid, name: FixedString[THREAD_NAME_MAX_LEN],
+               stack_base: u64) -> ThreadControlBlock
+        effects: [deterministic]
+    {
+        let tls_addr: u64 = stack_base + THREAD_STACK_SIZE_DEFAULT
+        let mut tcb: ThreadControlBlock = ThreadControlBlock {
+            tid: tid,
+            pid: pid,
+            state: THR_STATE_INIT,
+            flags: THR_FLAG_JOINABLE,
+            priority: THREAD_PRIORITY_DEFAULT,
+            name: name,
+            context: SchedulingContext::new(),
+            stack_base: stack_base,
+            stack_size: THREAD_STACK_SIZE_DEFAULT,
+            tls_region: TlsRegion::new(tls_addr),
+            cpu_time_used: Word64::zero(),
+            start_time: Word64::zero(),
+            wakeup_time: Word64::zero(),
+            block_reason: 0,
+            join_tid: Tid::zero(),
+            cleanup_handler: 0,
+            generation: Word32::initial(),
+        }
+        tcb.context.set_stack(stack_base + THREAD_STACK_SIZE_DEFAULT)
+        tcb.context.set_tls_base(tls_addr, tls_addr)
+        tcb
+    }
+
+    pub fn is_runnable(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == THR_STATE_READY ||
+        self.state == THR_STATE_RUNNING
+    }
+
+    pub fn is_terminated(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == THR_STATE_TERMINATED
+    }
+
+    pub fn is_detached(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & THR_FLAG_DETACHED) != 0
+    }
+
+    pub fn set_state(self: ref mut, state: u8)
+        effects: [deterministic]
+    {
+        self.state = state
+        self.generation.bump()
+    }
+
+    pub fn set_priority(self: ref mut, priority: u8)
+        effects: [deterministic]
+    {
+        if priority >= THREAD_PRIORITY_MIN && priority <= THREAD_PRIORITY_MAX {
+            self.priority = priority
+        }
+    }
+
+    pub fn set_cleanup(self: ref mut, handler: u64)
+        effects: [deterministic]
+    {
+        self.cleanup_handler = handler
+    }
+
+    pub fn accumulate_cpu(self: ref mut, delta: Word64)
+        effects: [deterministic]
+    {
+        let current: u64 = self.cpu_time_used.to_u64()
+        let delta_v: u64 = delta.to_u64()
+        self.cpu_time_used = Word64::from_u64(current + delta_v)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Thread Table
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-TABLE-001 through PROC-THR-TABLE-050
+
+pub type ThreadTable : struct {
+    threads: FixedArray[MAX_THREADS, ThreadControlBlock],
+    num_threads: u32,
+    next_tid: u32,
+    total_created: u64,
+    total_exited: u64,
+    generation: Word32,
+}
+
+impl ThreadTable {
+    pub fn new() -> ThreadTable
+        effects: [deterministic]
+    {
+        ThreadTable {
+            threads: FixedArray::new(),
+            num_threads: 0,
+            next_tid: 1,
+            total_created: 0,
+            total_exited: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn create_thread(self: ref mut, pid: Pid,
+                          entry: u64, arg: u64,
+                          stack_base: u64,
+                          name: FixedString[THREAD_NAME_MAX_LEN])
+        -> Result[Tid, ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_threads >= MAX_THREADS {
+            return Result::Err(proc_error(
+                DIAG_THR_CREATE_FAIL,
+                FixedString[128]::from_slice("Max threads reached")))
+        }
+        let tid_value: u32 = self.next_tid
+        self.next_tid = self.next_tid + 1
+        if self.next_tid >= MAX_THREADS {
+            self.next_tid = 1
+        }
+        let tid: Tid = Tid::new(tid_value)
+        let mut thread: ThreadControlBlock = ThreadControlBlock::new(
+            tid, pid, name, stack_base)
+        thread.context.setup(entry, stack_base + thread.stack_size, arg)
+        thread.set_state(THR_STATE_READY)
+        self.threads.push(thread);
+        self.num_threads = self.num_threads + 1
+        self.total_created = self.total_created + 1
+        self.generation.bump();
+        self.record_create_residual(tid, pid, entry)
+        Result::Ok(tid)
+    }
+
+    pub fn create_main_thread(self: ref mut, pid: Pid,
+                               name: FixedString[THREAD_NAME_MAX_LEN],
+                               stack_base: u64)
+        -> Result[Tid, ProcessError>
+        effects: [deterministic]
+    {
+        let tid: Tid = self.create_thread(
+            pid, 0, 0, stack_base, name)?;
+        let thread: ref mut ThreadControlBlock = self.get_thread_mut(tid)?
+        thread.flags = thread.flags | THR_FLAG_MAIN
+        thread.set_state(THR_STATE_RUNNING)
+        Result::Ok(tid)
+    }
+
+    pub fn get_thread(self, tid: Tid) -> Result[ref ThreadControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_threads
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_threads {
+            let thread: ref ThreadControlBlock = self.threads.get(i)
+            if thread.tid.value() == tid.value() {
+                return Result::Ok(thread)
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_THR_NOT_FOUND,
+            FixedString[128]::from_slice("Thread not found")))
+    }
+
+    pub fn get_thread_mut(self: ref mut, tid: Tid)
+        -> Result[ref mut ThreadControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_threads
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_threads {
+            let tcb: ref ThreadControlBlock = self.threads.get(i)
+            if tcb.tid.value() == tid.value() {
+                return Result::Ok(self.threads.get_mut(i))
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_THR_NOT_FOUND,
+            FixedString[128]::from_slice("Thread not found")))
+    }
+
+    pub fn exit_thread(self: ref mut, tid: Tid)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let thread: ref mut ThreadControlBlock = self.get_thread_mut(tid)?
+        thread.set_state(THR_STATE_TERMINATED);
+        self.total_exited = self.total_exited + 1
+        self.generation.bump();
+        self.record_exit_residual(tid)
+        Result::Ok(())
+    }
+
+    pub fn remove_thread(self: ref mut, tid: Tid) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_threads
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_threads {
+            let thread: ref ThreadControlBlock = self.threads.get(i)
+            if thread.tid.value() == tid.value() {
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_threads - 1) {
+                    let next: ThreadControlBlock = self.threads.get(j + 1)
+                    self.threads.set(j, next)
+                }
+                self.num_threads = self.num_threads - 1
+                self.generation.bump()
+                return Result::Ok(())
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_THR_NOT_FOUND,
+            FixedString[128]::from_slice("Thread to remove not found")))
+    }
+
+    pub fn switch_to(self: ref mut, tid: Tid)
+        -> Result[ref mut ThreadControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        let thread: ref mut ThreadControlBlock = self.get_thread_mut(tid)?
+        thread.set_state(THR_STATE_RUNNING)
+        self.generation.bump();
+        self.record_switch_residual(tid)
+        Result::Ok(thread)
+    }
+
+    pub fn thread_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_threads
+    }
+
+    pub fn thread_count_for_pid(self, pid: Pid) -> u32
+        effects: [deterministic]
+    {
+        let mut count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_threads
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_threads {
+            let thread: ref ThreadControlBlock = self.threads.get(i)
+            if thread.pid.value() == pid.value() {
+                count = count + 1
+            }
+        }
+        count
+    }
+
+    fn record_create_residual(self, tid: Tid, pid: Pid, entry: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Thread created",
+            code: DIAG_THR_OK,
+            data: (tid.value(), pid.value(), entry),
+        )
+    }
+
+    fn record_exit_residual(self, tid: Tid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Thread exited",
+            code: DIAG_THR_OK,
+            data: tid.value(),
+        )
+    }
+
+    fn record_switch_residual(self, tid: Tid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Thread switched",
+            code: DIAG_THR_OK,
+            data: tid.value(),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Thread Pool
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-POOL-001 through PROC-THR-POOL-035
+
+pub type ThreadPool : struct {
+    pool_id: u32,
+    name: FixedString[THREAD_NAME_MAX_LEN],
+    threads: FixedArray[MAX_THREADS_PER_POOL, Tid],
+    num_threads: u32,
+    max_threads: u32,
+    min_threads: u32,
+    num_busy: u32,
+    task_queue: FixedArray[64, u64],  // Task function pointers
+    task_queue_count: u32,
+    is_active: bool,
+    generation: Word32,
+}
+
+impl ThreadPool {
+    pub fn new(pool_id: u32, name: FixedString[THREAD_NAME_MAX_LEN],
+               min_threads: u32, max_threads: u32) -> ThreadPool
+        effects: [deterministic]
+    {
+        ThreadPool {
+            pool_id: pool_id,
+            name: name,
+            threads: FixedArray::new(),
+            num_threads: 0,
+            max_threads: max_threads,
+            min_threads: min_threads,
+            num_busy: 0,
+            task_queue: FixedArray::new(),
+            task_queue_count: 0,
+            is_active: true,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn add_thread(self: ref mut, tid: Tid) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_threads >= self.max_threads {
+            return Result::Err(proc_error(
+                DIAG_THR_POOL_FULL,
+                FixedString[128]::from_slice("Thread pool at max capacity")))
+        }
+        self.threads.push(tid);
+        self.num_threads = self.num_threads + 1
+        Result::Ok(())
+    }
+
+    pub fn remove_thread(self: ref mut, tid: Tid) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_threads
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_threads {
+            let t: ref Tid = self.threads.get(i)
+            if t.value() == tid.value() {
+                // loop: bounds[BOUND_SMALL] — bounded by remaining
+                loop: bounds[BOUND_SMALL] for j in i..(self.num_threads - 1) {
+                    let next: Tid = self.threads.get(j + 1)
+                    self.threads.set(j, next)
+                }
+                self.num_threads = self.num_threads - 1
+                return Result::Ok(())
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_THR_NOT_FOUND,
+            FixedString[128]::from_slice("Thread not in pool")))
+    }
+
+    pub fn enqueue_task(self: ref mut, task_fn: u64) -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.task_queue_count >= 64 {
+            return Result::Err(proc_error(
+                DIAG_THR_POOL_FULL,
+                FixedString[128]::from_slice("Task queue full")))
+        }
+        self.task_queue.push(task_fn);
+        self.task_queue_count = self.task_queue_count + 1
+        Result::Ok(())
+    }
+
+    pub fn dequeue_task(self: ref mut) -> Result[u64, ProcessError>
+        effects: [deterministic]
+    {
+        if self.task_queue_count == 0 {
+            return Result::Err(proc_error(
+                DIAG_THR_NOT_FOUND,
+                FixedString[128]::from_slice("No tasks in queue")))
+        }
+        let task: u64 = self.task_queue.get(0)
+        // loop: bounds[BOUND_MEDIUM] — bounded by task_queue_count
+        loop: bounds[BOUND_MEDIUM] for j in 0..(self.task_queue_count - 1) {
+            let next: u64 = self.task_queue.get(j + 1)
+            self.task_queue.set(j, next)
+        }
+        self.task_queue_count = self.task_queue_count - 1
+        Result::Ok(task)
+    }
+
+    pub fn busy_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_busy
+    }
+
+    pub fn idle_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_threads - self.num_busy
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.num_threads == 0 {
+            return 0
+        }
+        ((self.num_busy as u64) * 100 / (self.num_threads as u64)) as u8
+    }
+
+    pub fn shutdown(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_active = false
+        self.task_queue_count = 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Thread Pool Manager
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-POOLMGR-001 through PROC-THR-POOLMGR-025
+
+pub type ThreadPoolManager : struct {
+    pools: FixedArray[MAX_THREAD_POOLS, ThreadPool],
+    num_pools: u32,
+    generation: Word32,
+}
+
+impl ThreadPoolManager {
+    pub fn new() -> ThreadPoolManager
+        effects: [deterministic]
+    {
+        ThreadPoolManager {
+            pools: FixedArray::new(),
+            num_pools: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn create_pool(self: ref mut, name: FixedString[THREAD_NAME_MAX_LEN],
+                        min_threads: u32, max_threads: u32)
+        -> Result[u32, ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_pools >= MAX_THREAD_POOLS {
+            return Result::Err(proc_error(
+                DIAG_THR_POOL_FULL,
+                FixedString[128]::from_slice("Max thread pools reached")))
+        }
+        let pool_id: u32 = self.num_pools
+        let pool: ThreadPool = ThreadPool::new(
+            pool_id, name, min_threads, max_threads)
+        self.pools.push(pool);
+        self.num_pools = self.num_pools + 1
+        self.generation.bump()
+        Result::Ok(pool_id)
+    }
+
+    pub fn get_pool(self: ref mut, pool_id: u32)
+        -> Result[ref mut ThreadPool, ProcessError>
+        effects: [deterministic]
+    {
+        if pool_id >= self.num_pools {
+            return Result::Err(proc_error(
+                DIAG_THR_NOT_FOUND,
+                FixedString[128]::from_slice("Thread pool not found")))
+        }
+        // trust: pool_id bounds-checked
+        trusted("pool access: pool_id within range") {
+            Result::Ok(self.pools.get_mut(pool_id))
+        }
+    }
+
+    pub fn add_thread_to_pool(self: ref mut, pool_id: u32, tid: Tid)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let pool: ref mut ThreadPool = self.get_pool(pool_id)?
+        pool.add_thread(tid)
+    }
+
+    pub fn enqueue_task(self: ref mut, pool_id: u32, task_fn: u64)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let pool: ref mut ThreadPool = self.get_pool(pool_id)?
+        pool.enqueue_task(task_fn)
+    }
+
+    pub fn pool_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_pools
+    }
+}
+
+// ──────────────────────────────────────────────
+// Scheduler (Cooperative/Preemptive)
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-SCHED-001 through PROC-THR-SCHED-050
+
+pub type Scheduler : struct {
+    thread_table: ThreadTable,
+    current_tid: Tid,
+    pool_mgr: ThreadPoolManager,
+    is_preemptive: bool,
+    time_slice_ns: u64,
+    total_switches: u64,
+    generation: Word32,
+}
+
+impl Scheduler {
+    pub fn new(is_preemptive: bool, time_slice_ns: u64) -> Scheduler
+        effects: [deterministic]
+    {
+        Scheduler {
+            thread_table: ThreadTable::new(),
+            current_tid: Tid::zero(),
+            pool_mgr: ThreadPoolManager::new(),
+            is_preemptive: is_preemptive,
+            time_slice_ns: time_slice_ns,
+            total_switches: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn schedule(self: ref mut) -> Result[Tid, ProcessError>
+        effects: [deterministic]
+    {
+        // Simple round-robin: find next runnable thread
+        let start_idx: u32 = if self.current_tid.is_valid() {
+            self.current_tid.value()
+        } else {
+            0
+        }
+        // Save current context
+        if self.current_tid.is_valid() {
+            let current: ref mut ThreadControlBlock =
+                self.thread_table.get_thread_mut(self.current_tid)?
+            current.context.save();
+            current.set_state(THR_STATE_READY);
+        }
+        // Find next runnable thread
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_threads
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.thread_table.num_threads {
+            let idx: u32 = (start_idx + i) % self.thread_table.num_threads
+            let thread: ref ThreadControlBlock = self.thread_table.threads.get(idx)
+            if thread.state == THR_STATE_READY && thread.tid.is_valid() {
+                let next_tid: Tid = thread.tid
+                let next: ref mut ThreadControlBlock =
+                    self.thread_table.get_thread_mut(next_tid)?
+                next.set_state(THR_STATE_RUNNING);
+                next.context.restore();
+                self.current_tid = next_tid
+                self.total_switches = self.total_switches + 1
+                self.generation.bump();
+                self.record_schedule_residual(next_tid)
+                return Result::Ok(next_tid)
+            }
+        }
+        // No runnable threads (shouldn't happen with idle thread)
+        Result::Err(proc_error(
+            DIAG_THR_NOT_FOUND,
+            FixedString[128]::from_slice("No runnable threads")))
+    }
+
+    pub fn yield_now(self: ref mut) -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        self.schedule()?;
+        Result::Ok(())
+    }
+
+    pub fn block_thread(self: ref mut, tid: Tid, reason: u8)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        let thread: ref mut ThreadControlBlock =
+            self.thread_table.get_thread_mut(tid)?
+        thread.set_state(THR_STATE_BLOCKED);
+        thread.block_reason = reason
+        self.generation.bump();
+        self.record_block_residual(tid, reason)
+        Result::Ok(())
+    }
+
+    pub fn unblock_thread(self: ref mut, tid: Tid)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        let thread: ref mut ThreadControlBlock =
+            self.thread_table.get_thread_mut(tid)?
+        thread.set_state(THR_STATE_READY);
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn sleep_thread(self: ref mut, tid: Tid, duration_ns: u64)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        let thread: ref mut ThreadControlBlock =
+            self.thread_table.get_thread_mut(tid)?
+        thread.set_state(THR_STATE_SLEEPING);
+        let now: u64 = __builtin_read_timestamp()
+        thread.wakeup_time = Word64::from_u64(now + duration_ns)
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn current_thread(self) -> Result[ref ThreadControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        self.thread_table.get_thread(self.current_tid)
+    }
+
+    pub fn current_thread_mut(self: ref mut) -> Result[ref mut ThreadControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        self.thread_table.get_thread_mut(self.current_tid)
+    }
+
+    pub fn thread_table(self: ref mut) -> ref mut ThreadTable
+        effects: [deterministic]
+    {
+        &mut self.thread_table
+    }
+
+    pub fn pool_manager(self: ref mut) -> ref mut ThreadPoolManager
+        effects: [deterministic]
+    {
+        &mut self.pool_mgr
+    }
+
+    pub fn set_preemptive(self: ref mut, preemptive: bool)
+        effects: [deterministic]
+    {
+        self.is_preemptive = preemptive
+    }
+
+    pub fn set_time_slice(self: ref mut, ns: u64)
+        effects: [deterministic]
+    {
+        self.time_slice_ns = ns
+    }
+
+    pub fn switch_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_switches
+    }
+
+    fn record_schedule_residual(self, tid: Tid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Thread scheduled",
+            code: DIAG_THR_OK,
+            data: tid.value(),
+        )
+    }
+
+    fn record_block_residual(self, tid: Tid, reason: u8)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Thread blocked",
+            code: DIAG_THR_OK,
+            data: (tid.value(), reason),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-INIT-001 through PROC-THR-INIT-010
+
+pub fn init_scheduler(preemptive: bool, time_slice_ns: u64) -> Scheduler
+    effects: [deterministic]
+{
+    let sched: Scheduler = Scheduler::new(preemptive, time_slice_ns)
+    sched
+}
+
+pub fn create_idle_thread(sched: ref mut Scheduler)
+    -> Result[Tid, ProcessError>
+    effects: [deterministic]
+{
+    let idle_name: FixedString[THREAD_NAME_MAX_LEN] = FixedString::from_slice("idle")
+    let idle_tid: Tid = sched.thread_table.create_thread(
+        Pid::zero(), 0, 0, 0, idle_name)?
+    let thread: ref mut ThreadControlBlock =
+        sched.thread_table.get_thread_mut(idle_tid)?
+    thread.flags = thread.flags | THR_FLAG_IDLE
+    thread.set_state(THR_STATE_READY)
+    Result::Ok(idle_tid)
+}
+
+// ──────────────────────────────────────────────
+// Thread Cleanup
+// ──────────────────────────────────────────────
+// Evidence path: PROC-THR-CLEANUP-001 through PROC-THR-CLEANUP-010
+
+pub fn thread_cleanup(sched: ref mut Scheduler, tid: Tid)
+    -> Result<(), ProcessError>
+    effects: [deterministic]
+{
+    let thread: ref mut ThreadControlBlock =
+        sched.thread_table.get_thread_mut(tid)?
+    // Call cleanup handler if set
+    if thread.cleanup_handler != 0 {
+        // trust: call the thread's registered cleanup handler
+        trusted("thread cleanup: call registered handler") {
+            let handler: fn() = __builtin_fn_ptr(thread.cleanup_handler)
+            handler()
+        }
+    }
+    thread.set_state(THR_STATE_TERMINATED);
+    sched.thread_table.total_exited =
+        sched.thread_table.total_exited + 1
+    sched.record_cleanup_residual(tid)
+    Result::Ok(())
+}
+
+impl Scheduler {
+    fn record_cleanup_residual(self, tid: Tid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Thread cleanup",
+            code: DIAG_THR_OK,
+            data: tid.value(),
+        )
+    }
+}

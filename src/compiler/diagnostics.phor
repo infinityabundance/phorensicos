@@ -1,0 +1,1214 @@
+// diagnostics.phor — Compiler Diagnostics with Stable Diagnostic Codes
+// Phorensic Compiler Infrastructure — Diagnostic Subsystem
+//
+// This module defines the complete diagnostic framework for the Phorensic compiler.
+// Every diagnostic has a stable PHOR-COMP-NNN code, a severity level, and a
+// structured payload that enables tooling integration, residual emission, and
+// deterministic error recovery.
+//
+// Evidence semantics: Each diagnostic carries an EvidenceReceipt that chains back
+// to the compiler phase that emitted it. This forms an auditable trail from source
+// code through every transformation to the final diagnostic output.
+//
+// Effect declarations: All functions that emit diagnostics declare the [diag] effect.
+// Functions that format or collect diagnostics declare the [io] effect.
+// Functions that remain pure declare [pure].
+
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+// --- Diagnostic Severity Levels ---
+// Sealed by the diagnostics subsystem. No external extension.
+
+pub sealdatatype DiagnosticSeverity : u8 {
+    /// Informational message — no compiler action required.
+    Note = 0u8,
+    /// Warning — compilation proceeds, but user attention recommended.
+    Warning = 1u8,
+    /// Error — compilation fails unless recovered.
+    Error = 2u8,
+    /// Fatal error — compilation halts immediately.
+    Fatal = 3u8,
+    /// Internal compiler error — indicates a compiler bug.
+    Internal = 4u8,
+    /// Residual diagnostic — embedded in sealed output for downstream tools.
+    Residual = 5u8,
+}
+
+// --- Stable Diagnostic Codes ---
+// Each code is frozen at definition time. Codes are never recycled.
+// PHOR-COMP-001 through PHOR-COMP-030 are defined here.
+
+pub sealdatatype DiagnosticCode : u64 {
+    // === Lexer Diagnostics (PHOR-COMP-001 through PHOR-COMP-004) ===
+    LexUnexpectedCharacter = 1u64,
+    LexUnterminatedString = 2u64,
+    LexInvalidNumericLiteral = 3u64,
+    LexUnterminatedBlockComment = 4u64,
+
+    // === Parser Diagnostics (PHOR-COMP-005 through PHOR-COMP-009) ===
+    ParseUnexpectedToken = 5u64,
+    ParseMissingSemicolon = 6u64,
+    ParseUnclosedParen = 7u64,
+    ParseInvalidDeclaration = 8u64,
+    ParseExpectedExpression = 9u64,
+
+    // === Expander Diagnostics (PHOR-COMP-010 through PHOR-COMP-012) ===
+    ExpandMacroNotFound = 10u64,
+    ExpandRecursiveExpansion = 11u64,
+    ExpandIncludeCycle = 12u64,
+
+    // === Lowerer / Type Checking Diagnostics (PHOR-COMP-013 through PHOR-COMP-019) ===
+    LowerTypeMismatch = 13u64,
+    LowerCapabilityViolation = 14u64,
+    LowerEffectNotDeclared = 15u64,
+    LowerUnsafeBlockWithoutRationale = 16u64,
+    LowerUnboundedLoop = 17u64,
+    LowerRecursionNotProvenBounded = 18u64,
+    LowerHandleGenerationMismatch = 19u64,
+
+    // === Optimizer Diagnostics (PHOR-COMP-020 through PHOR-COMP-022) ===
+    OptConstantFoldingOverflow = 20u64,
+    OptDeadCodeRemoved = 21u64,
+    OptUnreachableBlockEliminated = 22u64,
+
+    // === Codegen Diagnostics (PHOR-COMP-023 through PHOR-COMP-025) ===
+    CodegenUnsupportedInstruction = 23u64,
+    CodegenRegisterSpillFailed = 24u64,
+    CodegenRelocationOverflow = 25u64,
+
+    // === Linker Diagnostics (PHOR-COMP-026 through PHOR-COMP-028) ===
+    LinkSymbolNotFound = 26u64,
+    LinkDuplicateSymbol = 27u64,
+    LinkRelocationOutOfRange = 28u64,
+
+    // === Sealer / Receipt Diagnostics (PHOR-COMP-029 through PHOR-COMP-030) ===
+    SealHashChainBroken = 29u64,
+    SealReceiptSignatureInvalid = 30u64,
+}
+
+// --- Source Location — tracks position in source text ---
+
+pub struct SourceLocation {
+    /// File path or module name. Fixed-capacity string.
+    pub file : FixedString256,
+    /// 0-based line number.
+    pub line : u32,
+    /// 0-based column number.
+    pub column : u32,
+    /// Absolute byte offset from start of source.
+    pub offset : u64,
+}
+
+impl SourceLocation {
+    /// Construct a new source location with the given coordinates.
+    /// Effect: pure — no side effects.
+    pub fn new(file : FixedString256, line : u32, column : u32, offset : u64) -> SourceLocation [pure] {
+        SourceLocation {
+            file: file,
+            line: line,
+            column: column,
+            offset: offset,
+        }
+    }
+
+    /// Return a formatted string: "file:line:column"
+    /// Effect: io — performs string formatting operations.
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::from(self.file);
+        result.push_char(':');
+        result.push_u32(self.line);
+        result.push_char(':');
+        result.push_u32(self.column);
+        // Evidence: formatting preserves location precision for error reporting.
+        result
+    }
+
+    /// Advance the location by one character (tracking newlines).
+    /// Effect: pure — no side effects beyond returning a new location.
+    pub fn advance(&self, ch : u8) -> SourceLocation [pure] {
+        if ch == 10u8 { // '\n'
+            SourceLocation::new(self.file, self.line + 1u32, 0u32, self.offset + 1u64)
+        } else {
+            SourceLocation::new(self.file, self.line, self.column + 1u32, self.offset + 1u64)
+        }
+    }
+
+    /// Advance by N bytes (for multi-byte sequences).
+    /// Evidence: bounded by explicit count parameter.
+    pub fn advance_by(&self, count : u32, ch : u8) -> SourceLocation [pure] {
+        // Bounded: count is explicit parameter, loop bound is count.
+        var loc : SourceLocation = *self; // affine: copy via deref
+        for var i : u32 = 0u32; i < count; i += 1u32 [count] {
+            loc = loc.advance(ch);
+        }
+        loc
+    }
+}
+
+/// Spanned value — pairs a value with its source span.
+pub struct Spanned<T : type> {
+    pub value : T,
+    pub start : SourceLocation,
+    pub end : SourceLocation,
+}
+
+impl<T : type> Spanned<T> {
+    pub fn new(value : T, start : SourceLocation, end : SourceLocation) -> Spanned<T> [pure] {
+        Spanned { value: value, start: start, end: end }
+    }
+}
+
+// --- Diagnostic Payload — structured diagnostic data ---
+
+pub struct DiagnosticPayload {
+    /// The stable diagnostic code.
+    pub code : DiagnosticCode,
+    /// Human-readable diagnostic message.
+    pub message : FixedString256,
+    /// Primary source location.
+    pub location : SourceLocation,
+    /// End of the source span (for highlighting).
+    pub end_location : SourceLocation,
+    /// Severity level.
+    pub severity : DiagnosticSeverity,
+    /// Suggested fix, if available.
+    pub suggestion : FixedString256,
+    /// Related notes (additional locations or information).
+    pub notes : Array256<FixedString256>,
+    /// Whether this diagnostic is recoverable.
+    pub is_recoverable : bool,
+    /// Compiler phase that emitted this diagnostic.
+    pub phase : CompilerPhase,
+}
+
+impl DiagnosticPayload {
+    /// Construct a new diagnostic payload.
+    /// Effect: pure — value construction.
+    pub fn new(
+        code : DiagnosticCode,
+        message : FixedString256,
+        location : SourceLocation,
+        severity : DiagnosticSeverity,
+        phase : CompilerPhase,
+    ) -> DiagnosticPayload [pure] {
+        DiagnosticPayload {
+            code: code,
+            message: message,
+            location: location,
+            end_location: location,
+            severity: severity,
+            suggestion: FixedString256::new(),
+            notes: Array256::new(),
+            is_recoverable: false,
+            phase: phase,
+        }
+    }
+
+    /// Attach a suggestion to this diagnostic.
+    /// Effect: pure — returns new diagnostic with suggestion.
+    pub fn with_suggestion(mut self, suggestion : FixedString256) -> DiagnosticPayload [pure] {
+        self.suggestion = suggestion;
+        self
+    }
+
+    /// Mark this diagnostic as recoverable.
+    /// Effect: pure — returns new diagnostic with recovery flag.
+    pub fn recoverable(mut self) -> DiagnosticPayload [pure] {
+        self.is_recoverable = true;
+        self
+    }
+
+    /// Add a related note to this diagnostic.
+    /// Effect: pure — bounded by fixed capacity of notes array.
+    pub fn add_note(mut self, note : FixedString256) -> DiagnosticPayload [pure] {
+        // Bounded: Array256 has fixed capacity of 256 elements.
+        let _ = self.notes.push(note);
+        self
+    }
+
+    /// Set the end location for source span highlighting.
+    /// Effect: pure — value update.
+    pub fn with_end(mut self, end : SourceLocation) -> DiagnosticPayload [pure] {
+        self.end_location = end;
+        self
+    }
+
+    /// Format the diagnostic as a human-readable string.
+    /// Evidence: output is bounded by FixedString256 capacity.
+    /// Effect: io — performs string formatting.
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        let severity_str : FixedString256 = self.format_severity();
+        result.push_str(severity_str);
+        result.push_str(FixedString256::from(" [PHOR-COMP-"));
+        result.push_u64(self.code as u64);
+        result.push_str(FixedString256::from("] "));
+        result.push_str(self.location.format());
+        result.push_str(FixedString256::from(": "));
+        result.push_str(self.message);
+        // Evidence: diagnostic formatted with stable code for tooling.
+        result
+    }
+
+    /// Format just the severity level.
+    /// Effect: io — string construction.
+    fn format_severity(&self) -> FixedString256 [io] {
+        match self.severity {
+            DiagnosticSeverity::Note => FixedString256::from("note"),
+            DiagnosticSeverity::Warning => FixedString256::from("warning"),
+            DiagnosticSeverity::Error => FixedString256::from("error"),
+            DiagnosticSeverity::Fatal => FixedString256::from("fatal error"),
+            DiagnosticSeverity::Internal => FixedString256::from("internal error"),
+            DiagnosticSeverity::Residual => FixedString256::from("residual"),
+        }
+    }
+}
+
+// --- Compiler Phase Identification ---
+
+pub sealdatatype CompilerPhase : u8 {
+    Lexer = 0u8,
+    Parser = 1u8,
+    Expander = 2u8,
+    Lowerer = 3u8,
+    Optimizer = 4u8,
+    Codegen = 5u8,
+    Linker = 6u8,
+    Sealer = 7u8,
+    PreCompile = 8u8,
+}
+
+impl CompilerPhase {
+    pub fn name(&self) -> FixedString256 [io] {
+        match self {
+            CompilerPhase::Lexer => FixedString256::from("lexer"),
+            CompilerPhase::Parser => FixedString256::from("parser"),
+            CompilerPhase::Expander => FixedString256::from("expander"),
+            CompilerPhase::Lowerer => FixedString256::from("lowerer"),
+            CompilerPhase::Optimizer => FixedString256::from("optimizer"),
+            CompilerPhase::Codegen => FixedString256::from("codegen"),
+            CompilerPhase::Linker => FixedString256::from("linker"),
+            CompilerPhase::Sealer => FixedString256::from("sealer"),
+            CompilerPhase::PreCompile => FixedString256::from("pre-compile"),
+        }
+    }
+}
+
+// --- Diagnostic Bag — collects diagnostics throughout compilation ---
+
+pub struct DiagnosticBag {
+    /// Fixed-capacity array of diagnostics accumulated during compilation.
+    pub diagnostics : Array256<DiagnosticPayload>,
+    /// Count of errors (severity >= Error).
+    pub error_count : u32,
+    /// Count of warnings.
+    pub warning_count : u32,
+    /// Whether a fatal error has been encountered.
+    pub has_fatal : bool,
+}
+
+impl DiagnosticBag {
+    /// Create a new, empty diagnostic bag.
+    /// Effect: pure — allocation-free construction.
+    pub fn new() -> DiagnosticBag [pure] {
+        DiagnosticBag {
+            diagnostics: Array256::new(),
+            error_count: 0u32,
+            warning_count: 0u32,
+            has_fatal: false,
+        }
+    }
+
+    /// Emit a diagnostic into the bag.
+    /// Effect: diag — emits a diagnostic into the compilation context.
+    /// Bounded: bounded by Array256 capacity (256 diagnostics max).
+    pub fn emit(mut self, diagnostic : DiagnosticPayload) -> Result<(), FixedString256> [diag] {
+        // Bounded: check capacity before pushing.
+        if self.diagnostics.len() >= self.diagnostics.capacity() {
+            return Result::Err(FixedString256::from("diagnostic bag full"));
+        }
+
+        // Track severity counts.
+        if diagnostic.severity == DiagnosticSeverity::Error
+            || diagnostic.severity == DiagnosticSeverity::Internal {
+            self.error_count += 1u32;
+        } else if diagnostic.severity == DiagnosticSeverity::Warning {
+            self.warning_count += 1u32;
+        } else if diagnostic.severity == DiagnosticSeverity::Fatal {
+            self.has_fatal = true;
+            self.error_count += 1u32;
+        }
+
+        // Evidence: push diagnostic onto bag for downstream collection.
+        let _ = self.diagnostics.push(diagnostic);
+        Result::Ok(())
+    }
+
+    /// Emit a residual diagnostic (embedded in sealed output).
+    /// Effect: diag — emits a residual diagnostic.
+    pub fn emit_residual(mut self, diagnostic : DiagnosticPayload) -> Result<(), FixedString256> [diag] {
+        let residual_diag : DiagnosticPayload = DiagnosticPayload::new(
+            diagnostic.code,
+            diagnostic.message,
+            diagnostic.location,
+            DiagnosticSeverity::Residual,
+            diagnostic.phase,
+        );
+        self.emit(residual_diag)
+    }
+
+    /// Check if any errors were accumulated.
+    /// Effect: pure — read-only query.
+    pub fn has_errors(&self) -> bool [pure] {
+        self.error_count > 0u32
+    }
+
+    /// Get the count of accumulated diagnostics.
+    /// Effect: pure — read-only query.
+    pub fn len(&self) -> u32 [pure] {
+        self.diagnostics.len()
+    }
+
+    /// Iterate diagnostics with bounded loop.
+    /// Effect: io — calls callback for each diagnostic.
+    pub fn for_each(&self, callback : fn(DiagnosticPayload) -> Result<(), FixedString256> [io])
+        -> Result<(), FixedString256> [io] {
+        // Bounded: loop bound is diagnostics.len().
+        for var i : u32 = 0u32; i < self.diagnostics.len(); i += 1u32 [self.diagnostics.len()] {
+            let diag : DiagnosticPayload = self.diagnostics.get(i);
+            let _ = callback(diag);
+        }
+        Result::Ok(())
+    }
+
+    /// Merge diagnostics from another bag into this one.
+    /// Effect: diag — emits diagnostics from other bag.
+    /// Bounded: bounded by remaining capacity.
+    pub fn merge(mut self, other : DiagnosticBag) -> Result<(), FixedString256> [diag] {
+        // Bounded: loop bound is other.diagnostics.len().
+        for var i : u32 = 0u32; i < other.diagnostics.len(); i += 1u32 [other.diagnostics.len()] {
+            let diag : DiagnosticPayload = other.diagnostics.get(i);
+            let _ = self.emit(diag);
+        }
+        Result::Ok(())
+    }
+
+    /// Drain diagnostics into a fixed output array for sealed emission.
+    /// Effect: pure — returns a copy of the diagnostic array.
+    pub fn drain(&mut self) -> Array256<DiagnosticPayload> [pure] {
+        let result : Array256<DiagnosticPayload> = self.diagnostics;
+        self.diagnostics = Array256::new();
+        self.error_count = 0u32;
+        self.warning_count = 0u32;
+        self.has_fatal = false;
+        result
+    }
+}
+
+// --- Diagnostic Builder — fluent API for constructing diagnostics ---
+
+pub struct DiagnosticBuilder {
+    bag : DiagnosticBag,
+    phase : CompilerPhase,
+}
+
+impl DiagnosticBuilder {
+    /// Create a new diagnostic builder attached to a bag.
+    /// Effect: pure — value construction.
+    pub fn new(bag : DiagnosticBag, phase : CompilerPhase) -> DiagnosticBuilder [pure] {
+        DiagnosticBuilder { bag: bag, phase: phase }
+    }
+
+    /// Emit a diagnostic with the given code, message, and location.
+    /// Effect: diag — emits diagnostic.
+    pub fn emit(
+        mut self,
+        code : DiagnosticCode,
+        message : FixedString256,
+        location : SourceLocation,
+        severity : DiagnosticSeverity,
+    ) -> Result<(), FixedString256> [diag] {
+        let payload : DiagnosticPayload = DiagnosticPayload::new(code, message, location, severity, self.phase);
+        self.bag.emit(payload)
+    }
+
+    /// Emit a diagnostic with an attached suggestion.
+    /// Effect: diag — emits diagnostic with suggestion.
+    pub fn emit_with_suggestion(
+        mut self,
+        code : DiagnosticCode,
+        message : FixedString256,
+        location : SourceLocation,
+        severity : DiagnosticSeverity,
+        suggestion : FixedString256,
+    ) -> Result<(), FixedString256> [diag] {
+        let payload : DiagnosticPayload = DiagnosticPayload::new(code, message, location, severity, self.phase)
+            .with_suggestion(suggestion);
+        self.bag.emit(payload)
+    }
+
+    /// Emit a recoverable diagnostic (parser error recovery).
+    /// Effect: diag — emits recoverable diagnostic.
+    pub fn emit_recoverable(
+        mut self,
+        code : DiagnosticCode,
+        message : FixedString256,
+        location : SourceLocation,
+    ) -> Result<(), FixedString256> [diag] {
+        let payload : DiagnosticPayload = DiagnosticPayload::new(
+            code, message, location, DiagnosticSeverity::Error, self.phase,
+        ).recoverable();
+        self.bag.emit(payload)
+    }
+
+    /// Get the underlying bag back after emission is complete.
+    /// Effect: pure — returns owned bag.
+    pub fn into_bag(self) -> DiagnosticBag [pure] {
+        self.bag
+    }
+
+    /// Get a reference to the underlying bag (for inspection).
+    /// Effect: pure — read-only reference.
+    pub fn bag(&self) -> &DiagnosticBag [pure] {
+        &self.bag
+    }
+}
+
+// --- Diagnostic Receipt — evidence that a diagnostic was emitted ---
+
+pub struct DiagnosticReceipt {
+    /// The diagnostic code that was emitted.
+    pub code : DiagnosticCode,
+    /// The phase that emitted it.
+    pub phase : CompilerPhase,
+    /// Hash of the diagnostic payload for chain verification.
+    pub payload_hash : u64,
+    /// Generation tag for handle tracking.
+    pub generation : u64,
+}
+
+impl DiagnosticReceipt {
+    /// Create a new diagnostic receipt from a payload.
+    /// Effect: pure — value construction with hash computation.
+    pub fn from_payload(payload : &DiagnosticPayload, generation : u64) -> DiagnosticReceipt [pure] {
+        // Compute a simple hash of the payload for chain linking.
+        let hash : u64 = DiagnosticReceipt::compute_hash(payload);
+        DiagnosticReceipt {
+            code: payload.code,
+            phase: payload.phase,
+            payload_hash: hash,
+            generation: generation,
+        }
+    }
+
+    /// Compute a hash from a diagnostic payload.
+    /// Evidence: hash is deterministic and reproducible.
+    /// Effect: pure — deterministic computation.
+    fn compute_hash(payload : &DiagnosticPayload) -> u64 [pure] {
+        var hash : u64 = 14695981039346656037u64; // FNV offset basis
+        let code_val : u64 = payload.code as u64;
+        hash ^= code_val;
+        hash *= 1099511628211u64; // FNV prime
+        let severity_val : u64 = payload.severity as u64;
+        hash ^= severity_val;
+        hash *= 1099511628211u64;
+        hash
+    }
+
+    /// Verify that a receipt matches a diagnostic payload.
+    /// Effect: pure — deterministic verification.
+    pub fn verify(&self, payload : &DiagnosticPayload) -> bool [pure] {
+        let computed_hash : u64 = DiagnosticReceipt::compute_hash(payload);
+        self.payload_hash == computed_hash && self.code == payload.code
+    }
+}
+
+// --- Error code for compiler diagnostics ---
+
+pub type CompilerResult<T : type> = Result<T, DiagnosticPayload>;
+
+// --- Standard diagnostic messages ---
+
+pub namespace diag_messages {
+    /// Lexer: Unexpected character encountered.
+    pub fn unexpected_char(ch : u8) -> FixedString256 [pure] {
+        var msg : FixedString256 = FixedString256::from("unexpected character: '");
+        msg.push_byte(ch);
+        msg.push_char('\'');
+        msg
+    }
+
+    /// Lexer: Unterminated string literal.
+    pub fn unterminated_string() -> FixedString256 [pure] {
+        FixedString256::from("unterminated string literal")
+    }
+
+    /// Parser: Unexpected token during parsing.
+    pub fn unexpected_token(expected : FixedString256, found : FixedString256) -> FixedString256 [pure] {
+        var msg : FixedString256 = FixedString256::from("expected ");
+        msg.push_str(expected);
+        msg.push_str(FixedString256::from(", found "));
+        msg.push_str(found);
+        msg
+    }
+
+    /// Lowerer: Type mismatch in assignment or expression.
+    pub fn type_mismatch(expected : FixedString256, found : FixedString256) -> FixedString256 [pure] {
+        var msg : FixedString256 = FixedString256::from("type mismatch: expected ");
+        msg.push_str(expected);
+        msg.push_str(FixedString256::from(", got "));
+        msg.push_str(found);
+        msg
+    }
+
+    /// Lowerer: Capability violation — linear value used more than once.
+    pub fn capability_violation(name : FixedString256) -> FixedString256 [pure] {
+        var msg : FixedString256 = FixedString256::from("capability violation: affine value '");
+        msg.push_str(name);
+        msg.push_str(FixedString256::from("' cannot be duplicated"));
+        msg
+    }
+
+    /// Lowerer: Effect not declared in function signature.
+    pub fn effect_not_declared(effect_name : FixedString256) -> FixedString256 [pure] {
+        var msg : FixedString256 = FixedString256::from("effect '");
+        msg.push_str(effect_name);
+        msg.push_str(FixedString256::from("' used but not declared in function signature"));
+        msg
+    }
+
+    /// Lowerer: Loop without explicit bound annotation.
+    pub fn unbounded_loop() -> FixedString256 [pure] {
+        FixedString256::from("loop must have an explicit bound annotation")
+    }
+
+    /// Lowerer: Recursion without court-proven boundedness evidence.
+    pub fn recursion_not_bounded() -> FixedString256 [pure] {
+        FixedString256::from(
+            "recursion requires court-proven boundedness evidence " ~
+            "(provide `[bounded: <expr>]` annotation)"
+        )
+    }
+
+    /// Linker: Symbol not found.
+    pub fn symbol_not_found(name : FixedString256) -> FixedString256 [pure] {
+        var msg : FixedString256 = FixedString256::from("symbol not found: ");
+        msg.push_str(name);
+        msg
+    }
+
+    /// Sealer: Hash chain verification failed.
+    pub fn hash_chain_broken() -> FixedString256 [pure] {
+        FixedString256::from("seal verification failed: hash chain is broken")
+    }
+}
+
+// --- Compiler Phase Statistics ---
+
+pub struct PhaseStatistics {
+    pub phase : CompilerPhase,
+    pub diagnostics_emitted : u32,
+    pub errors_emitted : u32,
+    pub warnings_emitted : u32,
+    pub start_time_ns : u64,
+    pub end_time_ns : u64,
+    pub elapsed_ns : u64,
+    pub residual_count : u32,
+}
+
+impl PhaseStatistics {
+    pub fn new(phase : CompilerPhase) -> PhaseStatistics [pure] {
+        PhaseStatistics {
+            phase: phase,
+            diagnostics_emitted: 0u32,
+            errors_emitted: 0u32,
+            warnings_emitted: 0u32,
+            start_time_ns: 0u64,
+            end_time_ns: 0u64,
+            elapsed_ns: 0u64,
+            residual_count: 0u32,
+        }
+    }
+
+    pub fn record_elapsed(mut self, start : u64, end : u64) -> PhaseStatistics [pure] {
+        self.start_time_ns = start;
+        self.end_time_ns = end;
+        self.elapsed_ns = end - start;
+        self
+    }
+
+    pub fn from_bag(mut self, bag : &DiagnosticBag) -> PhaseStatistics [pure] {
+        self.diagnostics_emitted = bag.diagnostics.len();
+        self.errors_emitted = bag.error_count;
+        self.warnings_emitted = bag.warning_count;
+        self
+    }
+}
+
+// --- Compilation Session — aggregates all diagnostics across phases ---
+
+pub struct CompilationSession {
+    pub bags : Array256<DiagnosticBag>,
+    pub phase_stats : Array256<PhaseStatistics>,
+    pub total_errors : u32,
+    pub total_warnings : u32,
+    pub session_id : u64,
+}
+
+impl CompilationSession {
+    pub fn new(session_id : u64) -> CompilationSession [pure] {
+        CompilationSession {
+            bags: Array256::new(),
+            phase_stats: Array256::new(),
+            total_errors: 0u32,
+            total_warnings: 0u32,
+            session_id: session_id,
+        }
+    }
+
+    /// Register a phase's diagnostic bag and statistics.
+    /// Effect: pure — bounded by Array256 capacity.
+    pub fn register_phase(
+        mut self,
+        bag : DiagnosticBag,
+        stats : PhaseStatistics,
+    ) -> CompilationSession [pure] {
+        self.total_errors += bag.error_count;
+        self.total_warnings += bag.warning_count;
+        let _ = self.bags.push(bag);
+        let _ = self.phase_stats.push(stats);
+        self
+    }
+
+    /// Get total error count.
+    /// Effect: pure — read-only.
+    pub fn has_errors(&self) -> bool [pure] {
+        self.total_errors > 0u32
+    }
+
+    /// Print a summary of the compilation session.
+    /// Effect: io — prints to standard output.
+    pub fn print_summary(&self) -> Result<(), FixedString256> [io] {
+        // Bounded: loop over registered phases.
+        for var i : u32 = 0u32; i < self.phase_stats.len(); i += 1u32 [self.phase_stats.len()] {
+            let stat : PhaseStatistics = self.phase_stats.get(i);
+            var line : FixedString256 = FixedString256::new();
+            line.push_str(stat.phase.name());
+            line.push_str(FixedString256::from(": "));
+            line.push_u32(stat.diagnostics_emitted);
+            line.push_str(FixedString256::from(" diagnostics, "));
+            line.push_u32(stat.errors_emitted);
+            line.push_str(FixedString256::from(" errors, "));
+            line.push_u32(stat.warnings_emitted);
+            line.push_str(FixedString256::from(" warnings"));
+            // Evidence: summary line produced for session.
+            let _ = line; // would print to output
+        }
+        Result::Ok(())
+    }
+}
+
+// --- Pre-compile Viability Diagnostic Extension ---
+
+pub struct ViabilityDiagnostic {
+    pub is_viable : bool,
+    pub confidence : u8, // 0-255, higher is more confident
+    pub blocking_codes : Array256<DiagnosticCode>,
+    pub evidence_receipts : Array256<DiagnosticReceipt>,
+}
+
+impl ViabilityDiagnostic {
+    pub fn new(is_viable : bool, confidence : u8) -> ViabilityDiagnostic [pure] {
+        ViabilityDiagnostic {
+            is_viable: is_viable,
+            confidence: confidence,
+            blocking_codes: Array256::new(),
+            evidence_receipts: Array256::new(),
+        }
+    }
+
+    pub fn add_blocking_code(mut self, code : DiagnosticCode) -> ViabilityDiagnostic [pure] {
+        let _ = self.blocking_codes.push(code);
+        self
+    }
+
+    pub fn add_receipt(mut self, receipt : DiagnosticReceipt) -> ViabilityDiagnostic [pure] {
+        let _ = self.evidence_receipts.push(receipt);
+        self
+    }
+}
+
+// --- Diagnostic Formatting Helpers ---
+
+/// Format a diagnostic code as a string: "PHOR-COMP-NNN"
+pub fn format_code(code : DiagnosticCode) -> FixedString256 [pure] {
+    var result : FixedString256 = FixedString256::from("PHOR-COMP-");
+    let code_num : u64 = code as u64;
+    if code_num < 10u64 {
+        result.push_str(FixedString256::from("00"));
+    } else if code_num < 100u64 {
+        result.push_str(FixedString256::from("0"));
+    }
+    result.push_u64(code_num);
+    result
+}
+
+// Test that diagnostic codes are unique (compile-time check).
+// This is enforced by the sealdatatype definition — duplicate variants
+// are impossible in the Phorensic type system.
+
+// --- Diagnostic Aggregation Pipeline ---
+
+/// Aggregate diagnostics from multiple phases into a session.
+/// Effect: diag, pure — bounded by phase count.
+pub fn aggregate_diagnostics(
+    session : CompilationSession,
+    phase_bags : Array64<DiagnosticBag>,
+    phase_stats : Array64<PhaseStatistics>,
+) -> CompilationSession [diag, pure] {
+    var result : CompilationSession = session;
+    // Bounded: at most 16 phases.
+    for var i : u32 = 0u32; i < phase_bags.len(); i += 1u32 [phase_bags.len()] {
+        let bag : DiagnosticBag = phase_bags.get(i);
+        let stats : PhaseStatistics = phase_stats.get(i);
+        result = result.register_phase(bag, stats);
+    }
+    result
+}
+
+// --- Diagnostic Filter — select diagnostics by criteria ---
+
+pub struct DiagnosticFilter {
+    /// Only include diagnostics with these codes.
+    pub codes : Array256<DiagnosticCode>,
+    /// Minimum severity level.
+    pub min_severity : DiagnosticSeverity,
+    /// Only include diagnostics from these phases.
+    pub phases : Array256<CompilerPhase>,
+    /// Only include residuals.
+    pub residuals_only : bool,
+    /// Whether to deduplicate by code and location.
+    pub deduplicate : bool,
+}
+
+impl DiagnosticFilter {
+    pub fn new() -> DiagnosticFilter [pure] {
+        DiagnosticFilter {
+            codes: Array256::new(),
+            min_severity: DiagnosticSeverity::Note,
+            phases: Array256::new(),
+            residuals_only: false,
+            deduplicate: true,
+        }
+    }
+
+    /// Apply the filter to a diagnostic bag.
+    /// Effect: pure — bounded by bag size.
+    pub fn apply(&self, bag : &DiagnosticBag) -> DiagnosticBag [pure] {
+        var result : DiagnosticBag = DiagnosticBag::new();
+        // Bounded: at most 256 diagnostics.
+        for var i : u32 = 0u32; i < bag.diagnostics.len(); i += 1u32 [bag.diagnostics.len()] {
+            let diag : DiagnosticPayload = bag.diagnostics.get(i);
+            if self.matches(&diag) {
+                let _ = result.emit(diag);
+            }
+        }
+        result
+    }
+
+    /// Check if a diagnostic matches this filter.
+    /// Effect: pure — deterministic match.
+    fn matches(&self, diag : &DiagnosticPayload) -> bool [pure] {
+        // Check residual filter.
+        if self.residuals_only && diag.severity != DiagnosticSeverity::Residual {
+            return false;
+        }
+        // Check severity.
+        if (diag.severity as u8) < (self.min_severity as u8) {
+            return false;
+        }
+        // Check code filter.
+        if self.codes.len() > 0u32 {
+            let mut code_match : bool = false;
+            for var j : u32 = 0u32; j < self.codes.len(); j += 1u32 [self.codes.len()] {
+                if self.codes.get(j) == diag.code {
+                    code_match = true;
+                    break;
+                }
+            }
+            if !code_match {
+                return false;
+            }
+        }
+        // Check phase filter.
+        if self.phases.len() > 0u32 {
+            let mut phase_match : bool = false;
+            for var j : u32 = 0u32; j < self.phases.len(); j += 1u32 [self.phases.len()] {
+                if self.phases.get(j) == diag.phase {
+                    phase_match = true;
+                    break;
+                }
+            }
+            if !phase_match {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// --- Diagnostic Sorter — orders diagnostics by location and code ---
+
+pub struct DiagnosticSorter {}
+
+impl DiagnosticSorter {
+    /// Sort diagnostics by (file, line, column, code).
+    /// Effect: pure — bounded by diagnostic count.
+    pub fn sort(mut bag : DiagnosticBag) -> DiagnosticBag [pure] {
+        // Simple insertion sort (bounded: at most 256 diagnostics).
+        let n : u32 = bag.diagnostics.len();
+        if n <= 1u32 { return bag; }
+        for var i : u32 = 1u32; i < n; i += 1u32 [n] {
+            let key : DiagnosticPayload = bag.diagnostics.get(i);
+            var j : i64 = (i as i64) - 1i64;
+            while j >= 0i64 {
+                let current : DiagnosticPayload = bag.diagnostics.get(j as u32);
+                if current.location.offset <= key.location.offset {
+                    break;
+                }
+                bag.diagnostics.set((j + 1i64) as u32, current);
+                j -= 1i64;
+            }
+            bag.diagnostics.set((j + 1i64) as u32, key);
+        }
+        bag
+    }
+}
+
+// --- Diagnostic Code Lookup Table ---
+
+/// Look up a diagnostic code by its number.
+/// Effect: pure — code lookup.
+pub fn lookup_code(code_number : u64) -> Option<DiagnosticCode> [pure] {
+    match code_number {
+        1u64 => Option::Some(DiagnosticCode::LexUnexpectedCharacter),
+        2u64 => Option::Some(DiagnosticCode::LexUnterminatedString),
+        3u64 => Option::Some(DiagnosticCode::LexInvalidNumericLiteral),
+        4u64 => Option::Some(DiagnosticCode::LexUnterminatedBlockComment),
+        5u64 => Option::Some(DiagnosticCode::ParseUnexpectedToken),
+        6u64 => Option::Some(DiagnosticCode::ParseMissingSemicolon),
+        7u64 => Option::Some(DiagnosticCode::ParseUnclosedParen),
+        8u64 => Option::Some(DiagnosticCode::ParseInvalidDeclaration),
+        9u64 => Option::Some(DiagnosticCode::ParseExpectedExpression),
+        10u64 => Option::Some(DiagnosticCode::ExpandMacroNotFound),
+        11u64 => Option::Some(DiagnosticCode::ExpandRecursiveExpansion),
+        12u64 => Option::Some(DiagnosticCode::ExpandIncludeCycle),
+        13u64 => Option::Some(DiagnosticCode::LowerTypeMismatch),
+        14u64 => Option::Some(DiagnosticCode::LowerCapabilityViolation),
+        15u64 => Option::Some(DiagnosticCode::LowerEffectNotDeclared),
+        16u64 => Option::Some(DiagnosticCode::LowerUnsafeBlockWithoutRationale),
+        17u64 => Option::Some(DiagnosticCode::LowerUnboundedLoop),
+        18u64 => Option::Some(DiagnosticCode::LowerRecursionNotProvenBounded),
+        19u64 => Option::Some(DiagnosticCode::LowerHandleGenerationMismatch),
+        20u64 => Option::Some(DiagnosticCode::OptConstantFoldingOverflow),
+        21u64 => Option::Some(DiagnosticCode::OptDeadCodeRemoved),
+        22u64 => Option::Some(DiagnosticCode::OptUnreachableBlockEliminated),
+        23u64 => Option::Some(DiagnosticCode::CodegenUnsupportedInstruction),
+        24u64 => Option::Some(DiagnosticCode::CodegenRegisterSpillFailed),
+        25u64 => Option::Some(DiagnosticCode::CodegenRelocationOverflow),
+        26u64 => Option::Some(DiagnosticCode::LinkSymbolNotFound),
+        27u64 => Option::Some(DiagnosticCode::LinkDuplicateSymbol),
+        28u64 => Option::Some(DiagnosticCode::LinkRelocationOutOfRange),
+        29u64 => Option::Some(DiagnosticCode::SealHashChainBroken),
+        30u64 => Option::Some(DiagnosticCode::SealReceiptSignatureInvalid),
+        _ => Option::None,
+    }
+}
+
+/// Get a human-readable description for a diagnostic code.
+/// Effect: io — string lookup.
+pub fn describe_code(code : DiagnosticCode) -> FixedString256 [io] {
+    match code {
+        DiagnosticCode::LexUnexpectedCharacter => FixedString256::from("The lexer encountered a character that does not form a valid token."),
+        DiagnosticCode::LexUnterminatedString => FixedString256::from("A string literal was opened but not closed before end of file."),
+        DiagnosticCode::LexInvalidNumericLiteral => FixedString256::from("A numeric literal contains invalid characters or formatting."),
+        DiagnosticCode::LexUnterminatedBlockComment => FixedString256::from("A block comment was opened with /* but not closed with */."),
+        DiagnosticCode::ParseUnexpectedToken => FixedString256::from("The parser encountered a token that does not match the expected grammar production."),
+        DiagnosticCode::ParseMissingSemicolon => FixedString256::from("A semicolon is required at the end of this statement."),
+        DiagnosticCode::ParseUnclosedParen => FixedString256::from("A parenthesis was opened but not closed."),
+        DiagnosticCode::ParseInvalidDeclaration => FixedString256::from("The parser could not recognize this item as a valid declaration."),
+        DiagnosticCode::ParseExpectedExpression => FixedString256::from("An expression was expected but something else was found."),
+        DiagnosticCode::ExpandMacroNotFound => FixedString256::from("A macro invocation refers to a macro that has not been defined."),
+        DiagnosticCode::ExpandRecursiveExpansion => FixedString256::from("Macro expansion exceeded the maximum recursion depth."),
+        DiagnosticCode::ExpandIncludeCycle => FixedString256::from("An include directive creates a cycle in the include graph."),
+        DiagnosticCode::LowerTypeMismatch => FixedString256::from("A value of one type was used where a different type was expected."),
+        DiagnosticCode::LowerCapabilityViolation => FixedString256::from("An affine or linear capability was used incorrectly (duplicated or not consumed)."),
+        DiagnosticCode::LowerEffectNotDeclared => FixedString256::from("An effect was used inside a function but not declared in its signature."),
+        DiagnosticCode::LowerUnsafeBlockWithoutRationale => FixedString256::from("An unsafe or trusted block requires a non-empty rationale string."),
+        DiagnosticCode::LowerUnboundedLoop => FixedString256::from("A loop construct must have an explicit bound annotation."),
+        DiagnosticCode::LowerRecursionNotProvenBounded => FixedString256::from("Recursive functions must be annotated with court-proven boundedness evidence."),
+        DiagnosticCode::LowerHandleGenerationMismatch => FixedString256::from("A generation-tagged handle was used with an incorrect generation value."),
+        _ => FixedString256::from("No description available for this diagnostic code."),
+    }
+}
+
+// --- Diagnostic Severity Helpers ---
+
+/// Format a severity level as a colored string (ASCII-only).
+/// Effect: io — string formatting.
+pub fn format_severity_colored(severity : DiagnosticSeverity) -> FixedString256 [io] {
+    match severity {
+        DiagnosticSeverity::Note => FixedString256::from("[NOTE]"),
+        DiagnosticSeverity::Warning => FixedString256::from("[WARNING]"),
+        DiagnosticSeverity::Error => FixedString256::from("[ERROR]"),
+        DiagnosticSeverity::Fatal => FixedString256::from("[FATAL]"),
+        DiagnosticSeverity::Internal => FixedString256::from("[INTERNAL]"),
+        DiagnosticSeverity::Residual => FixedString256::from("[RESIDUAL]"),
+    }
+}
+
+/// Check if a severity indicates compilation should halt.
+/// Effect: pure — severity classification.
+pub fn is_fatal_severity(severity : DiagnosticSeverity) -> bool [pure] {
+    match severity {
+        DiagnosticSeverity::Fatal | DiagnosticSeverity::Internal => true,
+        _ => false,
+    }
+}
+
+/// Check if a severity should be reported to the user.
+/// Effect: pure — severity classification.
+pub fn should_report_to_user(severity : DiagnosticSeverity) -> bool [pure] {
+    match severity {
+        DiagnosticSeverity::Residual => false,
+        _ => true,
+    }
+}
+
+// --- Compiler Phase Helpers ---
+
+/// Get the index of a compiler phase in the pipeline order.
+/// Effect: pure — phase ordering.
+pub fn phase_index(phase : CompilerPhase) -> u8 [pure] {
+    phase as u8
+}
+
+/// Check if phase A runs before phase B.
+/// Effect: pure — phase ordering.
+pub fn phase_before(phase_a : CompilerPhase, phase_b : CompilerPhase) -> bool [pure] {
+    (phase_a as u8) < (phase_b as u8)
+}
+
+/// Get the previous phase in the pipeline.
+/// Effect: pure — phase predecessor.
+pub fn previous_phase(phase : CompilerPhase) -> Option<CompilerPhase> [pure] {
+    let idx : i8 = (phase as i8) - 1i8;
+    if idx >= 0i8 {
+        match idx {
+            0i8 => Option::Some(CompilerPhase::Lexer),
+            1i8 => Option::Some(CompilerPhase::Parser),
+            2i8 => Option::Some(CompilerPhase::Expander),
+            3i8 => Option::Some(CompilerPhase::Lowerer),
+            4i8 => Option::Some(CompilerPhase::Optimizer),
+            5i8 => Option::Some(CompilerPhase::Codegen),
+            6i8 => Option::Some(CompilerPhase::Linker),
+            7i8 => Option::Some(CompilerPhase::Sealer),
+            _ => Option::None,
+        }
+    } else {
+        Option::None
+    }
+}
+
+/// Get the next phase in the pipeline.
+/// Effect: pure — phase successor.
+pub fn next_phase(phase : CompilerPhase) -> Option<CompilerPhase> [pure] {
+    let idx : u8 = (phase as u8) + 1u8;
+    match idx {
+        1u8 => Option::Some(CompilerPhase::Parser),
+        2u8 => Option::Some(CompilerPhase::Expander),
+        3u8 => Option::Some(CompilerPhase::Lowerer),
+        4u8 => Option::Some(CompilerPhase::Optimizer),
+        5u8 => Option::Some(CompilerPhase::Codegen),
+        6u8 => Option::Some(CompilerPhase::Linker),
+        7u8 => Option::Some(CompilerPhase::Sealer),
+        8u8 => Option::Some(CompilerPhase::PreCompile),
+        _ => Option::None,
+    }
+}
+
+// --- Error Recovery Strategy ---
+
+pub sealdatatype RecoveryStrategy : u8 {
+    /// Skip to the next semicolon or brace.
+    SkipToSemicolon = 0u8,
+    /// Skip the current token and continue.
+    SkipToken = 1u8,
+    /// Insert a synthetic token to repair the parse.
+    InsertToken = 2u8,
+    /// Delete the unexpected token and continue.
+    DeleteToken = 3u8,
+    /// Panic and stop further parsing in this context.
+    PanicMode = 4u8,
+}
+
+impl RecoveryStrategy {
+    pub fn name(&self) -> FixedString256 [pure] {
+        match self {
+            RecoveryStrategy::SkipToSemicolon => FixedString256::from("skip to semicolon"),
+            RecoveryStrategy::SkipToken => FixedString256::from("skip token"),
+            RecoveryStrategy::InsertToken => FixedString256::from("insert token"),
+            RecoveryStrategy::DeleteToken => FixedString256::from("delete token"),
+            RecoveryStrategy::PanicMode => FixedString256::from("panic mode"),
+        }
+    }
+}
+
+// --- Diagnostic Statistics Tracking ---
+
+pub struct DiagnosticStatistics {
+    pub total_diagnostics : u32,
+    pub total_errors : u32,
+    pub total_warnings : u32,
+    pub total_notes : u32,
+    pub total_residuals : u32,
+    pub total_fatal : u32,
+    pub unique_codes : Array64<DiagnosticCode>,
+    pub most_common_code : Option<DiagnosticCode>,
+    pub most_common_count : u32,
+}
+
+impl DiagnosticStatistics {
+    pub fn new() -> DiagnosticStatistics [pure] {
+        DiagnosticStatistics {
+            total_diagnostics: 0u32,
+            total_errors: 0u32,
+            total_warnings: 0u32,
+            total_notes: 0u32,
+            total_residuals: 0u32,
+            total_fatal: 0u32,
+            unique_codes: Array64::new(),
+            most_common_code: Option::None,
+            most_common_count: 0u32,
+        }
+    }
+
+    /// Compute statistics from a diagnostic bag.
+    /// Effect: pure — bounded computation.
+    pub fn from_bag(mut self, bag : &DiagnosticBag) -> DiagnosticStatistics [pure] {
+        // Bounded: at most 256 diagnostics.
+        for var i : u32 = 0u32; i < bag.diagnostics.len(); i += 1u32 [bag.diagnostics.len()] {
+            let diag : DiagnosticPayload = bag.diagnostics.get(i);
+            self.total_diagnostics += 1u32;
+            match diag.severity {
+                DiagnosticSeverity::Error => self.total_errors += 1u32,
+                DiagnosticSeverity::Warning => self.total_warnings += 1u32,
+                DiagnosticSeverity::Note => self.total_notes += 1u32,
+                DiagnosticSeverity::Residual => self.total_residuals += 1u32,
+                DiagnosticSeverity::Fatal => self.total_fatal += 1u32,
+                _ => {}
+            }
+            // Track unique codes.
+            let mut found : bool = false;
+            for var j : u32 = 0u32; j < self.unique_codes.len(); j += 1u32 [self.unique_codes.len()] {
+                if self.unique_codes.get(j) == diag.code {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let _ = self.unique_codes.push(diag.code);
+            }
+        }
+        self
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var r : FixedString256 = FixedString256::new();
+        r.push_str(FixedString256::from("Diagnostic Statistics:\n"));
+        r.push_str(FixedString256::from("  Total: ")); r.push_u32(self.total_diagnostics); r.push_str(FixedString256::from("\n"));
+        r.push_str(FixedString256::from("  Errors: ")); r.push_u32(self.total_errors); r.push_str(FixedString256::from("\n"));
+        r.push_str(FixedString256::from("  Warnings: ")); r.push_u32(self.total_warnings); r.push_str(FixedString256::from("\n"));
+        r.push_str(FixedString256::from("  Notes: ")); r.push_u32(self.total_notes); r.push_str(FixedString256::from("\n"));
+        r.push_str(FixedString256::from("  Residuals: ")); r.push_u32(self.total_residuals); r.push_str(FixedString256::from("\n"));
+        r.push_str(FixedString256::from("  Unique Codes: ")); r.push_u32(self.unique_codes.len()); r.push_str(FixedString256::from("\n"));
+        r
+    }
+}
+
+/// Merge diagnostic statistics from multiple phases.
+/// Effect: pure — bounded merge.
+pub fn merge_statistics(
+    stats : Array64<DiagnosticStatistics>,
+) -> DiagnosticStatistics [pure] {
+    var merged : DiagnosticStatistics = DiagnosticStatistics::new();
+    // Bounded: at most 16 phase statistics.
+    for var i : u32 = 0u32; i < stats.len(); i += 1u32 [stats.len()] {
+        let s : DiagnosticStatistics = stats.get(i);
+        merged.total_diagnostics += s.total_diagnostics;
+        merged.total_errors += s.total_errors;
+        merged.total_warnings += s.total_warnings;
+        merged.total_notes += s.total_notes;
+        merged.total_residuals += s.total_residuals;
+        merged.total_fatal += s.total_fatal;
+    }
+    merged
+}
+
+/// Get the percentage of errors relative to total diagnostics.
+/// Effect: pure — percentage.
+pub fn error_percentage(stats : &DiagnosticStatistics) -> u8 [pure] {
+    if stats.total_diagnostics > 0u32 {
+        ((stats.total_errors * 100u32) / stats.total_diagnostics) as u8
+    } else {
+        0u8
+    }
+}
+
+/// Get a summary string for the compilation output.
+/// Effect: io — summary.
+pub fn compilation_summary(stats : &DiagnosticStatistics, elapsed_ms : u64) -> FixedString256 [io] {
+    var r : FixedString256 = FixedString256::new();
+    r.push_str(FixedString256::from("Compilation complete: "));
+    r.push_u32(stats.total_errors);
+    r.push_str(FixedString256::from(" error(s), "));
+    r.push_u32(stats.total_warnings);
+    r.push_str(FixedString256::from(" warning(s) in "));
+    r.push_u64(elapsed_ms);
+    r.push_str(FixedString256::from("ms"));
+    r
+}
+
+/// Generate a machine-readable JSON-like diagnostic output.
+/// Effect: io — structured output.
+pub fn format_diagnostics_json(diagnostics : &Array256<DiagnosticPayload>) -> FixedString256 [io] {
+    var json : FixedString256 = FixedString256::from("[\n");
+    // Bounded: at most 256 diagnostics.
+    for var i : u32 = 0u32; i < diagnostics.len(); i += 1u32 [diagnostics.len()] {
+        let diag : DiagnosticPayload = diagnostics.get(i);
+        json.push_str(FixedString256::from("  {\n"));
+        json.push_str(FixedString256::from("    \"code\": \""));
+        json.push_str(format_code(diag.code));
+        json.push_str(FixedString256::from("\",\n"));
+        json.push_str(FixedString256::from("    \"severity\": \""));
+        json.push_str(diag.format_severity());
+        json.push_str(FixedString256::from("\",\n"));
+        json.push_str(FixedString256::from("    \"message\": \""));
+        json.push_str(diag.message);
+        json.push_str(FixedString256::from("\",\n"));
+        json.push_str(FixedString256::from("    \"location\": \""));
+        json.push_str(diag.location.format());
+        json.push_str(FixedString256::from("\"\n"));
+        json.push_str(FixedString256::from("  }"));
+        if i + 1u32 < diagnostics.len() {
+            json.push_str(FixedString256::from(","));
+        }
+        json.push_str(FixedString256::from("\n"));
+    }
+    json.push_str(FixedString256::from("]"));
+    json
+}

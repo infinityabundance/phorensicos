@@ -1,0 +1,1223 @@
+// icmp.phor — ICMPv4/v6: echo request/reply, destination unreachable, time exceeded, parameter problem, rate limiting
+// Implements RFC 792 (ICMPv4) and RFC 4443 (ICMPv6) with residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/icmp.phor
+// Court: icmp:v1
+
+package network.icmp;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.math.*;
+import core.serialization.*;
+import network.ethernet.*;
+import network.ipv4.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// ICMP sub-range: 0xE400 - 0xE4FF
+
+type IcmpError = enum {
+    IcmpPacketTooShort      = 0xE400,  // NE400: ICMP packet shorter than minimum
+    IcmpUnknownType         = 0xE401,  // NE401: Unknown ICMP type
+    IcmpChecksumFail        = 0xE402,  // NE402: ICMP checksum mismatch
+    IcmpCodeInvalid         = 0xE403,  // NE403: Invalid ICMP code for type
+    IcmpRateLimitExceeded   = 0xE404,  // NE404: ICMP rate limit exceeded
+    IcmpBufferOverflow      = 0xE405,  // NE405: ICMP buffer overflow
+    IcmpCapabilityError     = 0xE406,  // NE406: Insufficient capability
+    IcmpTooBigForMtu        = 0xE407,  // NE407: ICMP packet too large for MTU
+    IcmpParameterProblem    = 0xE408,  // NE408: ICMP parameter problem
+    IcmpRedirectInvalid     = 0xE409,  // NE409: Invalid ICMP redirect
+    IcmpSourceQuench        = 0xE40A,  // NE40A: ICMP source quench received
+    IcmpNoRoute             = 0xE40B,  // NE40B: ICMP destination unreachable, no route
+    IcmpAdminProhibited     = 0xE40C,  // NE40C: ICMP communication administratively prohibited
+    IcmpIpv6NotSupported    = 0xE40D,  // NE40D: ICMPv6 not supported in this context
+    IcmpIpv4NotSupported    = 0xE40E,  // NE40E: ICMPv4 not supported in this context
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const ICMPV4_HDR_LEN      : u64 = 4;
+const ICMPV6_HDR_LEN      : u64 = 4;
+const ICMP_MIN_ECHO_LEN   : u64 = 8;
+const ICMP_MAX_PAYLOAD    : u64 = 576;
+const ICMP_DEFAULT_TTL    : u8 = 64;
+const ICMP_RATE_LIMIT_MS  : u64 = 1000;
+const ICMP_MAX_PER_SECOND : u64 = 100;
+const ICMP_ECHO_ID_MAX    : u64 = 65535;
+
+// ─────────────────────────────────────────────────────────────
+// ICMPv4 Types and Codes
+// ─────────────────────────────────────────────────────────────
+
+type Icmpv4Type = enum {
+    Icmpv4EchoReply         = 0,
+    Icmpv4DestUnreach       = 3,
+    Icmpv4SourceQuench      = 4,
+    Icmpv4Redirect          = 5,
+    Icmpv4EchoRequest       = 8,
+    Icmpv4RouterAdvert      = 9,
+    Icmpv4RouterSolicit     = 10,
+    Icmpv4TimeExceeded      = 11,
+    Icmpv4ParamProblem      = 12,
+    Icmpv4Timestamp         = 13,
+    Icmpv4TimestampReply    = 14,
+    Icmpv4InfoRequest       = 15,
+    Icmpv4InfoReply         = 16,
+    Icmpv4AddrMaskReq       = 17,
+    Icmpv4AddrMaskReply     = 18,
+    Icmpv4Traceroute        = 30,
+}
+
+type Icmpv4DestUnreachCode = enum {
+    NetUnreach          = 0,
+    HostUnreach         = 1,
+    ProtocolUnreach     = 2,
+    PortUnreach         = 3,
+    FragNeededDfSet     = 4,
+    SourceRouteFailed   = 5,
+    DestNetUnknown      = 6,
+    DestHostUnknown     = 7,
+    SrcHostIsolated     = 8,
+    NetProhibited       = 9,
+    HostProhibited      = 10,
+    NetTosUnreach       = 11,
+    HostTosUnreach      = 12,
+    AdminProhibited     = 13,
+    HostPrecedence      = 14,
+    PrecedenceCutoff    = 15,
+}
+
+type Icmpv4TimeExceededCode = enum {
+    TtlExpired          = 0,
+    FragReassemTimeout  = 1,
+}
+
+type Icmpv4ParamProbCode = enum {
+    PointerIndicates    = 0,
+    MissingRequired     = 1,
+    BadLength           = 2,
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMPv6 Types and Codes
+// ─────────────────────────────────────────────────────────────
+
+type Icmpv6Type = enum {
+    Icmpv6DestUnreach       = 1,
+    Icmpv6PacketTooBig      = 2,
+    Icmpv6TimeExceeded      = 3,
+    Icmpv6ParamProblem      = 4,
+    Icmpv6EchoRequest       = 128,
+    Icmpv6EchoReply         = 129,
+    Icmpv6MldQuery          = 130,
+    Icmpv6MldReport         = 131,
+    Icmpv6MldDone           = 132,
+    Icmpv6NdRouterSol       = 133,
+    Icmpv6NdRouterAdv       = 134,
+    Icmpv6NdNeighborSol     = 135,
+    Icmpv6NdNeighborAdv     = 136,
+    Icmpv6NdRedirect        = 137,
+}
+
+type Icmpv6DestUnreachCode = enum {
+    NoRouteToDest       = 0,
+    CommWithDestProhib  = 1,
+    BeyondScope         = 2,
+    AddrUnreach         = 3,
+    PortUnreach         = 4,
+    SourceAddrFailed    = 5,
+    RejectRoute         = 6,
+}
+
+type Icmpv6TimeExceededCode = enum {
+    HopLimitExpired     = 0,
+    FragReassemTimeout  = 1,
+}
+
+type Icmpv6ParamProbCode = enum {
+    ErroneousHeaderField = 0,
+    UnknownNextHeader    = 1,
+    UnknownOption        = 2,
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Echo (Ping) State
+// ─────────────────────────────────────────────────────────────
+
+struct IcmpEchoState {
+    identifier: u16,
+    sequence: u16,
+    data: Array(u8, 64),
+    data_len: u64,
+}
+
+impl IcmpEchoState {
+    fn new(id: u16, seq: u16, payload: Array(u8, 64), payload_len: u64) -> IcmpEchoState
+        effect [deterministic]
+    {
+        return IcmpEchoState {
+            identifier: id,
+            sequence: seq,
+            data: payload,
+            data_len: payload_len,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Rate Limiter
+// ─────────────────────────────────────────────────────────────
+
+struct IcmpRateLimiter {
+    last_reset: u64,
+    count: u64,
+    limit: u64,
+}
+
+impl IcmpRateLimiter {
+    fn new() -> IcmpRateLimiter
+        effect [deterministic]
+    {
+        return IcmpRateLimiter {
+            last_reset: 0,
+            count: 0,
+            limit: ICMP_MAX_PER_SECOND,
+        };
+    }
+
+    fn allow(self: ref mut, now: u64) -> bool
+        effect [deterministic]
+    {
+        if (now - self.last_reset) >= ICMP_RATE_LIMIT_MS {
+            self.count = 0;
+            self.last_reset = now;
+        };
+        if self.count >= self.limit {
+            return false;
+        };
+        self.count = self.count + 1;
+        return true;
+    }
+
+    fn remaining(self) -> u64
+        effect [deterministic]
+    {
+        if self.count >= self.limit {
+            return 0;
+        } else {
+            return self.limit - self.count;
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMPv4 Packet
+// ─────────────────────────────────────────────────────────────
+
+struct Icmpv4Packet {
+    icmp_type: u8,
+    icmp_code: u8,
+    checksum: u16,
+    body: Array(u8, ICMP_MAX_PAYLOAD),
+    body_length: u64,
+}
+
+impl Icmpv4Packet {
+    fn new(icmp_type: u8, icmp_code: u8) -> Icmpv4Packet
+        effect [deterministic]
+    {
+        return Icmpv4Packet {
+            icmp_type: icmp_type,
+            icmp_code: icmp_code,
+            checksum: 0,
+            body: Array::zeroed(),
+            body_length: 0,
+        };
+    }
+
+    fn echo_request(identifier: u16, sequence: u16, payload: Array(u8, 64), payload_len: u64) -> Icmpv4Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = ((identifier >> 8) & 0xFF) as u8;
+        body[1] = (identifier & 0xFF) as u8;
+        body[2] = ((sequence >> 8) & 0xFF) as u8;
+        body[3] = (sequence & 0xFF) as u8;
+        loop bound 64 {
+            if i >= payload_len {
+                break;
+            };
+            body[4 + i] = payload[i];
+        };
+        let mut pkt: Icmpv4Packet = Icmpv4Packet::new(8, 0);
+        pkt.body = body;
+        pkt.body_length = 4 + payload_len;
+        return pkt;
+    }
+
+    fn echo_reply(identifier: u16, sequence: u16, payload: Array(u8, 64), payload_len: u64) -> Icmpv4Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = ((identifier >> 8) & 0xFF) as u8;
+        body[1] = (identifier & 0xFF) as u8;
+        body[2] = ((sequence >> 8) & 0xFF) as u8;
+        body[3] = (sequence & 0xFF) as u8;
+        loop bound 64 {
+            if i >= payload_len {
+                break;
+            };
+            body[4 + i] = payload[i];
+        };
+        let mut pkt: Icmpv4Packet = Icmpv4Packet::new(0, 0);
+        pkt.body = body;
+        pkt.body_length = 4 + payload_len;
+        return pkt;
+    }
+
+    fn destination_unreachable(code: u8, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv4Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = 0; // unused
+        body[1] = 0;
+        body[2] = 0;
+        body[3] = 0;
+        let copy_len: u64 = if orig_len > 572 { 572 } else { orig_len };
+        loop bound 572 {
+            if i >= copy_len {
+                break;
+            };
+            body[4 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv4Packet = Icmpv4Packet::new(3, code);
+        pkt.body = body;
+        pkt.body_length = 4 + copy_len;
+        return pkt;
+    }
+
+    fn time_exceeded(code: u8, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv4Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = 0;
+        body[1] = 0;
+        body[2] = 0;
+        body[3] = 0;
+        let copy_len: u64 = if orig_len > 572 { 572 } else { orig_len };
+        loop bound 572 {
+            if i >= copy_len {
+                break;
+            };
+            body[4 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv4Packet = Icmpv4Packet::new(11, code);
+        pkt.body = body;
+        pkt.body_length = 4 + copy_len;
+        return pkt;
+    }
+
+    fn parameter_problem(pointer: u8, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv4Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = pointer;
+        body[1] = 0;
+        body[2] = 0;
+        body[3] = 0;
+        let copy_len: u64 = if orig_len > 572 { 572 } else { orig_len };
+        loop bound 572 {
+            if i >= copy_len {
+                break;
+            };
+            body[4 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv4Packet = Icmpv4Packet::new(12, 0);
+        pkt.body = body;
+        pkt.body_length = 4 + copy_len;
+        return pkt;
+    }
+
+    fn compute_checksum(self) -> u16
+        effect [deterministic]
+        court "icmpv4_checksum:v1"
+    {
+        let mut sum: u32 = 0;
+        let total_len: u64 = ICMPV4_HDR_LEN + self.body_length;
+        sum = sum + ((self.icmp_type as u32) << 8) | (self.icmp_code as u32);
+        // Skip checksum field (positions 2-3), it's zeroed
+        let mut idx: u64 = 0;
+        loop bound (ICMP_MAX_PAYLOAD / 2) {
+            if (idx * 2) >= self.body_length {
+                break;
+            };
+            let byte0: u16 = if idx * 2 < self.body_length {
+                self.body[idx * 2] as u16
+            } else {
+                0
+            };
+            let byte1: u16 = if (idx * 2 + 1) < self.body_length {
+                self.body[idx * 2 + 1] as u16
+            } else {
+                0
+            };
+            sum = sum + ((byte0 << 8) | byte1) as u32;
+        };
+        loop bound 4 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        };
+        return (!(sum as u16)) as u16;
+    }
+
+    fn verify_checksum(self) -> bool
+        effect [deterministic]
+    {
+        // Copy and zero checksum for computation
+        let mut copy: Icmpv4Packet = self;
+        copy.checksum = 0;
+        let computed: u16 = copy.compute_checksum();
+        return computed == self.checksum;
+    }
+
+    fn set_and_compute_checksum(self: ref mut)
+        effect [deterministic]
+    {
+        self.checksum = 0;
+        self.checksum = self.compute_checksum();
+    }
+
+    fn parse(data: Array(u8, 1518), len: u64) -> Result(Icmpv4Packet, IcmpError)
+        effect [deterministic]
+        court "icmpv4_parse:v1"
+    {
+        if len < ICMPV4_HDR_LEN {
+            return Result::Err(IcmpError::IcmpPacketTooShort);
+        };
+        let icmp_type: u8 = data[0];
+        let icmp_code: u8 = data[1];
+        let checksum: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        let body_len: u64 = len - ICMPV4_HDR_LEN;
+        if body_len > ICMP_MAX_PAYLOAD {
+            return Result::Err(IcmpError::IcmpBufferOverflow);
+        };
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        loop bound ICMP_MAX_PAYLOAD {
+            if i >= body_len {
+                break;
+            };
+            body[i] = data[ICMPV4_HDR_LEN + i];
+        };
+        let pkt: Icmpv4Packet = Icmpv4Packet {
+            icmp_type: icmp_type,
+            icmp_code: icmp_code,
+            checksum: checksum,
+            body: body,
+            body_length: body_len,
+        };
+        if !pkt.verify_checksum() {
+            return Result::Err(IcmpError::IcmpChecksumFail);
+        };
+        return Result::Ok(pkt);
+    }
+
+    fn serialize(self) -> Result(Array(u8, 1518), IcmpError)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, 1518) = Array::zeroed();
+        buf[0] = self.icmp_type;
+        buf[1] = self.icmp_code;
+        let computed: u16 = self.compute_checksum();
+        buf[2] = ((computed >> 8) & 0xFF) as u8;
+        buf[3] = (computed & 0xFF) as u8;
+        loop bound ICMP_MAX_PAYLOAD {
+            if i >= self.body_length {
+                break;
+            };
+            buf[ICMPV4_HDR_LEN + i] = self.body[i];
+        };
+        return Result::Ok(buf);
+    }
+
+    fn is_echo_request(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 8;
+    }
+
+    fn is_echo_reply(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 0;
+    }
+
+    fn is_dest_unreachable(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 3;
+    }
+
+    fn is_time_exceeded(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 11;
+    }
+
+    fn is_param_problem(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 12;
+    }
+
+    fn echo_id_and_seq(self) -> (u16, u16)
+        effect [deterministic]
+    {
+        let id: u16 = ((self.body[0] as u16) << 8) | (self.body[1] as u16);
+        let seq: u16 = ((self.body[2] as u16) << 8) | (self.body[3] as u16);
+        return (id, seq);
+    }
+
+    fn echo_payload(self) -> (Array(u8, 64), u64)
+        effect [deterministic]
+    {
+        let mut payload: Array(u8, 64) = Array::zeroed();
+        let payload_len: u64 = if self.body_length >= 4 {
+            let plen: u64 = self.body_length - 4;
+            if plen > 64 { 64 } else { plen }
+        } else { 0 };
+        loop bound 64 {
+            if i >= payload_len {
+                break;
+            };
+            payload[i] = self.body[4 + i];
+        };
+        return (payload, payload_len);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMPv6 Packet
+// ─────────────────────────────────────────────────────────────
+
+struct Icmpv6Packet {
+    icmp_type: u8,
+    icmp_code: u8,
+    checksum: u16,
+    body: Array(u8, ICMP_MAX_PAYLOAD),
+    body_length: u64,
+}
+
+impl Icmpv6Packet {
+    fn new(icmp_type: u8, icmp_code: u8) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        return Icmpv6Packet {
+            icmp_type: icmp_type,
+            icmp_code: icmp_code,
+            checksum: 0,
+            body: Array::zeroed(),
+            body_length: 0,
+        };
+    }
+
+    fn echo_request(identifier: u16, sequence: u16, payload: Array(u8, 64), payload_len: u64) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = ((identifier >> 8) & 0xFF) as u8;
+        body[1] = (identifier & 0xFF) as u8;
+        body[2] = ((sequence >> 8) & 0xFF) as u8;
+        body[3] = (sequence & 0xFF) as u8;
+        loop bound 64 {
+            if i >= payload_len {
+                break;
+            };
+            body[4 + i] = payload[i];
+        };
+        let mut pkt: Icmpv6Packet = Icmpv6Packet::new(128, 0);
+        pkt.body = body;
+        pkt.body_length = 4 + payload_len;
+        return pkt;
+    }
+
+    fn echo_reply(identifier: u16, sequence: u16, payload: Array(u8, 64), payload_len: u64) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = ((identifier >> 8) & 0xFF) as u8;
+        body[1] = (identifier & 0xFF) as u8;
+        body[2] = ((sequence >> 8) & 0xFF) as u8;
+        body[3] = (sequence & 0xFF) as u8;
+        loop bound 64 {
+            if i >= payload_len {
+                break;
+            };
+            body[4 + i] = payload[i];
+        };
+        let mut pkt: Icmpv6Packet = Icmpv6Packet::new(129, 0);
+        pkt.body = body;
+        pkt.body_length = 4 + payload_len;
+        return pkt;
+    }
+
+    fn destination_unreachable(code: u8, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = 0; body[1] = 0; body[2] = 0; body[3] = 0;
+        let copy_len: u64 = if orig_len > 572 { 572 } else { orig_len };
+        loop bound 572 {
+            if i >= copy_len {
+                break;
+            };
+            body[4 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv6Packet = Icmpv6Packet::new(1, code);
+        pkt.body = body;
+        pkt.body_length = 4 + copy_len;
+        return pkt;
+    }
+
+    fn packet_too_big(mtu: u32, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = 0; body[1] = 0; body[2] = 0; body[3] = 0;
+        body[4] = ((mtu >> 24) & 0xFF) as u8;
+        body[5] = ((mtu >> 16) & 0xFF) as u8;
+        body[6] = ((mtu >> 8) & 0xFF) as u8;
+        body[7] = (mtu & 0xFF) as u8;
+        let copy_len: u64 = if orig_len > 568 { 568 } else { orig_len };
+        loop bound 568 {
+            if i >= copy_len {
+                break;
+            };
+            body[8 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv6Packet = Icmpv6Packet::new(2, 0);
+        pkt.body = body;
+        pkt.body_length = 8 + copy_len;
+        return pkt;
+    }
+
+    fn time_exceeded(code: u8, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = 0; body[1] = 0; body[2] = 0; body[3] = 0;
+        let copy_len: u64 = if orig_len > 572 { 572 } else { orig_len };
+        loop bound 572 {
+            if i >= copy_len {
+                break;
+            };
+            body[4 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv6Packet = Icmpv6Packet::new(3, code);
+        pkt.body = body;
+        pkt.body_length = 4 + copy_len;
+        return pkt;
+    }
+
+    fn parameter_problem(code: u8, pointer: u32, original_packet: Array(u8, 576), orig_len: u64) -> Icmpv6Packet
+        effect [deterministic]
+    {
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        body[0] = ((pointer >> 24) & 0xFF) as u8;
+        body[1] = ((pointer >> 16) & 0xFF) as u8;
+        body[2] = ((pointer >> 8) & 0xFF) as u8;
+        body[3] = (pointer & 0xFF) as u8;
+        let copy_len: u64 = if orig_len > 572 { 572 } else { orig_len };
+        loop bound 572 {
+            if i >= copy_len {
+                break;
+            };
+            body[4 + i] = original_packet[i];
+        };
+        let mut pkt: Icmpv6Packet = Icmpv6Packet::new(4, code);
+        pkt.body = body;
+        pkt.body_length = 4 + copy_len;
+        return pkt;
+    }
+
+    fn compute_checksum(self, src_addr: Array(u8, 16), dst_addr: Array(u8, 16),
+                         next_header: u8) -> u16
+        effect [deterministic]
+        court "icmpv6_checksum:v1"
+    {
+        let total_len: u64 = ICMPV6_HDR_LEN + self.body_length;
+        // Pseudo-header sum
+        let mut sum: u32 = 0;
+        // Source and destination addresses (16 bytes each)
+        loop bound 16 {
+            let idx: u64 = i;
+            let word_val: u16 = ((src_addr[idx] as u16) << 8) |
+                                (if (idx + 1) < 16 { src_addr[idx + 1] as u16 } else { 0 });
+            sum = sum + word_val as u32;
+        };
+        loop bound 16 {
+            let idx: u64 = i;
+            let word_val: u16 = ((dst_addr[idx] as u16) << 8) |
+                                (if (idx + 1) < 16 { dst_addr[idx + 1] as u16 } else { 0 });
+            sum = sum + word_val as u32;
+        };
+        // Upper-layer packet length
+        sum = sum + ((total_len >> 16) & 0xFFFF) as u32;
+        sum = sum + (total_len & 0xFFFF) as u32;
+        // Next header (zero-extended)
+        sum = sum + ((next_header as u32) << 8);
+        // ICMP header: type and code
+        sum = sum + ((self.icmp_type as u32) << 8) | (self.icmp_code as u32);
+        // Body
+        let mut idx2: u64 = 0;
+        loop bound (ICMP_MAX_PAYLOAD / 2) {
+            if (idx2 * 2) >= self.body_length {
+                break;
+            };
+            let byte0: u16 = if idx2 * 2 < self.body_length {
+                self.body[idx2 * 2] as u16
+            } else { 0 };
+            let byte1: u16 = if (idx2 * 2 + 1) < self.body_length {
+                self.body[idx2 * 2 + 1] as u16
+            } else { 0 };
+            sum = sum + ((byte0 << 8) | byte1) as u32;
+        };
+        loop bound 4 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        };
+        return (!(sum as u16)) as u16;
+    }
+
+    fn parse(data: Array(u8, 1518), len: u64) -> Result(Icmpv6Packet, IcmpError)
+        effect [deterministic]
+    {
+        if len < ICMPV6_HDR_LEN {
+            return Result::Err(IcmpError::IcmpPacketTooShort);
+        };
+        let icmp_type: u8 = data[0];
+        let icmp_code: u8 = data[1];
+        let checksum: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        let body_len: u64 = len - ICMPV6_HDR_LEN;
+        if body_len > ICMP_MAX_PAYLOAD {
+            return Result::Err(IcmpError::IcmpBufferOverflow);
+        };
+        let mut body: Array(u8, ICMP_MAX_PAYLOAD) = Array::zeroed();
+        loop bound ICMP_MAX_PAYLOAD {
+            if i >= body_len {
+                break;
+            };
+            body[i] = data[ICMPV6_HDR_LEN + i];
+        };
+        return Result::Ok(Icmpv6Packet {
+            icmp_type: icmp_type,
+            icmp_code: icmp_code,
+            checksum: checksum,
+            body: body,
+            body_length: body_len,
+        });
+    }
+
+    fn is_echo_request(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 128;
+    }
+
+    fn is_echo_reply(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 129;
+    }
+
+    fn is_dest_unreachable(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 1;
+    }
+
+    fn is_time_exceeded(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 3;
+    }
+
+    fn is_param_problem(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 4;
+    }
+
+    fn is_packet_too_big(self) -> bool
+        effect [deterministic]
+    {
+        return self.icmp_type == 2;
+    }
+
+    fn echo_id_and_seq(self) -> (u16, u16)
+        effect [deterministic]
+    {
+        let id: u16 = ((self.body[0] as u16) << 8) | (self.body[1] as u16);
+        let seq: u16 = ((self.body[2] as u16) << 8) | (self.body[3] as u16);
+        return (id, seq);
+    }
+
+    fn mtu_from_ptb(self) -> u32
+        effect [deterministic]
+    {
+        return ((self.body[4] as u32) << 24) |
+               ((self.body[5] as u32) << 16) |
+               ((self.body[6] as u32) << 8) |
+               (self.body[7] as u32);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Handler State
+// ─────────────────────────────────────────────────────────────
+
+struct IcmpState {
+    v4_rate_limiter: IcmpRateLimiter,
+    v6_rate_limiter: IcmpRateLimiter,
+    echo_id_counter: u16,
+    v4_echo_requests_sent: u64,
+    v4_echo_replies_sent: u64,
+    v4_echo_requests_rcvd: u64,
+    v4_echo_replies_rcvd: u64,
+    v4_errors_sent: u64,
+    v4_errors_rcvd: u64,
+    v6_echo_requests_sent: u64,
+    v6_echo_replies_sent: u64,
+    v6_echo_requests_rcvd: u64,
+    v6_echo_replies_rcvd: u64,
+    v6_errors_sent: u64,
+    v6_errors_rcvd: u64,
+    generation: u64,
+}
+
+impl IcmpState {
+    fn new() -> IcmpState
+        effect [deterministic]
+    {
+        return IcmpState {
+            v4_rate_limiter: IcmpRateLimiter::new(),
+            v6_rate_limiter: IcmpRateLimiter::new(),
+            echo_id_counter: 1,
+            v4_echo_requests_sent: 0,
+            v4_echo_replies_sent: 0,
+            v4_echo_requests_rcvd: 0,
+            v4_echo_replies_rcvd: 0,
+            v4_errors_sent: 0,
+            v4_errors_rcvd: 0,
+            v6_echo_requests_sent: 0,
+            v6_echo_replies_sent: 0,
+            v6_echo_requests_rcvd: 0,
+            v6_echo_replies_rcvd: 0,
+            v6_errors_sent: 0,
+            v6_errors_rcvd: 0,
+            generation: 1,
+        };
+    }
+
+    fn next_echo_id(self: ref mut) -> u16
+        effect [deterministic]
+    {
+        let id: u16 = self.echo_id_counter;
+        self.echo_id_counter = self.echo_id_counter + 1;
+        return id;
+    }
+
+    fn handle_v4_echo(
+        self: ref mut,
+        packet: Icmpv4Packet,
+        now: u64,
+    ) -> Result(Option(Icmpv4Packet), IcmpError)
+        effect [deterministic]
+        court "icmp_handle_v4_echo:v1"
+    {
+        if !packet.is_echo_request() {
+            return Result::Err(IcmpError::IcmpUnknownType);
+        };
+        if !self.v4_rate_limiter.allow(now) {
+            self.v4_echo_requests_rcvd = self.v4_echo_requests_rcvd + 1;
+            return Result::Err(IcmpError::IcmpRateLimitExceeded);
+        };
+        let (id, seq): (u16, u16) = packet.echo_id_and_seq();
+        let (payload, payload_len): (Array(u8, 64), u64) = packet.echo_payload();
+        self.v4_echo_replies_sent = self.v4_echo_replies_sent + 1;
+        self.v4_echo_requests_rcvd = self.v4_echo_requests_rcvd + 1;
+
+        residual emit {
+            op: "icmpv4.echo_reply",
+            identifier: id,
+            sequence: seq,
+            timestamp: now,
+        };
+
+        return Result::Ok(Option::Some(Icmpv4Packet::echo_reply(id, seq, payload, payload_len)));
+    }
+
+    fn handle_v6_echo(
+        self: ref mut,
+        packet: Icmpv6Packet,
+        now: u64,
+    ) -> Result(Option(Icmpv6Packet), IcmpError)
+        effect [deterministic]
+        court "icmp_handle_v6_echo:v1"
+    {
+        if !packet.is_echo_request() {
+            return Result::Err(IcmpError::IcmpUnknownType);
+        };
+        if !self.v6_rate_limiter.allow(now) {
+            return Result::Err(IcmpError::IcmpRateLimitExceeded);
+        };
+        let (id, seq): (u16, u16) = packet.echo_id_and_seq();
+        self.v6_echo_replies_sent = self.v6_echo_replies_sent + 1;
+        self.v6_echo_requests_rcvd = self.v6_echo_requests_rcvd + 1;
+
+        residual emit {
+            op: "icmpv6.echo_reply",
+            identifier: id,
+            sequence: seq,
+            timestamp: now,
+        };
+
+        return Result::Ok(Option::Some(Icmpv6Packet::echo_reply(id, seq, Array::zeroed(), 0)));
+    }
+
+    fn create_v4_dest_unreach(
+        self: ref mut,
+        code: u8,
+        original: Array(u8, 576),
+        orig_len: u64,
+        now: u64,
+    ) -> Result(Icmpv4Packet, IcmpError)
+        effect [deterministic]
+    {
+        if !self.v4_rate_limiter.allow(now) {
+            return Result::Err(IcmpError::IcmpRateLimitExceeded);
+        };
+        self.v4_errors_sent = self.v4_errors_sent + 1;
+
+        residual emit {
+            op: "icmpv4.dest_unreach",
+            code: code,
+            timestamp: now,
+        };
+
+        return Result::Ok(Icmpv4Packet::destination_unreachable(code, original, orig_len));
+    }
+
+    fn create_v4_time_exceeded(
+        self: ref mut,
+        code: u8,
+        original: Array(u8, 576),
+        orig_len: u64,
+        now: u64,
+    ) -> Result(Icmpv4Packet, IcmpError)
+        effect [deterministic]
+    {
+        if !self.v4_rate_limiter.allow(now) {
+            return Result::Err(IcmpError::IcmpRateLimitExceeded);
+        };
+        self.v4_errors_sent = self.v4_errors_sent + 1;
+        return Result::Ok(Icmpv4Packet::time_exceeded(code, original, orig_len));
+    }
+
+    fn create_v4_param_problem(
+        self: ref mut,
+        pointer: u8,
+        original: Array(u8, 576),
+        orig_len: u64,
+        now: u64,
+    ) -> Result(Icmpv4Packet, IcmpError)
+        effect [deterministic]
+    {
+        if !self.v4_rate_limiter.allow(now) {
+            return Result::Err(IcmpError::IcmpRateLimitExceeded);
+        };
+        self.v4_errors_sent = self.v4_errors_sent + 1;
+        return Result::Ok(Icmpv4Packet::parameter_problem(pointer, original, orig_len));
+    }
+
+    fn get_statistics(self) -> IcmpStatistics
+        effect [deterministic]
+    {
+        return IcmpStatistics {
+            v4_echo_requests_sent: self.v4_echo_requests_sent,
+            v4_echo_replies_sent: self.v4_echo_replies_sent,
+            v4_echo_requests_rcvd: self.v4_echo_requests_rcvd,
+            v4_echo_replies_rcvd: self.v4_echo_replies_rcvd,
+            v4_errors_sent: self.v4_errors_sent,
+            v4_errors_rcvd: self.v4_errors_rcvd,
+            v6_echo_requests_sent: self.v6_echo_requests_sent,
+            v6_echo_replies_sent: self.v6_echo_replies_sent,
+            v6_echo_requests_rcvd: self.v6_echo_requests_rcvd,
+            v6_echo_replies_rcvd: self.v6_echo_replies_rcvd,
+            v6_errors_sent: self.v6_errors_sent,
+            v6_errors_rcvd: self.v6_errors_rcvd,
+            generation: self.generation,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Statistics
+// ─────────────────────────────────────────────────────────────
+
+struct IcmpStatistics {
+    v4_echo_requests_sent: u64,
+    v4_echo_replies_sent: u64,
+    v4_echo_requests_rcvd: u64,
+    v4_echo_replies_rcvd: u64,
+    v4_errors_sent: u64,
+    v4_errors_rcvd: u64,
+    v6_echo_requests_sent: u64,
+    v6_echo_replies_sent: u64,
+    v6_echo_requests_rcvd: u64,
+    v6_echo_replies_rcvd: u64,
+    v6_errors_sent: u64,
+    v6_errors_rcvd: u64,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn icmp_init() -> Result(IcmpState, IcmpError)
+    effect [deterministic]
+    court "icmp_init:v1"
+{
+    residual emit {
+        op: "icmp.init",
+        status: "ready",
+    };
+    return Result::Ok(IcmpState::new());
+}
+
+fn icmpv4_code_to_string(icmp_type: u8, icmp_code: u8) -> Array(u8, 64)
+    effect [deterministic]
+{
+    if icmp_type == 0 {
+        return Array::from_literal("Echo Reply");
+    } else if icmp_type == 3 {
+        if icmp_code == 0 { return Array::from_literal("Net Unreachable"); };
+        if icmp_code == 1 { return Array::from_literal("Host Unreachable"); };
+        if icmp_code == 2 { return Array::from_literal("Protocol Unreachable"); };
+        if icmp_code == 3 { return Array::from_literal("Port Unreachable"); };
+        if icmp_code == 4 { return Array::from_literal("Fragmentation Needed DF Set"); };
+        if icmp_code == 13 { return Array::from_literal("Communication Administratively Prohibited"); };
+        return Array::from_literal("Destination Unreachable");
+    } else if icmp_type == 8 {
+        return Array::from_literal("Echo Request");
+    } else if icmp_type == 11 {
+        if icmp_code == 0 { return Array::from_literal("TTL Expired"); };
+        if icmp_code == 1 { return Array::from_literal("Fragment Reassembly Timeout"); };
+        return Array::from_literal("Time Exceeded");
+    } else if icmp_type == 12 {
+        return Array::from_literal("Parameter Problem");
+    } else {
+        return Array::from_literal("Unknown ICMPv4 Type");
+    };
+}
+
+fn icmpv6_type_to_string(icmp_type: u8) -> Array(u8, 64)
+    effect [deterministic]
+{
+    if icmp_type == 1 { return Array::from_literal("Destination Unreachable"); };
+    if icmp_type == 2 { return Array::from_literal("Packet Too Big"); };
+    if icmp_type == 3 { return Array::from_literal("Time Exceeded"); };
+    if icmp_type == 4 { return Array::from_literal("Parameter Problem"); };
+    if icmp_type == 128 { return Array::from_literal("Echo Request"); };
+    if icmp_type == 129 { return Array::from_literal("Echo Reply"); };
+    return Array::from_literal("Unknown ICMPv6 Type");
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Error Reply Generation
+// ─────────────────────────────────────────────────────────────
+
+fn icmpv4_make_error_reply(
+    original: Icmpv4Packet,
+    error_type: u8,
+    error_code: u8,
+    state: ref mut IcmpState,
+    now: u64,
+) -> Result(Option(Icmpv4Packet), IcmpError)
+    effect [deterministic]
+{
+    if !state.v4_rate_limiter.allow(now) {
+        return Result::Err(IcmpError::IcmpRateLimitExceeded);
+    };
+    if error_type == 3 {
+        let reply: Icmpv4Packet = Icmpv4Packet::destination_unreachable(
+            error_code, Array::zeroed(), 576,
+        );
+        state.v4_errors_sent = state.v4_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    } else if error_type == 11 {
+        let reply: Icmpv4Packet = Icmpv4Packet::time_exceeded(
+            error_code, Array::zeroed(), 576,
+        );
+        state.v4_errors_sent = state.v4_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    } else if error_type == 12 {
+        let reply: Icmpv4Packet = Icmpv4Packet::parameter_problem(
+            error_code, Array::zeroed(), 576,
+        );
+        state.v4_errors_sent = state.v4_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    };
+    return Result::Ok(Option::None);
+}
+
+fn icmpv6_make_error_reply(
+    original: Icmpv6Packet,
+    error_type: u8,
+    error_code: u8,
+    state: ref mut IcmpState,
+    now: u64,
+) -> Result(Option(Icmpv6Packet), IcmpError)
+    effect [deterministic]
+{
+    if !state.v6_rate_limiter.allow(now) {
+        return Result::Err(IcmpError::IcmpRateLimitExceeded);
+    };
+    if error_type == 1 {
+        let reply: Icmpv6Packet = Icmpv6Packet::destination_unreachable(
+            error_code, Array::zeroed(), 576,
+        );
+        state.v6_errors_sent = state.v6_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    } else if error_type == 2 {
+        let reply: Icmpv6Packet = Icmpv6Packet::packet_too_big(
+            1280, Array::zeroed(), 576,
+        );
+        state.v6_errors_sent = state.v6_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    } else if error_type == 3 {
+        let reply: Icmpv6Packet = Icmpv6Packet::time_exceeded(
+            error_code, Array::zeroed(), 576,
+        );
+        state.v6_errors_sent = state.v6_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    } else if error_type == 4 {
+        let reply: Icmpv6Packet = Icmpv6Packet::parameter_problem(
+            error_code, 0, Array::zeroed(), 576,
+        );
+        state.v6_errors_sent = state.v6_errors_sent + 1;
+        return Result::Ok(Option::Some(reply));
+    };
+    return Result::Ok(Option::None);
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Ping State Tracking
+// ─────────────────────────────────────────────────────────────
+
+struct PingStats {
+    transmitted: u64,
+    received: u64,
+    lost: u64,
+    min_rtt_ms: u64,
+    max_rtt_ms: u64,
+    avg_rtt_ms: u64,
+    total_rtt_ms: u64,
+    responses: u64,
+}
+
+impl PingStats {
+    fn new() -> PingStats
+        effect [deterministic]
+    {
+        return PingStats {
+            transmitted: 0,
+            received: 0,
+            lost: 0,
+            min_rtt_ms: 0xFFFFFFFFFFFFFFFF,
+            max_rtt_ms: 0,
+            avg_rtt_ms: 0,
+            total_rtt_ms: 0,
+            responses: 0,
+        };
+    }
+
+    fn record_transmit(self: ref mut)
+        effect [deterministic]
+    {
+        self.transmitted = self.transmitted + 1;
+    }
+
+    fn record_response(self: ref mut, rtt_ms: u64)
+        effect [deterministic]
+    {
+        self.received = self.received + 1;
+        self.responses = self.responses + 1;
+        self.total_rtt_ms = self.total_rtt_ms + rtt_ms;
+        if rtt_ms < self.min_rtt_ms {
+            self.min_rtt_ms = rtt_ms;
+        };
+        if rtt_ms > self.max_rtt_ms {
+            self.max_rtt_ms = rtt_ms;
+        };
+        self.avg_rtt_ms = self.total_rtt_ms / self.responses;
+    }
+
+    fn record_loss(self: ref mut)
+        effect [deterministic]
+    {
+        self.lost = self.lost + 1;
+    }
+
+    fn loss_percent(self) -> u64
+        effect [deterministic]
+    {
+        if self.transmitted == 0 {
+            return 0;
+        };
+        return (self.lost * 100) / self.transmitted;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ICMP Echo Payload Generator
+// ─────────────────────────────────────────────────────────────
+
+fn icmp_build_echo_payload(pattern: u8, len: u64) -> Result(Array(u8, 64), IcmpError)
+    effect [deterministic]
+{
+    if len > 64 {
+        return Result::Err(IcmpError::IcmpBufferOverflow);
+    };
+    let mut payload: Array(u8, 64) = Array::zeroed();
+    loop bound 64 {
+        if i >= len {
+            break;
+        };
+        payload[i] = pattern + (i as u8);
+    };
+    return Result::Ok(payload);
+}
+
+fn icmp_validate_echo_payload(payload: Array(u8, 64), payload_len: u64, pattern: u8) -> bool
+    effect [deterministic]
+{
+    loop bound 64 {
+        if i >= payload_len {
+            break;
+        };
+        if payload[i] != (pattern + (i as u8)) {
+            return false;
+        };
+    };
+    return true;
+}

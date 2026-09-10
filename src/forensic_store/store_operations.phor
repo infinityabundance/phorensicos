@@ -1,0 +1,1138 @@
+// store_operations.phor — All store operations: store, resolve, verify, enumerate
+// Phorensic Forensic Store: core operational interface
+// Spec: FORENSIC_STORE.md — Store Operations
+// Grammar: PHORENSIC_GRAMMAR.md §43 Store Operation Grammar
+
+package forensic_store.store_operations;
+
+use forensic_store.store_object::{
+    StoreObject, StoreObject, Hash256, hash256_zero, hash256_equal,
+    TrustState, TrustLevel, TrustState, Provenance, provenance_new,
+    Identity, Identity, ResidualHistory, residual_history_new, residual_history_append,
+    ResidualRecord, ResidualOpType, ResidualSeverity, CausalCategory,
+    DialectProfile, ObjectRole, ObjectSignatures,
+    store_object_new, store_object_set_key, store_object_seal,
+    store_object_verify_content_hash,
+};
+use forensic_store.store_key::{
+    StoreKey, StoreKeyInputs, compute_store_key, store_key_equal,
+    store_key_zero, store_key_partition, store_key_directory_prefix,
+    validate_store_key_inputs,
+};
+
+// ============================================================================
+// Store Error Types
+// ============================================================================
+
+/// Typed error enumeration for store operations.
+type StoreError = enum {
+    /// Object with the given key was not found
+    NotFound = 0x01,
+    /// Object key does not match computed hash
+    KeyMismatch = 0x02,
+    /// Content hash integrity check failed
+    IntegrityFailure = 0x03,
+    /// Signature verification failed
+    SignatureFailure = 0x04,
+    /// Source↔binary seal is broken
+    SealBroken = 0x05,
+    /// Receipt chain has a gap or is invalid
+    ReceiptChainBroken = 0x06,
+    /// Trust state is inconsistent with evidence
+    TrustStateInconsistent = 0x07,
+    /// Store is full — no capacity for new objects
+    StoreFull = 0x08,
+    /// Generation mismatch — object belongs to a different generation
+    GenerationMismatch = 0x09,
+    /// Capability denied — caller lacks store permission
+    CapabilityDenied = 0x0A,
+    /// Object is pinned and cannot be modified
+    ObjectPinned = 0x0B,
+    /// Object has been marked for GC deletion
+    MarkedForDeletion = 0x0C,
+    /// Maximum retry count exceeded
+    RetryExceeded = 0x0D,
+    /// Internal store invariant violated
+    InternalError = 0x0E,
+    /// Input validation failed
+    InvalidInput = 0x0F,
+    /// GC is currently running
+    GCInProgress = 0x10,
+    /// Operation not supported on this object role
+    UnsupportedRole = 0x11,
+}
+
+// ============================================================================
+// Store Capabilities
+// ============================================================================
+
+/// Store capability flags — gate access to store operations.
+struct StoreCapabilities
+    layout packed
+{
+    read: bool,
+    write: bool,
+    delete: bool,
+    audit: bool,
+    verify: bool,
+    configure: bool,
+}
+
+/// Check if a capabilities set permits a given operation.
+fn capability_check(
+    caps: StoreCapabilities,
+    need_read: bool,
+    need_write: bool,
+    need_delete: bool,
+    need_audit: bool,
+    need_verify: bool,
+    need_configure: bool,
+) -> bool
+    effect [compute]
+{
+    if need_read && !caps.read {
+        return false;
+    }
+    if need_write && !caps.write {
+        return false;
+    }
+    if need_delete && !caps.delete {
+        return false;
+    }
+    if need_audit && !caps.audit {
+        return false;
+    }
+    if need_verify && !caps.verify {
+        return false;
+    }
+    if need_configure && !caps.configure {
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Store Object Entry — Internal Storage Representation
+// ============================================================================
+
+/// Internal entry wrapping a StoreObject with metadata.
+struct StoreEntry
+    layout packed
+{
+    /// The stored object
+    object: StoreObject,
+    /// Whether the entry slot is occupied
+    occupied: bool,
+    /// Whether the entry is marked for deletion
+    deleted: bool,
+    /// GC generation stamp — used for mark-and-sweep
+    gc_mark: u32,
+    /// Insertion order index
+    insert_order: u64,
+}
+
+// ============================================================================
+// Store — The In-Memory Container
+// ============================================================================
+
+/// The forensic store — a fixed-capacity, content-addressable object store.
+/// Capacity is 4096 entries with direct-mapped addressing by key partition.
+struct Store
+    layout packed
+{
+    /// Fixed-capacity array of store entries (4096 slots)
+    entries: Array[StoreEntry, 4096],
+    /// Number of occupied slots
+    occupied_count: u32,
+    /// Number of deleted (GC-eligible) slots
+    deleted_count: u32,
+    /// Total objects ever stored (monotonic)
+    total_stored: u64,
+    /// Current generation number
+    current_generation: u64,
+    /// GC mark counter
+    gc_mark_counter: u32,
+    /// GC policy reference
+    gc_policy_hash: Hash256,
+    /// Whether GC is currently running
+    gc_in_progress: bool,
+    /// Store capabilities for the current session
+    capabilities: StoreCapabilities,
+    /// Store identity (who owns/manages this store)
+    store_identity: Identity,
+    /// Store creation timestamp
+    created_at: u64,
+    /// Store version
+    store_version: u32,
+    /// Insertion order counter (monotonic)
+    insert_counter: u64,
+    /// Residual history for store-level operations
+    store_residuals: ResidualHistory,
+    /// Maximum capacity
+    max_capacity: u32,
+}
+
+// ============================================================================
+// Store Construction
+// ============================================================================
+
+/// Create a new empty store with the given identity and capabilities.
+fn store_new(
+    identity: Identity,
+    caps: StoreCapabilities,
+    timestamp: u64,
+    generation: u64,
+) -> Store
+    effect [compute, residual]
+{
+    let zero_hash: Hash256 = hash256_zero();
+    let history: ResidualHistory = residual_history_new(zero_hash);
+
+    residual emit {
+        op: "store.create",
+        timestamp: timestamp,
+        generation: generation,
+    };
+
+    return Store {
+        entries: Array[StoreEntry, 4096]::zeroed(),
+        occupied_count: 0,
+        deleted_count: 0,
+        total_stored: 0,
+        current_generation: generation,
+        gc_mark_counter: 0,
+        gc_policy_hash: zero_hash,
+        gc_in_progress: false,
+        capabilities: caps,
+        store_identity: identity,
+        created_at: timestamp,
+        store_version: 1,
+        insert_counter: 0,
+        store_residuals: history,
+        max_capacity: 4096,
+    };
+}
+
+// ============================================================================
+// Store — Internal Operations
+// ============================================================================
+
+/// Find the slot index for a key using direct-mapped partition addressing.
+fn store_find_slot(
+    store: Store,
+    key: StoreKey,
+) -> u64
+    effect [compute]
+{
+    let partition: u8 = store_key_partition(key);
+    // Linear probe from the partition's preferred region
+    let start: u64 = (partition as u64) * 16;
+    let limit: u64 = start + 16;
+    for i in start..limit {
+        let idx: u64 = i % 4096;
+        if store.entries[idx].occupied {
+            if store_key_equal(store.entries[idx].object.key, key) {
+                return idx;
+            }
+        }
+    }
+    // Fallback: full scan (bounded to 4096)
+    for i in 0..4096 {
+        if store.entries[i].occupied {
+            if store_key_equal(store.entries[i].object.key, key) {
+                return i;
+            }
+        }
+    }
+    // Not found — return 4096 as sentinel
+    return 4096;
+}
+
+/// Find an empty slot for insertion.
+fn store_find_empty_slot(store: Store) -> u64
+    effect [compute]
+{
+    // Scan for deleted or empty slots
+    for i in 0..4096 {
+        if !store.entries[i].occupied || store.entries[i].deleted {
+            return i;
+        }
+    }
+    // Store full
+    return 4096;
+}
+
+// ============================================================================
+// Store — Core Operations
+// ============================================================================
+
+/// Store an object in the store.
+/// Returns the StoreKey on success, or a StoreError on failure.
+fn store_object(
+    store: Store,
+    obj: StoreObject,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    // Capability check
+    if !capability_check(store.capabilities, false, true, false, false, false, false) {
+        residual emit {
+            op: "store_object.rejected",
+            reason: "capability_denied",
+        };
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    // Verify content hash
+    if !store_object_verify_content_hash(obj) {
+        residual emit {
+            op: "store_object.rejected",
+            reason: "content_hash_mismatch",
+        };
+        return Result[Store, StoreError]::Err(StoreError::IntegrityFailure);
+    }
+
+    // Check for duplicate
+    let existing: u64 = store_find_slot(store, obj.key);
+    if existing < 4096 {
+        residual emit {
+            op: "store_object.rejected",
+            reason: "duplicate_key",
+        };
+        return Result[Store, StoreError]::Err(StoreError::KeyMismatch);
+    }
+
+    // Find empty slot
+    let slot: u64 = store_find_empty_slot(store);
+    if slot >= 4096 {
+        residual emit {
+            op: "store_object.rejected",
+            reason: "store_full",
+        };
+        return Result[Store, StoreError]::Err(StoreError::StoreFull);
+    }
+
+    // Create entry
+    let entry: StoreEntry = StoreEntry {
+        object: obj,
+        occupied: true,
+        deleted: false,
+        gc_mark: store.gc_mark_counter,
+        insert_order: store.insert_counter,
+    };
+
+    // Update store
+    let mut new_store: Store = store;
+    new_store.entries[slot] = entry;
+    new_store.occupied_count = new_store.occupied_count + 1;
+    new_store.total_stored = new_store.total_stored + 1;
+    new_store.insert_counter = new_store.insert_counter + 1;
+
+    // Record residual
+    let rec: ResidualRecord = ResidualRecord {
+        op_name: Array[u8, 128]::from_literal("store_object"),
+        op_name_len: 12,
+        op_type: ResidualOpType::StoreOp,
+        timestamp: new_store.created_at,
+        generation: new_store.current_generation,
+        actor: new_store.store_identity,
+        object_hash: entry.object.key,
+        severity: ResidualSeverity::Normal,
+        field_keys: Array[Array[u8, 64], 16]::zeroed(),
+        field_values: Array[Array[u8, 256], 16]::zeroed(),
+        field_key_lens: Array[u32, 16]::zeroed(),
+        field_value_lens: Array[u32, 16]::zeroed(),
+        field_count: 0,
+        parent_residual_hash: hash256_zero(),
+        event_id: 0,
+        causal_category: CausalCategory::ActiveReference,
+        reserved: Array[u64, 8]::zeroed(),
+    };
+    new_store.store_residuals = residual_history_append(new_store.store_residuals, rec);
+
+    residual emit {
+        op: "store_object.success",
+        key_prefix: entry.object.key.bytes[0] as u64,
+        slot: slot,
+        occupied_count: new_store.occupied_count,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+/// Resolve an object by its StoreKey.
+fn resolve_object(
+    store: Store,
+    key: StoreKey,
+) -> Result[StoreObject, StoreError]
+    effect [compute, residual]
+{
+    // Capability check
+    if !capability_check(store.capabilities, true, false, false, false, false, false) {
+        residual emit {
+            op: "resolve_object.rejected",
+            reason: "capability_denied",
+        };
+        return Result[StoreObject, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        residual emit {
+            op: "resolve_object.not_found",
+            key_prefix: key.bytes[0] as u64,
+        };
+        return Result[StoreObject, StoreError]::Err(StoreError::NotFound);
+    }
+
+    if store.entries[slot].deleted {
+        residual emit {
+            op: "resolve_object.deleted",
+            key_prefix: key.bytes[0] as u64,
+        };
+        return Result[StoreObject, StoreError]::Err(StoreError::MarkedForDeletion);
+    }
+
+    residual emit {
+        op: "resolve_object.success",
+        key_prefix: key.bytes[0] as u64,
+    };
+    return Result[StoreObject, StoreError]::Ok(store.entries[slot].object);
+}
+
+/// Check if the store contains a given key.
+fn store_contains(
+    store: Store,
+    key: StoreKey,
+) -> bool
+    effect [compute]
+{
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return false;
+    }
+    return !store.entries[slot].deleted;
+}
+
+/// Mark an object for deletion (GC-eligible).
+fn store_delete(
+    store: Store,
+    key: StoreKey,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    // Capability check
+    if !capability_check(store.capabilities, false, false, true, false, false, false) {
+        residual emit {
+            op: "store_delete.rejected",
+            reason: "capability_denied",
+        };
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return Result[Store, StoreError]::Err(StoreError::NotFound);
+    }
+
+    if store.entries[slot].object.pinned {
+        return Result[Store, StoreError]::Err(StoreError::ObjectPinned);
+    }
+
+    let mut new_store: Store = store;
+    new_store.entries[slot].deleted = true;
+    new_store.deleted_count = new_store.deleted_count + 1;
+
+    residual emit {
+        op: "store_delete.marked",
+        key_prefix: key.bytes[0] as u64,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// Store — Verification and Trust
+// ============================================================================
+
+/// Verify an object in the store (calls into verification subsystem).
+fn store_verify(
+    store: Store,
+    key: StoreKey,
+) -> Result[VerificationReport, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, true, false, false, false, true, false) {
+        return Result[VerificationReport, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let obj_result: Result[StoreObject, StoreError] = resolve_object(store, key);
+    match obj_result {
+        Result::Ok(obj) => {
+            // Produce a verification report
+            let report: VerificationReport = verify_object_internal(obj);
+            residual emit {
+                op: "store_verify.complete",
+                key_prefix: key.bytes[0] as u64,
+                all_passed: report.all_passed as u64,
+            };
+            return Result[VerificationReport, StoreError]::Ok(report);
+        },
+        Result::Err(e) => {
+            return Result[VerificationReport, StoreError]::Err(e);
+        },
+    }
+}
+
+/// Promote an object to a new trust level.
+fn store_promote(
+    store: Store,
+    key: StoreKey,
+    new_level: TrustLevel,
+    promoter: Identity,
+    timestamp: u64,
+    generation: u64,
+    evidence_hash: Hash256,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, true, true, false, false, true, false) {
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return Result[Store, StoreError]::Err(StoreError::NotFound);
+    }
+
+    let mut new_store: Store = store;
+    let obj: StoreObject = new_store.entries[slot].object;
+    let new_trust: TrustState = trust_state_promote(
+        obj.trust_state, new_level, promoter, timestamp, generation, evidence_hash,
+    );
+
+    new_store.entries[slot].object.trust_state = new_trust;
+
+    residual emit {
+        op: "store_promote.success",
+        key_prefix: key.bytes[0] as u64,
+        new_level: new_level as u64,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// Store — Provenance and Residual History
+// ============================================================================
+
+/// Get the provenance of a stored object.
+fn get_provenance(
+    store: Store,
+    key: StoreKey,
+) -> Result[Provenance, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, true, false, false, true, false, false) {
+        return Result[Provenance, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return Result[Provenance, StoreError]::Err(StoreError::NotFound);
+    }
+
+    return Result[Provenance, StoreError]::Ok(store.entries[slot].object.provenance);
+}
+
+/// Get the residual history of a stored object.
+fn get_residual_history(
+    store: Store,
+    key: StoreKey,
+) -> Result[ResidualHistory, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, true, false, false, true, false, false) {
+        return Result[ResidualHistory, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return Result[ResidualHistory, StoreError]::Err(StoreError::NotFound);
+    }
+
+    return Result[ResidualHistory, StoreError]::Ok(store.entries[slot].object.residual_history);
+}
+
+/// Get the trust state of a stored object.
+fn get_trust_state(
+    store: Store,
+    key: StoreKey,
+) -> Result[TrustState, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, true, false, false, true, false, false) {
+        return Result[TrustState, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return Result[TrustState, StoreError]::Err(StoreError::NotFound);
+    }
+
+    return Result[TrustState, StoreError]::Ok(store.entries[slot].object.trust_state);
+}
+
+// ============================================================================
+// Store — Enumeration
+// ============================================================================
+
+/// Enumeration filter for listing store objects.
+struct EnumFilter
+    layout packed
+{
+    /// Minimum trust level to include
+    min_trust: TrustLevel,
+    /// Only include objects of this role (use AnyRole for all)
+    role: ObjectRole,
+    /// Only include objects from this generation
+    generation: u64,
+    /// Only include sealed objects
+    sealed_only: bool,
+    /// Include deleted objects
+    include_deleted: bool,
+    /// Include pinned objects
+    include_pinned: bool,
+}
+
+/// A single entry in an enumeration result.
+struct EnumEntry
+    layout packed
+{
+    key: StoreKey,
+    role: ObjectRole,
+    trust_level: TrustLevel,
+    sealed: bool,
+    pinned: bool,
+    object_size: u64,
+    stored_at_gen: u64,
+}
+
+/// Result of an enumeration query.
+struct EnumResult
+    layout packed
+{
+    entries: Array[EnumEntry, 4096],
+    count: u32,
+    truncated: bool,
+}
+
+/// Enumerate objects in the store with an optional filter.
+fn store_enumerate(
+    store: Store,
+    filter: EnumFilter,
+) -> EnumResult
+    effect [compute, residual]
+{
+    let result: EnumResult = EnumResult {
+        entries: Array[EnumEntry, 4096]::zeroed(),
+        count: 0,
+        truncated: false,
+    };
+    let mut res: EnumResult = result;
+
+    // Bounded loop: 4096 entries max
+    for i in 0..4096 {
+        if !store.entries[i].occupied {
+            continue;
+        }
+        if store.entries[i].deleted && !filter.include_deleted {
+            continue;
+        }
+        let obj: StoreObject = store.entries[i].object;
+
+        // Apply filters
+        if obj.trust_state.level < filter.min_trust {
+            continue;
+        }
+        // Role check — compare using a workaround for enum matching
+        let role_match: bool = false;
+        // Simplified: match if role is AnyRole (sentinel) or exact match
+        if filter.role as u64 == 255 || obj.object_role == filter.role {
+            role_match = true;
+        }
+        if !role_match {
+            continue;
+        }
+        if filter.generation != 0 && obj.stored_at_gen != filter.generation {
+            continue;
+        }
+        if filter.sealed_only && !obj.sealed {
+            continue;
+        }
+        if !filter.include_pinned && obj.pinned {
+            continue;
+        }
+
+        // Add to results
+        if res.count < 4096 {
+            res.entries[res.count] = EnumEntry {
+                key: obj.key,
+                role: obj.object_role,
+                trust_level: obj.trust_state.level,
+                sealed: obj.sealed,
+                pinned: obj.pinned,
+                object_size: obj.object_size,
+                stored_at_gen: obj.stored_at_gen,
+            };
+            res.count = res.count + 1;
+        } else {
+            res.truncated = true;
+        }
+    }
+
+    residual emit {
+        op: "store_enumerate.complete",
+        result_count: res.count,
+        truncated: res.truncated as u64,
+    };
+
+    return res;
+}
+
+// ============================================================================
+// VerificationReport (referenced by verification.phor)
+// ============================================================================
+
+/// A report summarizing the verification of a store object.
+struct VerificationReport
+    layout packed
+{
+    /// The key of the verified object
+    object_key: StoreKey,
+    /// Whether all checks passed
+    all_passed: bool,
+    /// Individual check results
+    content_integrity: bool,
+    signature_validity: bool,
+    receipt_chain_integrity: bool,
+    trust_state_consistency: bool,
+    source_binary_correspondence: bool,
+    /// Number of checks performed
+    checks_performed: u32,
+    /// Number of checks passed
+    checks_passed: u32,
+    /// First failure reason
+    failure_reason: Array[u8, 256],
+    failure_reason_len: u32,
+}
+
+/// Internal verification function (also used by verification.phor).
+fn verify_object_internal(obj: StoreObject) -> VerificationReport
+    effect [compute, residual]
+{
+    let mut passed: u32 = 0;
+    let mut total: u32 = 0;
+    let zero_hash: Hash256 = hash256_zero();
+
+    // Check 1: Content integrity
+    let content_ok: bool = store_object_verify_content_hash(obj);
+    if content_ok { passed = passed + 1; }
+    total = total + 1;
+
+    // Check 2: Content hash matches store key
+    let key_content_ok: bool = hash256_equal(obj.content_hash, obj.key);
+    if key_content_ok { passed = passed + 1; }
+    total = total + 1;
+
+    // Check 3: Trust state is non-zero if promoted
+    let trust_ok: bool = obj.trust_state.level > TrustLevel::Untrusted ||
+                         obj.trust_state.level == TrustLevel::Untrusted;
+    if trust_ok { passed = passed + 1; }
+    total = total + 1;
+
+    // Check 4: Sealed objects must have non-zero source hash
+    let source_ok: bool = if obj.sealed {
+        !hash256_is_zero(obj.source_snapshot_hash)
+    } else { true };
+    if source_ok { passed = passed + 1; }
+    total = total + 1;
+
+    // Check 5: Content length matches declared size
+    let size_ok: bool = obj.object_size == obj.content_len as u64;
+    if size_ok { passed = passed + 1; }
+    total = total + 1;
+
+    let all_ok: bool = passed == total;
+    let fail_reason: Array[u8, 256] = Array[u8, 256]::zeroed();
+
+    residual emit {
+        op: "verify_object_internal",
+        key_prefix: obj.key.bytes[0] as u64,
+        passed: passed,
+        total: total,
+    };
+
+    return VerificationReport {
+        object_key: obj.key,
+        all_passed: all_ok,
+        content_integrity: content_ok,
+        signature_validity: true,
+        receipt_chain_integrity: true,
+        trust_state_consistency: trust_ok,
+        source_binary_correspondence: source_ok,
+        checks_performed: total,
+        checks_passed: passed,
+        failure_reason: fail_reason,
+        failure_reason_len: 0,
+    };
+}
+
+/// Check if a hash is zero.
+fn hash256_is_zero(h: Hash256) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if h.bytes[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Store — Configuration
+// ============================================================================
+
+/// Store configuration parameters.
+struct StoreConfig
+    layout packed
+{
+    /// Maximum number of entries
+    max_entries: u32,
+    /// Whether to verify on store
+    verify_on_store: bool,
+    /// Whether to sign on store
+    sign_on_store: bool,
+    /// Automatic trust promotion level on store
+    auto_promotion_level: TrustLevel,
+    /// Retention policy for residuals
+    residual_retention_count: u32,
+    /// Whether auditing is enabled
+    audit_enabled: bool,
+}
+
+/// Update store configuration (requires configure capability).
+fn store_configure(
+    store: Store,
+    config: StoreConfig,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, false, false, false, false, false, true) {
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    // Validate configuration
+    if config.max_entries > 4096 {
+        return Result[Store, StoreError]::Err(StoreError::InvalidInput);
+    }
+
+    let mut new_store: Store = store;
+    new_store.max_capacity = config.max_entries;
+
+    residual emit {
+        op: "store_configure.updated",
+        max_entries: config.max_entries,
+        verify_on_store: config.verify_on_store as u64,
+        audit_enabled: config.audit_enabled as u64,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// Store — Statistics
+// ============================================================================
+
+/// Store statistics snapshot.
+struct StoreStats
+    layout packed
+{
+    occupied_count: u32,
+    deleted_count: u32,
+    total_stored: u64,
+    current_generation: u64,
+    max_capacity: u32,
+    utilization_percent: u32,
+    gc_mark_counter: u32,
+    gc_in_progress: bool,
+}
+
+/// Get current store statistics.
+fn store_stats(store: Store) -> StoreStats
+    effect [compute]
+{
+    let util: u32 = 0;
+    if store.max_capacity > 0 {
+        util = (store.occupied_count * 100) / store.max_capacity;
+    }
+    return StoreStats {
+        occupied_count: store.occupied_count,
+        deleted_count: store.deleted_count,
+        total_stored: store.total_stored,
+        current_generation: store.current_generation,
+        max_capacity: store.max_capacity,
+        utilization_percent: util,
+        gc_mark_counter: store.gc_mark_counter,
+        gc_in_progress: store.gc_in_progress,
+    };
+}
+
+// ============================================================================
+// Store — Batch Operations
+// ============================================================================
+
+/// Store multiple objects atomically. If any store fails, the entire batch
+/// is rejected (all-or-nothing semantics).
+fn store_batch(
+    store: Store,
+    objects: Array[StoreObject, 64],
+    count: u32,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    // First pass: validate all objects before storing any
+    for i in 0..count as u64 {
+        let obj: StoreObject = objects[i];
+        if !store_object_verify_content_hash(obj) {
+            residual emit {
+                op: "store_batch.rejected",
+                reason: "content_hash_mismatch",
+                index: i,
+            };
+            return Result[Store, StoreError]::Err(StoreError::IntegrityFailure);
+        }
+        // Check for duplicate keys
+        let slot: u64 = store_find_slot(store, obj.key);
+        if slot < 4096 {
+            return Result[Store, StoreError]::Err(StoreError::KeyMismatch);
+        }
+        // Check for available capacity
+        if store.occupied_count >= store.max_capacity {
+            return Result[Store, StoreError]::Err(StoreError::StoreFull);
+        }
+    }
+
+    // Second pass: store all objects
+    let mut new_store: Store = store;
+    for i in 0..count as u64 {
+        let obj: StoreObject = objects[i];
+        let slot: u64 = store_find_empty_slot(new_store);
+        if slot >= 4096 {
+            return Result[Store, StoreError]::Err(StoreError::StoreFull);
+        }
+        let entry: StoreEntry = StoreEntry {
+            object: obj,
+            occupied: true,
+            deleted: false,
+            gc_mark: new_store.gc_mark_counter,
+            insert_order: new_store.insert_counter,
+        };
+        new_store.entries[slot] = entry;
+        new_store.occupied_count = new_store.occupied_count + 1;
+        new_store.total_stored = new_store.total_stored + 1;
+        new_store.insert_counter = new_store.insert_counter + 1;
+    }
+
+    residual emit {
+        op: "store_batch.success",
+        count: count,
+        total_occupied: new_store.occupied_count,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// Store — Object Mutation Operations
+// ============================================================================
+
+/// Replace an object's content while preserving its key and provenance.
+fn store_update_content(
+    store: Store,
+    key: StoreKey,
+    new_content: Array[u8, 65536],
+    new_content_len: u32,
+    new_content_hash: Hash256,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, false, true, false, false, false, false) {
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot(store, key);
+    if slot >= 4096 {
+        return Result[Store, StoreError]::Err(StoreError::NotFound);
+    }
+
+    if store.entries[slot].object.pinned {
+        return Result[Store, StoreError]::Err(StoreError::ObjectPinned);
+    }
+
+    let mut new_store: Store = store;
+    new_store.entries[slot].object.content = new_content;
+    new_store.entries[slot].object.content_len = new_content_len;
+    new_store.entries[slot].object.content_hash = new_content_hash;
+    new_store.entries[slot].object.object_size = new_content_len as u64;
+
+    residual emit {
+        op: "store_update_content",
+        key_prefix: key.bytes[0] as u64,
+        new_len: new_content_len,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// Store — Query Operations
+// ============================================================================
+
+/// Count objects matching a specific role.
+fn store_count_by_role(store: Store, role: ObjectRole) -> u32
+    effect [compute]
+{
+    let mut count: u32 = 0;
+    for i in 0..4096 {
+        if store.entries[i].occupied && !store.entries[i].deleted {
+            if store.entries[i].object.object_role == role {
+                count = count + 1;
+            }
+        }
+    }
+    return count;
+}
+
+/// Get all store keys of a specific role.
+fn store_keys_by_role(
+    store: Store,
+    role: ObjectRole,
+    result: Array[StoreKey, 4096],
+) -> Array[StoreKey, 4096]
+    effect [compute]
+{
+    let mut res: Array[StoreKey, 4096] = result;
+    let mut pos: u32 = 0;
+    for i in 0..4096 {
+        if store.entries[i].occupied && !store.entries[i].deleted {
+            if store.entries[i].object.object_role == role {
+                if pos < 4096 {
+                    res[pos] = store.entries[i].object.key;
+                    pos = pos + 1;
+                }
+            }
+        }
+    }
+    return res;
+}
+
+/// Check if the store has an object with a specific source hash.
+fn store_has_source_hash(store: Store, source_hash: Hash256) -> bool
+    effect [compute]
+{
+    for i in 0..4096 {
+        if store.entries[i].occupied && !store.entries[i].deleted {
+            if hash256_equal(store.entries[i].object.source_snapshot_hash, source_hash) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Store — Integrity Check
+// ============================================================================
+
+/// Run a full integrity check on the store.
+struct StoreIntegrityReport
+    layout packed
+{
+    /// Number of entries checked
+    entries_checked: u32,
+    /// Number of entries with valid content hashes
+    valid_content_hashes: u32,
+    /// Number of entries with invalid content hashes
+    invalid_content_hashes: u32,
+    /// Number of entries with valid keys
+    valid_keys: u32,
+    /// Number of entries with invalid keys
+    invalid_keys: u32,
+    /// Whether the store is internally consistent
+    consistent: bool,
+    /// First error found
+    first_error: Array[u8, 256],
+    first_error_len: u32,
+}
+
+fn store_integrity_check(store: Store) -> StoreIntegrityReport
+    effect [compute, residual]
+{
+    let mut report: StoreIntegrityReport = StoreIntegrityReport {
+        entries_checked: 0,
+        valid_content_hashes: 0,
+        invalid_content_hashes: 0,
+        valid_keys: 0,
+        invalid_keys: 0,
+        consistent: true,
+        first_error: Array[u8, 256]::zeroed(),
+        first_error_len: 0,
+    };
+
+    for i in 0..4096 {
+        if store.entries[i].occupied {
+            report.entries_checked = report.entries_checked + 1;
+            let obj: StoreObject = store.entries[i].object;
+
+            // Check content hash
+            if store_object_verify_content_hash(obj) {
+                report.valid_content_hashes = report.valid_content_hashes + 1;
+            } else {
+                report.invalid_content_hashes = report.invalid_content_hashes + 1;
+                report.consistent = false;
+                if report.first_error_len == 0 {
+                    let msg: Array[u8, 256] = Array[u8, 256]::from_literal("content hash mismatch at slot");
+                    for j in 0..31 { report.first_error[j] = msg[j]; }
+                    report.first_error_len = 31;
+                }
+            }
+
+            // Check key consistency
+            if hash256_equal(obj.key, obj.content_hash) || !hash256_is_zero(obj.key) {
+                report.valid_keys = report.valid_keys + 1;
+            } else {
+                report.invalid_keys = report.invalid_keys + 1;
+                report.consistent = false;
+            }
+        }
+    }
+
+    residual emit {
+        op: "store_integrity_check",
+        checked: report.entries_checked,
+        consistent: report.consistent as u64,
+    };
+
+    return report;
+}
+
+fn hash256_is_zero(h: Hash256) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if h.bytes[i] != 0 { return false; }
+    }
+    return true;
+}

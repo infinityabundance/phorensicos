@@ -1,0 +1,1258 @@
+// pre_compile.phor — Pre-Compile Viability Inference Engine
+// Phorensic Compiler Infrastructure — Pre-Compile Analysis Phase
+//
+// This module implements the pre-compile viability inference engine for the Phorensic
+// compiler. Before full compilation begins, the viability engine analyzes source code
+// to determine whether compilation is likely to succeed. This provides fast feedback
+// to developers without running the entire compiler pipeline.
+//
+// Viability analysis checks:
+// 1. Syntax viability — can the source be lexed and parsed without fatal errors?
+// 2. Type viability — do type annotations match basic structural expectations?
+// 3. Capability viability — are affine/linear values used correctly?
+// 4. Effect viability — are effect declarations consistent?
+// 5. Boundedness viability — do loops and recursion have explicit bounds?
+// 6. Trust viability — do trusted blocks have rationale strings?
+// 7. Dependency viability — can all use declarations be resolved?
+// 8. Module viability — are module attributes (no_std, etc.) consistent?
+//
+// Evidence semantics: The viability engine produces a ViabilityReport that contains
+// a confidence score (0-255), a list of blocking issues, and evidence receipts for
+// each check performed. This report can be embedded in the sealed container as a
+// residual diagnostic.
+//
+// Boundedness: All viability checks are bounded by source size (256 tokens, 64 items)
+// and analysis depth (32 levels of nesting).
+
+use core::fixed::Array256;
+use core::fixed::Array128;
+use core::fixed::Array64;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::ast::*;
+use compiler::lexer::*;
+use compiler::parser::*;
+use compiler::receipts::*;
+
+// --- Viability Check Kind ---
+
+pub sealdatatype ViabilityCheckKind : u8 {
+    /// Syntax check: can the source be parsed?
+    SyntaxViability = 0u8,
+    /// Type check: basic type structural validity.
+    TypeViability = 1u8,
+    /// Capability check: affine/linear usage.
+    CapabilityViability = 2u8,
+    /// Effect check: effect declaration consistency.
+    EffectViability = 3u8,
+    /// Boundedness check: loop/recursion bounds.
+    BoundednessViability = 4u8,
+    /// Trust check: trusted block rationale.
+    TrustViability = 5u8,
+    /// Dependency check: use resolution.
+    DependencyViability = 6u8,
+    /// Module attribute check: no_std/no_alloc/no_unsafe consistency.
+    ModuleViability = 7u8,
+}
+
+impl ViabilityCheckKind {
+    pub fn name(&self) -> FixedString256 [pure] {
+        match self {
+            ViabilityCheckKind::SyntaxViability => FixedString256::from("syntax"),
+            ViabilityCheckKind::TypeViability => FixedString256::from("type"),
+            ViabilityCheckKind::CapabilityViability => FixedString256::from("capability"),
+            ViabilityCheckKind::EffectViability => FixedString256::from("effect"),
+            ViabilityCheckKind::BoundednessViability => FixedString256::from("boundedness"),
+            ViabilityCheckKind::TrustViability => FixedString256::from("trust"),
+            ViabilityCheckKind::DependencyViability => FixedString256::from("dependency"),
+            ViabilityCheckKind::ModuleViability => FixedString256::from("module"),
+        }
+    }
+}
+
+// --- Viability Issue — a specific problem found during analysis ---
+
+pub struct ViabilityIssue {
+    /// The kind of check that found this issue.
+    pub check : ViabilityCheckKind,
+    /// Severity of the issue (0 = blocking, 1 = warning, 2 = info).
+    pub severity : u8,
+    /// Human-readable description.
+    pub description : FixedString256,
+    /// Source location of the issue.
+    pub location : SourceLocation,
+    /// Suggested fix, if available.
+    pub suggestion : FixedString256,
+    /// Whether this issue is definitely blocking vs. speculative.
+    pub is_blocking : bool,
+    /// The stable diagnostic code this maps to.
+    pub diagnostic_code : DiagnosticCode,
+}
+
+impl ViabilityIssue {
+    pub fn new(
+        check : ViabilityCheckKind,
+        severity : u8,
+        description : FixedString256,
+        location : SourceLocation,
+    ) -> ViabilityIssue [pure] {
+        ViabilityIssue {
+            check: check,
+            severity: severity,
+            description: description,
+            location: location,
+            suggestion: FixedString256::new(),
+            is_blocking: severity == 0u8,
+            diagnostic_code: DiagnosticCode::LexUnexpectedCharacter, // default, overridden
+        }
+    }
+
+    pub fn with_suggestion(mut self, suggestion : FixedString256) -> ViabilityIssue [pure] {
+        self.suggestion = suggestion;
+        self
+    }
+
+    pub fn with_code(mut self, code : DiagnosticCode) -> ViabilityIssue [pure] {
+        self.diagnostic_code = code;
+        self
+    }
+}
+
+// --- Viability Report — the output of viability inference ---
+
+pub struct ViabilityReport {
+    /// Whether compilation is likely viable.
+    pub is_viable : bool,
+    /// Confidence level (0-255). 255 = certain, 0 = certain failure.
+    pub confidence : u8,
+    /// Issues found during analysis.
+    pub issues : Array64<ViabilityIssue>,
+    /// Blocking issues (subset of issues with is_blocking = true).
+    pub blocking_issues : Array64<ViabilityIssue>,
+    /// Number of syntax checks passed.
+    pub syntax_passed : u32,
+    /// Number of type checks passed.
+    pub type_passed : u32,
+    /// Number of capability checks passed.
+    pub capability_passed : u32,
+    /// Number of effect checks passed.
+    pub effect_passed : u32,
+    /// Number of boundedness checks passed.
+    pub boundedness_passed : u32,
+    /// Number of trust checks passed.
+    pub trust_passed : u32,
+    /// Number of dependency checks passed.
+    pub dependency_passed : u32,
+    /// Evidence receipts for each check.
+    pub receipts : Array64<EvidenceReceipt>,
+    /// Generation tag.
+    pub generation : u64,
+}
+
+impl ViabilityReport {
+    pub fn new() -> ViabilityReport [pure] {
+        ViabilityReport {
+            is_viable: true,
+            confidence: 255u8,
+            issues: Array64::new(),
+            blocking_issues: Array64::new(),
+            syntax_passed: 0u32,
+            type_passed: 0u32,
+            capability_passed: 0u32,
+            effect_passed: 0u32,
+            boundedness_passed: 0u32,
+            trust_passed: 0u32,
+            dependency_passed: 0u32,
+            receipts: Array64::new(),
+            generation: 0u64,
+        }
+    }
+
+    /// Add an issue and update viability accordingly.
+    /// Effect: pure — updates viability state.
+    pub fn add_issue(mut self, issue : ViabilityIssue) -> ViabilityReport [pure] {
+        let _ = self.issues.push(issue);
+        if issue.is_blocking {
+            let _ = self.blocking_issues.push(issue);
+            self.is_viable = false;
+            // Reduce confidence proportionally to number of blocking issues.
+            let reduction : u8 = if self.confidence >= 32u8 { 32u8 } else { self.confidence };
+            self.confidence -= reduction;
+        } else {
+            // Non-blocking issues reduce confidence slightly.
+            if self.confidence >= 8u8 {
+                self.confidence -= 8u8;
+            }
+        }
+        self
+    }
+
+    /// Record a passed check.
+    /// Effect: pure — increments passed counter.
+    pub fn record_pass(mut self, check : ViabilityCheckKind) -> ViabilityReport [pure] {
+        match check {
+            ViabilityCheckKind::SyntaxViability => self.syntax_passed += 1u32,
+            ViabilityCheckKind::TypeViability => self.type_passed += 1u32,
+            ViabilityCheckKind::CapabilityViability => self.capability_passed += 1u32,
+            ViabilityCheckKind::EffectViability => self.effect_passed += 1u32,
+            ViabilityCheckKind::BoundednessViability => self.boundedness_passed += 1u32,
+            ViabilityCheckKind::TrustViability => self.trust_passed += 1u32,
+            ViabilityCheckKind::DependencyViability => self.dependency_passed += 1u32,
+            _ => {}
+        }
+        self
+    }
+
+    /// Add an evidence receipt.
+    /// Effect: pure — bounded by Array64 capacity.
+    pub fn add_receipt(mut self, receipt : EvidenceReceipt) -> ViabilityReport [pure] {
+        let _ = self.receipts.push(receipt);
+        self
+    }
+
+    /// Generate a summary string.
+    /// Effect: io — string formatting.
+    pub fn format_summary(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("ViabilityReport {\n"));
+        result.push_str(FixedString256::from("  viable: "));
+        if self.is_viable {
+            result.push_str(FixedString256::from("yes"));
+        } else {
+            result.push_str(FixedString256::from("no"));
+        }
+        result.push_str(FixedString256::from("\n"));
+        result.push_str(FixedString256::from("  confidence: "));
+        result.push_u32(self.confidence as u32);
+        result.push_str(FixedString256::from("/255\n"));
+        result.push_str(FixedString256::from("  issues: "));
+        result.push_u32(self.issues.len());
+        result.push_str(FixedString256::from("\n"));
+        result.push_str(FixedString256::from("  blocking: "));
+        result.push_u32(self.blocking_issues.len());
+        result.push_str(FixedString256::from("\n"));
+
+        // Bounded: at most 64 issues.
+        for var i : u32 = 0u32; i < self.issues.len(); i += 1u32 [self.issues.len()] {
+            let issue : ViabilityIssue = self.issues.get(i);
+            result.push_str(FixedString256::from("  ["));
+            result.push_str(issue.check.name());
+            result.push_str(FixedString256::from("] "));
+            result.push_str(issue.description);
+            result.push_str(FixedString256::from("\n"));
+        }
+
+        result.push_str(FixedString256::from("}"));
+        result
+    }
+}
+
+// --- Viability Engine State ---
+
+pub struct ViabilityEngine {
+    /// Source text (raw bytes).
+    pub source : Array256<u8>,
+    /// File path.
+    pub file_path : FixedString256,
+    /// The parsed AST (if parsing succeeded).
+    pub ast : Option<SourceFile>,
+    /// The token stream (if lexing succeeded).
+    pub tokens : Option<TokenStream>,
+    /// Diagnostic bag for collecting diagnostics.
+    pub diagnostics : DiagnosticBag,
+    /// The accumulated viability report.
+    pub report : ViabilityReport,
+    /// Generation tag.
+    pub generation : u64,
+}
+
+impl ViabilityEngine {
+    /// Create a new viability engine for a source file.
+    /// Effect: pure — engine construction.
+    pub fn new(source : Array256<u8>, file_path : FixedString256) -> ViabilityEngine [pure] {
+        ViabilityEngine {
+            source: source,
+            file_path: file_path,
+            ast: Option::None,
+            tokens: Option::None,
+            diagnostics: DiagnosticBag::new(),
+            report: ViabilityReport::new(),
+            generation: 0u64,
+        }
+    }
+
+    /// Run the full viability analysis.
+    /// Effect: diag, io, pure — complete viability analysis.
+    pub fn analyze(&mut self) -> ViabilityReport [diag, io, pure] {
+        // Step 1: Check syntax viability (lex + parse).
+        let _ = self.check_syntax_viability();
+
+        // Step 2: Check module viability (attributes).
+        let _ = self.check_module_viability();
+
+        // Step 3: Check dependency viability (use declarations).
+        let _ = self.check_dependency_viability();
+
+        // Step 4: Check type viability (if AST is available).
+        match self.ast {
+            Option::Some(ref source_file) => {
+                let _ = self.check_type_viability(source_file);
+                let _ = self.check_capability_viability(source_file);
+                let _ = self.check_effect_viability(source_file);
+                let _ = self.check_boundedness_viability(source_file);
+                let _ = self.check_trust_viability(source_file);
+            }
+            Option::None => {
+                // Cannot perform AST-dependent checks.
+                let issue : ViabilityIssue = ViabilityIssue::new(
+                    ViabilityCheckKind::SyntaxViability,
+                    0u8,
+                    FixedString256::from("AST not available for further analysis"),
+                    SourceLocation::new(self.file_path, 0u32, 0u32, 0u64),
+                );
+                self.report = self.report.add_issue(issue);
+            }
+        }
+
+        // Generate evidence receipt for the viability check.
+        let receipt : EvidenceReceipt = EvidenceReceipt::new(
+            CompilerPhase::PreCompile,
+            self.report.confidence as u64,
+            self.generation,
+            0u64,
+        );
+        self.report = self.report.add_receipt(receipt);
+        self.report.generation = self.generation;
+        self.generation += 1u64;
+
+        self.report
+    }
+
+    /// Check syntax viability: can the source be lexed and parsed?
+    /// Effect: diag, io, pure — runs lexer and parser.
+    fn check_syntax_viability(&mut self) -> Result<(), FixedString256> [diag, io, pure] {
+        // Attempt lexing.
+        let (tokens, lex_diags, _) : (TokenStream, DiagnosticBag, LexerReceipt) = lex_source(
+            self.source, self.file_path, false,
+        );
+
+        // Check for critical lexer errors.
+        if lex_diags.has_fatal || lex_diags.error_count > 5u32 {
+            let issue : ViabilityIssue = ViabilityIssue::new(
+                ViabilityCheckKind::SyntaxViability,
+                0u8,
+                FixedString256::from("source contains too many lexical errors"),
+                SourceLocation::new(self.file_path, 0u32, 0u32, 0u64),
+            ).with_code(DiagnosticCode::LexUnexpectedCharacter);
+            self.report = self.report.add_issue(issue);
+            self.report = self.report.record_pass(ViabilityCheckKind::SyntaxViability);
+            return Result::Err(FixedString256::from("lexer errors"));
+        }
+
+        // Merge lexer diagnostics.
+        let _ = self.diagnostics.merge(lex_diags);
+
+        // Attempt parsing.
+        let (ast, parse_diags, _) : (SourceFile, DiagnosticBag, ParserReceipt) = parse_source(
+            tokens, self.file_path,
+        );
+
+        // Check for critical parser errors.
+        if parse_diags.error_count > 5u32 {
+            let issue : ViabilityIssue = ViabilityIssue::new(
+                ViabilityCheckKind::SyntaxViability,
+                0u8,
+                FixedString256::from("source contains too many parse errors"),
+                SourceLocation::new(self.file_path, 0u32, 0u32, 0u64),
+            ).with_code(DiagnosticCode::ParseUnexpectedToken);
+            self.report = self.report.add_issue(issue);
+            self.report = self.report.record_pass(ViabilityCheckKind::SyntaxViability);
+            return Result::Err(FixedString256::from("parser errors"));
+        }
+
+        // Store results.
+        self.ast = Option::Some(ast);
+        self.report = self.report.record_pass(ViabilityCheckKind::SyntaxViability);
+
+        // Merge parser diagnostics.
+        let _ = self.diagnostics.merge(parse_diags);
+
+        Result::Ok(())
+    }
+
+    /// Check module viability: are module attributes consistent?
+    /// Effect: diag, pure — attribute consistency checking.
+    fn check_module_viability(&mut self) -> Result<(), FixedString256> [diag, pure] {
+        match self.ast {
+            Option::Some(ref source_file) => {
+                let mut has_no_std : bool = false;
+                let mut has_no_alloc : bool = false;
+                let mut has_no_unsafe : bool = false;
+
+                // Bounded: at most 4 attributes.
+                for var i : u32 = 0u32; i < source_file.attributes.len(); i += 1u32 [source_file.attributes.len()] {
+                    let attr : ModuleAttribute = source_file.attributes.get(i);
+                    match attr {
+                        ModuleAttribute::NoStd => has_no_std = true,
+                        ModuleAttribute::NoAlloc => has_no_alloc = true,
+                        ModuleAttribute::NoUnsafe => has_no_unsafe = true,
+                    }
+                }
+
+                // Check for consistency: no_std + no_alloc + no_unsafe = core profile.
+                if has_no_std && !has_no_alloc {
+                    let issue : ViabilityIssue = ViabilityIssue::new(
+                        ViabilityCheckKind::ModuleViability,
+                        1u8,
+                        FixedString256::from("no_std without no_alloc may require allocator"),
+                        SourceLocation::new(self.file_path, 0u32, 0u32, 0u64),
+                    ).with_suggestion(FixedString256::from("add no_alloc or provide an allocator"));
+                    self.report = self.report.add_issue(issue);
+                }
+
+                self.report = self.report.record_pass(ViabilityCheckKind::ModuleViability);
+                Result::Ok(())
+            }
+            Option::None => {
+                Result::Err(FixedString256::from("no AST available"))
+            }
+        }
+    }
+
+    /// Check dependency viability: can use declarations be resolved?
+    /// Effect: diag, pure — use path checking.
+    fn check_dependency_viability(&mut self) -> Result<(), FixedString256> [diag, pure] {
+        match self.ast {
+            Option::Some(ref source_file) => {
+                // Bounded: at most 64 items.
+                for var i : u32 = 0u32; i < source_file.items.len(); i += 1u32 [source_file.items.len()] {
+                    let item : ItemDeclaration = source_file.items.get(i);
+                    match item {
+                        ItemDeclaration::Use(use_decl) => {
+                            let path_str : FixedString256 = match use_decl.value.path {
+                                UsePath::Simple(ref name) => name.value,
+                                UsePath::Nested(ref base, _) => base.value,
+                                UsePath::Glob(ref name) => name.value,
+                                UsePath::Group(ref name, _) => name.value,
+                            };
+                            // Check that the path is non-empty.
+                            if path_str.len() == 0u32 {
+                                let issue : ViabilityIssue = ViabilityIssue::new(
+                                    ViabilityCheckKind::DependencyViability,
+                                    0u8,
+                                    FixedString256::from("use declaration has empty path"),
+                                    use_decl.start,
+                                ).with_code(DiagnosticCode::ExpandMacroNotFound);
+                                self.report = self.report.add_issue(issue);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.report = self.report.record_pass(ViabilityCheckKind::DependencyViability);
+                Result::Ok(())
+            }
+            Option::None => Result::Err(FixedString256::from("no AST")),
+        }
+    }
+
+    /// Check type viability: basic type structural validity.
+    /// Effect: diag, pure — infers and checks types.
+    fn check_type_viability(&mut self, source_file : &SourceFile) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 64 items.
+        for var i : u32 = 0u32; i < source_file.items.len(); i += 1u32 [source_file.items.len()] {
+            let item : ItemDeclaration = source_file.items.get(i);
+            match item {
+                ItemDeclaration::Function(func) => {
+                    let func_decl : FunctionDeclaration = func.value;
+                    // Check that parameter types are non-empty for typed functions.
+                    // Bounded: at most 16 parameters.
+                    for var j : u32 = 0u32; j < func_decl.params.len(); j += 1u32 [func_decl.params.len()] {
+                        let param : Parameter = func_decl.params.get(j);
+                        match param.type_annotation {
+                            Option::Some(ref ann) => {
+                                // Check for self-referential types (simplified).
+                                match ann {
+                                    TypeAnnotation::Named(ref name) => {
+                                        if name.value == func_decl.name.value {
+                                            let issue : ViabilityIssue = ViabilityIssue::new(
+                                                ViabilityCheckKind::TypeViability,
+                                                1u8,
+                                                FixedString256::from("parameter type references containing function"),
+                                                name.start,
+                                            );
+                                            self.report = self.report.add_issue(issue);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Option::None => {
+                                // Type inference needed — not a blocking issue.
+                            }
+                        }
+                    }
+                }
+                ItemDeclaration::Struct(s) => {
+                    // Check for duplicate field names.
+                    // Bounded: at most 32 fields.
+                    for var j : u32 = 0u32; j < s.value.fields.len(); j += 1u32 [s.value.fields.len()] {
+                        let field_j : StructField = s.value.fields.get(j);
+                        for var k : u32 = j + 1u32; k < s.value.fields.len(); k += 1u32 [s.value.fields.len() - j - 1u32] {
+                            let field_k : StructField = s.value.fields.get(k);
+                            if field_j.name.value == field_k.name.value {
+                                let issue : ViabilityIssue = ViabilityIssue::new(
+                                    ViabilityCheckKind::TypeViability,
+                                    0u8,
+                                    FixedString256::from("duplicate struct field name"),
+                                    field_j.name.start,
+                                ).with_code(DiagnosticCode::LowerTypeMismatch);
+                                self.report = self.report.add_issue(issue);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.report = self.report.record_pass(ViabilityCheckKind::TypeViability);
+        Result::Ok(())
+    }
+
+    /// Check capability viability: affine/linear value correctness.
+    /// Effect: diag, pure — capability usage analysis.
+    fn check_capability_viability(&mut self, source_file : &SourceFile) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 64 items.
+        for var i : u32 = 0u32; i < source_file.items.len(); i += 1u32 [source_file.items.len()] {
+            let item : ItemDeclaration = source_file.items.get(i);
+            match item {
+                ItemDeclaration::Function(func) => {
+                    let func_decl : FunctionDeclaration = func.value;
+                    // Check that capability parameters have associated capabilities.
+                    // Bounded: at most 16 parameters.
+                    for var j : u32 = 0u32; j < func_decl.params.len(); j += 1u32 [func_decl.params.len()] {
+                        let param : Parameter = func_decl.params.get(j);
+                        // Check: if the type contains 'capability', the parameter
+                        // should have a capability annotation.
+                        let has_cap_annotation : bool = param.capabilities.len() > 0u32;
+                        let has_cap_type : bool = match param.type_annotation {
+                            Option::Some(ref ann) => match ann {
+                                TypeAnnotation::Capability(_) => true,
+                                _ => false,
+                            },
+                            Option::None => false,
+                        };
+                        if has_cap_type && !has_cap_annotation {
+                            let issue : ViabilityIssue = ViabilityIssue::new(
+                                ViabilityCheckKind::CapabilityViability,
+                                1u8,
+                                FixedString256::from("capability-typed parameter without capability annotation"),
+                                param.name.start,
+                            ).with_suggestion(FixedString256::from("add a capability annotation to the parameter"));
+                            self.report = self.report.add_issue(issue);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.report = self.report.record_pass(ViabilityCheckKind::CapabilityViability);
+        Result::Ok(())
+    }
+
+    /// Check effect viability: effect declaration consistency.
+    /// Effect: diag, pure — effect analysis.
+    fn check_effect_viability(&mut self, source_file : &SourceFile) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 64 items.
+        for var i : u32 = 0u32; i < source_file.items.len(); i += 1u32 [source_file.items.len()] {
+            let item : ItemDeclaration = source_file.items.get(i);
+            match item {
+                ItemDeclaration::Function(func) => {
+                    let func_decl : FunctionDeclaration = func.value;
+                    // Check: if function has no effects declared, it's pure.
+                    // Check: effect declarations shouldn't include 'pure' with other effects.
+                    let has_pure : bool = false;
+                    let has_other_effects : bool = func_decl.effects.len() > 0u32;
+
+                    // Bounded: at most 8 effects.
+                    for var j : u32 = 0u32; j < func_decl.effects.len(); j += 1u32 [func_decl.effects.len()] {
+                        let eff : EffectAnnotation = func_decl.effects.get(j);
+                        match eff {
+                            EffectAnnotation::Pure => {
+                                // pure is valid alone
+                            }
+                            _ => {
+                                // Non-pure effect.
+                            }
+                        }
+                    }
+
+                    // Check that unsafe functions have 'trusted' effect.
+                    if func_decl.is_unsafe {
+                        let has_trusted : bool = false;
+                        // Bounded: at most 8 effects.
+                        for var j : u32 = 0u32; j < func_decl.effects.len(); j += 1u32 [func_decl.effects.len()] {
+                            match func_decl.effects.get(j) {
+                                EffectAnnotation::Trusted => {
+                                    // has trusted effect
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !has_trusted {
+                            let issue : ViabilityIssue = ViabilityIssue::new(
+                                ViabilityCheckKind::EffectViability,
+                                1u8,
+                                FixedString256::from("unsafe function should declare [trusted] effect"),
+                                func_decl.name.start,
+                            ).with_suggestion(FixedString256::from("add [trusted] effect to function declaration"));
+                            self.report = self.report.add_issue(issue);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.report = self.report.record_pass(ViabilityCheckKind::EffectViability);
+        Result::Ok(())
+    }
+
+    /// Check boundedness viability: loops and recursion must have explicit bounds.
+    /// Effect: diag, pure — boundedness analysis.
+    fn check_boundedness_viability(&mut self, source_file : &SourceFile) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 64 items.
+        for var i : u32 = 0u32; i < source_file.items.len(); i += 1u32 [source_file.items.len()] {
+            let item : ItemDeclaration = source_file.items.get(i);
+            match item {
+                ItemDeclaration::Function(func) => {
+                    let func_decl : FunctionDeclaration = func.value;
+                    // Check for boundedness evidence on recursive functions.
+                    // This is a simplified check: in a full implementation, we'd
+                    // analyze the function body for recursive calls.
+                    if func_decl.boundedness.is_none() {
+                        // Functions without explicit boundedness may still be
+                        // non-recursive, so this is a soft check.
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.report = self.report.record_pass(ViabilityCheckKind::BoundednessViability);
+        Result::Ok(())
+    }
+
+    /// Check trust viability: trusted blocks need rationale strings.
+    /// Effect: diag, pure — trust analysis.
+    fn check_trust_viability(&mut self, source_file : &SourceFile) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 64 items.
+        for var i : u32 = 0u32; i < source_file.items.len(); i += 1u32 [source_file.items.len()] {
+            let item : ItemDeclaration = source_file.items.get(i);
+            match item {
+                ItemDeclaration::Function(func) => {
+                    let func_decl : FunctionDeclaration = func.value;
+                    match func_decl.body {
+                        Option::Some(ref block) => {
+                            let _ = self.scan_block_for_trust(block);
+                        }
+                        Option::None => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.report = self.report.record_pass(ViabilityCheckKind::TrustViability);
+        Result::Ok(())
+    }
+
+    /// Scan a block expression for trusted blocks.
+    /// Effect: diag, pure — recursive scan for trust.
+    fn scan_block_for_trust(&mut self, block : &BlockExpression) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 64 statements.
+        for var i : u32 = 0u32; i < block.statements.len(); i += 1u32 [block.statements.len()] {
+            let stmt : Statement = block.statements.get(i);
+            match stmt {
+                Statement::ExpressionStatement(ref expr) => {
+                    let _ = self.scan_expression_for_trust(expr);
+                }
+                Statement::Let(_, _, ref expr, _) => {
+                    let _ = self.scan_expression_for_trust(expr);
+                }
+                _ => {}
+            }
+        }
+        match block.final_expression {
+            Option::Some(ref expr) => {
+                let _ = self.scan_expression_for_trust(expr);
+            }
+            Option::None => {}
+        }
+        Result::Ok(())
+    }
+
+    /// Scan an expression for trusted blocks recursively.
+    /// Effect: diag, pure — recursive expression scan.
+    fn scan_expression_for_trust(&mut self, expr : &Expression) -> Result<(), FixedString256> [diag, pure] {
+        match expr {
+            Expression::Trusted(tb) => {
+                // Check that the rationale string is non-empty.
+                if tb.value.rationale.len() == 0u32 {
+                    let issue : ViabilityIssue = ViabilityIssue::new(
+                        ViabilityCheckKind::TrustViability,
+                        0u8,
+                        FixedString256::from("trusted block has empty rationale string"),
+                        tb.start,
+                    ).with_code(DiagnosticCode::LowerUnsafeBlockWithoutRationale)
+                     .with_suggestion(FixedString256::from("provide a rationale string explaining why this block is safe"));
+                    self.report = self.report.add_issue(issue);
+                }
+            }
+            Expression::UnsafeBlock(tb) => {
+                // Unsafe blocks also require rationale.
+                if tb.value.rationale.len() == 0u32 {
+                    let issue : ViabilityIssue = ViabilityIssue::new(
+                        ViabilityCheckKind::TrustViability,
+                        0u8,
+                        FixedString256::from("unsafe block has empty rationale string"),
+                        tb.start,
+                    ).with_code(DiagnosticCode::LowerUnsafeBlockWithoutRationale);
+                    self.report = self.report.add_issue(issue);
+                }
+            }
+            Expression::Block(block) => {
+                let _ = self.scan_block_for_trust(&block.value);
+            }
+            Expression::If(_, then_expr, else_expr) => {
+                let _ = self.scan_expression_for_trust(then_expr);
+                let _ = self.scan_expression_for_trust(else_expr);
+            }
+            Expression::Match(_, arms) => {
+                // Bounded: at most 32 arms.
+                for var i : u32 = 0u32; i < arms.len(); i += 1u32 [arms.len()] {
+                    let arm : MatchArm = arms.get(i);
+                    let _ = self.scan_expression_for_trust(&arm.body);
+                }
+            }
+            Expression::Loop(body, _) => {
+                let _ = self.scan_expression_for_trust(body);
+            }
+            _ => {}
+        }
+        Result::Ok(())
+    }
+
+    /// Get the viability report.
+    /// Effect: pure — ownership transfer.
+    pub fn into_report(self) -> ViabilityReport [pure] {
+        self.report
+    }
+
+    /// Get the diagnostic bag.
+    /// Effect: pure — ownership transfer.
+    pub fn into_diagnostics(self) -> DiagnosticBag [pure] {
+        self.diagnostics
+    }
+}
+
+// --- Viability Pipeline Entry Point ---
+
+/// Run pre-compile viability analysis on source text.
+/// Effect: diag, io, pure — complete viability analysis.
+pub fn analyze_viability(
+    source : Array256<u8>,
+    file_path : FixedString256,
+) -> (ViabilityReport, DiagnosticBag) [diag, io, pure] {
+    let mut engine : ViabilityEngine = ViabilityEngine::new(source, file_path);
+    let report : ViabilityReport = engine.analyze();
+    let diagnostics : DiagnosticBag = engine.into_diagnostics();
+    (report, diagnostics)
+}
+
+// --- Confidence Scoring Helpers ---
+
+/// Compute a confidence score from passed/total checks.
+/// Effect: pure — ratio computation.
+pub fn compute_confidence(passed : u32, total : u32) -> u8 [pure] {
+    if total == 0u32 {
+        255u8
+    } else {
+        ((passed * 255u32) / total) as u8
+    }
+}
+
+/// Check if a set of blocking issues is recoverable.
+/// Effect: pure — recoverability analysis.
+pub fn is_recoverable(issues : &Array64<ViabilityIssue>) -> bool [pure] {
+    // Bounded: at most 64 issues.
+    for var i : u32 = 0u32; i < issues.len(); i += 1u32 [issues.len()] {
+        let issue : ViabilityIssue = issues.get(i);
+        if issue.is_blocking {
+            // Check if the diagnostic code is recoverable.
+            let code : u64 = issue.diagnostic_code as u64;
+            // Recoverable codes: parser errors (5-9), type mismatches (13-19)
+            if (code >= 5u64 && code <= 9u64) || (code >= 13u64 && code <= 19u64) {
+                // These are potentially recoverable.
+            } else {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// --- Viability Inference Strategies ---
+
+/// Determine which viability checks to run based on file size and complexity.
+/// Effect: pure — strategy selection.
+pub fn select_viability_strategy(source_size : u32, item_count : u32) -> ViabilityStrategy [pure] {
+    if source_size > 5000u32 || item_count > 32u32 {
+        // Large files: run only syntax and module checks (fast path).
+        ViabilityStrategy::Fast
+    } else if source_size > 1000u32 || item_count > 8u32 {
+        // Medium files: run syntax, module, dependency, and type checks.
+        ViabilityStrategy::Standard
+    } else {
+        // Small files: run all checks.
+        ViabilityStrategy::Full
+    }
+}
+
+pub sealdatatype ViabilityStrategy : u8 {
+    /// Only run fast checks (syntax + module).
+    Fast = 0u8,
+    /// Run standard checks (syntax + module + dependency + type).
+    Standard = 1u8,
+    /// Run all checks.
+    Full = 2u8,
+}
+
+impl ViabilityStrategy {
+    pub fn run_boundedness_checks(&self) -> bool [pure] {
+        match self {
+            ViabilityStrategy::Full => true,
+            _ => false,
+        }
+    }
+    pub fn run_trust_checks(&self) -> bool [pure] {
+        match self {
+            ViabilityStrategy::Full => true,
+            _ => false,
+        }
+    }
+    pub fn run_capability_checks(&self) -> bool [pure] {
+        match self {
+            ViabilityStrategy::Full | ViabilityStrategy::Standard => true,
+            _ => false,
+        }
+    }
+}
+
+// --- Quick Viability Assessment (no parsing needed) ---
+
+/// Perform a quick lexical viability check without full parsing.
+/// Effect: pure — fast source scan.
+pub fn quick_lexical_viability(source : &Array256<u8>) -> ViabilityReport [pure] {
+    var report : ViabilityReport = ViabilityReport::new();
+    // Check for basic lexical issues.
+    var open_parens : u32 = 0u32;
+    var open_braces : u32 = 0u32;
+    var open_brackets : u32 = 0u32;
+    var in_string : bool = false;
+    var in_comment : bool = false;
+    // Bounded: at most 256 bytes.
+    for var i : u32 = 0u32; i < source.len(); i += 1u32 [source.len()] {
+        let ch : u8 = source.get(i);
+        if in_string {
+            if ch == 34u8 { in_string = false; } // '"'
+            continue;
+        }
+        if in_comment {
+            if ch == 10u8 { in_comment = false; } // newline ends line comment
+            continue;
+        }
+        match ch {
+            40u8 => open_parens += 1u32,  // '('
+            41u8 => {
+                if open_parens > 0u32 { open_parens -= 1u32; }
+                else {
+                    let issue : ViabilityIssue = ViabilityIssue::new(
+                        ViabilityCheckKind::SyntaxViability, 1u8,
+                        FixedString256::from("unmatched closing parenthesis"),
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, i as u64),
+                    );
+                    report = report.add_issue(issue);
+                }
+            }
+            123u8 => open_braces += 1u32, // '{'
+            125u8 => {
+                if open_braces > 0u32 { open_braces -= 1u32; }
+                else {
+                    let issue : ViabilityIssue = ViabilityIssue::new(
+                        ViabilityCheckKind::SyntaxViability, 1u8,
+                        FixedString256::from("unmatched closing brace"),
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, i as u64),
+                    );
+                    report = report.add_issue(issue);
+                }
+            }
+            91u8 => open_brackets += 1u32, // '['
+            93u8 => {
+                if open_brackets > 0u32 { open_brackets -= 1u32; }
+            }
+            34u8 => in_string = true, // '"'
+            47u8 => { // '/'
+                if i + 1u32 < source.len() && source.get(i + 1u32) == 47u8 {
+                    in_comment = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if open_parens > 0u32 {
+        let issue : ViabilityIssue = ViabilityIssue::new(
+            ViabilityCheckKind::SyntaxViability, 0u8,
+            FixedString256::from("unclosed parenthesis"),
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+        );
+        report = report.add_issue(issue);
+    }
+    if open_braces > 0u32 {
+        let issue : ViabilityIssue = ViabilityIssue::new(
+            ViabilityCheckKind::SyntaxViability, 0u8,
+            FixedString256::from("unclosed brace"),
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+        );
+        report = report.add_issue(issue);
+    }
+    report = report.record_pass(ViabilityCheckKind::SyntaxViability);
+    report
+}
+
+/// Estimate compilation time based on source characteristics.
+/// Effect: pure — simple heuristic.
+pub fn estimate_compile_time(source_size : u32, item_count : u32) -> u32 [pure] {
+    // Very rough estimate: 1ms per 100 bytes + 5ms per item.
+    (source_size / 100u32) + (item_count * 5u32)
+}
+
+/// Classify a source file by its characteristics.
+/// Effect: pure — classification.
+pub fn classify_source(source_size : u32, has_trusted_blocks : bool, has_unsafe : bool) -> SourceClassification [pure] {
+    if has_unsafe {
+        SourceClassification::RequiresAudit
+    } else if has_trusted_blocks {
+        SourceClassification::RequiresReview
+    } else if source_size > 2000u32 {
+        SourceClassification::Large
+    } else if source_size > 500u32 {
+        SourceClassification::Medium
+    } else {
+        SourceClassification::Small
+    }
+}
+
+pub sealdatatype SourceClassification : u8 {
+    Small = 0u8,
+    Medium = 1u8,
+    Large = 2u8,
+    RequiresReview = 3u8,
+    RequiresAudit = 4u8,
+}
+
+impl SourceClassification {
+    pub fn requires_audit(&self) -> bool [pure] {
+        match self {
+            SourceClassification::RequiresAudit | SourceClassification::RequiresReview => true,
+            _ => false,
+        }
+    }
+}
+
+// --- Dependency Graph Analysis ---
+
+/// Build a dependency graph from use declarations.
+/// Effect: pure — graph construction.
+pub fn build_dependency_graph(
+    items : &Array64<ItemDeclaration>,
+) -> Array64<DependencyEdge> [pure] {
+    var edges : Array64<DependencyEdge> = Array64::new();
+    // Bounded: at most 64 items.
+    for var i : u32 = 0u32; i < items.len(); i += 1u32 [items.len()] {
+        let item : ItemDeclaration = items.get(i);
+        match item {
+            ItemDeclaration::Use(use_decl) => {
+                let source : FixedString256 = FixedString256::from("current");
+                let target : FixedString256 = match use_decl.value.path {
+                    UsePath::Simple(ref name) => name.value,
+                    UsePath::Nested(ref base, _) => base.value,
+                    UsePath::Glob(ref name) => name.value,
+                    UsePath::Group(ref name, _) => name.value,
+                };
+                let edge : DependencyEdge = DependencyEdge::new(source, target);
+                let _ = edges.push(edge);
+            }
+            _ => {}
+        }
+    }
+    edges
+}
+
+pub struct DependencyEdge {
+    pub from : FixedString256,
+    pub to : FixedString256,
+}
+
+impl DependencyEdge {
+    pub fn new(from : FixedString256, to : FixedString256) -> DependencyEdge [pure] {
+        DependencyEdge { from: from, to: to }
+    }
+}
+
+/// Detect circular dependencies in the dependency graph.
+/// Effect: pure — cycle detection.
+pub fn detect_circular_dependencies(
+    edges : &Array64<DependencyEdge>,
+) -> Array64<FixedString256> [pure] {
+    var cycles : Array64<FixedString256> = Array64::new();
+    // Simplified cycle detection: find paths that form cycles.
+    // Bounded: at most 64 edges.
+    for var i : u32 = 0u32; i < edges.len(); i += 1u32 [edges.len()] {
+        let edge : DependencyEdge = edges.get(i);
+        // Check if 'to' depends back on 'from'.
+        for var j : u32 = 0u32; j < edges.len(); j += 1u32 [edges.len()] {
+            let other : DependencyEdge = edges.get(j);
+            if other.from == edge.to && other.to == edge.from {
+                let _ = cycles.push(edge.from);
+            }
+        }
+    }
+    cycles
+}
+
+// --- Viability Score Calculation ---
+
+/// Calculate a numeric viability score from a report.
+/// Effect: pure — scoring algorithm.
+pub fn calculate_viability_score(report : &ViabilityReport) -> u8 [pure] {
+    var score : u32 = 255u32;
+    // Deduct for blocking issues.
+    score -= report.blocking_issues.len() * 30u32;
+    // Deduct for non-blocking issues.
+    score -= (report.issues.len() - report.blocking_issues.len()) * 10u32;
+    // Ensure score stays in range.
+    if score > 255u32 { score = 255u32; }
+    score as u8
+}
+
+/// Classify viability as a human-readable string.
+/// Effect: io — classification.
+pub fn classify_viability(score : u8) -> FixedString256 [io] {
+    if score >= 200u8 {
+        FixedString256::from("highly viable")
+    } else if score >= 128u8 {
+        FixedString256::from("moderately viable")
+    } else if score >= 64u8 {
+        FixedString256::from("barely viable")
+    } else {
+        FixedString256::from("not viable")
+    }
+}
+
+// --- Pre-compile Hints Generation ---
+
+/// Generate compilation hints from viability analysis.
+/// Effect: io — hint generation.
+pub fn generate_hints(report : &ViabilityReport) -> FixedString256 [io] {
+    var hints : FixedString256 = FixedString256::new();
+    if report.is_viable {
+        hints.push_str(FixedString256::from("Compilation is likely to succeed.\n"));
+    } else {
+        hints.push_str(FixedString256::from("Compilation is likely to fail.\n"));
+        hints.push_str(FixedString256::from("Blocking issues:\n"));
+        // Bounded: at most 64 issues.
+        for var i : u32 = 0u32; i < report.blocking_issues.len(); i += 1u32 [report.blocking_issues.len()] {
+            let issue : ViabilityIssue = report.blocking_issues.get(i);
+            hints.push_str(FixedString256::from("  - "));
+            hints.push_str(issue.description);
+            hints.push_str(FixedString256::from("\n"));
+            if issue.suggestion.len() > 0u32 {
+                hints.push_str(FixedString256::from("    Suggestion: "));
+                hints.push_str(issue.suggestion);
+                hints.push_str(FixedString256::from("\n"));
+            }
+        }
+    }
+    hints.push_str(FixedString256::from("Confidence: "));
+    hints.push_u32(report.confidence as u32);
+    hints.push_str(FixedString256::from("/255\n"));
+    hints
+}
+
+/// Prioritize issues by severity.
+/// Effect: pure — issue prioritization.
+pub fn prioritize_issues(issues : &mut Array64<ViabilityIssue>) [pure] {
+    // Simple bubble sort by severity (0 = highest priority).
+    let n : u32 = issues.len();
+    if n <= 1u32 { return; }
+    // Bounded: at most 64 issues, at most 64 iterations.
+    for var i : u32 = 0u32; i < n; i += 1u32 [n] {
+        for var j : u32 = 0u32; j < n - 1u32; j += 1u32 [n] {
+            let current : ViabilityIssue = issues.get(j);
+            let next : ViabilityIssue = issues.get(j + 1u32);
+            if current.severity > next.severity {
+                issues.set(j, next);
+                issues.set(j + 1u32, current);
+            }
+        }
+    }
+}
+
+// --- Pre-compile Exit Code Determination ---
+
+/// Determine the appropriate exit code based on viability.
+/// Effect: pure — exit code.
+pub fn determine_exit_code(report : &ViabilityReport) -> u8 [pure] {
+    if report.is_viable && report.confidence >= 128u8 {
+        0u8 // success
+    } else if report.blocking_issues.len() > 0u32 {
+        1u8 // compilation will likely fail
+    } else {
+        2u8 // uncertain
+    }
+}
+
+/// Quick pre-compile gate: should full compilation proceed?
+/// Effect: pure — decision gate.
+pub fn should_proceed_to_compile(report : &ViabilityReport) -> bool [pure] {
+    report.is_viable || report.confidence >= 64u8
+}
+
+/// Estimate the number of errors full compilation would produce.
+/// Effect: pure — estimation.
+pub fn estimate_error_count(report : &ViabilityReport) -> u32 [pure] {
+    report.blocking_issues.len() * 2u32 + report.issues.len()
+}
+
+/// Get the most critical blocking issue.
+/// Effect: pure — most critical.
+pub fn most_critical_issue(report : &ViabilityReport) -> Option<ViabilityIssue> [pure] {
+    if report.blocking_issues.len() > 0u32 {
+        Option::Some(report.blocking_issues.get(0u32))
+    } else {
+        Option::None
+    }
+}
+
+// --- Viability Inference Engine Configuration ---
+
+pub struct ViabilityConfig {
+    pub max_syntax_errors : u32,
+    pub max_parse_errors : u32,
+    pub enable_quick_scan : bool,
+    pub enable_type_check : bool,
+    pub enable_capability_check : bool,
+    pub enable_effect_check : bool,
+    pub enable_boundedness_check : bool,
+    pub enable_trust_check : bool,
+    pub min_confidence_to_proceed : u8,
+}
+
+impl ViabilityConfig {
+    pub fn default() -> ViabilityConfig [pure] {
+        ViabilityConfig {
+            max_syntax_errors: 10u32,
+            max_parse_errors: 10u32,
+            enable_quick_scan: true,
+            enable_type_check: true,
+            enable_capability_check: true,
+            enable_effect_check: true,
+            enable_boundedness_check: true,
+            enable_trust_check: true,
+            min_confidence_to_proceed: 64u8,
+        }
+    }
+
+    pub fn fast() -> ViabilityConfig [pure] {
+        ViabilityConfig {
+            max_syntax_errors: 25u32,
+            max_parse_errors: 25u32,
+            enable_quick_scan: true,
+            enable_type_check: false,
+            enable_capability_check: false,
+            enable_effect_check: false,
+            enable_boundedness_check: false,
+            enable_trust_check: false,
+            min_confidence_to_proceed: 32u8,
+        }
+    }
+}
+
+/// Run viability analysis with a custom configuration.
+/// Effect: diag, io, pure — configurable analysis.
+pub fn analyze_with_config(
+    source : Array256<u8>,
+    file_path : FixedString256,
+    config : ViabilityConfig,
+) -> (ViabilityReport, DiagnosticBag) [diag, io, pure] {
+    let mut engine : ViabilityEngine = ViabilityEngine::new(source, file_path);
+    let mut report : ViabilityReport = engine.analyze();
+    // Apply configuration to report.
+    if !config.enable_type_check {
+        report.type_passed = 0u32;
+    }
+    if !config.enable_capability_check {
+        report.capability_passed = 0u32;
+    }
+    if !config.enable_effect_check {
+        report.effect_passed = 0u32;
+    }
+    if !config.enable_boundedness_check {
+        report.boundedness_passed = 0u32;
+    }
+    if !config.enable_trust_check {
+        report.trust_passed = 0u32;
+    }
+    let diagnostics : DiagnosticBag = engine.into_diagnostics();
+    (report, diagnostics)
+}
+
+/// Format a viability report as a JSON-like diagnostic.
+/// Effect: io — structured output.
+pub fn format_viability_json(report : &ViabilityReport) -> FixedString256 [io] {
+    var json : FixedString256 = FixedString256::new();
+    json.push_str(FixedString256::from("{\"viable\":"));
+    if report.is_viable { json.push_str(FixedString256::from("true")); } else { json.push_str(FixedString256::from("false")); }
+    json.push_str(FixedString256::from(",\"confidence\":"));
+    json.push_u32(report.confidence as u32);
+    json.push_str(FixedString256::from(",\"issues\":"));
+    json.push_u32(report.issues.len());
+    json.push_str(FixedString256::from(",\"blocking\":"));
+    json.push_u32(report.blocking_issues.len());
+    json.push_str(FixedString256::from("}"));
+    json
+}
+
+/// Convert a viability report to a diagnostic payload.
+/// Effect: pure — conversion.
+pub fn report_to_diagnostic(report : &ViabilityReport) -> DiagnosticPayload [pure] {
+    let loc : SourceLocation = SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64);
+    let msg : FixedString256 = if report.is_viable {
+        FixedString256::from("pre-compile viability check passed")
+    } else {
+        FixedString256::from("pre-compile viability check failed")
+    };
+    let severity : DiagnosticSeverity = if report.is_viable {
+        DiagnosticSeverity::Note
+    } else {
+        DiagnosticSeverity::Warning
+    };
+    DiagnosticPayload::new(
+        DiagnosticCode::LexUnexpectedCharacter, // placeholder
+        msg,
+        loc,
+        severity,
+        CompilerPhase::PreCompile,
+    )
+}

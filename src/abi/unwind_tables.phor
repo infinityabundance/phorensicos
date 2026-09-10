@@ -1,0 +1,1304 @@
+//==============================================================================
+// unwind_tables.phor — Phorensic Unwind Information
+//
+// Defines unwind information format: call frame information (CFI),
+// personality routines, language-specific data area (LSDA),
+// exception handling tables, stack unwinding for crash recovery,
+// and residual capture on unwind.
+//
+// All operations are bounded-loop, capability-gated, and residual-recorded.
+//==============================================================================
+
+module unwind_tables
+  @[receipt("unwind-v1")]
+  @[audit("UNWIND")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{unwind, alloc, unsafe, io};
+use core::residual::*;
+use core::mem::*;
+
+//==============================================================================
+// Common Header
+//==============================================================================
+
+/// Common information entry (CIE) for call frame information.
+pub struct CieEntry(
+  /// Length of this CIE (excluding length field).
+  length: u32,
+  /// CIE identifier (0 for CIE).
+  cie_id: u32,
+  /// Version.
+  version: u8,
+  /// Augmentation string.
+  augmentation: [u8; 8],
+  /// Code alignment factor.
+  code_align_factor: u64,
+  /// Data alignment factor.
+  data_align_factor: i64,
+  /// Return address register.
+  return_addr_reg: u8,
+  /// Initial instructions follow (in .eh_frame).
+  initial_instructions_offset: u64,
+  /// Personality routine address (from augmentation).
+  personality_addr: u64,
+  /// LSDA encoding (from augmentation).
+  lsda_encoding: u8,
+  /// FDE encoding (from augmentation).
+  fde_encoding: u8,
+  /// Whether this is a Phorensic-specific CIE.
+  is_phor_cie: bool,
+  /// Capability token for this CIE.
+  cap_token: u64,
+  /// Effect mask for this CIE's functions.
+  effect_mask: u64,
+) : effect:(pure);
+
+const CIE_ID: u32 = 0;
+const CIE_VERSION_1: u8 = 1;
+const CIE_VERSION_4: u8 = 4;
+
+/// Frame descriptor entry (FDE) for call frame information.
+pub struct FdeEntry(
+  /// Length of this FDE (excluding length field).
+  length: u32,
+  /// Offset to associated CIE.
+  cie_offset: u32,
+  /// Initial location (PC start).
+  initial_loc: u64,
+  /// Address range.
+  address_range: u64,
+  /// Augmentation data length.
+  aug_data_len: u8,
+  /// LSDA pointer.
+  lsda: u64,
+  /// Personality routine for this FDE.
+  personality: u64,
+  /// Capability token for this function's unwinding.
+  cap_token: u64,
+  /// Whether this function has landing pads.
+  has_landing_pads: bool,
+  /// Number of unwind actions.
+  num_actions: u32,
+) : effect:(pure);
+
+//==============================================================================
+// Call Frame Instructions
+//==============================================================================
+
+/// CFI instruction opcodes.
+pub enum CfiInstruction : u8 {
+  AdvanceLoc        = 0x40,  // high 2 bits = 01, low 6 = delta
+  Offset            = 0x80,  // high 2 bits = 10
+  Restore           = 0xC0,  // high 2 bits = 11
+
+  // Primary opcodes (low 6 bits = 0x00-0x3F)
+  Nop               = 0x00,
+  SetLoc            = 0x01,
+  AdvLoc1           = 0x02,
+  AdvLoc2           = 0x03,
+  AdvLoc4           = 0x04,
+  OffsetExt         = 0x05,
+  RestoreExt        = 0x06,
+  Undefined         = 0x07,
+  SameValue         = 0x08,
+  Register          = 0x09,
+  RememberState     = 0x0A,
+  RestoreState      = 0x0B,
+  DefCfa            = 0x0C,
+  DefCfaRegister    = 0x0D,
+  DefCfaOffset      = 0x0E,
+  DefCfaExpression  = 0x0F,
+  Expression        = 0x10,
+  OffsetExtSf       = 0x11,
+  ValOffset         = 0x12,
+  ValOffsetSf       = 0x13,
+  ValExpression     = 0x14,
+
+  // Phorensic extensions
+  CapDefCfa        = 0x20,  // Define CFA via capability slot
+  CapSave          = 0x21,  // Save capability register
+  CapRestore       = 0x22,  // Restore capability register
+  ResidualCapture   = 0x23,  // Capture residual at this point
+  EffectPush       = 0x24,  // Push effect context
+  EffectPop        = 0x25,  // Pop effect context
+  AffineTrack      = 0x26,  // Track affine state change
+}
+
+/// Decoded CFI instruction with operands.
+pub struct CfiDecoded(
+  opcode: CfiInstruction,
+  reg: u8,
+  offset: i64,
+  expression: *u8,
+  expr_len: u32,
+  cap_slot: u8,
+) : effect:(pure);
+
+/// Decode a CFI instruction.
+pub fn decode_cfi_instruction[
+  data: *u8,
+  pos: *u32,
+  data_len: u32,
+  code_align: u64,
+  data_align: i64,
+] -> Option[CfiDecoded] : effect:(unsafe)
+  loop: bounded(1)
+{
+  if pos >= data_len {
+    return None;
+  }
+
+  let byte: u8 = data[pos];
+  pos += 1;
+
+  let result: CfiDecoded;
+
+  // High 2 bits determine instruction class
+  if (byte & 0xC0) == 0x40 {
+    // DW_CFA_advance_loc
+    let delta: u8 = byte & 0x3F;
+    result = CfiDecoded(opcode: CfiInstruction::AdvanceLoc, reg: 0, offset: delta as i64 * code_align as i64, expression: null, expr_len: 0, cap_slot: 0);
+  } else if (byte & 0xC0) == 0x80 {
+    // DW_CFA_offset
+    let reg: u8 = byte & 0x3F;
+    let uoff: u64 = decode_uleb128_ref(data, pos);
+    result = CfiDecoded(opcode: CfiInstruction::Offset, reg: reg, offset: uoff as i64 * data_align, expression: null, expr_len: 0, cap_slot: 0);
+  } else if (byte & 0xC0) == 0xC0 {
+    // DW_CFA_restore
+    let reg: u8 = byte & 0x3F;
+    result = CfiDecoded(opcode: CfiInstruction::Restore, reg: reg, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+  } else {
+    match byte {
+      0x00 => { result = CfiDecoded(opcode: CfiInstruction::Nop, reg: 0, offset: 0, expression: null, expr_len: 0, cap_slot: 0); },
+      0x01 => { // DW_CFA_set_loc
+        let addr: u64 = @read_u64(data + pos);
+        pos += 8;
+        result = CfiDecoded(opcode: CfiInstruction::SetLoc, reg: 0, offset: addr as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x02 => { // DW_CFA_advance_loc1
+        let delta: u8 = data[pos];
+        pos += 1;
+        result = CfiDecoded(opcode: CfiInstruction::AdvLoc1, reg: 0, offset: delta as i64 * code_align as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x03 => { // DW_CFA_advance_loc2
+        let delta: u16 = @read_u16(data + pos);
+        pos += 2;
+        result = CfiDecoded(opcode: CfiInstruction::AdvLoc2, reg: 0, offset: delta as i64 * code_align as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x04 => { // DW_CFA_advance_loc4
+        let delta: u32 = @read_u32(data + pos);
+        pos += 4;
+        result = CfiDecoded(opcode: CfiInstruction::AdvLoc4, reg: 0, offset: delta as i64 * code_align as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x05 => { // DW_CFA_offset_extended
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        let uoff: u64 = decode_uleb128_ref(data, pos);
+        result = CfiDecoded(opcode: CfiInstruction::OffsetExt, reg: reg, offset: uoff as i64 * data_align, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x06 => { // DW_CFA_restore_extended
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        result = CfiDecoded(opcode: CfiInstruction::RestoreExt, reg: reg, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x07 => { // DW_CFA_undefined
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        result = CfiDecoded(opcode: CfiInstruction::Undefined, reg: reg, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x08 => { // DW_CFA_same_value
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        result = CfiDecoded(opcode: CfiInstruction::SameValue, reg: reg, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x09 => { // DW_CFA_register
+        let reg1: u8 = decode_uleb128_ref(data, pos) as u8;
+        let reg2: u8 = decode_uleb128_ref(data, pos) as u8;
+        result = CfiDecoded(opcode: CfiInstruction::Register, reg: reg1, offset: reg2 as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x0A => { // DW_CFA_remember_state
+        result = CfiDecoded(opcode: CfiInstruction::RememberState, reg: 0, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x0B => { // DW_CFA_restore_state
+        result = CfiDecoded(opcode: CfiInstruction::RestoreState, reg: 0, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x0C => { // DW_CFA_def_cfa
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        let uoff: u64 = decode_uleb128_ref(data, pos);
+        result = CfiDecoded(opcode: CfiInstruction::DefCfa, reg: reg, offset: uoff as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x0D => { // DW_CFA_def_cfa_register
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        result = CfiDecoded(opcode: CfiInstruction::DefCfaRegister, reg: reg, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x0E => { // DW_CFA_def_cfa_offset
+        let uoff: u64 = decode_uleb128_ref(data, pos);
+        result = CfiDecoded(opcode: CfiInstruction::DefCfaOffset, reg: 0, offset: uoff as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x0F => { // DW_CFA_def_cfa_expression
+        let len: u32 = decode_uleb128_ref(data, pos) as u32;
+        result = CfiDecoded(opcode: CfiInstruction::DefCfaExpression, reg: 0, offset: 0, expression: data + pos, expr_len: len);
+        pos += len;
+      },
+      0x10 => { // DW_CFA_expression
+        let reg: u8 = decode_uleb128_ref(data, pos) as u8;
+        let len: u32 = decode_uleb128_ref(data, pos) as u32;
+        result = CfiDecoded(opcode: CfiInstruction::Expression, reg: reg, offset: 0, expression: data + pos, expr_len: len);
+        pos += len;
+      },
+      0x20 => { // DW_CFA_PHOR_cap_def_cfa (Phorensic extension)
+        let cap_slot: u8 = data[pos];
+        pos += 1;
+        let uoff: u64 = decode_uleb128_ref(data, pos);
+        result = CfiDecoded(opcode: CfiInstruction::CapDefCfa, reg: 0, offset: uoff as i64, expression: null, expr_len: 0, cap_slot: cap_slot);
+      },
+      0x21 => { // DW_CFA_PHOR_cap_save
+        let cap_slot: u8 = data[pos];
+        pos += 1;
+        let offset: u64 = decode_uleb128_ref(data, pos);
+        result = CfiDecoded(opcode: CfiInstruction::CapSave, reg: 0, offset: offset as i64, expression: null, expr_len: 0, cap_slot: cap_slot);
+      },
+      0x22 => { // DW_CFA_PHOR_cap_restore
+        let cap_slot: u8 = data[pos];
+        pos += 1;
+        result = CfiDecoded(opcode: CfiInstruction::CapRestore, reg: 0, offset: 0, expression: null, expr_len: 0, cap_slot: cap_slot);
+      },
+      0x23 => { // DW_CFA_PHOR_residual_capture
+        result = CfiDecoded(opcode: CfiInstruction::ResidualCapture, reg: 0, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x24 => { // DW_CFA_PHOR_effect_push
+        let effect_mask: u64 = @read_u64(data + pos);
+        pos += 8;
+        result = CfiDecoded(opcode: CfiInstruction::EffectPush, reg: 0, offset: effect_mask as i64, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      0x25 => { // DW_CFA_PHOR_effect_pop
+        result = CfiDecoded(opcode: CfiInstruction::EffectPop, reg: 0, offset: 0, expression: null, expr_len: 0, cap_slot: 0);
+      },
+      _ => {
+        // Unknown instruction
+        return None;
+      },
+    }
+  }
+
+  return Some(result);
+}
+
+//==============================================================================
+// FDE Table (Unwind Info)
+//==============================================================================
+
+/// Complete unwind table for a module (all FDEs).
+pub struct UnwindTable(
+  /// Base address of the module.
+  module_base: u64,
+  /// Array of FDE entries.
+  fdes: [FdeEntry; 65536],
+  /// Number of FDE entries.
+  num_fdes: u32,
+  /// Associated CIE.
+  cie: CieEntry,
+  /// Capability token for accessing this table.
+  cap_token: u64,
+) : effect:(alloc, unsafe);
+
+/// Lookup unwind info for a program counter.
+pub fn lookup_unwind_entry[
+  table: *UnwindTable,
+  pc: u64,
+] -> Option[(FdeEntry, u32)] : effect:(pure)
+  loop: bounded(65536)
+{
+  // Binary search on initial_loc
+  var low: u32 = 0;
+  var high: u32 = table.num_fdes;
+
+  while low < high {
+    let mid: u32 = low + (high - low) / 2;
+    let fde: FdeEntry = table.fdes[mid];
+    let fde_start: u64 = table.module_base + fde.initial_loc;
+    let fde_end: u64 = fde_start + fde.address_range;
+
+    if pc < fde_start {
+      high = mid;
+    } else if pc >= fde_end {
+      low = mid + 1;
+    } else {
+      return Some((fde, mid));
+    }
+  }
+
+  return None;
+}
+
+/// Parse an unwind table from raw .eh_frame data.
+pub fn parse_unwind_table[
+  eh_frame_data: *u8,
+  eh_frame_size: u32,
+  module_base: u64,
+  cap_token: u64,
+] -> Result[UnwindTable, UnwindParseError] : effect:(alloc, unsafe)
+  loop: bounded(65536)
+{
+  var table: UnwindTable = UnwindTable(
+    module_base: module_base,
+    fdes: Default,
+    num_fdes: 0,
+    cie: Default,
+    cap_token: cap_token,
+  );
+
+  var offset: u32 = 0;
+  var cie_found: bool = false;
+
+  while offset < eh_frame_size && table.num_fdes < 65536 {
+    // Read entry length
+    let length: u32 = @read_u32(eh_frame_data + offset);
+    if length == 0 {
+      break;  // Terminator
+    }
+
+    // Read CIE/FDE ID
+    let id: u32 = @read_u32(eh_frame_data + offset + 4);
+
+    if id == CIE_ID {
+      // Parse CIE
+      if cie_found {
+        return Err(UnwindParseError::MultipleCIEs);
+      }
+      parse_cie(eh_frame_data + offset, length, &table.cie);
+      cie_found = true;
+    } else {
+      // Parse FDE
+      let cie_rel_offset: u32 = offset + 4 - id;  // CIE is id bytes back from ID field
+      parse_fde(eh_frame_data + offset, length, module_base, &table.fdes[table.num_fdes]);
+      table.num_fdes += 1;
+    }
+
+    offset += 4 + length;  // length field + entry data
+    offset = align_up(offset, 8);  // CIE/FDE entries are 8-byte aligned
+  }
+
+  if !cie_found {
+    return Err(UnwindParseError::NoCIE);
+  }
+
+  return Ok(table);
+}
+
+pub enum UnwindParseError : u64 {
+  TruncatedData = 1,
+  NoCIE         = 2,
+  MultipleCIEs  = 3,
+  BadEntry      = 4,
+  CapTokenMismatch = 5,
+}
+
+/// Parse a CIE entry.
+fn parse_cie[
+  data: *u8,
+  length: u32,
+  cie: *CieEntry,
+] : effect:(unsafe)
+  loop: bounded(1)
+{
+  cie.length = length;
+  cie.cie_id = @read_u32(data + 4);
+  cie.version = data[8];
+
+  // Parse augmentation string (null-terminated)
+  var aug_offset: u32 = 9;
+  for var i: u32 = 0; i < 7; i += 1 {
+    cie.augmentation[i] = data[aug_offset];
+    aug_offset += 1;
+    if data[aug_offset - 1] == 0 {
+      break;
+    }
+  }
+
+  // Parse alignment factors and return address register
+  cie.code_align_factor = decode_uleb128_ref(data, &aug_offset);
+  cie.data_align_factor = decode_sleb128_ref(data, &aug_offset);
+  if cie.version >= 4 {
+    cie.return_addr_reg = data[aug_offset];
+    aug_offset += 1;
+  } else {
+    cie.return_addr_reg = decode_uleb128_ref(data, &aug_offset) as u8;
+  }
+
+  // Parse augmentation data
+  cie.fde_encoding = 0xFF;  // default: DW_EH_PE_omit
+  cie.lsda_encoding = 0xFF;
+  cie.personality_addr = 0;
+  cie.is_phor_cie = false;
+
+  var aug_ptr: u32 = 0;
+  while cie.augmentation[aug_ptr] != 0 && aug_ptr < 7 {
+    let aug_char: u8 = cie.augmentation[aug_ptr];
+    match aug_char {
+      'z' => {
+        // Augmentation data length follows
+        let aug_data_len: u64 = decode_uleb128_ref(data, &aug_offset);
+      },
+      'L' => {
+        cie.lsda_encoding = data[aug_offset];
+        aug_offset += 1;
+      },
+      'P' => {
+        cie.personality_encoding = data[aug_offset];
+        aug_offset += 1;
+        cie.personality_addr = read_encoded_pointer(data, &aug_offset, cie.personality_encoding);
+      },
+      'R' => {
+        cie.fde_encoding = data[aug_offset];
+        aug_offset += 1;
+      },
+      'S' => {
+        // Signal frame marker (no data)
+      },
+      'P' => {
+        // Phorensic CIE marker
+        cie.is_phor_cie = true;
+        cie.cap_token = @read_u64(data + aug_offset);
+        aug_offset += 8;
+        cie.effect_mask = @read_u64(data + aug_offset);
+        aug_offset += 8;
+      },
+      _ => {
+        // Unknown augmentation character
+      },
+    }
+    aug_ptr += 1;
+  }
+
+  // Initial instructions start here
+  cie.initial_instructions_offset = aug_offset;
+}
+
+/// Parse an FDE entry.
+fn parse_fde[
+  data: *u8,
+  length: u32,
+  module_base: u64,
+  fde: *FdeEntry,
+] : effect:(unsafe)
+  loop: bounded(1)
+{
+  fde.length = length;
+  fde.cie_offset = @read_u32(data + 4);
+  // initial_loc and address_range use the encoding specified in the CIE
+  fde.initial_loc = read_encoded_pointer(data, &pos, cie.fde_encoding);
+  fde.address_range = read_encoded_pointer(data, &pos, cie.fde_encoding & 0x0F);
+
+  // If augmentation data exists
+  fde.lsda = 0;
+  fde.personality = 0;
+  fde.cap_token = 0;
+  fde.has_landing_pads = false;
+  fde.num_actions = 0;
+}
+
+//==============================================================================
+// Personality Routines
+//==============================================================================
+
+/// Personality routine interface for exception handling.
+pub trait PersonalityRoutine {
+  /// Examine a frame during exception unwinding.
+  fn examine_frame[
+    context: *UnwindContext,
+    exception: *ExceptionObject,
+    fde: *FdeEntry,
+    lsda: *u8,
+  ] -> UnwindAction : (unwind, unsafe);
+
+  /// Install a landing pad for cleanup/catch.
+  fn install_landing_pad[
+    context: *UnwindContext,
+    landing_pad: *LandingPadInfo,
+    exception: *ExceptionObject,
+  ] : (unwind, unsafe);
+}
+
+/// Standard Phorensic personality routine.
+pub fn phor_personality[
+  context: *UnwindContext,
+  exception: *ExceptionObject,
+  fde: *FdeEntry,
+  lsda: *u8,
+] -> UnwindAction : (unwind, unsafe)
+  loop: bounded(256)
+{
+  // Parse LSDA for landing pad and action table
+  if lsda == null {
+    return UnwindAction::Continue;
+  }
+
+  let lsda_header: *LsdaHeader = @int_to_ptr(lsda);
+  let action_table: *u8 = lsda + lsda_header.action_table_offset;
+
+  // Search for a matching catch handler or cleanup
+  var call_site_offset: u32 = 0;
+  while call_site_offset < lsda_header.call_site_table_length {
+    let cs_entry: *CallSiteEntry = @int_to_ptr(lsda_header.call_site_table + call_site_offset);
+
+    let cs_start: u64 = fde.initial_loc + cs_entry.start_offset;
+    let cs_end: u64 = cs_start + cs_entry.length;
+
+    if context.pc >= cs_start && context.pc < cs_end {
+      if cs_entry.landing_pad_offset == 0 {
+        // No landing pad — this is a cleanup-only entry
+        continue;
+      }
+
+      let landing_pad_pc: u64 = fde.initial_loc + cs_entry.landing_pad_offset;
+
+      if cs_entry.action_offset == 0 {
+        // Cleanup only
+        return UnwindAction::InstallPad;
+      }
+
+      // Decode action table entries
+      let action_ptr: *u8 = action_table + cs_entry.action_offset - 1;
+      while true {
+        let type_offset: i64 = decode_sleb128_ref(action_ptr, &action_ptr);
+        let action_offset: i64 = decode_sleb128_ref(action_ptr, &action_ptr);
+
+        if type_offset == 0 {
+          // Cleanup action
+          return UnwindAction::CleanupThenContinue;
+        }
+
+        // Check if exception type matches
+        let catch_type: *u8 = lsda + type_offset;
+        let caught: bool = check_exception_type(catch_type, exception);
+
+        if caught {
+          // Found a matching catch handler
+          let landing_pad: LandingPadInfo = LandingPadInfo(
+            landing_pad_pc: landing_pad_pc,
+            action_kind: ActionKind::Catch,
+            catch_type_info: @ptr_to_int(catch_type),
+            cleanup_code: 0,
+            requires_capability: fde.cap_token != 0,
+            capability_token: fde.cap_token,
+          );
+          return UnwindAction::InstallPad;
+        }
+
+        if action_offset == 0 {
+          break;  // End of action chain
+        }
+
+        action_ptr = action_table + action_offset - 1;
+      }
+    }
+
+    call_site_offset += 16;  // sizeof(CallSiteEntry)
+  }
+
+  return UnwindAction::Continue;
+}
+
+//==============================================================================
+// Language-Specific Data Area (LSDA)
+//==============================================================================
+
+/// LSDA header structure.
+pub struct LsdaHeader(
+  /// LSDA encoding for type info.
+  type_encoding: u8,
+  /// Type info table offset (relative to LSDA start).
+  type_table_offset: u32,
+  /// Action table offset (relative to LSDA start).
+  action_table_offset: u32,
+  /// Call site table.
+  call_site_table: *u8,
+  /// Call site table length.
+  call_site_table_length: u32,
+  /// Number of call site entries.
+  num_call_sites: u32,
+  /// Capability token for this LSDA.
+  cap_token: u64,
+) : effect:(unsafe);
+
+/// Call site entry in the LSDA.
+pub struct CallSiteEntry(
+  /// Start offset relative to function start.
+  start_offset: u64,
+  /// Length of the call site range.
+  length: u64,
+  /// Landing pad offset (0 = no landing pad).
+  landing_pad_offset: u64,
+  /// Action table offset (0 = cleanup only).
+  action_offset: u64,
+) : effect:(pure);
+
+/// Landing pad descriptor.
+pub struct LandingPadInfo(
+  /// PC of the landing pad.
+  landing_pad_pc: u64,
+  /// Type of action (catch, cleanup, filter, terminate).
+  action_kind: ActionKind,
+  /// Type info for catch (null for cleanup).
+  catch_type_info: u64,
+  /// Cleanup code hook.
+  cleanup_code: u64,
+  /// Whether a capability is required to enter landing pad.
+  requires_capability: bool,
+  /// The capability token needed.
+  capability_token: u64,
+) : effect:(pure);
+
+pub enum ActionKind : u8 {
+  Catch      = 0,
+  Cleanup    = 1,
+  Filter     = 2,
+  Terminate  = 3,
+  Residual   = 4,
+}
+
+/// Parse the LSDA for a given FDE.
+pub fn parse_lsda[
+  lsda_ptr: *u8,
+  fde: *FdeEntry,
+  encoding: u8,
+] -> LsdaHeader : effect:(unsafe)
+  loop: bounded(1)
+{
+  var pos: u32 = 0;
+
+  let type_encoding: u8 = lsda_ptr[pos];
+  pos += 1;
+
+  // Type table offset (if encoding is not DW_EH_PE_omit)
+  var type_table_offset: u32 = 0;
+  if type_encoding != 0xFF {
+    type_table_offset = decode_uleb128_ref(lsda_ptr, &pos) as u32;
+  }
+
+  // Action table offset
+  let action_table_offset: u32 = decode_uleb128_ref(lsda_ptr, &pos) as u32;
+
+  let call_site_table: *u8 = lsda_ptr + pos;
+  let remaining: u32 = 0;  // would be computed from FDE length
+
+  // Count call site entries
+  var num_cs: u32 = 0;
+  var cs_pos: u32 = pos;
+  while cs_pos < remaining {
+    let start_offset: u64 = read_encoded_pointer(lsda_ptr, &cs_pos, encoding);
+    let length: u64 = read_encoded_pointer(lsda_ptr, &cs_pos, encoding);
+    let lp_offset: u64 = read_encoded_pointer(lsda_ptr, &cs_pos, encoding);
+    let action_offset: u64 = read_encoded_pointer(lsda_ptr, &cs_pos, encoding);
+    if start_offset == 0 && length == 0 && lp_offset == 0 && action_offset == 0 {
+      break;  // Terminator
+    }
+    num_cs += 1;
+  }
+
+  return LsdaHeader(
+    type_encoding: type_encoding,
+    type_table_offset: type_table_offset,
+    action_table_offset: action_table_offset,
+    call_site_table: call_site_table,
+    call_site_table_length: remaining - pos,
+    num_call_sites: num_cs,
+    cap_token: fde.cap_token,
+  );
+}
+
+//==============================================================================
+// Stack Unwinding Engine
+//==============================================================================
+
+/// Context for stack unwinding.
+pub struct UnwindContext(
+  /// Current program counter.
+  pc: u64,
+  /// Current stack pointer.
+  sp: u64,
+  /// Current frame pointer.
+  fp: u64,
+  /// CFA (canonical frame address).
+  cfa: u64,
+  /// Callee-saved integer registers.
+  callee_saved: [u64; 8],
+  /// Callee-saved capability registers.
+  cap_regs: [CapabilitySlot; 2],
+  /// Current unwind table.
+  unwind_table: *UnwindTable,
+  /// Current FDE index.
+  fde_index: u32,
+  /// Capability state at current point.
+  cap_state: CapabilityState,
+  /// Residual chain being built.
+  residual_chain: ResidualChain,
+  /// Effect context stack depth.
+  effect_depth: u32,
+  /// Whether this is the outermost frame.
+  is_outermost: bool,
+) : effect:(unsafe);
+
+/// Unwind action result.
+pub enum UnwindAction : u8 {
+  Continue           = 0,
+  InstallPad         = 1,
+  CleanupThenContinue = 2,
+  Handled            = 3,
+  CaptureResidual    = 4,
+  Terminate          = 5,
+}
+
+/// Unwind the stack one frame, updating context.
+pub fn unwind_one_frame[
+  context: *UnwindContext,
+  table: *UnwindTable,
+] -> Result[(), UnwindError] : (unwind, unsafe)
+  loop: bounded(256)
+{
+  // Lookup FDE for current PC
+  let fde_opt: Option[(FdeEntry, u32)] = lookup_unwind_entry(table, context.pc);
+  if fde_opt.is_none() {
+    return Err(UnwindError::NoUnwindInfo);
+  }
+
+  let (fde, fde_idx): (FdeEntry, u32) = fde_opt.unwrap();
+  context.fde_index = fde_idx;
+
+  // Execute CFI instructions to compute CFA and saved register locations
+  let cie: CieEntry = table.cie;
+  let cfi_start: *u8 = eh_frame_data + cie.initial_instructions_offset;
+  let cfi_size: u32 = fde.cie_offset - cie.initial_instructions_offset;  // approximate
+
+  // State for virtual CFI interpreter
+  var cfa_reg: u8 = 23;  // default: sp
+  var cfa_offset: i64 = 8;  // default: return address pushed
+  var reg_rules: [RegisterRule; 32] = Default;
+
+  var cfi_pos: u32 = cie.initial_instructions_offset;
+  while cfi_pos < cfi_size {
+    let instr: Option[CfiDecoded] = decode_cfi_instruction(
+      eh_frame_data, &cfi_pos, cfi_size,
+      cie.code_align_factor, cie.data_align_factor,
+    );
+
+    if instr.is_none() {
+      break;
+    }
+
+    let decoded: CfiDecoded = instr.unwrap();
+
+    match decoded.opcode {
+      CfiInstruction::DefCfa => {
+        cfa_reg = decoded.reg;
+        cfa_offset = decoded.offset;
+      },
+      CfiInstruction::DefCfaRegister => {
+        cfa_reg = decoded.reg;
+      },
+      CfiInstruction::DefCfaOffset => {
+        cfa_offset = decoded.offset;
+      },
+      CfiInstruction::Offset | CfiInstruction::OffsetExt => {
+        let reg_idx: u32 = decoded.reg as u32;
+        if reg_idx < 32 {
+          reg_rules[reg_idx] = RegisterRule(
+            reg_num: decoded.reg,
+            rule: RuleKind::Offset,
+            value: decoded.offset,
+          );
+        }
+      },
+      CfiInstruction::SameValue => {
+        if (decoded.reg as u32) < 32 {
+          reg_rules[decoded.reg as u32] = RegisterRule(
+            reg_num: decoded.reg,
+            rule: RuleKind::SameValue,
+            value: 0,
+          );
+        }
+      },
+      CfiInstruction::Undefined => {
+        if (decoded.reg as u32) < 32 {
+          reg_rules[decoded.reg as u32] = RegisterRule(
+            reg_num: decoded.reg,
+            rule: RuleKind::Undefined,
+            value: 0,
+          );
+        }
+      },
+      CfiInstruction::Register => {
+        if (decoded.reg as u32) < 32 {
+          reg_rules[decoded.reg as u32] = RegisterRule(
+            reg_num: decoded.reg,
+            rule: RuleKind::Register,
+            value: decoded.offset,
+          );
+        }
+      },
+      CfiInstruction::AdvanceLoc => {
+        // PC advancement not needed for single-frame unwind
+      },
+      CfiInstruction::RememberState => {
+        // Push state (simplified)
+      },
+      CfiInstruction::RestoreState => {
+        // Pop state (simplified)
+      },
+      CfiInstruction::CapSave => {
+        // Save capability register context
+      },
+      CfiInstruction::CapRestore => {
+        // Restore capability register context
+      },
+      CfiInstruction::ResidualCapture => {
+        // Capture residual at this point
+        capture_residual_at_point(context);
+      },
+      _ => {},
+    }
+  }
+
+  // Compute CFA
+  let cfa_value: u64 = match cfa_reg {
+    23 => context.sp + cfa_offset as u64,  // sp + offset
+    24 => context.fp + cfa_offset as u64,  // fp + offset
+    _ => context.sp + cfa_offset as u64,   // default
+  };
+
+  // Unwind register state
+  let new_sp: u64 = cfa_value;
+  let new_fp: u64 = cfa_value;
+  let new_ra: u64 = 0;
+
+  // Restore return address from CFA-8 (standard ABI)
+  if reg_rules[27].rule == RuleKind::Offset {
+    let ra_addr: u64 = cfa_value + reg_rules[27].value as u64;
+    new_ra = *(@int_to_ptr(ra_addr) as *u64);
+  } else {
+    new_ra = *(@int_to_ptr(cfa_value - 8) as *u64);
+  }
+
+  // Restore frame pointer from CFA-16 (standard ABI)
+  if reg_rules[24].rule == RuleKind::Offset {
+    let fp_addr: u64 = cfa_value + reg_rules[24].value as u64;
+    new_fp = *(@int_to_ptr(fp_addr) as *u64);
+  } else {
+    new_fp = *(@int_to_ptr(cfa_value - 16) as *u64);
+  }
+
+  // Restore callee-saved registers
+  for var i: u32 = 0; i < 8; i += 1 {
+    let reg_num: u32 = 8 + i;  // s0-s7
+    let rule: RegisterRule = reg_rules[reg_num];
+    if rule.rule == RuleKind::Offset {
+      let reg_addr: u64 = cfa_value + rule.value as u64;
+      context.callee_saved[i] = *(@int_to_ptr(reg_addr) as *u64);
+    }
+  }
+
+  // Update context
+  context.pc = new_ra;
+  context.sp = new_sp;
+  context.fp = new_fp;
+  context.cfa = cfa_value;
+
+  // Record residual for this unwind step
+  record_unwind_residual(context);
+
+  return Ok(());
+}
+
+pub enum UnwindError : u64 {
+  NoUnwindInfo      = 1,
+  CorruptFrame      = 2,
+  CfaOverflow       = 3,
+  InvalidRegister   = 4,
+  CapTokenMismatch  = 5,
+  AffineViolation   = 6,
+}
+
+/// Record residual during unwinding.
+fn record_unwind_residual[
+  context: *UnwindContext,
+] : effect:(unwind, unsafe) {
+  __unwind_residual_write(
+    pc: context.pc,
+    sp: context.sp,
+    fp: context.fp,
+    cfa: context.cfa,
+  );
+}
+
+/// Capture residual at a specific point during unwinding.
+fn capture_residual_at_point[
+  context: *UnwindContext,
+] : effect:(unwind, unsafe) {
+  __unwind_residual_capture(context.pc, context.sp, context.fp);
+}
+
+//==============================================================================
+// Crash Recovery Unwinding
+//==============================================================================
+
+/// Crash context captured during a fault.
+pub struct CrashContext(
+  /// Fault address.
+  fault_addr: u64,
+  /// Fault type (page fault, protection fault, etc.)
+  fault_type: FaultType,
+  /// Register state at fault.
+  regs: CrashRegisters,
+  /// Unwind context for recovery.
+  unwind_ctx: UnwindContext,
+  /// Residual captured at crash point.
+  crash_residual: Residual,
+  /// Capability state at crash.
+  cap_state: CapabilityState,
+  /// Whether recovery is possible.
+  recoverable: bool,
+) : effect:(unsafe);
+
+pub enum FaultType : u64 {
+  PageFault       = 0,
+  ProtectionFault = 1,
+  CapViolation    = 2,
+  AffineViolation = 3,
+  StackOverflow   = 4,
+  DivideByZero    = 5,
+  InvalidOpcode   = 6,
+  AlignmentFault  = 7,
+  BoundViolation  = 8,
+  EffectViolation  = 9,
+  ResidualOverflow = 10,
+}
+
+pub struct CrashRegisters(
+  pc: u64,
+  sp: u64,
+  fp: u64,
+  ra: u64,
+  gp_regs: [u64; 8],
+) : effect:(pure);
+
+/// Attempt to recover from a crash by unwinding to a handler.
+pub fn crash_recovery_unwind[
+  crash: *CrashContext,
+  unwind_table: *UnwindTable,
+  max_frames: u32,
+] -> Result[UnwindAction, UnwindError] : (unwind, unsafe)
+  loop: bounded(256)
+{
+  // Initialize unwind context from crash context
+  var context: UnwindContext = UnwindContext(
+    pc: crash.regs.pc,
+    sp: crash.regs.sp,
+    fp: crash.regs.fp,
+    cfa: crash.regs.sp,
+    callee_saved: Default,
+    cap_regs: Default,
+    unwind_table: unwind_table,
+    fde_index: 0,
+    cap_state: crash.cap_state,
+    residual_chain: Default,
+    effect_depth: 0,
+    is_outermost: true,
+  );
+
+  // Attempt to find a handler up the call stack
+  for var i: u32 = 0; i < max_frames; i += 1 {
+    // Lookup personality routine for this frame
+    let fde_opt: Option[(FdeEntry, u32)] = lookup_unwind_entry(unwind_table, context.pc);
+    if fde_opt.is_none() {
+      // No unwind info — cannot recover
+      return Err(UnwindError::NoUnwindInfo);
+    }
+
+    let (fde, _): (FdeEntry, u32) = fde_opt.unwrap();
+
+    if fde.personality != 0 {
+      let personality: *PersonalityRoutine = @int_to_ptr(fde.personality);
+      let lsda: *u8 = @int_to_ptr(fde.lsda);
+
+      let action: UnwindAction = personality.examine_frame(
+        context: &context,
+        exception: null,  // In real impl, pass crash as exception object
+        fde: &fde,
+        lsda: lsda,
+      );
+
+      match action {
+        UnwindAction::Handled | UnwindAction::InstallPad => {
+          return Ok(action);
+        },
+        UnwindAction::CaptureResidual => {
+          // Capture the crash residual and continue unwinding
+          capture_crash_residual(crash, &context);
+        },
+        _ => {
+          // Continue unwinding
+        },
+      }
+    }
+
+    // Unwind to previous frame
+    unwind_one_frame(&context, unwind_table)?;
+  }
+
+  return Err(UnwindError::NoUnwindInfo);
+}
+
+/// Capture a residual record for the crash.
+fn capture_crash_residual[
+  crash: *CrashContext,
+  context: *UnwindContext,
+] : effect:(unwind, alloc, unsafe) {
+  crash.crash_residual = Residual(
+    fault_type: crash.fault_type as u64,
+    pc: crash.regs.pc,
+    sp: crash.regs.sp,
+    unwind_pc: context.pc,
+  );
+  __crash_residual_persist(&crash.crash_residual);
+}
+
+//==============================================================================
+// Exception Handling Tables
+//==============================================================================
+
+/// Exception type table entry (in .gcc_except_table).
+pub struct ExceptionTypeEntry(
+  /// Type info pointer (relative to table base).
+  type_offset: i64,
+  /// Type descriptor from DWARF debug info.
+  type_die_offset: u64,
+  /// Whether this type is a capability type.
+  is_cap_type: bool,
+  /// Whether catching by capability token.
+  cap_token_required: u64,
+) : effect:(pure);
+
+/// Check if an exception type matches a catch spec.
+fn check_exception_type[
+  catch_type_data: *u8,
+  exception: *ExceptionObject,
+] -> bool : effect:(unsafe)
+  loop: bounded(1)
+{
+  // In production, does full type comparison using DWARF type info.
+  // Simplified here.
+  let caught_type: u64 = @read_u64(catch_type_data);
+  return caught_type == exception.exception_type as u64;
+}
+
+/// Build exception handling table for a function.
+pub fn build_exception_table[
+  call_sites: [CallSiteEntry; 256],
+  num_call_sites: u32,
+  type_table: [u64; 64],
+  num_types: u32,
+  buffer: *u8,
+  buffer_size: u32,
+] -> Result[u32, ExceptionTableError] : effect:(alloc, unsafe)
+  loop: bounded(256)
+{
+  var offset: u32 = 0;
+
+  // LSDA header
+  // Type encoding byte
+  buffer[offset] = 0x9B;  // DW_EH_PE_indirect | DW_EH_PE_pcrel | DW_EH_PE_sdata4
+  offset += 1;
+
+  // Type table offset (placeholder)
+  let type_offset_pos: u32 = offset;
+  offset += encode_uleb128(buffer + offset, buffer_size - offset, 0);
+
+  // Call site table offset (placeholder)
+  let cs_offset_pos: u32 = offset;
+  offset += encode_uleb128(buffer + offset, buffer_size - offset, 0);
+
+  // Write type table first (at known offset)
+  let type_table_offset: u32 = offset;
+  for var i: u32 = 0; i < num_types; i += 1 {
+    @write_sleb128(buffer + offset, type_table[i] as i64);
+    offset += 8;  // simplified
+  }
+
+  // Write call site table
+  let cs_offset: u32 = offset;
+  for var i: u32 = 0; i < num_call_sites; i += 1 {
+    let cs: CallSiteEntry = call_sites[i];
+    @write_u64(buffer + offset, cs.start_offset);
+    offset += 8;
+    @write_u64(buffer + offset, cs.length);
+    offset += 8;
+    @write_u64(buffer + offset, cs.landing_pad_offset);
+    offset += 8;
+    @write_u64(buffer + offset, cs.action_offset);
+    offset += 8;
+  }
+
+  // Update offsets
+  let type_offset_saved: u32 = offset;
+  offset = type_offset_pos;
+  encode_uleb128(buffer + offset, buffer_size - offset, (type_table_offset - type_offset_pos) as u64);
+  offset = cs_offset_pos;
+  encode_uleb128(buffer + offset, buffer_size - offset, (cs_offset - cs_offset_pos) as u64);
+
+  return Ok(offset);
+}
+
+pub enum ExceptionTableError : u64 {
+  BufferTooSmall = 1,
+  TooManyCallSites = 2,
+  InvalidTypeEntry = 3,
+}
+
+//==============================================================================
+// Unwind Data Structures
+//==============================================================================
+
+pub struct RegisterRule(
+  reg_num: u8,
+  rule: RuleKind,
+  value: i64,
+) : effect:(pure);
+
+pub enum RuleKind : u8 {
+  Undefined = 0,
+  SameValue = 1,
+  Offset    = 2,
+  ValOffset = 3,
+  Register  = 4,
+  Expression = 5,
+}
+
+pub struct CapabilityState(:u64);
+pub struct ResidualChain(:u64);
+pub struct Residual(
+  fault_type: u64,
+  pc: u64,
+  sp: u64,
+  unwind_pc: u64,
+) : effect:(pure);
+
+pub struct ExceptionObject(
+  exception_type: u64,
+  exception_value: u64,
+  cause: u64,
+) : effect:(pure);
+
+//==============================================================================
+// LEB128 Helpers
+//==============================================================================
+
+fn decode_uleb128_ref[data: *u8, pos: *u32] -> u64 : effect:(unsafe) {
+  var result: u64 = 0;
+  var shift: u32 = 0;
+  for var i: u32 = 0; i < 10; i += 1 {
+    let byte: u8 = data[pos];
+    pos += 1;
+    result |= (byte as u64 & 0x7F) << shift;
+    if (byte & 0x80) == 0 { break; }
+    shift += 7;
+  }
+  return result;
+}
+
+fn decode_sleb128_ref[data: *u8, pos: *u32] -> i64 : effect:(unsafe) {
+  var result: i64 = 0;
+  var shift: u32 = 0;
+  for var i: u32 = 0; i < 10; i += 1 {
+    let byte: u8 = data[pos];
+    pos += 1;
+    result |= (byte as i64 & 0x7F) << shift;
+    shift += 7;
+    if (byte & 0x80) == 0 {
+      if shift < 64 && (byte & 0x40) != 0 {
+        result |= !0 << shift;
+      }
+      break;
+    }
+  }
+  return result;
+}
+
+fn read_encoded_pointer[data: *u8, pos: *u32, encoding: u8] -> u64 : effect:(unsafe) {
+  match encoding & 0x0F {
+    0x00 => { return 0; },  // DW_EH_PE_omit / absolute
+    0x01 => { let v: u16 = @read_u16(data + pos); pos += 2; return v as u64; },
+    0x02 => { let v: u32 = @read_u32(data + pos); pos += 4; return v as u64; },
+    0x03 => { let v: u64 = @read_u64(data + pos); pos += 8; return v; },
+    0x09 => { let v: i16 = @read_u16(data + pos) as i16; pos += 2; return v as u64; },  // signed
+    0x0A => { let v: i32 = @read_u32(data + pos) as i32; pos += 4; return v as u64; },
+    0x0B => { let v: i64 = @read_u64(data + pos) as i64; pos += 8; return v as u64; },
+    0x00...0x0F => { let v: u64 = decode_uleb128_ref(data, pos); return v; },
+    _ => { return 0; },
+  }
+}
+
+fn align_up[val: u32, alignment: u32] -> u32 : effect:(pure) {
+  return (val + alignment - 1) & !(alignment - 1);
+}
+
+fn @read_u16[ptr: *u8] -> u16 : effect:(unsafe) { return *(@int_to_ptr(ptr) as *u16); }
+fn @read_u32[ptr: *u8] -> u32 : effect:(unsafe) { return *(@int_to_ptr(ptr) as *u32); }
+fn @read_u64[ptr: *u8] -> u64 : effect:(unsafe) { return *(@int_to_ptr(ptr) as *u64); }
+fn @write_u32[ptr: *u8, val: u32] : effect:(unsafe) { *(@int_to_ptr(ptr) as *u32) = val; }
+fn @write_u64[ptr: *u8, val: u64] : effect:(unsafe) { *(@int_to_ptr(ptr) as *u64) = val; }
+fn @write_sleb128[ptr: *u8, val: i64] : effect:(unsafe) {}
+fn @write_u16[ptr: *u8, val: u16] : effect:(unsafe) {}
+fn encode_uleb128[ptr: *u8, sz: u32, val: u64] -> u32 : effect:(unsafe) { return 0; }
+fn __unwind_residual_write[pc: u64, sp: u64, fp: u64, cfa: u64] : effect:(unwind, unsafe) {}
+fn __unwind_residual_capture[pc: u64, sp: u64, fp: u64] : effect:(unwind, unsafe) {}
+fn __crash_residual_persist[residual: *Residual] : effect:(unsafe) {}
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_unwind_table_lookup[] : effect:(pure) {
+  var table: UnwindTable = UnwindTable(
+    module_base: 0x1000,
+    fdes: Default,
+    num_fdes: 0,
+    cie: Default,
+    cap_token: 0,
+  );
+  table.fdes[0] = FdeEntry(
+    length: 64, cie_offset: 0, initial_loc: 0x1000,
+    address_range: 0x200, lsda: 0, personality: 0,
+    cap_token: 0, has_landing_pads: false, num_actions: 0,
+  );
+  table.num_fdes = 1;
+
+  let result: Option[(FdeEntry, u32)] = lookup_unwind_entry(&table, 0x1000);
+  assert(result.is_some());
+
+  let not_found: Option[(FdeEntry, u32)] = lookup_unwind_entry(&table, 0x2000);
+  assert(not_found.is_none());
+}
+
+@Test
+pub fn test_leb128_decode[] : effect:(unsafe) {
+  var data: [u8; 4] = [0xE5, 0x8E, 0x26, 0x00];
+  var pos: u32 = 0;
+  let val: u64 = decode_uleb128_ref(data, &pos);
+  // 0x26E8E5 expected
+  assert(val == 0x26E8E5);
+}
+
+@Test
+pub fn test_crash_context[] : effect:(pure) {
+  let ctx: CrashContext = CrashContext(
+    fault_addr: 0xDEAD,
+    fault_type: FaultType::PageFault,
+    regs: CrashRegisters(pc: 0, sp: 0, fp: 0, ra: 0, gp_regs: Default),
+    unwind_ctx: UnwindContext(pc: 0, sp: 0, fp: 0, cfa: 0, callee_saved: Default, cap_regs: Default, unwind_table: null, fde_index: 0, cap_state: CapabilityState(0), residual_chain: ResidualChain(0), effect_depth: 0, is_outermost: true),
+    crash_residual: Residual(fault_type: 0, pc: 0, sp: 0, unwind_pc: 0),
+    cap_state: CapabilityState(0),
+    recoverable: false,
+  );
+  assert(ctx.fault_addr == 0xDEAD);
+}

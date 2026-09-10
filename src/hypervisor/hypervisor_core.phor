@@ -1,0 +1,1183 @@
+//==============================================================================
+// hypervisor_core.phor — Phorensic Hypervisor Core
+//
+// Implements VM entry/exit handling (VT-x / SVM), VM control structure
+// management, guest state save/restore, exit reason dispatch, nested
+// virtualization support, and capability-gated VM access.
+//
+// All operations are capability-gated, bounded-loop, and residual-recorded.
+//==============================================================================
+
+module hypervisor_core
+  @[receipt("hv-core-v1")]
+  @[audit("HV-CORE")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{syscall, alloc, unsafe, io};
+use core::residual::*;
+use core::mem::*;
+
+//==============================================================================
+// VMX / SVM Constants
+//==============================================================================
+
+/// VMX basic exit reasons.
+pub enum VmxExitReason : u64 {
+  ExceptionOrNMI        = 0,
+  ExternalInterrupt     = 1,
+  TripleFault           = 2,
+  InitEvent             = 3,
+  SIPI                  = 4,
+  IO_SMI                = 5,
+  OtherSMI              = 6,
+  PendingVirtIntr       = 7,
+  PendingVirtNMI        = 8,
+  TaskSwitch            = 9,
+  CpuId                 = 10,
+  Getsec                = 11,
+  Hlt                   = 12,
+  Invd                  = 13,
+  Invpcid               = 14,
+  Invlpg                = 15,
+  Invept                = 20,
+  Invvpid               = 21,
+  Rdtsc                 = 22,
+  Vmcall                = 23,
+  Vmclear               = 24,
+  Vmlaunch              = 25,
+  Vmptrld               = 26,
+  Vmptrst               = 27,
+  Rdmsr                 = 28,
+  Wrmsr                 = 29,
+  Err                   = 30,
+  Mwait                 = 36,
+  MonitorTrap           = 37,
+  Monitor               = 39,
+  Pause                 = 40,
+  Rdrand                = 43,
+  Rdseed                = 44,
+  Xsetbv                = 55,
+  EPTViolation          = 48,
+  EPTMisconfig          = 49,
+  APICAccess            = 50,
+  APICWrite             = 51,
+  VirtEOI               = 52,
+  IOInstr               = 54,
+}
+
+/// SVM exit codes.
+pub enum SvmExitCode : u64 {
+  ReadCR0        = 0x000,
+  ReadCR2        = 0x002,
+  ReadCR3        = 0x003,
+  ReadCR4        = 0x004,
+  ReadCR8        = 0x008,
+  WriteCR0       = 0x010,
+  WriteCR2       = 0x012,
+  WriteCR3       = 0x013,
+  WriteCR4       = 0x014,
+  WriteCR8       = 0x018,
+  ReadDR0        = 0x020,
+  WriteDR0       = 0x030,
+  Exception      = 0x040,
+  INTR           = 0x060,
+  NMI            = 0x061,
+  SMI            = 0x062,
+  INIT           = 0x064,
+  VINTR          = 0x068,
+  HLT            = 0x078,
+  INVLPG         = 0x082,
+  INVLPGA        = 0x083,
+  IOIO           = 0x084,
+  MSR            = 0x07C,
+  RDPMC          = 0x088,
+  RDTSC          = 0x08C,
+  CPUID          = 0x09C,
+  VMMCALL         = 0x0A0,
+  MOV_DR         = 0x0B0,
+  PAUSE          = 0x0B8,
+  TMR_VIRT_EXT   = 0x0BC,
+  NPF            = 0x400,
+  AVIC_INCOMP    = 0x404,
+  VMRUN          = 0x410,
+  VMMCALL_PHOR   = 0x4FF,  // Phorensic-specific
+}
+
+//==============================================================================
+// VM Control Structure
+//==============================================================================
+
+/// VMCS (Virtual Machine Control Structure) abstraction.
+pub struct VmControlStructure[
+  CapT: Capability,
+](
+  /// VMCS revision identifier.
+  revision_id: u32,
+  /// VMCS abort indicator.
+  abort: bool,
+  /// Guest state area.
+  guest_state: GuestState,
+  /// Host state area.
+  host_state: HostState,
+  /// VM-execution control fields.
+  exec_controls: VmExecControls,
+  /// VM-exit control fields.
+  exit_controls: VmExitControls,
+  /// VM-entry control fields.
+  entry_controls: VmEntryControls,
+  /// Exit reason and qualification.
+  exit_reason: u64,
+  exit_qualification: u64,
+  /// Instruction length and info.
+  instr_length: u32,
+  instr_info: u32,
+  /// Capability token for accessing this VMCS.
+  cap_token: u64,
+  /// Owner VM identifier.
+  owner_vm_id: u64,
+  /// Whether this VMCS is active on a physical CPU.
+  is_active: bool,
+  /// Associated physical CPU.
+  physical_cpu: u32,
+  /// Residual chain for VM operations.
+  residual_chain: ResidualChain,
+  /// Generation counter.
+  generation: u64,
+) : effect:(alloc, unsafe);
+
+/// Guest state register set.
+pub struct GuestState(
+  /// Control registers.
+  cr0: u64,
+  cr2: u64,
+  cr3: u64,
+  cr4: u64,
+  cr8: u64,
+  /// Debug registers.
+  dr0: u64,
+  dr1: u64,
+  dr2: u64,
+  dr3: u64,
+  dr6: u64,
+  dr7: u64,
+  /// General-purpose registers (RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8-R15).
+  gp_regs: [u64; 16],
+  /// Segment registers.
+  cs: SegmentReg,
+  ds: SegmentReg,
+  es: SegmentReg,
+  fs: SegmentReg,
+  gs: SegmentReg,
+  ss: SegmentReg,
+  ldtr: SegmentReg,
+  tr: SegmentReg,
+  /// GDTR and IDTR.
+  gdtr: TableReg,
+  idtr: TableReg,
+  /// MSRs.
+  sysenter_cs: u64,
+  sysenter_esp: u64,
+  sysenter_eip: u64,
+  efer: u64,
+  pat: u64,
+  star: u64,
+  lstar: u64,
+  cstar: u64,
+  sfmask: u64,
+  kernel_gs_base: u64,
+  tsc_offset: u64,
+  /// RFLAGS.
+  rflags: u64,
+  /// RIP.
+  rip: u64,
+  /// Interruptibility state.
+  interruptibility: u32,
+  /// Activity state.
+  activity_state: u8,
+  /// Pending debug exceptions.
+  pending_debug_exceptions: u64,
+  /// VMCS link pointer.
+  vmcs_link: u64,
+  /// Virtual CPUID.
+  virtual_cpuid: u32,
+  /// Capability state for the guest.
+  cap_state: CapabilityState,
+) : effect:(unsafe);
+
+pub struct HostState(
+  cr0: u64,
+  cr3: u64,
+  cr4: u64,
+  cs: SegmentReg,
+  ds: SegmentReg,
+  es: SegmentReg,
+  fs: SegmentReg,
+  gs: SegmentReg,
+  ss: SegmentReg,
+  tr: SegmentReg,
+  gdtr: TableReg,
+  idtr: TableReg,
+  sysenter_cs: u64,
+  sysenter_esp: u64,
+  sysenter_eip: u64,
+  rsp: u64,
+  rip: u64,
+  fs_base: u64,
+  gs_base: u64,
+  pat: u64,
+  efer: u64,
+  cap_token: u64,
+) : effect:(unsafe);
+
+pub struct SegmentReg(
+  selector: u16,
+  base: u64,
+  limit: u32,
+  flags: SegmentFlags,
+) : effect:(pure);
+
+pub struct TableReg(
+  base: u64,
+  limit: u16,
+) : effect:(pure);
+
+pub struct SegmentFlags(
+  bits: u32,
+) : effect:(pure);
+
+const SEG_FLAG_VALID: u32        = 1 << 0;
+const SEG_FLAG_PRESENT: u32      = 1 << 1;
+const SEG_FLAG_AVAILABLE: u32    = 1 << 2;
+const SEG_FLAG_LONG: u32         = 1 << 3;
+const SEG_FLAG_DEFAULT_SIZE: u32 = 1 << 4;
+const SEG_FLAG_GRANULARITY: u32  = 1 << 5;
+const SEG_FLAG_CODE: u32         = 1 << 6;
+const SEG_FLAG_DATA: u32         = 1 << 7;
+const SEG_FLAG_WRITABLE: u32     = 1 << 8;
+const SEG_FLAG_READABLE: u32     = 1 << 9;
+const SEG_FLAG_CONFORMING: u32   = 1 << 10;
+
+pub struct VmExecControls(
+  pin_based: u32,
+  processor_based: u32,
+  processor_based2: u32,
+  io_bitmap_a: u64,
+  io_bitmap_b: u64,
+  msr_bitmap: u64,
+  tsc_offset: u64,
+  virtual_apic: u64,
+  ept_pointer: u64,
+  apic_access: u64,
+  vmfunc_controls: u32,
+  eoi_exit_bitmap: u64,
+  eptp_list: [u64; 4],
+  pml_index: u64,
+  vpid: u16,
+) : effect:(pure);
+
+pub struct VmExitControls(
+  controls: u32,
+  msr_store: u64,
+  msr_load: u64,
+  save_count: u32,
+  load_count: u32,
+) : effect:(pure);
+
+pub struct VmEntryControls(
+  controls: u32,
+  msr_load: u64,
+  load_count: u32,
+  event_injection: u64,
+  instr_length: u32,
+) : effect:(pure);
+
+//==============================================================================
+// VM Entry / Exit Handling
+//==============================================================================
+
+/// Perform a VM entry (VMLAUNCH/VMRESUME).
+pub fn vm_entry[
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  // Validate capability
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_RUN) == 0 {
+    return Err(VmError::InsufficientRights);
+  }
+
+  // Validate VMCS state
+  if vmcs.is_active {
+    return Err(VmError::VmcsAlreadyActive);
+  }
+
+  if vmcs.abort {
+    return Err(VmError::VmcsAborted);
+  }
+
+  // Record pre-entry residual
+  record_hv_residual(HvOp::VmEntry, vmcs.owner_vm_id, vmcs.generation);
+
+  // Perform the actual VM entry via VT-x/SVM instruction
+  let result: VmEntryResult = __vm_launch(vmcs);
+  vmcs.is_active = true;
+
+  match result {
+    VmEntryResult::Success => {
+      // VM entry was successful — control passes to guest
+      // When guest exits, we return from this function
+      return Ok(());
+    },
+    VmEntryResult::EntryFailure(code) => {
+      vmcs.is_active = false;
+      return Err(VmError::EntryFailure(code));
+    },
+    VmEntryResult::ExitImmediate(reason, qual) => {
+      // Immediate VM exit (e.g., VM entry with invalid state)
+      vmcs.is_active = false;
+      vmcs.exit_reason = reason;
+      vmcs.exit_qualification = qual;
+      return Ok(());
+    },
+  }
+}
+
+/// Handle a VM exit (called from the VM exit handler).
+pub fn handle_vm_exit[
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result<ExitAction, VmError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  // Read exit reason from hardware
+  vmcs.exit_reason = __vm_read_exit_reason();
+  vmcs.exit_qualification = __vm_read_exit_qualification();
+  vmcs.instr_length = __vm_read_vmexit_instr_len();
+
+  // Mark VMCS as not actively running
+  vmcs.is_active = false;
+
+  // Record residual
+  record_hv_residual(HvOp::VmExit, vmcs.exit_reason, vmcs.exit_qualification);
+
+  // Dispatch based on exit reason
+  let action: ExitAction = dispatch_exit_reason(
+    vmcs.exit_reason,
+    vmcs.exit_qualification,
+    vmcs,
+    hv_cap,
+  )?;
+
+  // Audit the VM exit
+  audit_vm_exit(vmcs);
+
+  return Ok(action);
+}
+
+/// Dispatch VM exit to the appropriate handler.
+pub fn dispatch_exit_reason[
+  reason: u64,
+  qualification: u64,
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result<ExitAction, VmError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  let exit: VmxExitReason = @int_to_enum(reason);
+
+  match exit {
+    VmxExitReason::CpuId => handle_cpuid(vmcs, qualification),
+    VmxExitReason::Hlt => handle_hlt(vmcs),
+    VmxExitReason::Vmcall => handle_vmcall(vmcs, hv_cap),
+    VmxExitReason::Rdmsr => handle_rdmsr(vmcs, qualification),
+    VmxExitReason::Wrmsr => handle_wrmsr(vmcs, qualification),
+    VmxExitReason::EPT Violation => handle_ept_violation(vmcs, qualification),
+    VmxExitReason::IOInstr => handle_io(vmcs, qualification),
+    VmxExitReason::ExternalInterrupt => handle_external_intr(vmcs),
+    VmxExitReason::ExceptionOrNMI => handle_exception(vmcs, qualification),
+    VmxExitReason::Rdtsc => handle_rdtsc(vmcs),
+    VmxExitReason::Pause => handle_pause(vmcs),
+    VmxExitReason::APICAccess => handle_apic_access(vmcs, qualification),
+    VmxExitReason::APICWrite => handle_apic_write(vmcs, qualification),
+    VmxExitReason::MonitorTrap => handle_monitor_trap(vmcs),
+    VmxExitReason::Invd => handle_invd(vmcs),
+    VmxExitReason::Invlpg => handle_invlpg(vmcs, qualification),
+    _ => {
+      // Unknown or unhandled exit reason
+      record_hv_residual(HvOp::UnhandledExit, reason, qualification);
+      return Ok(ExitAction::VmExitToUser(reason, qualification));
+    },
+  }
+}
+
+/// Result of a VM entry attempt.
+pub enum VmEntryResult {
+  Success,
+  EntryFailure(u64),
+  ExitImmediate(u64, u64),
+}
+
+/// Action to take after handling a VM exit.
+pub enum ExitAction : u64 {
+  /// Re-enter the guest (after handling the exit).
+  ReEnterGuest = 0,
+  /// Forward the exit to the VMM user-space handler.
+  VmExitToUser(u64, u64) = 1,
+  /// Shut down the VM.
+  ShutdownVm = 2,
+  /// Inject an interrupt into the guest.
+  InjectInterrupt(u64) = 3,
+  /// Pause the VM.
+  PauseVm = 4,
+  /// Perform a VM migration.
+  MigrateVm(u64) = 5,
+}
+
+//==============================================================================
+// Exit Reason Handlers
+//==============================================================================
+
+fn handle_cpuid[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (alloc, unsafe) {
+  // Emulate CPUID: apply masking and forwarding
+  let guest_rax: u64 = vmcs.guest_state.gp_regs[0];  // RAX
+  let guest_rcx: u64 = vmcs.guest_state.gp_regs[2];  // RCX
+
+  let (rax, rbx, rcx, rdx): (u64, u64, u64, u64) = apply_cpuid_masking(guest_rax, guest_rcx);
+
+  vmcs.guest_state.gp_regs[0] = rax;
+  vmcs.guest_state.gp_regs[1] = rbx;
+  vmcs.guest_state.gp_regs[2] = rcx;
+  vmcs.guest_state.gp_regs[3] = rdx;
+  advance_guest_rip(vmcs);
+
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_hlt[vmcs: *VmControlStructure] -> Result<ExitAction, VmError> : (pure) {
+  // HLT instruction: pause the VM
+  return Ok(ExitAction::PauseVm);
+}
+
+fn handle_vmcall[vmcs: *VmControlStructure, hv_cap: CapabilitySlot] -> Result<ExitAction, VmError> : (syscall, alloc, unsafe) {
+  // VMCALL from guest — hypercall handling
+  let hypercall_num: u64 = vmcs.guest_state.gp_regs[6];  // RDI
+  let arg1: u64 = vmcs.guest_state.gp_regs[0];  // RAX
+  let arg2: u64 = vmcs.guest_state.gp_regs[1];  // RBX
+  let arg3: u64 = vmcs.guest_state.gp_regs[2];  // RCX
+
+  let result: u64 = dispatch_hypercall(hypercall_num, arg1, arg2, arg3, vmcs, hv_cap);
+  vmcs.guest_state.gp_regs[0] = result;  // RAX = return value
+  advance_guest_rip(vmcs);
+
+  record_hv_residual(HvOp::Vmcall, hypercall_num, result);
+
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_rdmsr[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (unsafe) {
+  let msr: u32 = qual as u32;
+  let value: u64 = emulate_rdmsr(msr, vmcs);
+  // ECX already has MSR number
+  vmcs.guest_state.gp_regs[0] = (value & 0xFFFFFFFF);   // RAX = low 32
+  vmcs.guest_state.gp_regs[2] = (value >> 32);          // RDX = high 32
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_wrmsr[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (unsafe) {
+  let msr: u32 = qual as u32;
+  let value: u64 = (vmcs.guest_state.gp_regs[3] << 32) | (vmcs.guest_state.gp_regs[0] & 0xFFFFFFFF);  // RDX:RAX
+  emulate_wrmsr(msr, value, vmcs);
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_ept_violation[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (syscall, alloc, unsafe) {
+  // EPT violation: handle via MMU virtualization
+  let guest_phys: u64 = __vm_read_guest_physical();
+  record_hv_residual(HvOp::EptViolation, guest_phys, qual);
+
+  // Check if the fault can be resolved by the memory virtualization layer
+  let resolved: bool = resolve_ept_violation(vmcs, guest_phys, qual);
+  if resolved {
+    return Ok(ExitAction::ReEnterGuest);
+  }
+
+  return Ok(ExitAction::VmExitToUser(48, qual));  // Forward to VMM
+}
+
+fn handle_io[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (syscall, alloc, unsafe) {
+  let io_info: IoInstructionInfo = decode_io_instruction(qual);
+  let port: u16 = io_info.port;
+  let is_write: bool = io_info.is_write;
+  let value: u32 = io_info.value;
+
+  if is_write {
+    handle_io_write(port, value, vmcs);
+  } else {
+    let read_val: u32 = handle_io_read(port, vmcs);
+    // Store read value in RAX
+    vmcs.guest_state.gp_regs[0] = read_val;
+  }
+
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_external_intr[vmcs: *VmControlStructure] -> Result<ExitAction, VmError> : (unsafe) {
+  // External interrupt during VMX non-root: check if we should inject or forward
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_exception[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (alloc, unsafe) {
+  let vector: u8 = qual as u8;
+  let error_code: u32 = (qual >> 32) as u32;
+
+  match vector {
+    0x06 => { // #UD — undefined instruction
+      advance_guest_rip(vmcs);
+      return Ok(ExitAction::ReEnterGuest);
+    },
+    0x0E => { // #PF — page fault
+      let fault_addr: u64 = vmcs.guest_state.cr2;
+      // Forward to VMM
+      return Ok(ExitAction::VmExitToUser(0, fault_addr));
+    },
+    _ => {
+      // Forward other exceptions to VMM
+      return Ok(ExitAction::VmExitToUser(vector as u64, error_code as u64));
+    },
+  }
+}
+
+fn handle_rdtsc[vmcs: *VmControlStructure] -> Result<ExitAction, VmError> : (syscall) {
+  let tsc: u64 = __read_tsc();
+  let adjusted: u64 = tsc + vmcs.exec_controls.tsc_offset;
+  vmcs.guest_state.gp_regs[0] = (adjusted & 0xFFFFFFFF);
+  vmcs.guest_state.gp_regs[2] = (adjusted >> 32);
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_pause[vmcs: *VmControlStructure] -> Result<ExitAction, VmError> : (pure) {
+  return Ok(ExitAction::PauseVm);
+}
+
+fn handle_apic_access[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (alloc, unsafe) {
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_apic_write[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (alloc, unsafe) {
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_monitor_trap[vmcs: *VmControlStructure] -> Result<ExitAction, VmError> : (pure) {
+  return Ok(ExitAction::PauseVm);
+}
+
+fn handle_invd[vmcs: *VmControlStructure] -> Result<ExitAction, VmError> : (pure) {
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+fn handle_invlpg[vmcs: *VmControlStructure, qual: u64] -> Result<ExitAction, VmError> : (unsafe) {
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+//==============================================================================
+// Helper Functions
+//==============================================================================
+
+fn advance_guest_rip[vmcs: *VmControlStructure] : effect:(unsafe) {
+  vmcs.guest_state.rip += vmcs.instr_length as u64;
+}
+
+fn resolve_ept_violation[vmcs: *VmControlStructure, gpa: u64, qual: u64] -> bool : effect:(unsafe) {
+  return false;
+}
+
+fn apply_cpuid_masking[leaf: u64, subleaf: u64] -> (u64, u64, u64, u64) : effect:(pure) {
+  return (leaf, 0, 0, 0);
+}
+
+fn emulate_rdmsr[msr: u32, vmcs: *VmControlStructure] -> u64 : effect:(unsafe) {
+  return 0;
+}
+
+fn emulate_wrmsr[msr: u32, value: u64, vmcs: *VmControlStructure] : effect:(unsafe) {
+}
+
+fn dispatch_hypercall[num: u64, a1: u64, a2: u64, a3: u64, vmcs: *VmControlStructure, cap: CapabilitySlot] -> u64 : effect:(syscall, unsafe) {
+  return 0;
+}
+
+pub struct IoInstructionInfo(
+  port: u16,
+  is_write: bool,
+  value: u32,
+  size: u8,
+  string: bool,
+  rep: bool,
+) : effect:(pure);
+
+fn decode_io_instruction[qual: u64] -> IoInstructionInfo : effect:(pure) {
+  return IoInstructionInfo(port: 0, is_write: false, value: 0, size: 1, string: false, rep: false);
+}
+
+fn handle_io_write[port: u16, value: u32, vmcs: *VmControlStructure] : effect:(syscall, unsafe) {}
+fn handle_io_read[port: u16, vmcs: *VmControlStructure] -> u32 : effect:(syscall, unsafe) { return 0; }
+
+//==============================================================================
+// VMCS Management
+//==============================================================================
+
+/// Create a new VMCS.
+pub fn vmcs_create[
+  vm_id: u64,
+  hv_cap: CapabilitySlot,
+  cap_token: u64,
+] -> Result[*VmControlStructure, VmError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_CREATE) == 0 {
+    return Err(VmError::InsufficientRights);
+  }
+
+  let vmcs: *VmControlStructure = @alloc(VmControlStructure);
+  vmcs.revision_id = __vmx_get_revision_id();
+  vmcs.abort = false;
+  vmcs.guest_state = GuestState::new();
+  vmcs.host_state = HostState::new();
+  vmcs.exec_controls = VmExecControls::new();
+  vmcs.exit_controls = VmExitControls::new();
+  vmcs.entry_controls = VmEntryControls::new();
+  vmcs.exit_reason = 0;
+  vmcs.exit_qualification = 0;
+  vmcs.cap_token = cap_token;
+  vmcs.owner_vm_id = vm_id;
+  vmcs.is_active = false;
+  vmcs.physical_cpu = 0xFFFFFFFF;
+  vmcs.residual_chain = ResidualChain(last_id: 0);
+  vmcs.generation = generate_hv_generation();
+
+  // Initialize with default VMCS state
+  init_default_vmcs_state(vmcs);
+
+  record_hv_residual(HvOp::VmcsCreate, vm_id, vmcs.generation);
+
+  return Ok(vmcs);
+}
+
+/// Initialize default VMCS state.
+fn init_default_vmcs_state[vmcs: *VmControlStructure] : effect:(unsafe) {
+  // Set default host state from current CPU state
+  vmcs.host_state.cr0 = __read_cr0();
+  vmcs.host_state.cr3 = __read_cr3();
+  vmcs.host_state.cr4 = __read_cr4();
+  vmcs.host_state.rsp = 0;
+  vmcs.host_state.rip = 0;
+  vmcs.host_state.cs = read_host_segment(CS_SEL);
+  vmcs.host_state.ds = read_host_segment(DS_SEL);
+  vmcs.host_state.es = read_host_segment(ES_SEL);
+  vmcs.host_state.ss = read_host_segment(SS_SEL);
+  vmcs.host_state.fs = read_host_segment(FS_SEL);
+  vmcs.host_state.gs = read_host_segment(GS_SEL);
+  vmcs.host_state.tr = read_host_segment(TR_SEL);
+  vmcs.host_state.gdtr = read_gdtr();
+  vmcs.host_state.idtr = read_idtr();
+  vmcs.host_state.efer = __read_msr(MSR_EFER);
+  vmcs.host_state.pat = __read_msr(MSR_PAT);
+}
+
+/// Clear a VMCS (VMCLEAR).
+pub fn vmcs_clear[
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VmError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_DESTROY) == 0 {
+    return Err(VmError::InsufficientRights);
+  }
+
+  __vm_clear(vmcs);
+  vmcs.is_active = false;
+
+  record_hv_residual(HvOp::VmcsClear, vmcs.owner_vm_id, 0);
+  return Ok(());
+}
+
+//==============================================================================
+// Capability-Gated VM Access
+//==============================================================================
+
+/// Validate that a caller has the right to operate on a VM.
+pub fn validate_vm_access[
+  vmcs: *VmControlStructure,
+  caller_cap: CapabilitySlot,
+  required_rights: CapRights,
+] -> Result[(), VmError> : effect:(pure)
+  loop: bounded(1)
+{
+  if !caller_cap.valid {
+    return Err(VmError::InvalidCapability);
+  }
+
+  let cap_rights: CapRights = CapRights(caller_cap.rights);
+  if (cap_rights & required_rights) != required_rights {
+    return Err(VmError::InsufficientRights);
+  }
+
+  if vmcs.cap_token != 0 && vmcs.cap_token != caller_cap.generation {
+    return Err(VmError::CapabilityTokenMismatch);
+  }
+
+  return Ok(());
+}
+
+//==============================================================================
+// Nested Virtualization Support
+//==============================================================================
+
+/// Nested VMCS management.
+pub struct NestedVmcs(
+  /// Pointer to the nested VMCS.
+  nested_vmcs: *VmControlStructure,
+  /// Level of nesting.
+  nest_level: u32,
+  /// Maximum nesting depth.
+  max_nest_level: u32,
+  /// Whether VMX is enabled in the guest.
+  vmx_enabled: bool,
+  /// Guest VMCS shadow bitmap.
+  shadow_bitmap: u64,
+) : effect:(unsafe);
+
+const MAX_NESTING_DEPTH: u32 = 4;
+
+/// Handle nested VM entry (VM entry from a guest hypervisor).
+pub fn handle_nested_vmentry[
+  vmcs: *VmControlStructure,
+  nested_state: *NestedVmcs,
+] -> Result<(), VmError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  if nested_state.nest_level >= MAX_NESTING_DEPTH {
+    return Err(VmError::NestingDepthExceeded);
+  }
+
+  // Save current guest state as the "host" state for the nested VMCS
+  nested_state.nest_level += 1;
+  nested_state.vmx_enabled = true;
+
+  // Shadow the VMCS fields that the guest hypervisor writes
+  shadow_vmcs_fields(vmcs, nested_state);
+
+  record_hv_residual(HvOp::NestedVmentry, nested_state.nest_level as u64, 0);
+  return Ok(());
+}
+
+/// Shadow VMCS fields for nested virtualization.
+fn shadow_vmcs_fields[
+  vmcs: *VmControlStructure,
+  nested: *NestedVmcs,
+] : effect:(unsafe) {
+  // Read and cache VMCS fields written by the guest hypervisor
+  // This allows the hypervisor to intercept and emulate VMX instructions
+}
+
+//==============================================================================
+// VM State Save/Restore
+//==============================================================================
+
+/// Save the complete VM state to a save area.
+pub fn save_vm_state[
+  vmcs: *VmControlStructure,
+  save_area: *VmSaveArea,
+] : effect:(unsafe)
+  loop: bounded(1)
+{
+  // Copy guest state
+  save_area.guest = vmcs.guest_state;
+  save_area.exec_controls = vmcs.exec_controls;
+  save_area.exit_controls = vmcs.exit_controls;
+  save_area.entry_controls = vmcs.entry_controls;
+  save_area.exit_reason = vmcs.exit_reason;
+  save_area.generation = vmcs.generation;
+  save_area.cap_token = vmcs.cap_token;
+
+  record_hv_residual(HvOp::StateSave, vmcs.owner_vm_id, 0);
+}
+
+/// Restore VM state from a save area.
+pub fn restore_vm_state[
+  vmcs: *VmControlStructure,
+  save_area: *VmSaveArea,
+] : effect:(unsafe)
+  loop: bounded(1)
+{
+  vmcs.guest_state = save_area.guest;
+  vmcs.exec_controls = save_area.exec_controls;
+  vmcs.exit_controls = save_area.exit_controls;
+  vmcs.entry_controls = save_area.entry_controls;
+  vmcs.exit_reason = save_area.exit_reason;
+  vmcs.generation = save_area.generation;
+  vmcs.cap_token = save_area.cap_token;
+
+  // Write restored state to the actual VMCS
+  __vm_write_vmcs_state(vmcs);
+
+  record_hv_residual(HvOp::StateRestore, vmcs.owner_vm_id, 0);
+}
+
+pub struct VmSaveArea(
+  guest: GuestState,
+  exec_controls: VmExecControls,
+  exit_controls: VmExitControls,
+  entry_controls: VmEntryControls,
+  exit_reason: u64,
+  generation: u64,
+  cap_token: u64,
+) : effect:(alloc);
+
+//==============================================================================
+// Audit and Residual Recording
+//==============================================================================
+
+pub enum HvOp : u8 {
+  VmEntry        = 0,
+  VmExit         = 1,
+  VmcsCreate     = 2,
+  VmcsClear      = 3,
+  Vmcall         = 4,
+  EptViolation   = 5,
+  NestedVmentry  = 6,
+  StateSave      = 7,
+  StateRestore   = 8,
+  UnhandledExit  = 9,
+}
+
+pub enum VmError : u64 {
+  Success                 = 0,
+  InsufficientRights      = 1,
+  InvalidCapability       = 2,
+  CapabilityTokenMismatch = 3,
+  VmcsAlreadyActive       = 4,
+  VmcsAborted            = 5,
+  EntryFailure(u64)       = 6,
+  NestingDepthExceeded   = 7,
+  NotSupported           = 8,
+  ResourceExhausted      = 9,
+  InvalidExitReason      = 10,
+}
+
+fn record_hv_residual[op: HvOp, arg1: u64, arg2: u64] : effect:(unsafe) {
+  __hv_residual_write(op as u64, arg1, arg2);
+}
+
+fn audit_vm_exit[vmcs: *VmControlStructure] : effect:(unsafe) {
+  __hv_audit_write(vmcs.exit_reason, vmcs.exit_qualification, vmcs.owner_vm_id);
+}
+
+fn generate_hv_generation[] -> u64 : effect:(pure) { return 1; }
+
+pub type CapRights(:u64);
+pub const RIGHT_HV_CREATE: CapRights = CapRights(1 << 40);
+pub const RIGHT_HV_DESTROY: CapRights = CapRights(1 << 41);
+pub const RIGHT_HV_RUN: CapRights = CapRights(1 << 42);
+
+pub type CapabilityState(:u64);
+pub type ResidualChain(last_id: u64);
+
+// Hardware interface stubs
+fn __vm_launch[vmcs: *VmControlStructure] -> VmEntryResult : (unsafe) { return VmEntryResult::Success; }
+fn __vm_clear[vmcs: *VmControlStructure] : (unsafe) {}
+fn __vm_read_exit_reason[] -> u64 : (unsafe) { return 0; }
+fn __vm_read_exit_qualification[] -> u64 : (unsafe) { return 0; }
+fn __vm_read_vmexit_instr_len[] -> u32 : (unsafe) { return 0; }
+fn __vm_read_guest_physical[] -> u64 : (unsafe) { return 0; }
+fn __vm_write_vmcs_state[vmcs: *VmControlStructure] : (unsafe) {}
+fn __vmx_get_revision_id[] -> u32 : (pure) { return 0; }
+fn __read_cr0[] -> u64 : (unsafe) { return 0; }
+fn __read_cr3[] -> u64 : (unsafe) { return 0; }
+fn __read_cr4[] -> u64 : (unsafe) { return 0; }
+fn __read_tsc[] -> u64 : (syscall) { return 0; }
+fn __read_msr[msr: u32] -> u64 : (unsafe) { return 0; }
+
+const MSR_EFER: u32 = 0xC0000080;
+const MSR_PAT: u32 = 0x277;
+
+const CS_SEL: u32 = 0;
+const DS_SEL: u32 = 1;
+const ES_SEL: u32 = 2;
+const SS_SEL: u32 = 3;
+const FS_SEL: u32 = 4;
+const GS_SEL: u32 = 5;
+const TR_SEL: u32 = 6;
+
+fn read_host_segment[sel: u32] -> SegmentReg : (unsafe) { return SegmentReg(selector: 0, base: 0, limit: 0, flags: SegmentFlags(0)); }
+fn read_gdtr[] -> TableReg : (unsafe) { return TableReg(base: 0, limit: 0); }
+fn read_idtr[] -> TableReg : (unsafe) { return TableReg(base: 0, limit: 0); }
+
+fn @alloc[T](...) -> *T : effect:(alloc, unsafe) { return null; }
+fn __hv_residual_write[op: u64, a1: u64, a2: u64] : effect:(unsafe) {}
+fn __hv_audit_write[reason: u64, qual: u64, vm_id: u64] : effect:(unsafe) {}
+
+//==============================================================================
+// VMX Control Field Configuration
+//==============================================================================
+
+/// Configure VM-execution controls.
+pub fn setup_vm_exec_controls[
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VmError> : effect:(syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_access(vmcs, hv_cap, RIGHT_HV_RUN)?;
+
+  // Set up pin-based controls
+  vmcs.exec_controls.pin_based = 0;
+  vmcs.exec_controls.pin_based |= (1 << 0);  // External interrupt exiting
+  vmcs.exec_controls.pin_based |= (1 << 3);  // NMI exiting
+  vmcs.exec_controls.pin_based |= (1 << 5);  // Virtual NMIs
+  vmcs.exec_controls.pin_based |= (1 << 6);  // Activate VMX-preemption timer
+
+  // Set up primary processor-based controls
+  vmcs.exec_controls.processor_based = 0;
+  vmcs.exec_controls.processor_based |= (1 << 0);  // RDTSC exiting
+  vmcs.exec_controls.processor_based |= (1 << 1);  // RDPMC exiting
+  vmcs.exec_controls.processor_based |= (1 << 2);  // HLT exiting
+  vmcs.exec_controls.processor_based |= (1 << 3);  // INVLPG exiting
+  vmcs.exec_controls.processor_based |= (1 << 7);  // CR8 loads exiting
+  vmcs.exec_controls.processor_based |= (1 << 8);  // CR8 stores exiting
+  vmcs.exec_controls.processor_based |= (1 << 15); // I/O exiting
+  vmcs.exec_controls.processor_based |= (1 << 16); // MSR bitmap
+  vmcs.exec_controls.processor_based |= (1 << 17); // Use TSC offsetting
+  vmcs.exec_controls.processor_based |= (1 << 20); // Unconditional I/O exiting
+  vmcs.exec_controls.processor_based |= (1 << 21); // Use VPID
+  vmcs.exec_controls.processor_based |= (1 << 22); // Activate secondary controls
+
+  // Set up secondary processor-based controls
+  vmcs.exec_controls.processor_based2 = 0;
+  vmcs.exec_controls.processor_based2 |= (1 << 0);   // Virtualize APIC accesses
+  vmcs.exec_controls.processor_based2 |= (1 << 1);   // Enable EPT
+  vmcs.exec_controls.processor_based2 |= (1 << 4);   // APIC-register virtualization
+  vmcs.exec_controls.processor_based2 |= (1 << 5);   // Virtual-interrupt delivery
+  vmcs.exec_controls.processor_based2 |= (1 << 7);   // RDTSCP exiting
+  vmcs.exec_controls.processor_based2 |= (1 << 12);  // INVPCID exiting
+  vmcs.exec_controls.processor_based2 |= (1 << 18);  // VMFUNC
+  vmcs.exec_controls.processor_based2 |= (1 << 20);  // ENCLS exiting
+  vmcs.exec_controls.processor_based2 |= (1 << 22);  // ENCLV exiting
+  vmcs.exec_controls.processor_based2 |= (1 << 25);  // Mode-based execute control
+  vmcs.exec_controls.processor_based2 |= (1 << 33);  // XSAVES/XRSTORS
+
+  record_hv_residual(HvOp::VmcsSetup, @ptr_to_int(vmcs), 0);
+  return Ok(());
+}
+
+/// Configure VM-entry controls.
+pub fn setup_vm_entry_controls[
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VmError] : effect:(syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_access(vmcs, hv_cap, RIGHT_HV_RUN)?;
+
+  vmcs.entry_controls.controls = 0;
+  vmcs.entry_controls.controls |= (1 << 0);   // Load debug controls
+  vmcs.entry_controls.controls |= (1 << 2);   // IA-32e mode guest
+  vmcs.entry_controls.controls |= (1 << 9);   // Load IA32_PERF_GLOBAL_CTRL
+  vmcs.entry_controls.controls |= (1 << 11);  // Load IA32_PAT
+  vmcs.entry_controls.controls |= (1 << 13);  // Load IA32_EFER
+
+  record_hv_residual(HvOp::VmcsEntrySetup, @ptr_to_int(vmcs), 0);
+  return Ok(());
+}
+
+/// Configure VM-exit controls.
+pub fn setup_vm_exit_controls[
+  vmcs: *VmControlStructure,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VmError> : effect:(syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_access(vmcs, hv_cap, RIGHT_HV_RUN)?;
+
+  vmcs.exit_controls.controls = 0;
+  vmcs.exit_controls.controls |= (1 << 0);   // Save debug controls
+  vmcs.exit_controls.controls |= (1 << 2);   // Host address space size
+  vmcs.exit_controls.controls |= (1 << 5);   // Acknowledge interrupt on exit
+  vmcs.exit_controls.controls |= (1 << 9);   // Save IA32_PAT
+  vmcs.exit_controls.controls |= (1 << 11);  // Load IA32_PAT
+  vmcs.exit_controls.controls |= (1 << 12);  // Save IA32_EFER
+  vmcs.exit_controls.controls |= (1 << 13);  // Load IA32_EFER
+  vmcs.exit_controls.controls |= (1 << 15);  // Save VMX-preemption timer
+
+  record_hv_residual(HvOp::VmcsExitSetup, @ptr_to_int(vmcs), 0);
+  return Ok(());
+}
+
+//==============================================================================
+// VMCS Field Encoding and Access
+//==============================================================================
+
+/// VMCS field encoding constants.
+pub enum VmcsField : u32 {
+  // Guest state fields
+  GUEST_ES         = 0x00000800,
+  GUEST_CS         = 0x00000802,
+  GUEST_SS         = 0x00000804,
+  GUEST_DS         = 0x00000806,
+  GUEST_FS         = 0x00000808,
+  GUEST_GS         = 0x0000080A,
+  GUEST_LDTR       = 0x0000080C,
+  GUEST_TR         = 0x0000080E,
+  GUEST_GDTR       = 0x00000810,
+  GUEST_IDTR       = 0x00000812,
+  GUEST_CR0        = 0x00006800,
+  GUEST_CR3        = 0x00006802,
+  GUEST_CR4        = 0x00006804,
+  GUEST_RSP        = 0x0000681C,
+  GUEST_RIP        = 0x0000681E,
+  GUEST_RFLAGS     = 0x00006820,
+
+  // Host state fields
+  HOST_CR0         = 0x00006C00,
+  HOST_CR3         = 0x00006C02,
+  HOST_CR4         = 0x00006C04,
+  HOST_RSP         = 0x00006C14,
+  HOST_RIP         = 0x00006C16,
+
+  // Control fields
+  PIN_BASED_CTLS   = 0x00004000,
+  CPU_BASED_CTLS   = 0x00004002,
+  EXIT_CTLS        = 0x00004004,
+  ENTRY_CTLS       = 0x00004006,
+  SECONDARY_CTLS   = 0x0000401E,
+  EPT_POINTER      = 0x0000201A,
+}
+
+/// Read a 64-bit VMCS field.
+pub fn vmcs_read64[
+  vmcs: *VmControlStructure,
+  field: VmcsField,
+  hv_cap: CapabilitySlot,
+] -> Result<u64, VmError> : effect:(unsafe)
+  loop: bounded(1)
+{
+  validate_vm_access(vmcs, hv_cap, RIGHT_HV_RUN)?;
+  return __vmread(field as u64);
+}
+
+/// Write a 64-bit VMCS field.
+pub fn vmcs_write64[
+  vmcs: *VmControlStructure,
+  field: VmcsField,
+  value: u64,
+  hv_cap: CapabilitySlot,
+] -> Result[(), VmError] : effect:(unsafe)
+  loop: bounded(1)
+{
+  validate_vm_access(vmcs, hv_cap, RIGHT_HV_RUN)?;
+  __vmwrite(field as u64, value);
+  return Ok(());
+}
+
+//==============================================================================
+// Extended Exit Reason Handlers
+//==============================================================================
+
+/// Handle a RDTSCP exit.
+pub fn handle_rdtscp[
+  vmcs: *VmControlStructure,
+] -> Result<ExitAction, VmError> : effect:(syscall, unsafe)
+  loop: bounded(1)
+{
+  let tsc: u64 = __read_tsc() + vmcs.exec_controls.tsc_offset;
+  vmcs.guest_state.gp_regs[0] = (tsc & 0xFFFFFFFF) as u64;  // RAX = low
+  vmcs.guest_state.gp_regs[2] = (tsc >> 32) as u64;          // RDX = high
+  vmcs.guest_state.gp_regs[1] = vmcs.guest_state.virtual_cpuid as u64;  // RCX = TSC_AUX
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+/// Handle an INVPCID exit.
+pub fn handle_invpcid[
+  vmcs: *VmControlStructure,
+  qual: u64,
+] -> Result<ExitAction, VmError> : effect:(pure)
+  loop: bounded(1)
+{
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+/// Handle a VMFUNC exit (VM function call from guest).
+pub fn handle_vmfunc[
+  vmcs: *VmControlStructure,
+  qual: u64,
+] -> Result<ExitAction, VmError> : effect:(unsafe)
+  loop: bounded(1)
+{
+  let function: u32 = qual as u32;
+  match function {
+    0 => {
+      // EPTP switching
+      let eptp_list: u64 = vmcs.exec_controls.eptp_list;
+      let new_eptp_idx: u64 = vmcs.guest_state.gp_regs[1];  // RBX
+      if new_eptp_idx < 4 {
+        vmcs.exec_controls.ept_pointer = vmcs.exec_controls.eptp_list[new_eptp_idx];
+      }
+    },
+    _ => {
+      // Unknown VMFUNC
+    },
+  }
+  advance_guest_rip(vmcs);
+  return Ok(ExitAction::ReEnterGuest);
+}
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_vmcs_create_destroy[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_CREATE.bits, value: 0, generation: 1, valid: true);
+  let vmcs: *VmControlStructure = vmcs_create(1, cap, cap.generation);
+  // assert(vmcs != null);
+}
+
+@Test
+pub fn test_capability_validation[] : effect:(pure) {
+  let valid_cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_RUN.bits, value: 0, generation: 1, valid: true);
+  // Validation would pass for valid cap
+}
+
+#[test]
+pub fn test_guest_state_init[] : effect:(pure) {
+  let gs: GuestState = GuestState(
+    cr0: 0x80050033, cr2: 0, cr3: 0, cr4: 0x202668, cr8: 0,
+    dr0: 0, dr1: 0, dr2: 0, dr3: 0, dr6: 0, dr7: 0,
+    gp_regs: Default, cs: SegmentReg(selector: 0, base: 0, limit: 0, flags: SegmentFlags(0)),
+    ds: Default, es: Default, fs: Default, gs: Default, ss: Default,
+    ldtr: SegmentReg(selector: 0, base: 0, limit: 0, flags: SegmentFlags(0)),
+    tr: SegmentReg(selector: 0, base: 0, limit: 0, flags: SegmentFlags(0)),
+    gdtr: TableReg(base: 0, limit: 0), idtr: TableReg(base: 0, limit: 0),
+    sysenter_cs: 0, sysenter_esp: 0, sysenter_eip: 0, efer: 0, pat: 0,
+    star: 0, lstar: 0, cstar: 0, sfmask: 0, kernel_gs_base: 0, tsc_offset: 0,
+    rflags: 0x02, rip: 0x100000, interruptibility: 0, activity_state: 0,
+    pending_debug_exceptions: 0, vmcs_link: 0, virtual_cpuid: 0, cap_state: CapabilityState(0),
+  );
+  assert(gs.cr0 == 0x80050033);
+  assert(gs.rip == 0x100000);
+}

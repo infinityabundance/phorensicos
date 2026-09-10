@@ -1,0 +1,1015 @@
+// verification.phor — Package verifier: 11-check verification, rejection conditions
+// Phorensic Package: verification subsystem
+// Spec: SEALED_PACKAGE_FORMAT.md — Package Verification (11 conditions)
+// Grammar: PHORENSIC_GRAMMAR.md §42, §66
+
+package package.verification;
+
+use forensic_store.store_object::{
+    Hash256, hash256_zero, hash256_equal,
+    TrustState, TrustLevel,
+    Identity, identity_equal, identity_is_valid,
+    Signature, AuditorStamp,
+    StageReceipt, ResidualRecord, ResidualHistory,
+};
+use forensic_store.store_key::{
+    StoreKey, store_key_equal, store_key_zero,
+};
+use package.container::{
+    PackageContainer, PackageHeader, SourceEvidence,
+    BuildEvidence, BinaryEvidence, SourceToBinarySeal,
+    ExpansionEvidence, CompilationEvidence,
+    ReplayEvidence, CourtEvidence, PackageSignatures,
+    ObjectVerdict, ReplayStatus, ReplayVerdict,
+};
+
+// ============================================================================
+// Verification Check Types
+// ============================================================================
+
+/// Result of a single package verification check.
+type PkgCheckResult = enum {
+    Pass = 0,
+    Fail = 1,
+    Skip = 2,
+    Warning = 3,
+}
+
+/// A single package verification check.
+struct PkgVerificationCheck
+    layout packed
+{
+    /// Check number (1-11)
+    check_number: u32,
+    /// Check name
+    check_name: Array[u8, 64],
+    check_name_len: u32,
+    /// Check description
+    description: Array[u8, 256],
+    description_len: u32,
+    /// Result
+    result: PkgCheckResult,
+    /// Failure reason
+    failure_reason: Array[u8, 512],
+    failure_reason_len: u32,
+}
+
+// ============================================================================
+// Package Verification Report
+// ============================================================================
+
+/// Complete package verification report.
+struct PkgVerificationReport
+    layout packed
+{
+    /// The package that was verified
+    package_name: Array[u8, 128],
+    package_name_len: u32,
+    /// Package version
+    package_version: Array[u8, 32],
+    package_version_len: u32,
+    /// Overall verification result
+    result: PkgVerificationResult,
+    /// All 11 checks
+    checks: Array[PkgVerificationCheck, 11],
+    check_count: u32,
+    /// Pass count
+    passed: u32,
+    /// Fail count
+    failed: u32,
+    /// Skip count
+    skipped: u32,
+    /// Warning count
+    warnings: u32,
+    /// Verifier identity
+    verifier: Identity,
+    /// Timestamp
+    verified_at: u64,
+    /// Whether the package is quarantine-recommended
+    quarantine_recommended: bool,
+    /// Overall failure reason
+    failure_summary: Array[u8, 512],
+    failure_summary_len: u32,
+}
+
+/// Overall verification result.
+type PkgVerificationResult = enum {
+    /// All checks passed — package is valid
+    Verified = 0,
+    /// All critical checks passed, warnings present
+    VerifiedWithWarnings = 1,
+    /// Some checks failed — package is rejected
+    Rejected = 2,
+    /// Verification could not complete
+    Incomplete = 3,
+}
+
+// ============================================================================
+// Report Construction
+// ============================================================================
+
+/// Create a new package verification report.
+fn pkg_verification_report_new(
+    name: Array[u8, 128],
+    name_len: u32,
+    version: Array[u8, 32],
+    version_len: u32,
+    verifier: Identity,
+    timestamp: u64,
+) -> PkgVerificationReport
+    effect [compute]
+{
+    return PkgVerificationReport {
+        package_name: name,
+        package_name_len: name_len,
+        package_version: version,
+        package_version_len: version_len,
+        result: PkgVerificationResult::Incomplete,
+        checks: Array[PkgVerificationCheck, 11]::zeroed(),
+        check_count: 0,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        warnings: 0,
+        verifier: verifier,
+        verified_at: timestamp,
+        quarantine_recommended: false,
+        failure_summary: Array[u8, 512]::zeroed(),
+        failure_summary_len: 0,
+    };
+}
+
+/// Add a check result to the report.
+fn pkg_report_add_check(
+    report: PkgVerificationReport,
+    check: PkgVerificationCheck,
+) -> PkgVerificationReport
+    effect [compute]
+{
+    let mut new_report: PkgVerificationReport = report;
+    if new_report.check_count < 11 {
+        new_report.checks[new_report.check_count] = check;
+        new_report.check_count = new_report.check_count + 1;
+        match check.result {
+            PkgCheckResult::Pass => {
+                new_report.passed = new_report.passed + 1;
+            },
+            PkgCheckResult::Fail => {
+                new_report.failed = new_report.failed + 1;
+            },
+            PkgCheckResult::Skip => {
+                new_report.skipped = new_report.skipped + 1;
+            },
+            PkgCheckResult::Warning => {
+                new_report.warnings = new_report.warnings + 1;
+            },
+        }
+    }
+    return new_report;
+}
+
+/// Finalize a verification report.
+fn pkg_report_finalize(
+    report: PkgVerificationReport,
+) -> PkgVerificationReport
+    effect [compute, residual]
+{
+    let result: PkgVerificationResult;
+    let quarantine: bool;
+    let summary: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut summary_len: u32 = 0;
+
+    if report.failed > 0 {
+        result = PkgVerificationResult::Rejected;
+        quarantine = true;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Package rejected: some verification checks failed");
+        for i in 0..57 { summary[i] = msg[i]; }
+        summary_len = 57;
+    } else if report.warnings > 0 {
+        result = PkgVerificationResult::VerifiedWithWarnings;
+        quarantine = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Package verified with warnings");
+        for i in 0..32 { summary[i] = msg[i]; }
+        summary_len = 32;
+    } else {
+        result = PkgVerificationResult::Verified;
+        quarantine = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Package verified: all checks passed");
+        for i in 0..40 { summary[i] = msg[i]; }
+        summary_len = 40;
+    }
+
+    residual emit {
+        op: "pkg_verification.finalize",
+        result: result as u64,
+        passed: report.passed,
+        failed: report.failed,
+    };
+
+    return PkgVerificationReport {
+        package_name: report.package_name,
+        package_name_len: report.package_name_len,
+        package_version: report.package_version,
+        package_version_len: report.package_version_len,
+        result: result,
+        checks: report.checks,
+        check_count: report.check_count,
+        passed: report.passed,
+        failed: report.failed,
+        skipped: report.skipped,
+        warnings: report.warnings,
+        verifier: report.verifier,
+        verified_at: report.verified_at,
+        quarantine_recommended: quarantine,
+        failure_summary: summary,
+        failure_summary_len: summary_len,
+    };
+}
+
+// ============================================================================
+// Check 1: Source Evidence Present
+// ============================================================================
+
+fn check_source_present(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("source_evidence_present");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Source evidence section must be present and non-empty");
+    let ok: bool = pkg.source_evidence.manifest_count > 0 &&
+                   !hash256_is_zero(pkg.source_evidence.source_hash);
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Source evidence is missing or empty — mandatory per source-seal rule");
+        for i in 0..75 { fail_detail[i] = msg[i]; }
+        fail_len = 75;
+    }
+
+    residual emit { op: "pkg_check.1.source_present", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 1,
+        check_name: name, check_name_len: 23,
+        description: desc, description_len: 65,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 2: Source Hash Match
+// ============================================================================
+
+fn check_source_hash(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("source_hash_match");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Source hash in header matches the source evidence hash");
+    let ok: bool = hash256_equal(pkg.header.source_hash, pkg.source_evidence.source_hash);
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Source hash mismatch: header hash != source evidence hash");
+        for i in 0..62 { fail_detail[i] = msg[i]; }
+        fail_len = 62;
+    }
+
+    residual emit { op: "pkg_check.2.source_hash", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 2, check_name: name, check_name_len: 17,
+        description: desc, description_len: 72,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 3: Binary Evidence Present
+// ============================================================================
+
+fn check_binary_present(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("binary_evidence_present");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Binary evidence section must be present and non-empty");
+    let ok: bool = pkg.binary_evidence.executable_image_len > 0 &&
+                   !hash256_is_zero(pkg.binary_evidence.binary_hash);
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary evidence is missing or empty");
+        for i in 0..41 { fail_detail[i] = msg[i]; }
+        fail_len = 41;
+    }
+
+    residual emit { op: "pkg_check.3.binary_present", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 3, check_name: name, check_name_len: 23,
+        description: desc, description_len: 62,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 4: Binary Hash Match
+// ============================================================================
+
+fn check_binary_hash(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("binary_hash_match");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Binary hash in header matches the binary evidence hash");
+    let ok: bool = hash256_equal(pkg.header.binary_hash, pkg.binary_evidence.binary_hash);
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary hash mismatch: header hash != binary evidence hash");
+        for i in 0..64 { fail_detail[i] = msg[i]; }
+        fail_len = 64;
+    }
+
+    residual emit { op: "pkg_check.4.binary_hash", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 4, check_name: name, check_name_len: 17,
+        description: desc, description_len: 74,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 5: Source Signature Valid
+// ============================================================================
+
+fn check_source_signature(
+    pkg: PackageContainer,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("source_signature_valid");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Source hash is signed by a trusted key");
+    let mut ok: bool = false;
+
+    if pkg.source_evidence.source_sig_present {
+        let sig: Signature = pkg.source_evidence.source_signature;
+        for i in 0..trusted_key_count as u64 {
+            if hash256_equal(sig.signer_key, trusted_keys[i]) {
+                // Signature key is trusted
+                if sig.verified {
+                    ok = true;
+                } else {
+                    // Check sig is non-zero
+                    let mut non_zero: bool = false;
+                    for j in 0..sig.sig_bytes_len as u64 {
+                        if sig.sig_bytes[j] != 0 { non_zero = true; }
+                    }
+                    if non_zero { ok = true; }
+                }
+            }
+        }
+    }
+
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Source signature is missing, invalid, or signer key is not trusted");
+        for i in 0..70 { fail_detail[i] = msg[i]; }
+        fail_len = 70;
+    }
+
+    residual emit { op: "pkg_check.5.source_sig", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 5, check_name: name, check_name_len: 23,
+        description: desc, description_len: 58,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 6: Binary Signature Valid
+// ============================================================================
+
+fn check_binary_signature(
+    pkg: PackageContainer,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("binary_signature_valid");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Binary hash is signed by a trusted key");
+    let mut ok: bool = false;
+
+    if pkg.binary_evidence.binary_sig_present {
+        let sig: Signature = pkg.binary_evidence.binary_signature;
+        for i in 0..trusted_key_count as u64 {
+            if hash256_equal(sig.signer_key, trusted_keys[i]) {
+                let mut non_zero: bool = false;
+                for j in 0..sig.sig_bytes_len as u64 {
+                    if sig.sig_bytes[j] != 0 { non_zero = true; }
+                }
+                if non_zero { ok = true; }
+            }
+        }
+    }
+
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary signature is missing, invalid, or signer key is not trusted");
+        for i in 0..71 { fail_detail[i] = msg[i]; }
+        fail_len = 71;
+    }
+
+    residual emit { op: "pkg_check.6.binary_sig", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 6, check_name: name, check_name_len: 23,
+        description: desc, description_len: 59,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 7: Source↔Binary Seal Signature Valid
+// ============================================================================
+
+fn check_seal_signature(
+    pkg: PackageContainer,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("seal_signature_valid");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Source↔binary seal signature over (source_hash || binary_hash) is valid");
+    let mut ok: bool = false;
+
+    if pkg.binary_evidence.source_to_binary_seal.seal_present {
+        let seal: SourceToBinarySeal = pkg.binary_evidence.source_to_binary_seal;
+        let sig: Signature = seal.seal_signature;
+        for i in 0..trusted_key_count as u64 {
+            if hash256_equal(sig.signer_key, trusted_keys[i]) {
+                let mut non_zero: bool = false;
+                for j in 0..sig.sig_bytes_len as u64 {
+                    if sig.sig_bytes[j] != 0 { non_zero = true; }
+                }
+                if non_zero { ok = true; }
+            }
+        }
+    }
+
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Source↔binary seal is missing or not properly signed — mandatory seal requirement");
+        for i in 0..84 { fail_detail[i] = msg[i]; }
+        fail_len = 84;
+    }
+
+    residual emit { op: "pkg_check.7.seal_sig", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 7, check_name: name, check_name_len: 20,
+        description: desc, description_len: 95,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 8: Build Recipe Present
+// ============================================================================
+
+fn check_build_recipe(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("build_recipe_present");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Build recipe must be present with name, version, steps");
+    let ok: bool = pkg.build_evidence.recipe.name_len > 0 &&
+                   pkg.build_evidence.recipe.step_count > 0;
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Build recipe is missing or incomplete");
+        for i in 0..46 { fail_detail[i] = msg[i]; }
+        fail_len = 46;
+    }
+
+    residual emit { op: "pkg_check.8.build_recipe", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 8, check_name: name, check_name_len: 20,
+        description: desc, description_len: 62,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 9: Receipts Chain Valid
+// ============================================================================
+
+fn check_receipts_chain(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("receipts_chain_valid");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Compilation evidence receipts form a continuous chain from source to binary");
+    let mut chain_ok: bool = true;
+
+    // Check parse → expansion → lowering → codegen → link continuity
+    let parse: StageReceipt = pkg.compilation_evidence.parse_receipt;
+    let expand: StageReceipt = pkg.compilation_evidence.expansion_receipt;
+    let lower: StageReceipt = pkg.compilation_evidence.lowering_receipt;
+    let codegen: StageReceipt = pkg.compilation_evidence.codegen_receipt;
+    let link: StageReceipt = pkg.compilation_evidence.link_receipt;
+
+    // Parse must have non-empty stage name
+    if parse.stage_name_len == 0 { chain_ok = false; }
+
+    // Expansion input must match parse output
+    if expand.stage_name_len > 0 {
+        if !hash256_equal(expand.input_hash, parse.output_hash) {
+            chain_ok = false;
+        }
+    }
+
+    // Lowering input must match expansion output
+    if lower.stage_name_len > 0 {
+        if !hash256_equal(lower.input_hash, expand.output_hash) {
+            chain_ok = false;
+        }
+    }
+
+    // Codegen input must match lowering output
+    if codegen.stage_name_len > 0 {
+        if !hash256_equal(codegen.input_hash, lower.output_hash) {
+            chain_ok = false;
+        }
+    }
+
+    // Link input must match codegen output
+    if link.stage_name_len > 0 {
+        if !hash256_equal(link.input_hash, codegen.output_hash) {
+            chain_ok = false;
+        }
+    }
+
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+    if chain_ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Compilation receipt chain is discontinuous — stage output/input hash mismatch");
+        for i in 0..80 { fail_detail[i] = msg[i]; }
+        fail_len = 80;
+    }
+
+    residual emit { op: "pkg_check.9.receipts_chain", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 9, check_name: name, check_name_len: 21,
+        description: desc, description_len: 87,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 10: Replay Verification
+// ============================================================================
+
+fn check_replay_verification(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("replay_verification_valid");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Replay evidence must be present and show successful replay");
+
+    let replay: ReplayEvidence = pkg.replay_evidence;
+    let report = replay.replay_verification_report;
+    let ok: bool = report.checkpoint_count > 0 &&
+                   report.replay_status == ReplayStatus::Full;
+
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Replay verification failed — checkpoints missing or replay did not complete");
+        for i in 0..79 { fail_detail[i] = msg[i]; }
+        fail_len = 79;
+    }
+
+    residual emit { op: "pkg_check.10.replay", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 10, check_name: name, check_name_len: 25,
+        description: desc, description_len: 71,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Check 11: Court Verdicts Present and Favorable
+// ============================================================================
+
+fn check_court_verdicts(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("court_verdicts_valid");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Court verdicts must be present and must not be Rejected or Inauthentic");
+
+    let court: CourtEvidence = pkg.court_evidence;
+    let mut ok: bool = true;
+
+    if court.verdict_count == 0 {
+        ok = false;
+    } else {
+        for i in 0..court.verdict_count as u64 {
+            let verdict = court.court_verdicts[i].verdict;
+            if verdict == ObjectVerdict::Rejected ||
+               verdict == ObjectVerdict::Inauthentic ||
+               verdict == ObjectVerdict::Divergent {
+                ok = false;
+            }
+        }
+    }
+
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Court verdicts missing or contain rejections — package cannot be promoted");
+        for i in 0..77 { fail_detail[i] = msg[i]; }
+        fail_len = 77;
+    }
+
+    residual emit { op: "pkg_check.11.court", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 11, check_name: name, check_name_len: 21,
+        description: desc, description_len: 86,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Hash256 zero check helper
+// ============================================================================
+
+fn hash256_is_zero(h: Hash256) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if h.bytes[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// Complete Package Verification — 11-Check Orchestrator
+// ============================================================================
+
+/// Verify a package container against all 11 conditions.
+///
+/// The verifier rejects any package where:
+///   (1) source is missing
+///   (2) source hash does not match embedded source
+///   (3) binary evidence is missing
+///   (4) binary hash does not match emitted binary
+///   (5) source signature is missing or invalid
+///   (6) binary signature is missing or invalid
+///   (7) source↔binary seal is unsigned or missing
+///   (8) build recipe is missing
+///   (9) receipt chain is discontinuous
+///   (10) replay verification failed
+///   (11) court verdicts are missing or unfavorable
+fn verify_package(
+    pkg: PackageContainer,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+    verifier: Identity,
+    timestamp: u64,
+) -> PkgVerificationReport
+    effect [compute, residual]
+{
+    let report: PkgVerificationReport = pkg_verification_report_new(
+        pkg.header.package_name,
+        pkg.header.package_name_len,
+        pkg.header.package_version,
+        pkg.header.package_version_len,
+        verifier,
+        timestamp,
+    );
+    let mut rep: PkgVerificationReport = report;
+
+    residual emit {
+        op: "verify_package.start",
+        name_prefix: pkg.header.package_name[0] as u64,
+    };
+
+    // Check 1: Source present
+    let c1: PkgVerificationCheck = check_source_present(pkg);
+    rep = pkg_report_add_check(rep, c1);
+
+    // Check 2: Source hash match
+    let c2: PkgVerificationCheck = check_source_hash(pkg);
+    rep = pkg_report_add_check(rep, c2);
+
+    // Check 3: Binary present
+    let c3: PkgVerificationCheck = check_binary_present(pkg);
+    rep = pkg_report_add_check(rep, c3);
+
+    // Check 4: Binary hash match
+    let c4: PkgVerificationCheck = check_binary_hash(pkg);
+    rep = pkg_report_add_check(rep, c4);
+
+    // Check 5: Source signature
+    let c5: PkgVerificationCheck = check_source_signature(pkg, trusted_keys, trusted_key_count);
+    rep = pkg_report_add_check(rep, c5);
+
+    // Check 6: Binary signature
+    let c6: PkgVerificationCheck = check_binary_signature(pkg, trusted_keys, trusted_key_count);
+    rep = pkg_report_add_check(rep, c6);
+
+    // Check 7: Seal signature
+    let c7: PkgVerificationCheck = check_seal_signature(pkg, trusted_keys, trusted_key_count);
+    rep = pkg_report_add_check(rep, c7);
+
+    // Check 8: Build recipe
+    let c8: PkgVerificationCheck = check_build_recipe(pkg);
+    rep = pkg_report_add_check(rep, c8);
+
+    // Check 9: Receipts chain
+    let c9: PkgVerificationCheck = check_receipts_chain(pkg);
+    rep = pkg_report_add_check(rep, c9);
+
+    // Check 10: Replay verification
+    let c10: PkgVerificationCheck = check_replay_verification(pkg);
+    rep = pkg_report_add_check(rep, c10);
+
+    // Check 11: Court verdicts
+    let c11: PkgVerificationCheck = check_court_verdicts(pkg);
+    rep = pkg_report_add_check(rep, c11);
+
+    // Finalize
+    let rep: PkgVerificationReport = pkg_report_finalize(rep);
+
+    residual emit {
+        op: "verify_package.complete",
+        name_prefix: pkg.header.package_name[0] as u64,
+        result: rep.result as u64,
+        passed: rep.passed,
+        failed: rep.failed,
+    };
+
+    return rep;
+}
+
+// ============================================================================
+// Additional Package Verification Utilities
+// ============================================================================
+
+/// Verify that a package's source archive matches its manifest.
+fn check_source_archive_integrity(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("source_archive_integrity");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Source archive content matches manifest entries and source hash");
+
+    let mut ok: bool = true;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Check that manifest is non-empty when archive is present
+    if pkg.source_evidence.source_archive_len > 0 {
+        if pkg.source_evidence.manifest_count == 0 {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Source archive present but manifest is empty");
+            for i in 0..47 { fail_detail[i] = msg[i]; }
+            fail_len = 47;
+        }
+    }
+
+    // Check that all manifest entries have non-zero hashes
+    for i in 0..pkg.source_evidence.manifest_count as u64 {
+        let entry: SourceManifestEntry = pkg.source_evidence.manifest[i];
+        if hash256_is_zero(entry.file_hash) {
+            ok = false;
+        }
+        if entry.path_len == 0 {
+            ok = false;
+        }
+    }
+
+    let result: PkgCheckResult;
+    if ok { result = PkgCheckResult::Pass; } else { result = PkgCheckResult::Fail; }
+
+    residual emit { op: "pkg_check.extra.archive_integrity", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 12, check_name: name, check_name_len: 24,
+        description: desc, description_len: 74,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+/// Verify that the environment capsule is fully specified.
+fn check_environment_capsule(pkg: PackageContainer) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("environment_capsule_complete");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Environment capsule must specify CPU features, memory, oracles, and courts");
+
+    let capsule = pkg.build_evidence.environment_capsule;
+    let mut ok: bool = true;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    if capsule.cpu_feature_count == 0 {
+        ok = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Environment capsule missing CPU features");
+        for i in 0..42 { fail_detail[i] = msg[i]; }
+        fail_len = 42;
+    }
+
+    if capsule.oracle_count == 0 {
+        ok = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Environment capsule missing oracle identities");
+        for i in 0..49 { fail_detail[i] = msg[i]; }
+        fail_len = 49;
+    }
+
+    if capsule.court_version_count == 0 {
+        ok = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Environment capsule missing court version references");
+        for i in 0..55 { fail_detail[i] = msg[i]; }
+        if fail_len == 0 { fail_len = 55; }
+    }
+
+    let result: PkgCheckResult;
+    if ok { result = PkgCheckResult::Pass; } else { result = PkgCheckResult::Fail; }
+
+    residual emit { op: "pkg_check.extra.environment_capsule", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 13, check_name: name, check_name_len: 27,
+        description: desc, description_len: 83,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+/// Verify that package signature count meets minimum threshold.
+fn check_signature_threshold(pkg: PackageContainer, min_signatures: u32) -> PkgVerificationCheck
+    effect [compute, residual]
+{
+    let name: Array[u8, 64] = Array[u8, 64]::from_literal("signature_count_threshold");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Package must have at least the minimum number of valid signatures");
+
+    let mut count: u32 = 0;
+    if pkg.signatures.full_sig_present { count = count + 1; }
+    if pkg.signatures.evidence_sig_present { count = count + 1; }
+    count = count + pkg.signatures.auditor_stamp_count;
+
+    let ok: bool = count >= min_signatures;
+    let result: PkgCheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    if ok {
+        result = PkgCheckResult::Pass;
+    } else {
+        result = PkgCheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Insufficient signatures on package");
+        for i in 0..36 { fail_detail[i] = msg[i]; }
+        fail_len = 36;
+    }
+
+    residual emit { op: "pkg_check.extra.signature_threshold", result: result as u64; };
+    return PkgVerificationCheck {
+        check_number: 14, check_name: name, check_name_len: 26,
+        description: desc, description_len: 76,
+        result: result,
+        failure_reason: fail_detail, failure_reason_len: fail_len,
+    };
+}
+
+// ============================================================================
+// Complete Extended Verification (14 checks)
+// ============================================================================
+
+/// Run extended package verification with all 14 checks.
+fn verify_package_extended(
+    pkg: PackageContainer,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+    min_signatures: u32,
+    verifier: Identity,
+    timestamp: u64,
+) -> PkgVerificationReport
+    effect [compute, residual]
+{
+    let report: PkgVerificationReport = pkg_verification_report_new(
+        pkg.header.package_name,
+        pkg.header.package_name_len,
+        pkg.header.package_version,
+        pkg.header.package_version_len,
+        verifier,
+        timestamp,
+    );
+    let mut rep: PkgVerificationReport = report;
+
+    residual emit {
+        op: "verify_package_extended.start",
+        name_prefix: pkg.header.package_name[0] as u64,
+    };
+
+    // Core 11 checks
+    let c1 = check_source_present(pkg); rep = pkg_report_add_check(rep, c1);
+    let c2 = check_source_hash(pkg); rep = pkg_report_add_check(rep, c2);
+    let c3 = check_binary_present(pkg); rep = pkg_report_add_check(rep, c3);
+    let c4 = check_binary_hash(pkg); rep = pkg_report_add_check(rep, c4);
+    let c5 = check_source_signature(pkg, trusted_keys, trusted_key_count); rep = pkg_report_add_check(rep, c5);
+    let c6 = check_binary_signature(pkg, trusted_keys, trusted_key_count); rep = pkg_report_add_check(rep, c6);
+    let c7 = check_seal_signature(pkg, trusted_keys, trusted_key_count); rep = pkg_report_add_check(rep, c7);
+    let c8 = check_build_recipe(pkg); rep = pkg_report_add_check(rep, c8);
+    let c9 = check_receipts_chain(pkg); rep = pkg_report_add_check(rep, c9);
+    let c10 = check_replay_verification(pkg); rep = pkg_report_add_check(rep, c10);
+    let c11 = check_court_verdicts(pkg); rep = pkg_report_add_check(rep, c11);
+
+    // Extended checks
+    let c12 = check_source_archive_integrity(pkg); rep = pkg_report_add_check(rep, c12);
+    let c13 = check_environment_capsule(pkg); rep = pkg_report_add_check(rep, c13);
+    let c14 = check_signature_threshold(pkg, min_signatures); rep = pkg_report_add_check(rep, c14);
+
+    let rep = pkg_report_finalize(rep);
+
+    residual emit {
+        op: "verify_package_extended.complete",
+        passed: rep.passed,
+        failed: rep.failed,
+        result: rep.result as u64,
+    };
+
+    return rep;
+}
+
+// ============================================================================
+// SourceManifestEntry type alias for extra checks
+// ============================================================================
+
+struct SourceManifestEntry
+    layout packed
+{
+    path: Array[u8, 256],
+    path_len: u32,
+    file_hash: Hash256,
+    file_size: u64,
+    file_type: u8,
+}

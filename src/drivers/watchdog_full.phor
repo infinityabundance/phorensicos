@@ -1,0 +1,886 @@
+// watchdog_full.phor — Watchdog subsystem
+// Pretimeout, pretimeout governors (panic, reset, noop),
+// watchdog device abstraction, nowayout, magic close,
+// boot status, thermal monitoring integration, heartbeat monitoring.
+//
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/watchdog_full.phor
+// Court: watchdog_full_driver:v2
+
+package drivers.watchdog_full;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type WatchdogError = enum {
+    WatchdogNotInitialized          = 0x1300,
+    WatchdogDeviceNotFound          = 0x1301,
+    WatchdogAlreadyRunning          = 0x1302,
+    WatchdogNotRunning              = 0x1303,
+    WatchdogTimeoutInvalid          = 0x1304,
+    WatchdogPretimeoutInvalid       = 0x1305,
+    WatchdogMagicCloseFailed        = 0x1306,
+    WatchdogNowayout                = 0x1307,
+    WatchdogCapabilityError         = 0x1308,
+    WatchdogGovernorError           = 0x1309,
+    WatchdogThermalError            = 0x130A,
+    WatchdogHeartbeatMissed         = 0x130B,
+    WatchdogMaxDevicesExceeded      = 0x130C,
+    WatchdogResidualStoreFull       = 0x130D,
+    WatchdogNotSupported            = 0x130E,
+    WatchdogBootStatusNotAvail      = 0x130F,
+    WatchdogPretimeoutNotSupported  = 0x1310,
+    WatchdogGovernorNotAvailable    = 0x1311,
+    WatchdogThermalCritical         = 0x1312,
+    WatchdogConfigLocked            = 0x1313,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Watchdog Full Capability
+// ─────────────────────────────────────────────────────────────
+
+struct WatchdogCapability {
+    object_id: Identity,
+    generation: u64,
+    can_pet: bool,
+    can_set_timeout: bool,
+    can_pretimeout: bool,
+    can_magic_close: bool,
+    can_nowayout: bool,
+    can_governor: bool,
+    can_thermal: bool,
+    can_heartbeat: bool,
+    max_devices: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Watchdog Pretimeout Governors
+// ─────────────────────────────────────────────────────────────
+
+type WatchdogPretimeoutGovernor = enum {
+    Noop   = 0,
+    Panic  = 1,
+    Reset  = 2,
+    Custom = 3,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Watchdog Boot Status
+// ─────────────────────────────────────────────────────────────
+
+struct WatchdogBootStatus {
+    watchdog_reset: bool,
+    thermal_reset: bool,
+    power_on_reset: bool,
+    soft_reset: bool,
+    timeout_reset: bool,
+    pretimeout_reset: bool,
+    system_restart: bool,
+    boot_timestamp: u64,
+    last_reset_reason: WatchdogResetReason,
+}
+
+type WatchdogResetReason = enum {
+    UnknownReset        = 0,
+    PowerOnReset        = 1,
+    SoftReset           = 2,
+    WatchdogTimeout     = 3,
+    WatchdogPretimeout  = 4,
+    ThermalShutdown     = 5,
+    ManualReset         = 6,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Watchdog Action on Expiry
+// ─────────────────────────────────────────────────────────────
+
+type WatchdogAction = enum {
+    NoAction         = 0,
+    ResetSystem      = 1,
+    GenerateInterrupt = 2,
+    GenerateNmi      = 3,
+    HaltSystem       = 4,
+    PowerOff         = 5,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Watchdog Device State
+// ─────────────────────────────────────────────────────────────
+
+struct WatchdogDevice {
+    device_id: u8,
+    mmio_base: u64,
+    reg_timeout: u64,
+    reg_control: u64,
+    reg_pretimeout: u64,
+    reg_status: u64,
+    reg_thermal: u64,
+    timeout_sec: u32,
+    pretimeout_sec: u32,
+    min_timeout: u32,
+    max_timeout: u32,
+    running: bool,
+    nowayout: bool,
+    magic_close_required: bool,
+    magic_close_done: bool,
+    pretimeout_supported: bool,
+    pretimeout_governor: WatchdogPretimeoutGovernor,
+    boot_status: WatchdogBootStatus,
+    thermal_limit_c: u16,
+    thermal_current_c: u16,
+    heartbeat_ms: u32,
+    heartbeat_last_pet: u64,
+    heartbeat_missed_count: u64,
+    action_on_expiry: WatchdogAction,
+    initialized: bool,
+    residual_log: RingBuf(ResidualRecord, 32),
+}
+
+// ─────────────────────────────────────────────────────────────
+// Controller State
+// ─────────────────────────────────────────────────────────────
+
+struct WatchdogController {
+    controller_identity: Identity,
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    mmio_base: u64,
+    mmio_size: u64,
+    irq_vector: u8,
+    devices: Array(WatchdogDevice, 4),
+    device_count: u8,
+    initialized: bool,
+    residual_log: RingBuf(ResidualRecord, 64),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct WatchdogDriverState {
+    driver_identity: Identity,
+    controllers: Array(WatchdogController, 4),
+    controller_count: u64,
+    initialized: bool,
+    initialization_timestamp: u64,
+    total_pets: u64,
+    total_timeouts: u64,
+    total_errors: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Watchdog MMIO Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_mmio_read32(base: u64, offset: u64) -> u32
+    effect [memory:mmio]
+{
+    return trusted reason "Watchdog MMIO register read" {
+        let ptr: *(u32) = (base + offset) as *(u32);
+        return *ptr;
+    };
+}
+
+fn wdt_mmio_write32(base: u64, offset: u64, value: u32) -> void
+    effect [memory:mmio]
+{
+    trusted reason "Watchdog MMIO register write" {
+        let ptr: *(u32) = (base + offset) as *(u32);
+        *ptr = value;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Magic Close Value
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_magic_close_value() -> u16 { return 0x5678; }
+fn wdt_magic_open_value() -> u16 { return 0x1234; }
+
+// ─────────────────────────────────────────────────────────────
+// Pet (Kick) the Watchdog
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_pet(
+    dev: Handle(WatchdogDevice),
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_pet:v1"
+{
+    if !cap.can_pet {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    if !dev.running {
+        return Result::Err(WatchdogError::WatchdogNotRunning);
+    };
+
+    let ctrl_offset: u64 = dev.reg_control;
+    let ctrl_val: u32 = wdt_mmio_read32(dev.mmio_base, ctrl_offset);
+    wdt_mmio_write32(dev.mmio_base, ctrl_offset, ctrl_val | 0x01);
+
+    dev.heartbeat_last_pet = timestamp;
+    dev.heartbeat_missed_count = 0;
+
+    residual emit {
+        op: "wdt.pet",
+        device_id: dev.device_id as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Timeout
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_set_timeout(
+    dev: Handle(WatchdogDevice),
+    timeout_sec: u32,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_set_timeout:v1"
+{
+    if !cap.can_set_timeout {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    if timeout_sec < dev.min_timeout || timeout_sec > dev.max_timeout {
+        return Result::Err(WatchdogError::WatchdogTimeoutInvalid);
+    };
+
+    dev.timeout_sec = timeout_sec;
+
+    let to_val: u32 = timeout_sec * 1000;
+    wdt_mmio_write32(dev.mmio_base, dev.reg_timeout, to_val);
+
+    residual emit {
+        op: "wdt.set_timeout",
+        device_id: dev.device_id as u64,
+        timeout_sec: timeout_sec,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Pretimeout
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_set_pretimeout(
+    dev: Handle(WatchdogDevice),
+    pretimeout_sec: u32,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_set_pretimeout:v1"
+{
+    if !cap.can_pretimeout {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    if !dev.pretimeout_supported {
+        return Result::Err(WatchdogError::WatchdogPretimeoutNotSupported);
+    };
+
+    if pretimeout_sec >= dev.timeout_sec {
+        return Result::Err(WatchdogError::WatchdogPretimeoutInvalid);
+    };
+
+    dev.pretimeout_sec = pretimeout_sec;
+
+    let pto_val: u32 = pretimeout_sec * 1000;
+    wdt_mmio_write32(dev.mmio_base, dev.reg_pretimeout, pto_val);
+
+    residual emit {
+        op: "wdt.set_pretimeout",
+        device_id: dev.device_id as u64,
+        pretimeout_sec: pretimeout_sec,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Pretimeout Governor
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_set_pretimeout_governor(
+    dev: Handle(WatchdogDevice),
+    governor: WatchdogPretimeoutGovernor,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [deterministic, residual]
+    court "wdt_set_pretimeout_governor:v1"
+{
+    if !cap.can_governor {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    if governor == WatchdogPretimeoutGovernor::Panic {
+        dev.pretimeout_governor = WatchdogPretimeoutGovernor::Panic;
+    } else if governor == WatchdogPretimeoutGovernor::Reset {
+        dev.pretimeout_governor = WatchdogPretimeoutGovernor::Reset;
+    } else if governor == WatchdogPretimeoutGovernor::Noop {
+        dev.pretimeout_governor = WatchdogPretimeoutGovernor::Noop;
+    } else {
+        return Result::Err(WatchdogError::WatchdogGovernorNotAvailable);
+    };
+
+    residual emit {
+        op: "wdt.set_pretimeout_governor",
+        device_id: dev.device_id as u64,
+        governor: governor as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable / Disable Nowayout
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_set_nowayout(
+    dev: Handle(WatchdogDevice),
+    nowayout: bool,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [deterministic, residual]
+    court "wdt_set_nowayout:v1"
+{
+    if !cap.can_nowayout {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    dev.nowayout = nowayout;
+
+    residual emit {
+        op: "wdt.set_nowayout",
+        device_id: dev.device_id as u64,
+        nowayout: nowayout,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Start Watchdog
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_start(
+    dev: Handle(WatchdogDevice),
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_start:v1"
+{
+    if dev.running {
+        return Result::Err(WatchdogError::WatchdogAlreadyRunning);
+    };
+
+    let ctrl_val: u32 = 0x03;
+    wdt_mmio_write32(dev.mmio_base, dev.reg_control, ctrl_val);
+
+    if dev.nowayout {
+        let ctrl_locked: u32 = wdt_mmio_read32(dev.mmio_base, dev.reg_control);
+        wdt_mmio_write32(dev.mmio_base, dev.reg_control, ctrl_locked | 0x08);
+    };
+
+    dev.running = true;
+
+    residual emit {
+        op: "wdt.start",
+        device_id: dev.device_id as u64,
+        timeout_sec: dev.timeout_sec,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Stop Watchdog (requires magic close if nowayout disabled)
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_stop(
+    dev: Handle(WatchdogDevice),
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_stop:v1"
+{
+    if !dev.running {
+        return Result::Err(WatchdogError::WatchdogNotRunning);
+    };
+
+    if dev.nowayout {
+        return Result::Err(WatchdogError::WatchdogNowayout);
+    };
+
+    if dev.magic_close_required && !dev.magic_close_done {
+        return Result::Err(WatchdogError::WatchdogMagicCloseFailed);
+    };
+
+    let ctrl_val: u32 = wdt_mmio_read32(dev.mmio_base, dev.reg_control);
+    wdt_mmio_write32(dev.mmio_base, dev.reg_control, ctrl_val & !0x03);
+
+    dev.running = false;
+
+    residual emit {
+        op: "wdt.stop",
+        device_id: dev.device_id as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Magic Close Sequence
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_magic_close(
+    dev: Handle(WatchdogDevice),
+    value: u16,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_magic_close:v1"
+{
+    if !cap.can_magic_close {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    let expected: u16 = wdt_magic_close_value();
+    if value == 0x5678 {
+        wdt_mmio_write32(dev.mmio_base, dev.reg_control, expected as u32);
+        dev.magic_close_done = true;
+        residual emit {
+            op: "wdt.magic_close",
+            device_id: dev.device_id as u64,
+            success: true,
+            timestamp: timestamp,
+        };
+        return Result::Ok(void);
+    };
+
+    dev.magic_close_done = false;
+
+    residual emit {
+        op: "wdt.magic_close",
+        device_id: dev.device_id as u64,
+        success: false,
+        timestamp: timestamp,
+    };
+
+    return Result::Err(WatchdogError::WatchdogMagicCloseFailed);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read Boot Status
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_read_boot_status(
+    dev: Handle(WatchdogDevice),
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(WatchdogBootStatus, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_read_boot_status:v1"
+{
+    let status_reg: u32 = wdt_mmio_read32(dev.mmio_base, dev.reg_status);
+    let boot: WatchdogBootStatus = WatchdogBootStatus {
+        watchdog_reset: (status_reg & 0x01) != 0,
+        thermal_reset: (status_reg & 0x02) != 0,
+        power_on_reset: (status_reg & 0x04) != 0,
+        soft_reset: (status_reg & 0x08) != 0,
+        timeout_reset: (status_reg & 0x10) != 0,
+        pretimeout_reset: (status_reg & 0x20) != 0,
+        system_restart: (status_reg & 0x40) != 0,
+        boot_timestamp: timestamp,
+        last_reset_reason: WatchdogResetReason::UnknownReset,
+    };
+
+    if boot.watchdog_reset {
+        boot.last_reset_reason = WatchdogResetReason::WatchdogTimeout;
+    } else if boot.thermal_reset {
+        boot.last_reset_reason = WatchdogResetReason::ThermalShutdown;
+    } else if boot.power_on_reset {
+        boot.last_reset_reason = WatchdogResetReason::PowerOnReset;
+    } else if boot.soft_reset {
+        boot.last_reset_reason = WatchdogResetReason::SoftReset;
+    };
+
+    dev.boot_status = boot;
+
+    residual emit {
+        op: "wdt.read_boot_status",
+        device_id: dev.device_id as u64,
+        watchdog_reset: boot.watchdog_reset,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(boot);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Action On Expiry
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_set_action(
+    dev: Handle(WatchdogDevice),
+    action: WatchdogAction,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_set_action:v1"
+{
+    let ctrl_val: u32 = wdt_mmio_read32(dev.mmio_base, dev.reg_control);
+    let action_bits: u32 = (action as u32) << 4;
+    let new_ctrl: u32 = (ctrl_val & !0x30) | action_bits;
+    wdt_mmio_write32(dev.mmio_base, dev.reg_control, new_ctrl);
+
+    dev.action_on_expiry = action;
+
+    residual emit {
+        op: "wdt.set_action",
+        device_id: dev.device_id as u64,
+        action: action as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Thermal Monitoring: Read Temperature
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_read_thermal(
+    dev: Handle(WatchdogDevice),
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(u16, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_read_thermal:v1"
+{
+    if !cap.can_thermal {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    let temp_reg: u32 = wdt_mmio_read32(dev.mmio_base, dev.reg_thermal);
+    let temp_c: u16 = (temp_reg & 0xFFFF) as u16;
+    dev.thermal_current_c = temp_c;
+
+    if temp_c >= dev.thermal_limit_c {
+        residual emit {
+            op: "wdt.thermal_critical",
+            device_id: dev.device_id as u64,
+            temp_c: temp_c as u64,
+            limit_c: dev.thermal_limit_c as u64,
+            timestamp: timestamp,
+        };
+        return Result::Err(WatchdogError::WatchdogThermalCritical);
+    };
+
+    residual emit {
+        op: "wdt.read_thermal",
+        device_id: dev.device_id as u64,
+        temp_c: temp_c as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(temp_c);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Thermal Limit
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_set_thermal_limit(
+    dev: Handle(WatchdogDevice),
+    limit_c: u16,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [deterministic, residual]
+    court "wdt_set_thermal_limit:v1"
+{
+    if !cap.can_thermal {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    dev.thermal_limit_c = limit_c;
+
+    residual emit {
+        op: "wdt.set_thermal_limit",
+        device_id: dev.device_id as u64,
+        limit_c: limit_c as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Heartbeat Monitoring: Check Health
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_check_heartbeat(
+    dev: Handle(WatchdogDevice),
+    current_timestamp: u64,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [deterministic, residual]
+    court "wdt_check_heartbeat:v1"
+{
+    if !cap.can_heartbeat {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    if !dev.running {
+        return Result::Ok(void);
+    };
+
+    let elapsed: u64 = current_timestamp - dev.heartbeat_last_pet;
+    if elapsed > (dev.heartbeat_ms as u64) {
+        dev.heartbeat_missed_count = dev.heartbeat_missed_count + 1;
+        residual emit {
+            op: "wdt.heartbeat_missed",
+            device_id: dev.device_id as u64,
+            missed_count: dev.heartbeat_missed_count,
+            elapsed_ms: elapsed,
+            timestamp: timestamp,
+        };
+        if dev.heartbeat_missed_count > 3 {
+            return Result::Err(WatchdogError::WatchdogHeartbeatMissed);
+        };
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Execute Pretimeout Governor Action
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_execute_pretimeout_governor(
+    dev: Handle(WatchdogDevice),
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [deterministic, residual]
+    court "wdt_execute_pretimeout_governor:v1"
+{
+    if !cap.can_governor {
+        return Result::Err(WatchdogError::WatchdogCapabilityError);
+    };
+
+    let governor: WatchdogPretimeoutGovernor = dev.pretimeout_governor;
+
+    if governor == WatchdogPretimeoutGovernor::Panic {
+        residual emit {
+            op: "wdt.governor_panic",
+            device_id: dev.device_id as u64,
+            timestamp: timestamp,
+        };
+    } else if governor == WatchdogPretimeoutGovernor::Reset {
+        residual emit {
+            op: "wdt.governor_reset",
+            device_id: dev.device_id as u64,
+            timestamp: timestamp,
+        };
+    } else {
+        residual emit {
+            op: "wdt.governor_noop",
+            device_id: dev.device_id as u64,
+            timestamp: timestamp,
+        };
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Device Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_device_init(
+    dev: Handle(WatchdogDevice),
+    device_id: u8,
+    mmio_base: u64,
+    min_timeout: u32,
+    max_timeout: u32,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_device_init:v1"
+{
+    dev.device_id = device_id;
+    dev.mmio_base = mmio_base;
+    dev.reg_timeout = 0x00;
+    dev.reg_control = 0x04;
+    dev.reg_pretimeout = 0x08;
+    dev.reg_status = 0x0C;
+    dev.reg_thermal = 0x10;
+    dev.min_timeout = min_timeout;
+    dev.max_timeout = max_timeout;
+    dev.timeout_sec = 30;
+    dev.pretimeout_sec = 5;
+    dev.pretimeout_supported = cap.can_pretimeout;
+    dev.pretimeout_governor = WatchdogPretimeoutGovernor::Noop;
+    dev.nowayout = false;
+    dev.magic_close_required = cap.can_magic_close;
+    dev.magic_close_done = false;
+    dev.thermal_limit_c = 85;
+    dev.thermal_current_c = 30;
+    dev.heartbeat_ms = 1000;
+    dev.heartbeat_last_pet = timestamp;
+    dev.heartbeat_missed_count = 0;
+    dev.action_on_expiry = WatchdogAction::ResetSystem;
+
+    wdt_mmio_write32(mmio_base, dev.reg_control, 0x00);
+
+    dev.initialized = true;
+
+    residual emit {
+        op: "wdt.device_init",
+        device_id: device_id as u64,
+        mmio_base: mmio_base,
+        min_timeout: min_timeout,
+        max_timeout: max_timeout,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Controller Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_controller_init(
+    controller: Handle(WatchdogController),
+    mmio_base: u64,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(void, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_controller_init:v1"
+{
+    controller.mmio_base = mmio_base;
+    controller.initialized = true;
+
+    residual emit {
+        op: "wdt.controller_init",
+        mmio_base: mmio_base,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_driver_init(
+    driver_identity: Identity,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> WatchdogDriverState
+    effect [deterministic, residual]
+    court "wdt_driver_init:v1"
+{
+    let state: WatchdogDriverState = WatchdogDriverState {
+        driver_identity: driver_identity,
+        controllers: Array::zeroed(),
+        controller_count: 0,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        total_pets: 0,
+        total_timeouts: 0,
+        total_errors: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "wdt.driver_init",
+        driver_identity: driver_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add Watchdog Device
+// ─────────────────────────────────────────────────────────────
+
+fn wdt_add_device(
+    controller: Handle(WatchdogController),
+    mmio_base: u64,
+    min_timeout: u32,
+    max_timeout: u32,
+    cap: WatchdogCapability,
+    timestamp: u64,
+) -> Result(u8, WatchdogError)
+    effect [memory:mmio, deterministic, residual]
+    court "wdt_add_device:v1"
+{
+    if (controller.device_count as u64) >= 4 {
+        return Result::Err(WatchdogError::WatchdogMaxDevicesExceeded);
+    };
+
+    let idx: u64 = controller.device_count as u64;
+    let dev: Handle(WatchdogDevice) = Handle(WatchdogDevice)::from_ptr(&controller.devices[idx]);
+
+    let init_result: Result(void, WatchdogError) = wdt_device_init(
+        dev, idx as u8, mmio_base, min_timeout, max_timeout, cap, timestamp,
+    );
+    match init_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    controller.device_count = controller.device_count + 1;
+
+    residual emit {
+        op: "wdt.add_device",
+        device_idx: idx,
+        mmio_base: mmio_base,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx as u8);
+}

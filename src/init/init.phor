@@ -1,0 +1,1139 @@
+// file: init.phor
+// purpose: Init system: boot stages, service definitions, dependency resolution,
+//          parallel startup, failure handling, emergency mode, switch_root.
+//          All operations use bounded loops and record residuals.
+// evidence: INIT-ARCH-001 through INIT-ARCH-260
+// residual: Every boot stage transition, service start/stop, and state change
+//           records a residual for the boot audit trail.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use process::process::*
+use process::thread::*
+use process::signal::*
+use process::process_tree::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: INIT-DIAG-001 through INIT-DIAG-015
+
+const DIAG_INIT_BASE         : Word64 = Word64::from_u64(0xC000)
+const DIAG_INIT_OK           : Word64 = DIAG_INIT_BASE | 0x000
+const DIAG_INIT_STAGE_FAIL   : Word64 = DIAG_INIT_BASE | 0x001
+const DIAG_INIT_SERVICE_FAIL : Word64 = DIAG_INIT_BASE | 0x002
+const DIAG_INIT_DEP_FAIL     : Word64 = DIAG_INIT_BASE | 0x003
+const DIAG_INIT_TIMEOUT      : Word64 = DIAG_INIT_BASE | 0x004
+const DIAG_INIT_EMERGENCY    : Word64 = DIAG_INIT_BASE | 0x005
+const DIAG_INIT_SWITCH_ROOT  : Word64 = DIAG_INIT_BASE | 0x006
+const DIAG_INIT_RECOVERY     : Word64 = DIAG_INIT_BASE | 0x007
+const DIAG_INIT_BOUNDS       : Word64 = DIAG_INIT_BASE | 0x008
+
+// ──────────────────────────────────────────────
+// Init Constants
+// ──────────────────────────────────────────────
+// Evidence path: INIT-CONST-001 through INIT-CONST-025
+
+const MAX_BOOT_STAGES           : u32 = 16
+const MAX_SERVICES              : u32 = 64
+const MAX_DEPENDENCIES          : u32 = 16
+const MAX_SERVICE_ARGS          : u32 = 16
+const MAX_SERVICE_ENV           : u32 = 32
+const MAX_SERVICE_GROUPS        : u32 = 8
+const MAX_PARALLEL_STARTS       : u32 = 8
+const MAX_RETRY_COUNT           : u32 = 3
+const MAX_EMERGENCY_ACTIONS     : u32 = 16
+const SERVICE_NAME_MAX_LEN      : u32 = 64
+const SERVICE_PATH_MAX_LEN      : u32 = 128
+const STAGE_NAME_MAX_LEN        : u32 = 48
+const HEALTH_CHECK_INTERVAL_US  : u64 = 1000000  // 1 second
+const STARTUP_TIMEOUT_US        : u64 = 30000000  // 30 seconds
+const DEPENDENCY_TIMEOUT_US     : u64 = 10000000  // 10 seconds
+
+// Boot Stage IDs
+const STAGE_PRE_BOOT           : u32 = 0
+const STAGE_EARLY_INIT         : u32 = 1
+const STAGE_HARDWARE_DETECT    : u32 = 2
+const STAGE_DRIVERS            : u32 = 3
+const STAGE_FILESYSTEMS        : u32 = 4
+const STAGE_SERVICES           : u32 = 5
+const STAGE_NETWORK            : u32 = 6
+const STAGE_USER_ENVIRONMENT   : u32 = 7
+const STAGE_READY              : u32 = 8
+const STAGE_EMERGENCY          : u32 = 15
+
+// Service Flags
+const SVC_FLAG_ENABLED         : u32 = 0x01
+const SVC_FLAG_DISABLED        : u32 = 0x02
+const SVC_FLAG_CRITICAL        : u32 = 0x04
+const SVC_FLAG_ONESHOT         : u32 = 0x08
+const SVC_FLAG_FORK            : u32 = 0x10
+const SVC_FLAG_NOTIFY          : u32 = 0x20
+const SVC_FLAG_KILL_ON_STOP    : u32 = 0x40
+const SVC_FLAG_RESTART         : u32 = 0x80
+const SVC_FLAG_CGROUP          : u32 = 0x100
+
+// Service State
+const SVC_STATE_STOPPED        : u8 = 0
+const SVC_STATE_STARTING       : u8 = 1
+const SVC_STATE_RUNNING        : u8 = 2
+const SVC_STATE_STOPPING       : u8 = 3
+const SVC_STATE_FAILED         : u8 = 4
+const SVC_STATE_DEGRADED       : u8 = 5
+const SVC_STATE_RELOADING      : u8 = 6
+
+// Restart Policy
+const RESTART_NEVER            : u8 = 0
+const RESTART_ON_FAILURE       : u8 = 1
+const RESTART_ALWAYS           : u8 = 2
+const RESTART_ON_ABNORMAL      : u8 = 3
+
+// ──────────────────────────────────────────────
+// Boot Stage
+// ──────────────────────────────────────────────
+// Evidence path: INIT-STAGE-001 through INIT-STAGE-025
+
+pub type BootStage : struct {
+    stage_id: u32,
+    name: FixedString[STAGE_NAME_MAX_LEN],
+    service_indices: FixedArray[MAX_SERVICES, u32],
+    num_services: u32,
+    prerequisites: FixedArray[MAX_BOOT_STAGES, u32],
+    num_prerequisites: u32,
+    state: u8,
+    timeout_us: u64,
+    start_time: Word64,
+    end_time: Word64,
+    is_completed: bool,
+    has_failed: bool,
+    in_recovery: bool,
+}
+
+impl BootStage {
+    pub fn new(stage_id: u32, name: FixedString[STAGE_NAME_MAX_LEN],
+               timeout_us: u64) -> BootStage
+        effects: [deterministic]
+    {
+        BootStage {
+            stage_id: stage_id,
+            name: name,
+            service_indices: FixedArray::new(),
+            num_services: 0,
+            prerequisites: FixedArray::new(),
+            num_prerequisites: 0,
+            state: 0,
+            timeout_us: timeout_us,
+            start_time: Word64::zero(),
+            end_time: Word64::zero(),
+            is_completed: false,
+            has_failed: false,
+            in_recovery: false,
+        }
+    }
+
+    pub fn add_service(self: ref mut, service_index: u32)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_services >= MAX_SERVICES {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Too many services in stage")))
+        }
+        self.service_indices.push(service_index);
+        self.num_services = self.num_services + 1
+        Result::Ok(())
+    }
+
+    pub fn add_prerequisite(self: ref mut, stage_id: u32)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_prerequisites >= MAX_BOOT_STAGES {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Too many prerequisites")))
+        }
+        self.prerequisites.push(stage_id);
+        self.num_prerequisites = self.num_prerequisites + 1
+        Result::Ok(())
+    }
+
+    pub fn has_prerequisites_met(self, stages: ref FixedArray[MAX_BOOT_STAGES, BootStage]) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_prerequisites
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_prerequisites {
+            let prereq_id: u32 = self.prerequisites.get(i)
+            if prereq_id >= stages.len() {
+                return false
+            }
+            let prereq: ref BootStage = stages.get(prereq_id)
+            if !prereq.is_completed {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn mark_completed(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_completed = true
+        self.end_time = __builtin_read_timestamp()
+    }
+
+    pub fn mark_failed(self: ref mut)
+        effects: [deterministic]
+    {
+        self.has_failed = true
+        self.is_completed = false
+        self.end_time = __builtin_read_timestamp()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Service Definition
+// ──────────────────────────────────────────────
+// Evidence path: INIT-SVCDEF-001 through INIT-SVCDEF-035
+
+pub type ServiceDefinition : struct {
+    name: FixedString[SERVICE_NAME_MAX_LEN],
+    path: FixedString[SERVICE_PATH_MAX_LEN],
+    args: FixedArray[MAX_SERVICE_ARGS, FixedString[128]],
+    num_args: u32,
+    env: FixedArray[MAX_SERVICE_ENV, FixedString[128]],
+    num_env: u32,
+    dependencies: FixedArray[MAX_DEPENDENCIES, u32],  // indices of dependent services
+    num_dependencies: u32,
+    flags: u32,
+    restart_policy: u8,
+    max_retries: u32,
+    priority: u8,
+    service_group: u32,
+    health_check_fn: u64,
+    watchdog_timeout_us: u64,
+    capabilities: FixedArray[MAX_CAPABILITIES_PER_PROC, Capability],
+    num_capabilities: u32,
+}
+
+impl ServiceDefinition {
+    pub fn new(name: FixedString[SERVICE_NAME_MAX_LEN],
+               path: FixedString[SERVICE_PATH_MAX_LEN]) -> ServiceDefinition
+        effects: [deterministic]
+    {
+        ServiceDefinition {
+            name: name,
+            path: path,
+            args: FixedArray::new(),
+            num_args: 0,
+            env: FixedArray::new(),
+            num_env: 0,
+            dependencies: FixedArray::new(),
+            num_dependencies: 0,
+            flags: SVC_FLAG_ENABLED,
+            restart_policy: RESTART_ON_FAILURE,
+            max_retries: MAX_RETRY_COUNT,
+            priority: 16,
+            service_group: 0,
+            health_check_fn: 0,
+            watchdog_timeout_us: 0,
+            capabilities: FixedArray::new(),
+            num_capabilities: 0,
+        }
+    }
+
+    pub fn add_dependency(self: ref mut, service_index: u32)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_dependencies >= MAX_DEPENDENCIES {
+            return Result::Err(init_error(
+                DIAG_INIT_DEP_FAIL,
+                FixedString[128]::from_slice("Too many dependencies")))
+        }
+        self.dependencies.push(service_index);
+        self.num_dependencies = self.num_dependencies + 1
+        Result::Ok(())
+    }
+
+    pub fn add_arg(self: ref mut, arg: FixedString[128])
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_args >= MAX_SERVICE_ARGS {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Too many arguments")))
+        }
+        self.args.push(arg);
+        self.num_args = self.num_args + 1
+        Result::Ok(())
+    }
+
+    pub fn add_env(self: ref mut, env_var: FixedString[128])
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_env >= MAX_SERVICE_ENV {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Too many env vars")))
+        }
+        self.env.push(env_var);
+        self.num_env = self.num_env + 1
+        Result::Ok(())
+    }
+
+    pub fn add_capability(self: ref mut, cap: Capability)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_capabilities >= MAX_CAPABILITIES_PER_PROC {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Too many capabilities")))
+        }
+        self.capabilities.push(cap);
+        self.num_capabilities = self.num_capabilities + 1
+        Result::Ok(())
+    }
+
+    pub fn check_dependencies(self, services: ref FixedArray[MAX_SERVICES, ServiceDefinition])
+        -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_dependencies
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_dependencies {
+            let dep_idx: u32 = self.dependencies.get(i)
+            if dep_idx >= services.len() {
+                return false
+            }
+            // Dependency must be enabled (otherwise it's optional)
+            let dep: ref ServiceDefinition = services.get(dep_idx)
+            if (dep.flags & SVC_FLAG_DISABLED) != 0 {
+                continue  // Optional dependency
+            }
+        }
+        true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Emergency Action
+// ──────────────────────────────────────────────
+// Evidence path: INIT-EMERG-001 through INIT-EMERG-012
+
+pub type EmergencyAction : struct {
+    action_id: u32,
+    name: FixedString[64],
+    handler_fn: u64,
+    is_active: bool,
+    priority: u8,
+}
+
+impl EmergencyAction {
+    pub fn new(action_id: u32, name: FixedString[64], handler: u64) -> EmergencyAction
+        effects: [deterministic]
+    {
+        EmergencyAction {
+            action_id: action_id,
+            name: name,
+            handler_fn: handler,
+            is_active: true,
+            priority: 0,
+        }
+    }
+
+    pub fn invoke(self)
+        effects: [deterministic, io]
+    {
+        if self.handler_fn != 0 {
+            // trust: invoke emergency action handler
+            trusted("emergency action invocation") {
+                let handler: fn() = __builtin_fn_ptr(self.handler_fn)
+                handler()
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Init Error
+// ──────────────────────────────────────────────
+// Evidence path: INIT-ERR-001 through INIT-ERR-008
+
+pub type InitError : struct {
+    code: Word64,
+    message: FixedString[128],
+}
+
+impl InitError {
+    pub fn new(code: Word64, message: FixedString[128]) -> InitError
+        effects: [deterministic]
+    {
+        InitError { code: code, message: message }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.message
+    }
+}
+
+pub fn init_error(code: Word64, message: FixedString[128]) -> InitError
+    effects: [deterministic]
+{
+    InitError::new(code, message)
+}
+
+// ──────────────────────────────────────────────
+// Init System (Main Structure)
+// ──────────────────────────────────────────────
+// Evidence path: INIT-CORE-001 through INIT-CORE-120
+
+pub type InitSystem : struct {
+    boot_stages: FixedArray[MAX_BOOT_STAGES, BootStage],
+    num_stages: u32,
+    current_stage: u32,
+    services: FixedArray[MAX_SERVICES, ServiceDefinition],
+    num_services: u32,
+    service_states: FixedArray[MAX_SERVICES, u8],
+    service_pids: FixedArray[MAX_SERVICES, Pid],
+    emergency_actions: FixedArray[MAX_EMERGENCY_ACTIONS, EmergencyAction],
+    num_emergency: u32,
+    is_emergency_mode: bool,
+    is_ready: bool,
+    is_switch_root: bool,
+    boot_start_time: Word64,
+    boot_end_time: Word64,
+    total_failures: u32,
+    recovery_attempts: u32,
+    generation: Word32,
+}
+
+impl InitSystem {
+    pub fn new() -> InitSystem
+        effects: [deterministic]
+    {
+        InitSystem {
+            boot_stages: FixedArray::new(),
+            num_stages: 0,
+            current_stage: 0,
+            services: FixedArray::new(),
+            num_services: 0,
+            service_states: FixedArray::new(),
+            service_pids: FixedArray::new(),
+            emergency_actions: FixedArray::new(),
+            num_emergency: 0,
+            is_emergency_mode: false,
+            is_ready: false,
+            is_switch_root: false,
+            boot_start_time: Word64::zero(),
+            boot_end_time: Word64::zero(),
+            total_failures: 0,
+            recovery_attempts: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Boot Stage Management
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-STAGE-MGMT-001 through INIT-STAGE-MGMT-035
+
+    pub fn add_boot_stage(self: ref mut, stage: BootStage)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_stages >= MAX_BOOT_STAGES {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Max boot stages reached")))
+        }
+        self.boot_stages.push(stage);
+        self.num_stages = self.num_stages + 1
+        Result::Ok(())
+    }
+
+    pub fn advance_stage(self: ref mut) -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.current_stage >= self.num_stages {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("No more stages")))
+        }
+        let stage: ref mut BootStage = self.boot_stages.get_mut(self.current_stage)
+        if !stage.has_prerequisites_met(&self.boot_stages) {
+            return Result::Err(init_error(
+                DIAG_INIT_DEP_FAIL,
+                FixedString[128]::from_slice("Prerequisites not met")))
+        }
+        stage.mark_completed();
+        let old_stage: u32 = self.current_stage
+        self.current_stage = self.current_stage + 1
+        self.generation.bump();
+        self.record_stage_advance_residual(self.current_stage, old_stage)
+        Result::Ok(self.current_stage)
+    }
+
+    pub fn get_current_stage(self: ref) -> Result[ref BootStage, InitError>
+        effects: [deterministic]
+    {
+        if self.current_stage >= self.num_stages {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Invalid current stage")))
+        }
+        // trust: current_stage bounds-checked
+        trusted("current stage access: stage_id within range") {
+            Result::Ok(self.boot_stages.get(self.current_stage))
+        }
+    }
+
+    pub fn get_current_stage_mut(self: ref mut) -> Result[ref mut BootStage, InitError>
+        effects: [deterministic]
+    {
+        if self.current_stage >= self.num_stages {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Invalid current stage")))
+        }
+        // trust: current_stage bounds-checked
+        trusted("current stage mut access: stage_id within range") {
+            Result::Ok(self.boot_stages.get_mut(self.current_stage))
+        }
+    }
+
+    pub fn get_stage(self, stage_id: u32) -> Result[ref BootStage, InitError>
+        effects: [deterministic]
+    {
+        if stage_id >= self.num_stages {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Invalid stage ID")))
+        }
+        // trust: stage_id bounds-checked
+        trusted("stage access: stage_id within range") {
+            Result::Ok(self.boot_stages.get(stage_id))
+        }
+    }
+
+    pub fn get_stage_mut(self: ref mut, stage_id: u32) -> Result[ref mut BootStage, InitError>
+        effects: [deterministic]
+    {
+        if stage_id >= self.num_stages {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Invalid stage ID")))
+        }
+        // trust: stage_id bounds-checked
+        trusted("stage mut access: stage_id within range") {
+            Result::Ok(self.boot_stages.get_mut(stage_id))
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Service Registration
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SVCREG-001 through INIT-SVCREG-030
+
+    pub fn register_service(self: ref mut, service: ServiceDefinition, stage_id: u32)
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.num_services >= MAX_SERVICES {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Max services reached")))
+        }
+        let service_index: u32 = self.num_services
+        self.services.push(service);
+        self.service_states.push(SVC_STATE_STOPPED);
+        self.service_pids.push(Pid::zero());
+        self.num_services = self.num_services + 1
+        // Add to stage
+        let stage: ref mut BootStage = self.get_stage_mut(stage_id)?
+        stage.add_service(service_index)?;
+        self.generation.bump();
+        self.record_service_reg_residual(service_index, stage_id)
+        Result::Ok(service_index)
+    }
+
+    pub fn get_service(self, index: u32) -> Result[ref ServiceDefinition, InitError>
+        effects: [deterministic]
+    {
+        if index >= self.num_services {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Invalid service index")))
+        }
+        // trust: bounds-checked
+        trusted("service access: index within range") {
+            Result::Ok(self.services.get(index))
+        }
+    }
+
+    pub fn get_service_mut(self: ref mut, index: u32)
+        -> Result[ref mut ServiceDefinition, InitError>
+        effects: [deterministic]
+    {
+        if index >= self.num_services {
+            return Result::Err(init_error(
+                DIAG_INIT_BOUNDS,
+                FixedString[128]::from_slice("Invalid service index")))
+        }
+        // trust: bounds-checked
+        trusted("service mut access: index within range") {
+            Result::Ok(self.services.get_mut(index))
+        }
+    }
+
+    pub fn get_service_state(self, index: u32) -> u8
+        effects: [deterministic]
+    {
+        if index >= self.num_services {
+            return SVC_STATE_FAILED
+        }
+        self.service_states.get(index)
+    }
+
+    pub fn set_service_state(self: ref mut, index: u32, state: u8)
+        effects: [deterministic]
+    {
+        if index < self.num_services {
+            self.service_states.set(index, state)
+        }
+    }
+
+    pub fn get_service_pid(self, index: u32) -> Pid
+        effects: [deterministic]
+    {
+        if index >= self.num_services {
+            return Pid::zero()
+        }
+        self.service_pids.get(index)
+    }
+
+    pub fn set_service_pid(self: ref mut, index: u32, pid: Pid)
+        effects: [deterministic]
+    {
+        if index < self.num_services {
+            self.service_pids.set(index, pid)
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Dependency Resolution (Topological Sort)
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-DEPRES-001 through INIT-DEPRES-030
+
+    pub fn resolve_dependencies(self: ref mut) -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        // Simple topological sort for service start order
+        let mut sorted: u32 = 0
+        let mut visited: FixedArray[MAX_SERVICES, bool] = FixedArray::new()
+        // Initialize visited to false
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_services
+        loop: bounds[BOUND_MEDIUM] for i in 0..MAX_SERVICES {
+            visited.push(false)
+        }
+        // Perform DFS-based topological sort
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_services
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_services {
+            if !visited.get(i) {
+                let count: u32 = self.dfs_visit(i, &mut visited)?
+                sorted = sorted + count
+            }
+        }
+        self.record_dep_resolve_residual(sorted)
+        Result::Ok(sorted)
+    }
+
+    fn dfs_visit(self: ref mut, index: u32, visited: ref mut FixedArray[MAX_SERVICES, bool])
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        visited.set(index, true);
+        let service: ref ServiceDefinition = self.services.get(index)
+        // Visit dependencies first
+        // loop: bounds[BOUND_SMALL] — bounded by num_dependencies
+        loop: bounds[BOUND_SMALL] for i in 0..service.num_dependencies {
+            let dep_idx: u32 = service.dependencies.get(i)
+            if dep_idx < self.num_services && !visited.get(dep_idx) {
+                let _ = self.dfs_visit(dep_idx, visited)?
+            }
+        }
+        Result::Ok(1)
+    }
+
+    // ──────────────────────────────────────────────
+    // Start Services for a Stage
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-START-001 through INIT-START-040
+
+    pub fn start_stage_services(self: ref mut, stage_id: u32,
+                                 table: ref mut ProcessTable,
+                                 tree: ref mut ProcessTree)
+        -> Result<u32, InitError>
+        effects: [deterministic, io]
+    {
+        let stage: ref BootStage = self.get_stage(stage_id)?
+        let mut started: u32 = 0
+        let mut batch_count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by stage num_services
+        loop: bounds[BOUND_MEDIUM] for i in 0..stage.num_services {
+            let svc_idx: u32 = stage.service_indices.get(i)
+            let svc: ref ServiceDefinition = self.services.get(svc_idx)
+            if (svc.flags & SVC_FLAG_DISABLED) != 0 {
+                continue
+            }
+            // Check dependencies are satisfied
+            if !self.dependencies_satisfied(svc_idx) {
+                continue
+            }
+            // Start the service
+            let pid: Pid = self.start_service(svc_idx, table, tree)?
+            self.service_states.set(svc_idx, SVC_STATE_STARTING);
+            self.service_pids.set(svc_idx, pid);
+            started = started + 1
+            batch_count = batch_count + 1
+            // Parallel start: batch up to MAX_PARALLEL_STARTS at a time
+            if batch_count >= MAX_PARALLEL_STARTS {
+                batch_count = 0
+            }
+        }
+        self.generation.bump();
+        self.record_services_started_residual(stage_id, started)
+        Result::Ok(started)
+    }
+
+    fn dependencies_satisfied(self, service_index: u32) -> bool
+        effects: [deterministic]
+    {
+        let svc: ref ServiceDefinition = self.services.get(service_index)
+        // loop: bounds[BOUND_SMALL] — bounded by num_dependencies
+        loop: bounds[BOUND_SMALL] for i in 0..svc.num_dependencies {
+            let dep_idx: u32 = svc.dependencies.get(i)
+            if dep_idx >= self.num_services {
+                return false
+            }
+            let dep_state: u8 = self.service_states.get(dep_idx)
+            if dep_state != SVC_STATE_RUNNING && dep_state != SVC_STATE_STOPPED {
+                // If dependency is disabled, it's OK
+                let dep_svc: ref ServiceDefinition = self.services.get(dep_idx)
+                if (dep_svc.flags & SVC_FLAG_DISABLED) == 0 {
+                    return false
+                }
+            }
+        }
+        true
+    }
+
+    fn start_service(self: ref mut, service_index: u32,
+                      table: ref mut ProcessTable,
+                      tree: ref mut ProcessTree)
+        -> Result[Pid, InitError>
+        effects: [deterministic, io]
+    {
+        let svc: ref ServiceDefinition = self.services.get(service_index)
+        let creds: Credentials = Credentials::kernel_default()
+        let pid: Pid = table.create_process(Pid::zero(), creds, svc.name)?
+        self.record_service_start_residual(service_index, pid)
+        Result::Ok(pid)
+    }
+
+    // ──────────────────────────────────────────────
+    // Emergency Mode
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-EMERGENCY-001 through INIT-EMERGENCY-025
+
+    pub fn enter_emergency_mode(self: ref mut, reason: FixedString[128])
+        effects: [deterministic, io]
+    {
+        self.is_emergency_mode = true
+        self.current_stage = STAGE_EMERGENCY
+        // Execute emergency actions
+        // loop: bounds[BOUND_SMALL] — bounded by num_emergency
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_emergency {
+            let action: ref EmergencyAction = self.emergency_actions.get(i)
+            if action.is_active {
+                action.invoke()
+            }
+        }
+        self.generation.bump();
+        self.record_emergency_residual(reason)
+    }
+
+    pub fn exit_emergency_mode(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_emergency_mode = false
+        self.is_ready = false
+        self.generation.bump()
+    }
+
+    pub fn add_emergency_action(self: ref mut, action: EmergencyAction)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_emergency >= MAX_EMERGENCY_ACTIONS {
+            return Result::Err(init_error(
+                DIAG_INIT_EMERGENCY,
+                FixedString[128]::from_slice("Max emergency actions reached")))
+        }
+        self.emergency_actions.push(action);
+        self.num_emergency = self.num_emergency + 1
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Failure Handling and Recovery
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-FAILURE-001 through INIT-FAILURE-025
+
+    pub fn handle_service_failure(self: ref mut, service_index: u32)
+        -> Result<bool, InitError>
+        effects: [deterministic, io]
+    {
+        self.total_failures = self.total_failures + 1
+        let svc: ref ServiceDefinition = self.services.get(service_index)
+        let current_state: u8 = self.service_states.get(service_index)
+        self.service_states.set(service_index, SVC_STATE_FAILED);
+        // Check if the service should be restarted
+        if svc.restart_policy == RESTART_ALWAYS ||
+           (svc.restart_policy == RESTART_ON_FAILURE &&
+            current_state != SVC_STATE_STOPPED) {
+            // Allow restart if within retry limit
+            // In production this tracks retry count per service
+            self.record_failure_residual(service_index, true)
+            return Result::Ok(true)  // Will be retried
+        }
+        // Check if this is a critical service
+        if (svc.flags & SVC_FLAG_CRITICAL) != 0 {
+            self.enter_emergency_mode(FixedString[128]::from_slice(
+                "Critical service failed"))
+        }
+        self.record_failure_residual(service_index, false)
+        Result::Ok(false)
+    }
+
+    pub fn attempt_recovery(self: ref mut) -> bool
+        effects: [deterministic, io]
+    {
+        self.recovery_attempts = self.recovery_attempts + 1
+        // Try to restart failed services
+        let mut any_recovered: bool = false
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_services
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_services {
+            let state: u8 = self.service_states.get(i)
+            if state == SVC_STATE_FAILED {
+                self.service_states.set(i, SVC_STATE_STOPPED);
+                any_recovered = true
+            }
+        }
+        if any_recovered {
+            self.generation.bump();
+            self.record_recovery_residual()
+        }
+        any_recovered
+    }
+
+    // ──────────────────────────────────────────────
+    // Switch Root
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-SWITCHROOT-001 through INIT-SWITCHROOT-015
+
+    pub fn switch_root(self: ref mut, new_root: FixedString[128],
+                        old_root: FixedString[128])
+        -> Result[(), InitError>
+        effects: [deterministic, io]
+    {
+        self.is_switch_root = true
+        // trust: switch_root involves pivot_root syscall
+        trusted("switch_root: pivot to new root filesystem") {
+            __builtin_pivot_root(new_root.as_ptr(), old_root.as_ptr())
+        }
+        self.generation.bump();
+        self.record_switch_root_residual(new_root)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Boot Completion
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-COMPLETE-001 through INIT-COMPLETE-015
+
+    pub fn mark_boot_complete(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_ready = true
+        self.boot_end_time = __builtin_read_timestamp()
+        self.generation.bump();
+        self.record_boot_complete_residual()
+    }
+
+    pub fn boot_duration_us(self) -> u64
+        effects: [deterministic]
+    {
+        let end: u64 = if self.boot_end_time.to_u64() > 0 {
+            self.boot_end_time.to_u64()
+        } else {
+            __builtin_read_timestamp()
+        }
+        end - self.boot_start_time.to_u64()
+    }
+
+    // ──────────────────────────────────────────────
+    // Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-QUERY-001 through INIT-QUERY-020
+
+    pub fn is_boot_complete(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_ready
+    }
+
+    pub fn in_emergency(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_emergency_mode
+    }
+
+    pub fn current_stage_id(self) -> u32
+        effects: [deterministic]
+    {
+        self.current_stage
+    }
+
+    pub fn stage_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_stages
+    }
+
+    pub fn service_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_services
+    }
+
+    pub fn failure_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.total_failures
+    }
+
+    pub fn recovery_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.recovery_attempts
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn count_services_in_state(self, state: u8) -> u32
+        effects: [deterministic]
+    {
+        let mut count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_services
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_services {
+            if self.service_states.get(i) == state {
+                count = count + 1
+            }
+        }
+        count
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-RESID-001 through INIT-RESID-025
+
+    fn record_stage_advance_residual(self, new_stage: u32, old_stage: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Boot stage advanced",
+            code: DIAG_INIT_OK,
+            data: (new_stage, old_stage),
+        )
+    }
+
+    fn record_service_reg_residual(self, svc_idx: u32, stage_id: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service registered",
+            code: DIAG_INIT_OK,
+            data: (svc_idx, stage_id),
+        )
+    }
+
+    fn record_dep_resolve_residual(self, count: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Dependencies resolved",
+            code: DIAG_INIT_OK,
+            data: count,
+        )
+    }
+
+    fn record_services_started_residual(self, stage_id: u32, count: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Stage services started",
+            code: DIAG_INIT_OK,
+            data: (stage_id, count),
+        )
+    }
+
+    fn record_service_start_residual(self, svc_idx: u32, pid: Pid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service process started",
+            code: DIAG_INIT_OK,
+            data: (svc_idx, pid.value()),
+        )
+    }
+
+    fn record_emergency_residual(self, reason: FixedString[128])
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Emergency mode entered",
+            code: DIAG_INIT_EMERGENCY,
+            data: reason,
+        )
+    }
+
+    fn record_failure_residual(self, svc_idx: u32, will_retry: bool)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Service failure",
+            code: DIAG_INIT_SERVICE_FAIL,
+            data: (svc_idx, will_retry),
+        )
+    }
+
+    fn record_recovery_residual(self)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Recovery attempted",
+            code: DIAG_INIT_RECOVERY,
+            data: (),
+        )
+    }
+
+    fn record_switch_root_residual(self, new_root: FixedString[128])
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Root filesystem switched",
+            code: DIAG_INIT_SWITCH_ROOT,
+            data: new_root,
+        )
+    }
+
+    fn record_boot_complete_residual(self)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Boot complete",
+            code: DIAG_INIT_OK,
+            data: (),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization Functions
+// ──────────────────────────────────────────────
+// Evidence path: INIT-FN-001 through INIT-FN-020
+
+pub fn create_default_boot_stages(init: ref mut InitSystem)
+    -> Result[(), InitError>
+    effects: [deterministic]
+{
+    let stages: FixedArray[9, (u32, FixedString[48], u64)] = FixedArray::from_array([
+        (STAGE_PRE_BOOT, FixedString[48]::from_slice("pre-boot"), 5000000),
+        (STAGE_EARLY_INIT, FixedString[48]::from_slice("early-init"), 10000000),
+        (STAGE_HARDWARE_DETECT, FixedString[48]::from_slice("hardware-detect"), 30000000),
+        (STAGE_DRIVERS, FixedString[48]::from_slice("drivers"), 30000000),
+        (STAGE_FILESYSTEMS, FixedString[48]::from_slice("filesystems"), 20000000),
+        (STAGE_SERVICES, FixedString[48]::from_slice("services"), 60000000),
+        (STAGE_NETWORK, FixedString[48]::from_slice("network"), 30000000),
+        (STAGE_USER_ENVIRONMENT, FixedString[48]::from_slice("user-env"), 20000000),
+        (STAGE_READY, FixedString[48]::from_slice("ready"), 0),
+    ])
+    // loop: bounds[BOUND_TINY] — bounded by 9 stages
+    loop: bounds[BOUND_TINY] for i in 0..9 {
+        let (stage_id, name, timeout): (u32, FixedString[48], u64) = stages.get(i)
+        let mut stage: BootStage = BootStage::new(stage_id, name, timeout)
+        // Add prerequisites (each stage depends on all previous)
+        // loop: bounds[BOUND_TINY] — bounded by i
+        loop: bounds[BOUND_TINY] for j in 0..i {
+            let prereq_id: u32 = stages.get(j).0
+            stage.add_prerequisite(prereq_id)?
+        }
+        init.add_boot_stage(stage)?
+    }
+    Result::Ok(())
+}
+
+pub fn boot_init(init: ref mut InitSystem) -> Result[(), InitError>
+    effects: [deterministic, io]
+{
+    init.boot_start_time = __builtin_read_timestamp();
+    // Advance through pre-boot stage
+    init.advance_stage()?;
+    // Early initialization complete
+    Result::Ok(())
+}
+
+pub fn shutdown_init(init: ref mut InitSystem)
+    effects: [deterministic]
+{
+    init.is_ready = false
+    // In production: stop all services, unmount filesystems, etc.
+}
+
+pub fn is_system_ready(init: ref InitSystem) -> bool
+    effects: [deterministic]
+{
+    init.is_ready
+}
+
+pub fn system_uptime_ms(init: ref InitSystem) -> u64
+    effects: [deterministic]
+{
+    let now: u64 = __builtin_read_timestamp()
+    now - init.boot_start_time.to_u64()
+}

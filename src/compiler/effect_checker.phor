@@ -1,0 +1,819 @@
+// effect_checker.phor — Effect Checker: Effect Set Computation, Closure Effect Capture,
+//                        Undeclared Effect Detection, Effect Polymorphism,
+//                        Higher-Order Effect Tracking, Cross-Function Effect Propagation
+// Phorensic Compiler Infrastructure — Effect Checking Phase
+//
+// This module implements the effect checking pass for the Phorensic compiler.
+// It validates that all functions declare their effects and that all effect
+// uses are within declared bounds. The effect checker operates on the AST
+// during the lowering phase.
+//
+// Checks performed:
+// 1. Effect set computation — computes the union of all effects in a function body
+// 2. Closure effect capture — computes effects captured by closures
+// 3. Undeclared effect detection — detects effects not in the function's declaration
+// 4. Effect polymorphism — handles generic effect parameters
+// 5. Higher-order effect tracking — tracks effects through function parameters
+// 6. Cross-function effect propagation — propagates effects through call chains
+//
+// Evidence semantics: Each check produces an EffectCheckReceipt. The checker
+// maintains an audit trail of all effect decisions for downstream sealing.
+//
+// Boundedness: All effect sets are Word64 bitmasks. Effect tracking arrays
+// are bounded at 128 entries. Loop bounds use BOUND_SMALL and BOUND_MEDIUM.
+//
+// Effect declarations: All checker functions are [pure] (deterministic) except
+// those emitting diagnostics [diag].
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+
+// ──────────────────────────────────────────────
+// EffectSet: Bitmask representation for effect checking
+// ──────────────────────────────────────────────
+// A fixed-size set of effect identifiers backed by a Word64 bitmask.
+// All effect checking operations use this representation.
+// Evidence path: EFF-CHECK-SET-001 through EFF-CHECK-SET-030
+
+pub type EffectSet : Word64 = struct {
+    mask: Word64,
+}
+
+impl EffectSet {
+    pub fn empty() -> EffectSet [pure] {
+        EffectSet { mask: Word64::from_u64(EFFECT_NONE) }
+    }
+
+    pub fn from_mask(mask: Word64) -> EffectSet [pure] {
+        EffectSet { mask: mask }
+    }
+
+    pub fn single(effect: Word64) -> EffectSet [pure] {
+        EffectSet { mask: effect }
+    }
+
+    pub fn has_effect(self, effect: Word64) -> bool [pure] {
+        let masked: Word64 = self.mask.bit_and(effect);
+        !masked.is_zero()
+    }
+
+    pub fn is_subset_of(self, other: EffectSet) -> bool [pure] {
+        let combined: Word64 = self.mask.bit_and(other.mask);
+        combined.eq(self.mask)
+    }
+
+    pub fn contains(self, other: EffectSet) -> bool [pure] {
+        let combined: Word64 = self.mask.bit_and(other.mask);
+        combined.eq(other.mask)
+    }
+
+    pub fn add(self: ref mut, effect: Word64) [pure] {
+        self.mask = self.mask.bit_or(effect);
+    }
+
+    pub fn union(self, other: EffectSet) -> EffectSet [pure] {
+        EffectSet { mask: self.mask.bit_or(other.mask) }
+    }
+
+    pub fn intersect(self, other: EffectSet) -> EffectSet [pure] {
+        EffectSet { mask: self.mask.bit_and(other.mask) }
+    }
+
+    pub fn is_pure(self) -> bool [pure] {
+        self.mask.is_zero()
+    }
+
+    pub fn mask(self) -> Word64 [pure] {
+        self.mask
+    }
+
+    pub fn count(self) -> u32 [pure] {
+        self.mask.count_ones()
+    }
+}
+
+// ──────────────────────────────────────────────
+// EffectDeclaration: A declared effect with polymorphism support
+// ──────────────────────────────────────────────
+// Each declared effect has a name, whether it is a parameter (polymorphic),
+// and the concrete effect mask it represents.
+// Evidence path: EFF-CHECK-DECL-001 through EFF-CHECK-DECL-015
+
+pub struct EffectDeclaration {
+    /// Name of the declared effect.
+    pub name : FixedString256,
+    /// Whether this is a polymorphic effect parameter.
+    pub is_polymorphic : bool,
+    /// The concrete effect mask.
+    pub effect_mask : Word64,
+    /// Scope depth where this declaration is active.
+    pub scope_depth : u32,
+}
+
+impl EffectDeclaration {
+    pub fn new(name : FixedString256, effect_mask : Word64, scope_depth : u32) -> EffectDeclaration [pure] {
+        EffectDeclaration {
+            name: name,
+            is_polymorphic: false,
+            effect_mask: effect_mask,
+            scope_depth: scope_depth,
+        }
+    }
+
+    pub fn polymorphic(name : FixedString256, scope_depth : u32) -> EffectDeclaration [pure] {
+        EffectDeclaration {
+            name: name,
+            is_polymorphic: true,
+            effect_mask: EFFECT_NONE,
+            scope_depth: scope_depth,
+        }
+    }
+
+    pub fn instantiate(mut self, concrete_mask : Word64) -> EffectDeclaration [pure] {
+        self.effect_mask = concrete_mask;
+        self.is_polymorphic = false;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// ClosureEffectCapture: Tracks effects captured by closures
+// ──────────────────────────────────────────────
+// When a closure captures values from its environment, it may also
+// capture effects. This structure tracks those captured effects.
+// Evidence path: EFF-CHECK-CLOSURE-001 through EFF-CHECK-CLOSURE-015
+
+pub struct ClosureEffectCapture {
+    /// Name of the closure.
+    pub closure_name : FixedString256,
+    /// Effects captured from the enclosing scope.
+    pub captured_effects : EffectSet,
+    /// Effects declared by the closure.
+    pub declared_effects : EffectSet,
+    /// Names of captured variables.
+    pub captured_vars : Array64<FixedString256>,
+    /// Whether the capture analysis is complete.
+    pub resolved : bool,
+}
+
+impl ClosureEffectCapture {
+    pub fn new(closure_name : FixedString256) -> ClosureEffectCapture [pure] {
+        ClosureEffectCapture {
+            closure_name: closure_name,
+            captured_effects: EffectSet::empty(),
+            declared_effects: EffectSet::empty(),
+            captured_vars: Array64::new(),
+            resolved: false,
+        }
+    }
+
+    pub fn capture_variable(mut self, var_name : FixedString256, var_effect : Word64) -> ClosureEffectCapture [pure] {
+        let _ = self.captured_vars.push(var_name);
+        self.captured_effects.add(var_effect);
+        self
+    }
+
+    pub fn set_declared(mut self, effects : EffectSet) -> ClosureEffectCapture [pure] {
+        self.declared_effects = effects;
+        self
+    }
+
+    pub fn resolve(mut self) -> ClosureEffectCapture [pure] {
+        self.resolved = true;
+        self
+    }
+
+    pub fn check_capture_consistency(&self) -> Result<(), FixedString256> [pure] {
+        if !self.captured_effects.is_subset_of(self.declared_effects) {
+            let msg : FixedString256 = FixedString256::from("closure '");
+            let msg2 : FixedString256 = msg + self.closure_name + FixedString256::from("' captures effects not in its declaration");
+            return Result::Err(msg2);
+        }
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// EffectPolymorphism: Tracks polymorphic effect parameters
+// ──────────────────────────────────────────────
+// Functions can be polymorphic over effects, meaning they accept
+// any effect that satisfies certain constraints.
+// Evidence path: EFF-CHECK-POLY-001 through EFF-CHECK-POLY-015
+
+pub struct EffectPolymorphism {
+    /// Name of the effect parameter.
+    pub param_name : FixedString256,
+    /// Constraint mask (effects that this parameter must include).
+    pub constraint : EffectSet,
+    /// Bound mask (effects that this parameter is limited to).
+    pub bound : EffectSet,
+    /// Whether the parameter has been instantiated.
+    pub instantiated : bool,
+    /// The instantiated concrete mask.
+    pub concrete_mask : Word64,
+}
+
+impl EffectPolymorphism {
+    pub fn new(param_name : FixedString256) -> EffectPolymorphism [pure] {
+        EffectPolymorphism {
+            param_name: param_name,
+            constraint: EffectSet::empty(),
+            bound: EffectSet::from_mask(EFFECT_ALL),
+            instantiated: false,
+            concrete_mask: EFFECT_NONE,
+        }
+    }
+
+    pub fn with_constraint(mut self, constraint : EffectSet) -> EffectPolymorphism [pure] {
+        self.constraint = constraint;
+        self
+    }
+
+    pub fn with_bound(mut self, bound : EffectSet) -> EffectPolymorphism [pure] {
+        self.bound = bound;
+        self
+    }
+
+    pub fn instantiate(mut self, concrete : Word64) -> Result<EffectPolymorphism, FixedString256> [pure] {
+        let concrete_set : EffectSet = EffectSet::from_mask(concrete);
+        if !concrete_set.is_subset_of(self.bound) {
+            let msg : FixedString256 = FixedString256::from("effect parameter '");
+            let msg2 : FixedString256 = msg + self.param_name + FixedString256::from("' cannot be instantiated with effects outside its bound");
+            return Result::Err(msg2);
+        }
+        if !self.constraint.is_subset_of(concrete_set) {
+            let msg : FixedString256 = FixedString256::from("effect parameter '");
+            let msg2 : FixedString256 = msg + self.param_name + FixedString256::from("' does not satisfy its constraints");
+            return Result::Err(msg2);
+        }
+        self.concrete_mask = concrete;
+        self.instantiated = true;
+        Result::Ok(self)
+    }
+}
+
+// ──────────────────────────────────────────────
+// EffectChecker: Main effect checking state machine
+// ──────────────────────────────────────────────
+// The effect checker validates that all functions declare their effects
+// and that all effect uses are within declared bounds.
+// Evidence path: EFF-CHECKER-001 through EFF-CHECKER-070
+
+pub struct EffectChecker {
+    /// Declared effects for each function (bounded: 128 max).
+    pub declarations : Array128<EffectDeclaration>,
+    /// Closure captures tracked (bounded: 64 max).
+    pub closures : Array64<ClosureEffectCapture>,
+    /// Polymorphic effect parameters (bounded: 32 max).
+    pub polymorphic_params : Array64<EffectPolymorphism>,
+    /// Current effect set being accumulated for the function body.
+    pub accumulated_effects : EffectSet,
+    /// Declared effects for the current function.
+    pub current_declared : EffectSet,
+    /// Current scope depth.
+    pub scope_depth : u32,
+    /// Diagnostic bag for collecting violations.
+    pub diagnostics : DiagnosticBag,
+    /// Number of undeclared effects detected.
+    pub undeclared_count : u32,
+    /// Number of closure violations detected.
+    pub closure_violation_count : u32,
+    /// Number of polymorphism violations detected.
+    pub poly_violation_count : u32,
+    /// Number of effect propagation steps.
+    pub propagation_count : u32,
+    /// Whether the checker has completed.
+    pub completed : bool,
+}
+
+impl EffectChecker {
+    pub fn new() -> EffectChecker [pure] {
+        EffectChecker {
+            declarations: Array128::new(),
+            closures: Array64::new(),
+            polymorphic_params: Array64::new(),
+            accumulated_effects: EffectSet::empty(),
+            current_declared: EffectSet::empty(),
+            scope_depth: 0u32,
+            diagnostics: DiagnosticBag::new(),
+            undeclared_count: 0u32,
+            closure_violation_count: 0u32,
+            poly_violation_count: 0u32,
+            propagation_count: 0u32,
+            completed: false,
+        }
+    }
+
+    // ── Effect Declaration Management ──
+
+    pub fn declare_function_effects(
+        mut self,
+        function_name : FixedString256,
+        effects : EffectSet,
+    ) -> EffectChecker [pure] {
+        if self.declarations.len() >= self.declarations.capacity() {
+            return self;
+        }
+        let decl : EffectDeclaration = EffectDeclaration::new(function_name, effects.mask(), self.scope_depth);
+        let _ = self.declarations.push(decl);
+        self.current_declared = effects;
+        self.accumulated_effects = EffectSet::empty();
+        self
+    }
+
+    pub fn declare_polymorphic_effect(
+        mut self,
+        param_name : FixedString256,
+        constraint : EffectSet,
+        bound : EffectSet,
+    ) -> EffectChecker [pure] {
+        if self.polymorphic_params.len() >= self.polymorphic_params.capacity() {
+            return self;
+        }
+        let poly : EffectPolymorphism = EffectPolymorphism::new(param_name)
+            .with_constraint(constraint)
+            .with_bound(bound);
+        let _ = self.polymorphic_params.push(poly);
+        self
+    }
+
+    // ── Effect Accumulation ──
+
+    pub fn use_effect(
+        mut self,
+        effect_name : FixedString256,
+        effect_mask : Word64,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        self.accumulated_effects.add(effect_mask);
+
+        // Check if the effect is declared in the current function.
+        if !self.current_declared.has_effect(effect_mask) {
+            // Check if it is covered by a polymorphic parameter.
+            let mut covered_by_poly : bool = false;
+            // loop: bounds[BOUND_SMALL] — bounded by 32 polymorphic params.
+            loop: bounds[BOUND_SMALL] for i in 0..self.polymorphic_params.len() {
+                let param : EffectPolymorphism = self.polymorphic_params.get(i);
+                if param.instantiated {
+                    let param_set : EffectSet = EffectSet::from_mask(param.concrete_mask);
+                    if param_set.has_effect(effect_mask) {
+                        covered_by_poly = true;
+                    }
+                }
+            }
+
+            if !covered_by_poly {
+                self.undeclared_count = self.undeclared_count + 1u32;
+                let msg : FixedString256 = FixedString256::from("undeclared effect '");
+                let msg2 : FixedString256 = msg + effect_name + FixedString256::from("'");
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LowerEffectNotDeclared,
+                    msg2,
+                    SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lowerer,
+                );
+                let _ = self.diagnostics.emit(diag);
+                return Result::Err(diag);
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    pub fn use_effect_set(
+        mut self,
+        effects : EffectSet,
+        context : FixedString256,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        // Check each effect in the set against the current declaration.
+        let all_effects : Word64 = effects.mask();
+        let check_mask : Word64 = all_effects;
+
+        // We iterate through each known effect bit to check individually.
+        // loop: bounds[BOUND_SMALL] — bounded by 64 bits (Word64).
+        loop: bounds[BOUND_SMALL] for bit in 0..64u32 {
+            let effect_bit : Word64 = Word64::from_u64(1u64 << bit);
+            if check_mask.bit_and(effect_bit).is_zero() {
+                // Skip to next iteration — effect not in set.
+            } else {
+                if !self.current_declared.has_effect(effect_bit) {
+                    self.undeclared_count = self.undeclared_count + 1u32;
+                    let msg : FixedString256 = FixedString256::from("effect set contains undeclared effect (bit ");
+                    let msg2 : FixedString256 = msg.push_u32(bit) + FixedString256::from(") in '") + context + FixedString256::from("'");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerEffectNotDeclared,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    let _ = self.diagnostics.emit(diag);
+                    return Result::Err(diag);
+                }
+                self.accumulated_effects.add(effect_bit);
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    // ── Closure Effect Capture ──
+
+    pub fn begin_closure(
+        mut self,
+        closure_name : FixedString256,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        if self.closures.len() >= self.closures.capacity() {
+            let msg : FixedString256 = FixedString256::from("closure tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerEffectNotDeclared,
+                msg,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+        let capture : ClosureEffectCapture = ClosureEffectCapture::new(closure_name);
+        let _ = self.closures.push(capture);
+        Result::Ok(self)
+    }
+
+    pub fn capture_variable_in_closure(
+        mut self,
+        closure_name : FixedString256,
+        var_name : FixedString256,
+        var_effect : Word64,
+    ) -> EffectChecker [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 closures.
+        loop: bounds[BOUND_SMALL] for i in 0..self.closures.len() {
+            let capture : ClosureEffectCapture = self.closures.get(i);
+            if capture.closure_name == closure_name && !capture.resolved {
+                let updated : ClosureEffectCapture = capture.capture_variable(var_name, var_effect);
+                self.closures.set(i, updated);
+            }
+        }
+        self
+    }
+
+    pub fn resolve_closure(
+        mut self,
+        closure_name : FixedString256,
+        declared_effects : EffectSet,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 closures.
+        loop: bounds[BOUND_SMALL] for i in 0..self.closures.len() {
+            let capture : ClosureEffectCapture = self.closures.get(i);
+            if capture.closure_name == closure_name && !capture.resolved {
+                let resolved : ClosureEffectCapture = capture
+                    .set_declared(declared_effects)
+                    .resolve();
+                self.closures.set(i, resolved);
+
+                // Check consistency.
+                match resolved.check_capture_consistency() {
+                    Result::Ok(()) => {
+                        // Capture is consistent.
+                    }
+                    Result::Err(msg) => {
+                        self.closure_violation_count = self.closure_violation_count + 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerEffectNotDeclared,
+                            msg,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+        Result::Ok(self)
+    }
+
+    // ── Higher-Order Effect Tracking ──
+
+    pub fn track_higher_order_call(
+        mut self,
+        function_name : FixedString256,
+        argument_effects : EffectSet,
+        declared_return_effects : EffectSet,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        // When a higher-order function is called with effectful arguments,
+        // the combined effects must be a subset of what the caller declared.
+        let combined : EffectSet = argument_effects.union(declared_return_effects);
+
+        if !combined.is_subset_of(self.current_declared) {
+            self.undeclared_count = self.undeclared_count + 1u32;
+            let msg : FixedString256 = FixedString256::from("higher-order call to '");
+            let msg2 : FixedString256 = msg + function_name + FixedString256::from("' produces undeclared effects");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerEffectNotDeclared,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            let _ = self.diagnostics.emit(diag);
+            return Result::Err(diag);
+        }
+
+        self.accumulated_effects = self.accumulated_effects.union(combined);
+        self.propagation_count = self.propagation_count + 1u32;
+        Result::Ok(self)
+    }
+
+    // ── Cross-Function Effect Propagation ──
+
+    pub fn propagate_effects(
+        mut self,
+        caller_name : FixedString256,
+        callee_name : FixedString256,
+        callee_effects : EffectSet,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        // Propagate effects from callee to caller.
+        self.accumulated_effects = self.accumulated_effects.union(callee_effects);
+
+        // Check that callee's effects are declared in the caller.
+        if !callee_effects.is_subset_of(self.current_declared) {
+            self.undeclared_count = self.undeclared_count + 1u32;
+            let msg : FixedString256 = FixedString256::from("call to '");
+            let msg2 : FixedString256 = msg + callee_name + FixedString256::from("' from '") + caller_name + FixedString256::from("' has undeclared effects");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerEffectNotDeclared,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            let _ = self.diagnostics.emit(diag);
+            return Result::Err(diag);
+        }
+
+        self.propagation_count = self.propagation_count + 1u32;
+        Result::Ok(self)
+    }
+
+    // ── Effect Polymorphism ──
+
+    pub fn instantiate_polymorphic_effect(
+        mut self,
+        param_name : FixedString256,
+        concrete_mask : Word64,
+    ) -> Result<EffectChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 32 params.
+        loop: bounds[BOUND_SMALL] for i in 0..self.polymorphic_params.len() {
+            let param : EffectPolymorphism = self.polymorphic_params.get(i);
+            if param.param_name == param_name && !param.instantiated {
+                match param.instantiate(concrete_mask) {
+                    Result::Ok(instantiated) => {
+                        self.polymorphic_params.set(i, instantiated);
+                        return Result::Ok(self);
+                    }
+                    Result::Err(msg) => {
+                        self.poly_violation_count = self.poly_violation_count + 1u32;
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerEffectNotDeclared,
+                            msg,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+
+        let msg : FixedString256 = FixedString256::from("unknown polymorphic effect parameter '");
+        let msg2 : FixedString256 = msg + param_name + FixedString256::from("'");
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerEffectNotDeclared,
+            msg2,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        self.poly_violation_count = self.poly_violation_count + 1u32;
+        let _ = self.diagnostics.emit(diag);
+        Result::Err(diag)
+    }
+
+    // ── Effect Set Computation ──
+
+    pub fn compute_function_effects(&self) -> EffectSet [pure] {
+        self.accumulated_effects
+    }
+
+    pub fn verify_effect_set_completeness(&self) -> Result<(), FixedString256> [pure] {
+        // Verify that all declared effects are actually used.
+        let unused : EffectSet = self.current_declared.intersect(
+            EffectSet::from_mask(self.accumulated_effects.mask().bit_not())
+        );
+
+        if !unused.is_pure() {
+            let msg : FixedString256 = FixedString256::from("declared effects are unused");
+            return Result::Err(msg);
+        }
+        Result::Ok(())
+    }
+
+    // ── Scope Management ──
+
+    pub fn enter_scope(mut self) -> EffectChecker [pure] {
+        self.scope_depth = self.scope_depth + 1u32;
+        self
+    }
+
+    pub fn exit_scope(mut self) -> EffectChecker [pure] {
+        if self.scope_depth > 0u32 {
+            self.scope_depth = self.scope_depth - 1u32;
+        }
+        self
+    }
+
+    // ── Finalization ──
+
+    pub fn finalize(mut self) -> (EffectChecker, EffectCheckReceipt) [pure] {
+        let has_violations : bool = self.undeclared_count > 0u32
+            || self.closure_violation_count > 0u32
+            || self.poly_violation_count > 0u32;
+        let receipt : EffectCheckReceipt = EffectCheckReceipt::new(
+            self.undeclared_count,
+            self.closure_violation_count,
+            self.poly_violation_count,
+            self.propagation_count,
+            self.accumulated_effects.mask(),
+            !has_violations,
+        );
+        self.completed = true;
+        (self, receipt)
+    }
+}
+
+// ──────────────────────────────────────────────
+// EffectCheckReceipt: Evidence receipt for effect checking
+// ──────────────────────────────────────────────
+// Records all effect checking results for downstream sealing.
+// Evidence path: EFF-RECEIPT-001 through EFF-RECEIPT-010
+
+pub struct EffectCheckReceipt {
+    pub evidence : EvidenceReceipt,
+    pub undeclared_count : u32,
+    pub closure_violation_count : u32,
+    pub poly_violation_count : u32,
+    pub propagation_count : u32,
+    pub accumulated_effects_mask : Word64,
+    pub passed : bool,
+}
+
+impl EffectCheckReceipt {
+    pub fn new(
+        undeclared_count : u32,
+        closure_violation_count : u32,
+        poly_violation_count : u32,
+        propagation_count : u32,
+        accumulated_effects_mask : Word64,
+        passed : bool,
+    ) -> EffectCheckReceipt [pure] {
+        var payload_hash : u64 = 14695981039346656037u64;
+        payload_hash ^= undeclared_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= closure_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= poly_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= propagation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= accumulated_effects_mask;
+        payload_hash *= 1099511628211u64;
+
+        EffectCheckReceipt {
+            evidence: EvidenceReceipt::new(
+                CompilerPhase::Lowerer,
+                payload_hash,
+                0u64,
+                0u64,
+            ),
+            undeclared_count: undeclared_count,
+            closure_violation_count: closure_violation_count,
+            poly_violation_count: poly_violation_count,
+            propagation_count: propagation_count,
+            accumulated_effects_mask: accumulated_effects_mask,
+            passed: passed,
+        }
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("EffectCheck: "));
+        if self.passed {
+            result.push_str(FixedString256::from("PASS"));
+        } else {
+            result.push_str(FixedString256::from("FAIL"));
+        }
+        result.push_str(FixedString256::from(" [undeclared="));
+        result.push_u32(self.undeclared_count);
+        result.push_str(FixedString256::from(", closure-violations="));
+        result.push_u32(self.closure_violation_count);
+        result.push_str(FixedString256::from(", poly-violations="));
+        result.push_u32(self.poly_violation_count);
+        result.push_str(FixedString256::from(", propagations="));
+        result.push_u32(self.propagation_count);
+        result.push_str(FixedString256::from(", effects-mask=0x"));
+        result.push_u64(self.accumulated_effects_mask);
+        result.push_str(FixedString256::from("]"));
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// Effect Checker Diagnostic Codes (PHOR-COMP-061 through PHOR-COMP-080)
+// ──────────────────────────────────────────────
+
+const EFF_ERR_UNDECLARED_EFFECT      : u64 = 61u64
+const EFF_ERR_CLOSURE_CAPTURE        : u64 = 62u64
+const EFF_ERR_POLY_INSTANTIATION     : u64 = 63u64
+const EFF_ERR_CROSS_PROPAGATION      : u64 = 64u64
+const EFF_ERR_HIGHER_ORDER           : u64 = 65u64
+const EFF_ERR_UNUSED_DECLARATION     : u64 = 66u64
+const EFF_ERR_DECLARATION_BOUND      : u64 = 67u64
+const EFF_ERR_CAPACITY_EXCEEDED      : u64 = 68u64
+
+// ──────────────────────────────────────────────
+// Diagnostic Helper Functions
+// ──────────────────────────────────────────────
+
+pub fn diag_undeclared_effect(
+    effect_name : FixedString256,
+    location : SourceLocation,
+) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("undeclared effect '");
+    let full_msg : FixedString256 = msg + effect_name + FixedString256::from("'");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerEffectNotDeclared,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_closure_capture_violation(
+    closure_name : FixedString256,
+    captured_effect : FixedString256,
+    location : SourceLocation,
+) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("closure '");
+    let msg2 : FixedString256 = msg + closure_name + FixedString256::from("' captures undeclared effect '") + captured_effect + FixedString256::from("'");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerEffectNotDeclared,
+        msg2,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_polymorphism_violation(
+    param_name : FixedString256,
+    reason : FixedString256,
+    location : SourceLocation,
+) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("polymorphic effect '");
+    let msg2 : FixedString256 = msg + param_name + FixedString256::from("': ") + reason;
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerEffectNotDeclared,
+        msg2,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_cross_propagation_violation(
+    caller : FixedString256,
+    callee : FixedString256,
+    undeclared_effect : FixedString256,
+    location : SourceLocation,
+) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("call to '");
+    let msg2 : FixedString256 = msg + callee + FixedString256::from("' from '") + caller + FixedString256::from("' propagates undeclared effect '") + undeclared_effect + FixedString256::from("'");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerEffectNotDeclared,
+        msg2,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}

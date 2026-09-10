@@ -1,0 +1,1014 @@
+// serial.phor — UART serial driver
+// MMIO/port-based serial communication with interrupt support
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/serial.phor
+// Court: serial_driver:v2
+
+package drivers.serial;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type SerialError = enum {
+    SerialNotInitialized  = 0xC0,  // E00C0: serial driver not initialized
+    SerialPortInvalid     = 0xC1,  // E00C1: invalid serial port address
+    SerialBaudInvalid     = 0xC2,  // E00C2: invalid baud rate
+    SerialTxTimeout       = 0xC3,  // E00C3: transmit timeout
+    SerialRxTimeout       = 0xC4,  // E00C4: receive timeout
+    SerialTxFull          = 0xC5,  // E00C5: transmit buffer full
+    SerialRxEmpty         = 0xC6,  // E00C6: receive buffer empty
+    SerialCapabilityError = 0xC7,  // E00C7: insufficient capability for serial operation
+    SerialParityError     = 0xC8,  // E00C8: parity error detected
+    SerialFramingError    = 0xC9,  // E00C9: framing error detected
+    SerialOverrunError    = 0xCA,  // E00CA: overrun error detected
+    SerialLineBreak       = 0xCB,  // E00CB: line break detected
+    SerialInterruptNotRegistered = 0xCC, // E00CC: interrupt handler not registered
+    SerialDmaError        = 0xCD,  // E00CD: DMA transfer error
+}
+
+// ─────────────────────────────────────────────────────────────
+// UART Register Offsets (16550)
+// ─────────────────────────────────────────────────────────────
+
+struct UartRegisters {
+    port_base: u64,
+    mmio: bool,
+}
+
+impl UartRegisters {
+    // 16550 register offsets (when DLAB=0)
+    fn rbr_offset() -> u64 { return 0; }   // Receive Buffer Register (read)
+    fn thr_offset() -> u64 { return 0; }   // Transmit Holding Register (write)
+    fn ier_offset() -> u64 { return 1; }   // Interrupt Enable Register
+    fn iir_offset() -> u64 { return 2; }   // Interrupt Identity Register (read)
+    fn fcr_offset() -> u64 { return 2; }   // FIFO Control Register (write)
+    fn lcr_offset() -> u64 { return 3; }   // Line Control Register
+    fn mcr_offset() -> u64 { return 4; }   // Modem Control Register
+    fn lsr_offset() -> u64 { return 5; }   // Line Status Register
+    fn msr_offset() -> u64 { return 6; }   // Modem Status Register
+    fn scr_offset() -> u64 { return 7; }   // Scratch Register
+    fn dll_offset() -> u64 { return 0; }   // Divisor Latch Low (when DLAB=1)
+    fn dlh_offset() -> u64 { return 1; }   // Divisor Latch High (when DLAB=1)
+
+    fn read_reg(self, offset: u64) -> u8
+        effect [machine:ioport, memory:mmio]
+    {
+        return trusted reason "UART register read at fixed port/MMIO offset verified by 16550 datasheet §3.2" {
+            if self.mmio {
+                let ptr: *(u8) = (self.port_base + offset) as *(u8);
+                return *ptr;
+            } else {
+                // inb(port_base + offset) — assembly instruction
+                return 0;
+            };
+        };
+    }
+
+    fn write_reg(self, offset: u64, value: u8) -> void
+        effect [machine:ioport, memory:mmio]
+    {
+        trusted reason "UART register write at fixed port/MMIO offset verified by 16550 datasheet §3.2" {
+            if self.mmio {
+                let ptr: *(u8) = (self.port_base + offset) as *(u8);
+                *ptr = value;
+            } else {
+                // outb(port_base + offset, value) — assembly instruction
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Port Configuration
+// ─────────────────────────────────────────────────────────────
+
+struct SerialConfig {
+    baud_rate: u64,
+    data_bits: u8,
+    stop_bits: u8,
+    parity: SerialParity,
+    flow_control: SerialFlowControl,
+    fifo_enabled: bool,
+    fifo_trigger: u8,
+    interrupt_enabled: bool,
+}
+
+type SerialParity = enum {
+    None    = 0,
+    Odd     = 1,
+    Even    = 2,
+    Mark    = 3,
+    Space   = 4,
+}
+
+type SerialFlowControl = enum {
+    None      = 0,
+    RtsCts    = 1,
+    XonXoff   = 2,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Port State
+// ─────────────────────────────────────────────────────────────
+
+struct SerialPort {
+    port_identity: Identity,
+    regs: UartRegisters,
+    config: SerialConfig,
+    tx_buffer: RingBuf(u8, 256),
+    rx_buffer: RingBuf(u8, 256),
+    tx_irq_enabled: bool,
+    rx_irq_enabled: bool,
+    initialized: bool,
+    baud_divisor: u16,
+    capability: Cap(SerialCapability),
+    interrupt_handler: Option(Handle(InterruptHandler)),
+    residual_log: RingBuf(ResidualRecord, 128),
+    total_bytes_sent: u64,
+    total_bytes_received: u64,
+    error_count: u64,
+    last_activity: u64,
+    trust_state: TrustState,
+    port_name: String(32),
+    generation: u64,
+}
+
+struct SerialCapability {
+    object_id: Identity,
+    generation: u64,
+    can_write: bool,
+    can_read: bool,
+    can_configure: bool,
+    can_set_irq: bool,
+    max_baud: u64,
+    port_count: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct SerialDriverState {
+    ports: Array(SerialPort, 4),
+    port_count: u64,
+    active_port: u64,
+    driver_identity: Identity,
+    default_config: SerialConfig,
+    initialized: bool,
+    initialization_timestamp: u64,
+    total_interrupts: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Compute Baud Divisor
+// ─────────────────────────────────────────────────────────────
+
+fn serial_baud_to_divisor(baud: u64, clock_hz: u64) -> u16
+    effect [deterministic]
+    court "serial_baud:v1"
+{
+    if baud == 0 {
+        return 1;
+    };
+
+    let divisor: u64 = clock_hz / (16 * baud);
+    if divisor > 65535 {
+        return 65535;
+    };
+    if divisor < 1 {
+        return 1;
+    };
+    return divisor as u16;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn serial_driver_init(
+    driver_identity: Identity,
+    port_base: u64,
+    mmio: bool,
+    config: SerialConfig,
+    cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> SerialDriverState
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "serial_driver_init:v2"
+{
+    let regs: UartRegisters = UartRegisters {
+        port_base: port_base,
+        mmio: mmio,
+    };
+
+    // Compute baud divisor
+    let clock_hz: u64 = 1843200;  // Standard UART clock
+    let divisor: u16 = serial_baud_to_divisor(config.baud_rate, clock_hz);
+
+    // Initialize port 0 (COM1)
+    let port: SerialPort = serial_port_init(regs, config, divisor, cap, timestamp);
+
+    let default_cfg: SerialConfig = SerialConfig {
+        baud_rate: 115200,
+        data_bits: 8,
+        stop_bits: 1,
+        parity: SerialParity::None,
+        flow_control: SerialFlowControl::None,
+        fifo_enabled: true,
+        fifo_trigger: 1,
+        interrupt_enabled: true,
+    };
+
+    let mut ports: Array(SerialPort, 4) = Array::zeroed();
+    ports[0] = port;
+
+    let state: SerialDriverState = SerialDriverState {
+        ports: ports,
+        port_count: 1,
+        active_port: 0,
+        driver_identity: driver_identity,
+        default_config: default_cfg,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        total_interrupts: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+    };
+
+    residual emit {
+        op: "serial_driver.init",
+        port_base: port_base,
+        mmio: if mmio { 1 } else { 0 },
+        baud: config.baud_rate,
+        divisor: divisor as u64,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialize Single Serial Port
+// ─────────────────────────────────────────────────────────────
+
+fn serial_port_init(
+    regs: UartRegisters,
+    config: SerialConfig,
+    baud_divisor: u16,
+    cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> SerialPort
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "serial_port_init:v1"
+{
+    let port_identity: Identity = identity_new(0x5345524C, timestamp, 0, 0);  // "SERL"
+
+    // Set DLAB=1 to program baud rate
+    regs.write_reg(UartRegisters::lcr_offset(), 0x80);
+
+    // Set divisor
+    let dll: u8 = (baud_divisor & 0xFF) as u8;
+    let dlh: u8 = ((baud_divisor >> 8) & 0xFF) as u8;
+    regs.write_reg(UartRegisters::dll_offset(), dll);
+    regs.write_reg(UartRegisters::dlh_offset(), dlh);
+
+    // Set line control: data bits, stop bits, parity
+    let mut lcr: u8 = 0;
+    lcr = lcr | ((config.data_bits - 5) & 0x03);  // bits 0-1: data length
+    if config.stop_bits == 2 {
+        lcr = lcr | 0x04;  // bit 2: stop bits
+    };
+    match config.parity {
+        SerialParity::Odd => lcr = lcr | 0x08,
+        SerialParity::Even => lcr = lcr | 0x18,
+        SerialParity::Mark => lcr = lcr | 0x28,
+        SerialParity::Space => lcr = lcr | 0x38,
+        _ => {},
+    };
+    regs.write_reg(UartRegisters::lcr_offset(), lcr);
+
+    // Configure FIFO
+    if config.fifo_enabled {
+        let fcr: u8 = 0x01;  // Enable FIFO
+        let trigger: u8 = match config.fifo_trigger {
+            0 => 0x00,
+            1 => 0x40,
+            2 => 0x80,
+            3 => 0xC0,
+            _ => 0x40,
+        };
+        regs.write_reg(UartRegisters::fcr_offset(), fcr | trigger);
+    };
+
+    // Enable interrupts
+    if config.interrupt_enabled {
+        let ier: u8 = 0x03;  // Enable RX and TX interrupts
+        regs.write_reg(UartRegisters::ier_offset(), ier);
+    };
+
+    // Enable modem control (DTR, RTS)
+    regs.write_reg(UartRegisters::mcr_offset(), 0x03);
+
+    // Clear pending interrupts
+    regs.read_reg(UartRegisters::iir_offset());
+
+    let port: SerialPort = SerialPort {
+        port_identity: port_identity,
+        regs: regs,
+        config: config,
+        tx_buffer: RingBuf::new(),
+        rx_buffer: RingBuf::new(),
+        tx_irq_enabled: config.interrupt_enabled,
+        rx_irq_enabled: config.interrupt_enabled,
+        initialized: true,
+        baud_divisor: baud_divisor,
+        capability: cap,
+        interrupt_handler: Option::None,
+        residual_log: RingBuf::new(),
+        total_bytes_sent: 0,
+        total_bytes_received: 0,
+        error_count: 0,
+        last_activity: timestamp,
+        trust_state: TrustState::Unknown,
+        port_name: String::from_bytes(Slice(u8)::from_str("COM1")),
+        generation: 1,
+    };
+
+    return port;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Write Byte
+// ─────────────────────────────────────────────────────────────
+
+fn serial_write_byte(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    byte: u8,
+    writer_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(void, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "serial_write:v2"
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    if !port.initialized {
+        return Result::Err(SerialError::SerialNotInitialized);
+    };
+
+    if !port.capability.can_write {
+        return Result::Err(SerialError::SerialCapabilityError);
+    };
+
+    // Wait for TX buffer to be empty (THR empty bit in LSR)
+    let mut timeout: u64 = 0;
+    let max_timeout: u64 = 10000;
+    loop bound 10000 {
+        let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+        if (lsr & 0x20) != 0 {  // THR empty
+            break;
+        };
+        timeout = timeout + 1;
+        if timeout >= max_timeout {
+            return Result::Err(SerialError::SerialTxTimeout);
+        };
+    };
+
+    // Write byte to THR
+    port.regs.write_reg(UartRegisters::thr_offset(), byte);
+    port.total_bytes_sent = port.total_bytes_sent + 1;
+    port.last_activity = timestamp;
+
+    // Record residual
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x70,
+        event_data_hash: byte as u64,
+        cause_identity: writer_cap.object_id,
+        prior_state_hash: port.total_bytes_sent - 1,
+        new_state_hash: port.total_bytes_sent,
+        delta_description: String::from_bytes(Slice(u8)::from_str("serial byte written")),
+        generation_at_event: port.generation,
+        verified: false,
+    };
+    port.residual_log.push(residual);
+
+    residual emit {
+        op: "serial_driver.write_byte",
+        port: port_index,
+        byte: byte as u64,
+        total_sent: port.total_bytes_sent,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Write String
+// ─────────────────────────────────────────────────────────────
+
+fn serial_write_string(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    data: Slice(u8),
+    writer_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(void, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "serial_write_string:v1"
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    if !port.initialized {
+        return Result::Err(SerialError::SerialNotInitialized);
+    };
+
+    if !port.capability.can_write {
+        return Result::Err(SerialError::SerialCapabilityError);
+    };
+
+    let len: u64 = data.len();
+    for i in 0..len {
+        let byte: u8 = data[i];
+
+        // Wait for TX buffer
+        let mut timeout: u64 = 0;
+        let max_timeout: u64 = 1000;
+        loop bound 1000 {
+            let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+            if (lsr & 0x20) != 0 {
+                break;
+            };
+            timeout = timeout + 1;
+            if timeout >= max_timeout {
+                return Result::Err(SerialError::SerialTxTimeout);
+            };
+        };
+
+        port.regs.write_reg(UartRegisters::thr_offset(), byte);
+        port.total_bytes_sent = port.total_bytes_sent + 1;
+    };
+
+    port.last_activity = timestamp;
+
+    residual emit {
+        op: "serial_driver.write_string",
+        port: port_index,
+        length: len,
+        total_sent: port.total_bytes_sent,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Read Byte
+// ─────────────────────────────────────────────────────────────
+
+fn serial_read_byte(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    reader_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(u8, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "serial_read:v2"
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    if !port.initialized {
+        return Result::Err(SerialError::SerialNotInitialized);
+    };
+
+    if !port.capability.can_read {
+        return Result::Err(SerialError::SerialCapabilityError);
+    };
+
+    // Check RX buffer first
+    if !port.rx_buffer.is_empty() {
+        let byte: u8 = port.rx_buffer.pop().unwrap_or(0);
+        port.total_bytes_received = port.total_bytes_received + 1;
+        port.last_activity = timestamp;
+
+        residual emit {
+            op: "serial_driver.read_byte",
+            port: port_index,
+            byte: byte as u64,
+            from_buffer: 1,
+        };
+
+        return Result::Ok(byte);
+    };
+
+    // Poll for data
+    let mut timeout: u64 = 0;
+    let max_timeout: u64 = 10000;
+    loop bound 10000 {
+        let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+        if (lsr & 0x01) != 0 {  // Data ready
+            let byte: u8 = port.regs.read_reg(UartRegisters::rbr_offset());
+            port.total_bytes_received = port.total_bytes_received + 1;
+            port.last_activity = timestamp;
+
+            // Check for errors
+            if (lsr & 0x86) != 0 {  // Parity, framing, or overrun error
+                port.error_count = port.error_count + 1;
+            };
+
+            residual emit {
+                op: "serial_driver.read_byte",
+                port: port_index,
+                byte: byte as u64,
+                from_buffer: 0,
+            };
+
+            return Result::Ok(byte);
+        };
+        timeout = timeout + 1;
+        if timeout >= max_timeout {
+            return Result::Err(SerialError::SerialRxTimeout);
+        };
+    };
+
+    return Result::Err(SerialError::SerialRxTimeout);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Interrupt Handler
+// ─────────────────────────────────────────────────────────────
+
+fn serial_interrupt_handler(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    timestamp: u64,
+) -> void
+    effect [machine:ioport, memory:mmio, deterministic, interrupt, residual]
+    court "serial_interrupt:v1"
+{
+    if port_index >= state.port_count {
+        return;
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    // Read IIR to determine interrupt type
+    let iir: u8 = port.regs.read_reg(UartRegisters::iir_offset());
+
+    if (iir & 0x01) != 0 {
+        // No interrupt pending (spurious)
+        return;
+    };
+
+    let interrupt_type: u8 = (iir >> 1) & 0x07;
+
+    match interrupt_type {
+        0x04 => {
+            // Receive data available or trigger level reached
+            loop bound 16 {  // Read up to 16 bytes (typical FIFO depth)
+                let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+                if (lsr & 0x01) == 0 {
+                    break;  // No more data
+                };
+                let byte: u8 = port.regs.read_reg(UartRegisters::rbr_offset());
+                port.rx_buffer.push(byte);
+                port.total_bytes_received = port.total_bytes_received + 1;
+            };
+        },
+        0x06 => {
+            // Receiver line status (error)
+            let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+            port.error_count = port.error_count + 1;
+        },
+        0x02 => {
+            // Transmit holding register empty
+            if !port.tx_buffer.is_empty() {
+                let byte: u8 = port.tx_buffer.pop().unwrap_or(0);
+                port.regs.write_reg(UartRegisters::thr_offset(), byte);
+                port.total_bytes_sent = port.total_bytes_sent + 1;
+            };
+        },
+        0x00 => {
+            // Modem status change
+            let msr: u8 = port.regs.read_reg(UartRegisters::msr_offset());
+        },
+        _ => {},
+    };
+
+    state.total_interrupts = state.total_interrupts + 1;
+
+    residual emit {
+        op: "serial_driver.interrupt",
+        port: port_index,
+        interrupt_type: interrupt_type as u64,
+        total_interrupts: state.total_interrupts,
+        rx_buffer_level: port.rx_buffer.len(),
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Configure
+// ─────────────────────────────────────────────────────────────
+
+fn serial_configure(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    config: SerialConfig,
+    config_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(void, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    if !port.capability.can_configure {
+        return Result::Err(SerialError::SerialCapabilityError);
+    };
+
+    // Reinitialize port with new config
+    let divisor: u16 = serial_baud_to_divisor(config.baud_rate, 1843200);
+
+    // Set DLAB=1
+    port.regs.write_reg(UartRegisters::lcr_offset(), 0x80);
+    port.regs.write_reg(UartRegisters::dll_offset(), (divisor & 0xFF) as u8);
+    port.regs.write_reg(UartRegisters::dlh_offset(), ((divisor >> 8) & 0xFF) as u8);
+
+    // Set line control
+    let mut lcr: u8 = (config.data_bits - 5) & 0x03;
+    if config.stop_bits == 2 { lcr = lcr | 0x04; };
+    match config.parity {
+        SerialParity::Odd => lcr = lcr | 0x08,
+        SerialParity::Even => lcr = lcr | 0x18,
+        SerialParity::Mark => lcr = lcr | 0x28,
+        SerialParity::Space => lcr = lcr | 0x38,
+        _ => {},
+    };
+    port.regs.write_reg(UartRegisters::lcr_offset(), lcr);
+
+    port.config = config;
+    port.baud_divisor = divisor;
+
+    residual emit {
+        op: "serial_driver.configure",
+        port: port_index,
+        baud: config.baud_rate,
+        data_bits: config.data_bits as u64,
+        parity: config.parity as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Query Status
+// ─────────────────────────────────────────────────────────────
+
+fn serial_query(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    querier_cap: Cap(SerialCapability),
+) -> Result(SerialPort, SerialError)
+    effect [deterministic]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    return Result::Ok(state.ports[port_index]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Register Serial IRQ Handler
+// ─────────────────────────────────────────────────────────────
+
+fn serial_register_irq(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    irq_num: u8,
+    handler: Handle(InterruptHandler),
+    cap: Cap(SerialCapability),
+) -> Result(void, SerialError)
+    effect [deterministic, residual]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    if !port.capability.can_set_irq {
+        return Result::Err(SerialError::SerialCapabilityError);
+    };
+
+    port.interrupt_handler = Option::Some(handler);
+
+    residual emit {
+        op: "serial_driver.register_irq",
+        port: port_index,
+        irq: irq_num as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn serial_self_test(
+    state: Handle(SerialDriverState),
+) -> Result(u64, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "serial_self_test:v1"
+{
+    let mut checks: u64 = 0;
+
+    if state.initialized {
+        checks = checks + 1;
+    };
+
+    if state.port_count > 0 {
+        checks = checks + 1;
+    };
+
+    // Test scratch register read/write
+    if state.port_count > 0 {
+        let port: SerialPort = state.ports[0];
+        if port.initialized {
+            port.regs.write_reg(UartRegisters::scr_offset(), 0x5A);
+            let test_byte: u8 = port.regs.read_reg(UartRegisters::scr_offset());
+            if test_byte == 0x5A {
+                checks = checks + 1;
+            };
+        };
+    };
+
+    residual emit {
+        op: "serial_driver.self_test",
+        checks_passed: checks,
+        ports: state.port_count,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Flush TX Buffer
+// ─────────────────────────────────────────────────────────────
+
+fn serial_flush_tx(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    flusher_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(u64, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+    let mut flushed: u64 = 0;
+
+    while !port.tx_buffer.is_empty() {
+        let byte: u8 = port.tx_buffer.pop().unwrap_or(0);
+
+        let mut timeout: u64 = 0;
+        loop bound 1000 {
+            let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+            if (lsr & 0x20) != 0 {
+                break;
+            };
+            timeout = timeout + 1;
+            if timeout >= 1000 {
+                break;
+            };
+        };
+
+        port.regs.write_reg(UartRegisters::thr_offset(), byte);
+        port.total_bytes_sent = port.total_bytes_sent + 1;
+        flushed = flushed + 1;
+    };
+
+    residual emit {
+        op: "serial_driver.flush_tx",
+        port: port_index,
+        flushed: flushed,
+    };
+
+    return Result::Ok(flushed);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Diagnostic — Read error status and diagnostics
+// ─────────────────────────────────────────────────────────────
+
+struct SerialDiagnostics {
+    port_index: u64,
+    initialized: bool,
+    baud_rate: u64,
+    total_sent: u64,
+    total_received: u64,
+    error_count: u64,
+    rx_buffer_level: u64,
+    tx_buffer_level: u64,
+    interrupt_count: u64,
+    lsr_value: u8,
+    msr_value: u8,
+    iir_value: u8,
+    mcr_value: u8,
+    scratch_test: u8,
+    port_name: String(32),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+fn serial_diagnostics(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    diag_cap: Cap(SerialCapability),
+) -> Result(SerialDiagnostics, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic]
+    court "serial_diagnostics:v1"
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: SerialPort = state.ports[port_index];
+    let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+    let msr: u8 = port.regs.read_reg(UartRegisters::msr_offset());
+    let iir: u8 = port.regs.read_reg(UartRegisters::iir_offset());
+    let mcr: u8 = port.regs.read_reg(UartRegisters::mcr_offset());
+
+    let diag: SerialDiagnostics = SerialDiagnostics {
+        port_index: port_index,
+        initialized: port.initialized,
+        baud_rate: port.config.baud_rate,
+        total_sent: port.total_bytes_sent,
+        total_received: port.total_bytes_received,
+        error_count: port.error_count,
+        rx_buffer_level: port.rx_buffer.len(),
+        tx_buffer_level: port.tx_buffer.len(),
+        interrupt_count: 0,
+        lsr_value: lsr,
+        msr_value: msr,
+        iir_value: iir,
+        mcr_value: mcr,
+        scratch_test: 0,
+        port_name: port.port_name,
+        trust_state: port.trust_state,
+        generation: port.generation,
+    };
+
+    return Result::Ok(diag);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Power Management
+// ─────────────────────────────────────────────────────────────
+
+fn serial_suspend(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    admin_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(void, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    // Save MCR for resume
+    let saved_mcr: u8 = port.regs.read_reg(UartRegisters::mcr_offset());
+
+    // Disable interrupts
+    port.regs.write_reg(UartRegisters::ier_offset(), 0x00);
+
+    residual emit {
+        op: "serial_driver.suspend",
+        port: port_index,
+        saved_mcr: saved_mcr as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+fn serial_resume(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    admin_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(void, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+
+    // Reinitialize port
+    port.regs.write_reg(UartRegisters::ier_offset(), 0x03);
+
+    residual emit {
+        op: "serial_driver.resume",
+        port: port_index,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Loopback Test
+// ─────────────────────────────────────────────────────────────
+
+fn serial_loopback_test(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    test_cap: Cap(SerialCapability),
+    timestamp: u64,
+) -> Result(bool, SerialError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+{
+    if port_index >= state.port_count {
+        return Result::Err(SerialError::SerialPortInvalid);
+    };
+
+    let port: Handle(SerialPort) = Handle(SerialPort)::from_ptr(&state.ports[port_index]);
+    let mcr: u8 = port.regs.read_reg(UartRegisters::mcr_offset());
+    port.regs.write_reg(UartRegisters::mcr_offset(), mcr | 0x10);
+
+    let test_bytes: Array(u8, 8) = Array(u8, 8) { data: [0x55, 0xAA, 0xFF, 0x00, 0x12, 0x34, 0x56, 0x78] };
+    let mut all_match: bool = true;
+
+    for i in 0..8 {
+        port.regs.write_reg(UartRegisters::thr_offset(), test_bytes[i]);
+        let mut timeout: u64 = 0;
+        let received: u8 = 0;
+        loop bound 100 {
+            let lsr: u8 = port.regs.read_reg(UartRegisters::lsr_offset());
+            if (lsr & 0x01) != 0 {
+                received = port.regs.read_reg(UartRegisters::rbr_offset());
+                break;
+            };
+            timeout = timeout + 1;
+            if timeout >= 100 { break; };
+        };
+        if received != test_bytes[i] {
+            all_match = false;
+        };
+    };
+
+    port.regs.write_reg(UartRegisters::mcr_offset(), mcr);
+
+    residual emit {
+        op: "serial_driver.loopback",
+        port: port_index,
+        passed: if all_match { 1 } else { 0 },
+    };
+
+    return Result::Ok(all_match);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Serial Port Statistics
+// ─────────────────────────────────────────────────────────────
+
+fn serial_port_statistics(
+    state: Handle(SerialDriverState),
+    port_index: u64,
+    querier_cap: Cap(SerialCapability),
+) -> Result(SerialDiagnostics, SerialError)
+    effect [deterministic]
+{
+    return serial_diagnostics(state, port_index, querier_cap);
+}

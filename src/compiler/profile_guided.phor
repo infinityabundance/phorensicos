@@ -1,0 +1,1436 @@
+// profile_guided.phor — Profile-Guided Optimization: Profile Data Loading, Hot/Cold
+//                        Function Splitting, Basic Block Reordering, Inlining Heuristics,
+//                        Function Specialization, Branch Probability Inference,
+//                        Profile Correlation
+// Phorensic Compiler Infrastructure — Profile-Guided Optimization Phase
+//
+// This module implements profile-guided optimization (PGO) for the Phorensic compiler.
+// It loads profile data from prior runs, uses it to guide optimization decisions such as
+// hot/cold function splitting, basic block reordering, inlining, and function specialization.
+// Branch probabilities are inferred from profile data for better code layout.
+//
+// Operations:
+// 1. Profile data loading — reads and parses profile data files
+// 2. Hot/cold function splitting — separates hot and cold code regions
+// 3. Basic block reordering — relayout blocks for better cache locality
+// 4. Inlining heuristics — use profile data for inline decisions
+// 5. Function specialization — create specialized versions of hot functions
+// 6. Branch probability inference — annotate branches with probabilities
+// 7. Profile correlation — correlate profile data with current compilation
+//
+// Boundedness: Profile entries 2048 max. Hot functions 256. Block counts 4096.
+// All loops bounded.
+//
+// Effect declarations:
+//   [pure] — deterministic optimization logic
+//   [diag] — residual recording
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+use compiler::lowerer::*;
+use compiler::ast::*;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const PGO_LOAD_DATA       : u64 = 0x1D000u64;
+const PGO_HOT_SPLIT       : u64 = 0x1D001u64;
+const PGO_BLOCK_REORDER   : u64 = 0x1D002u64;
+const PGO_INLINE_HEUR     : u64 = 0x1D003u64;
+const PGO_FUNC_SPEC       : u64 = 0x1D004u64;
+const PGO_BRANCH_PROB     : u64 = 0x1D005u64;
+const PGO_ERROR           : u64 = 0x1D00Fu64;
+
+// ──────────────────────────────────────────────
+// Profile Data Types
+// ──────────────────────────────────────────────
+
+/// A single profile entry for a function or block.
+pub struct ProfileEntry {
+    /// Function name.
+    pub function_name : FixedString256,
+    /// Total execution count.
+    pub execution_count : u64,
+    /// Block-level counts (indexed by block ID).
+    pub block_counts : Array256<u64>,
+    /// Edge-level counts.
+    pub edge_counts : Array256<u64>,
+    /// Number of blocks.
+    pub block_count : u32,
+    /// Number of edges.
+    pub edge_count : u32,
+    /// Source file path.
+    pub source_file : FixedString256,
+    /// Whether this function is hot.
+    pub is_hot : bool,
+    /// Hotness threshold (temperature).
+    pub temperature : u32,
+}
+
+/// A branch probability annotation.
+pub struct BranchProbability {
+    /// Source block ID.
+    pub source_block : u32,
+    /// Target block ID.
+    pub target_block : u32,
+    /// Probability (0-10000, representing 0.01% to 100%).
+    pub probability : u32,
+    /// Total count from source.
+    pub total_count : u64,
+    /// Count to this target.
+    pub target_count : u64,
+}
+
+/// Function specialization descriptor.
+pub struct FunctionSpecialization {
+    /// Original function name.
+    pub original_name : FixedString256,
+    /// Specialized function name.
+    pub specialized_name : FixedString256,
+    /// Specialization parameter values.
+    pub param_values : Array64<u64>,
+    /// Estimated benefit (saved cycles).
+    pub estimated_benefit : u64,
+    /// Whether this specialization was applied.
+    pub applied : bool,
+}
+
+/// Hot/cold function classification.
+pub struct HotColdFunction {
+    /// Function name.
+    pub name : FixedString256,
+    /// Whether this function is hot.
+    pub is_hot : bool,
+    /// Temperature ranking.
+    pub temperature : u32,
+    /// Execution count.
+    pub execution_count : u64,
+    /// Size in bytes.
+    pub size_bytes : u32,
+    /// Whether splitting was applied.
+    pub split_applied : bool,
+}
+
+/// PGO pass residual.
+pub struct PgoResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub functions_processed : u32,
+    pub optimizations_applied : u32,
+    pub timestamp : u64,
+}
+
+/// Profile entry for hot/cold block classification.
+pub struct BlockProfile {
+    /// Block ID.
+    pub block_id : u32,
+    /// Execution count.
+    pub execution_count : u64,
+    /// Size in IR instructions.
+    pub size : u32,
+    /// Whether this block is hot.
+    pub is_hot : bool,
+    /// Probability of being entered from predecessor.
+    pub entry_probability : u32,
+}
+
+/// Main PGO pass state.
+pub struct ProfileGuidedOptimizationPass {
+    /// Profile entries loaded.
+    pub profile_entries : Array512<ProfileEntry>,
+    /// Branch probability annotations.
+    pub branch_probabilities : Array512<BranchProbability>,
+    /// Function specialization descriptors.
+    pub specializations : Array256<FunctionSpecialization>,
+    /// Hot/cold function classifications.
+    pub hot_cold_functions : Array256<HotColdFunction>,
+    /// Block-level profile data.
+    pub block_profiles : Array512<BlockProfile>,
+    /// Path to the profile data file.
+    pub profile_path : FixedString256,
+    /// Whether profile data has been loaded.
+    pub data_loaded : bool,
+    /// Whether the pass has completed.
+    pub pass_completed : bool,
+    /// Hot threshold (minimum execution count for "hot").
+    pub hot_threshold : u64,
+    /// Cold threshold (below this is "cold").
+    pub cold_threshold : u64,
+    /// Inline threshold (hot functions smaller than this may be inlined).
+    pub inline_threshold : u32,
+    /// Whether to enable hot/cold splitting.
+    pub splitting_enabled : bool,
+    /// Whether to enable block reordering.
+    pub reordering_enabled : bool,
+    /// Whether to enable function specialization.
+    pub specialization_enabled : bool,
+    /// Total optimizations applied.
+    pub optimizations_applied : u32,
+    /// Residual log.
+    pub residual_log : Array128<PgoResidual>,
+}
+
+impl ProfileGuidedOptimizationPass {
+    /// Create a new PGO pass.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> ProfileGuidedOptimizationPass [pure] {
+        ProfileGuidedOptimizationPass {
+            profile_entries: Array512::new(),
+            branch_probabilities: Array512::new(),
+            specializations: Array256::new(),
+            hot_cold_functions: Array256::new(),
+            block_profiles: Array512::new(),
+            profile_path: FixedString256::new(),
+            data_loaded: false,
+            pass_completed: false,
+            hot_threshold: 1000u64,
+            cold_threshold: 10u64,
+            inline_threshold: 200u32,
+            splitting_enabled: true,
+            reordering_enabled: true,
+            specialization_enabled: true,
+            optimizations_applied: 0u32,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a PGO residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64) -> ProfileGuidedOptimizationPass [diag] {
+        let residual : PgoResidual = PgoResidual {
+            code: code,
+            message: message,
+            action: action,
+            functions_processed: self.profile_entries.len() as u32,
+            optimizations_applied: self.optimizations_applied,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Configuration
+    // ──────────────────────────────────────────
+
+    /// Set the hot/cold thresholds.
+    /// Effect: pure — threshold configuration.
+    pub fn set_thresholds(mut self, hot : u64, cold : u64) -> ProfileGuidedOptimizationPass [pure] {
+        self.hot_threshold = hot;
+        self.cold_threshold = cold;
+        self
+    }
+
+    /// Set the inline threshold.
+    /// Effect: pure — inline configuration.
+    pub fn set_inline_threshold(mut self, threshold : u32) -> ProfileGuidedOptimizationPass [pure] {
+        self.inline_threshold = threshold;
+        self
+    }
+
+    /// Enable or disable optimizations.
+    /// Effect: pure — feature toggles.
+    pub fn set_splitting_enabled(mut self, enabled : bool) -> ProfileGuidedOptimizationPass [pure] {
+        self.splitting_enabled = enabled;
+        self
+    }
+
+    pub fn set_reordering_enabled(mut self, enabled : bool) -> ProfileGuidedOptimizationPass [pure] {
+        self.reordering_enabled = enabled;
+        self
+    }
+
+    pub fn set_specialization_enabled(mut self, enabled : bool) -> ProfileGuidedOptimizationPass [pure] {
+        self.specialization_enabled = enabled;
+        self
+    }
+
+    /// Set the profile data path.
+    /// Effect: pure — path configuration.
+    pub fn set_profile_path(mut self, path : FixedString256) -> ProfileGuidedOptimizationPass [pure] {
+        self.profile_path = path;
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Profile Data Loading
+    // ──────────────────────────────────────────
+
+    /// Load and parse profile data.
+    /// Effect: pure — data loading.
+    pub fn load_profile_data(mut self, raw_data : Array256<u8>,
+                             data_size : u32) -> Result<ProfileGuidedOptimizationPass, FixedString256> [pure] {
+        if self.data_loaded {
+            return Result::Err(FixedString256::from("profile data already loaded"));
+        }
+
+        // Parse profile data format (binary: count(8) + block_count(4) + edge_count(4) + blocks + edges).
+        var offset : u32 = 0u32;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by data size.
+        loop: bounds[BOUND_LARGE] while offset + 16u32 <= data_size && !self.profile_entries.is_full() {
+            // Read function execution count.
+            var exec_count : u64 = 0u64;
+            // loop: bounds[BOUND_SMALL] — 8 bytes.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                exec_count |= (raw_data.get(offset) as u64) << (b * 8u32);
+                offset += 1u32;
+            }
+
+            // Read block count and edge count.
+            var block_cnt : u32 = 0u32;
+            // loop: bounds[BOUND_SMALL] — 4 bytes.
+            for var b : u32 = 0u32; b < 4u32; b += 1u32 [4u32] {
+                block_cnt |= (raw_data.get(offset) as u32) << (b * 8u32);
+                offset += 1u32;
+            }
+
+            var edge_cnt : u32 = 0u32;
+            // loop: bounds[BOUND_SMALL] — 4 bytes.
+            for var b : u32 = 0u32; b < 4u32; b += 1u32 [4u32] {
+                edge_cnt |= (raw_data.get(offset) as u32) << (b * 8u32);
+                offset += 1u32;
+            }
+
+            // Read block counts.
+            var block_counts : Array256<u64> = Array256::new();
+            // loop: bounds[BOUND_MEDIUM] — bounded by block count.
+            for var b : u32 = 0u32; b < block_cnt && b < 256u32; b += 1u32 [block_cnt] {
+                var count_val : u64 = 0u64;
+                // loop: bounds[BOUND_SMALL] — 8 bytes per count.
+                for var c : u32 = 0u32; c < 8u32 && offset < data_size; c += 1u32 [8u32] {
+                    count_val |= (raw_data.get(offset) as u64) << (c * 8u32);
+                    offset += 1u32;
+                }
+                let _ = block_counts.push(count_val);
+            }
+
+            // Read edge counts.
+            var edge_counts : Array256<u64> = Array256::new();
+            // loop: bounds[BOUND_MEDIUM] — bounded by edge count.
+            for var b : u32 = 0u32; b < edge_cnt && b < 256u32; b += 1u32 [edge_cnt] {
+                var count_val : u64 = 0u64;
+                // loop: bounds[BOUND_SMALL] — 8 bytes per count.
+                for var c : u32 = 0u32; c < 8u32 && offset < data_size; c += 1u32 [8u32] {
+                    count_val |= (raw_data.get(offset) as u64) << (c * 8u32);
+                    offset += 1u32;
+                }
+                let _ = edge_counts.push(count_val);
+            }
+
+            let entry : ProfileEntry = ProfileEntry {
+                function_name: FixedString256::from("unknown"),
+                execution_count: exec_count,
+                block_counts: block_counts,
+                edge_counts: edge_counts,
+                block_count: block_cnt,
+                edge_count: edge_cnt,
+                source_file: FixedString256::new(),
+                is_hot: exec_count >= self.hot_threshold,
+                temperature: if exec_count >= self.hot_threshold {
+                    100u32
+                } else if exec_count >= self.cold_threshold {
+                    50u32
+                } else {
+                    0u32
+                },
+            };
+            let _ = self.profile_entries.push(entry);
+        }
+
+        self.data_loaded = true;
+        self = self.record_residual(PGO_LOAD_DATA,
+                                    FixedString256::from("profile data loaded"),
+                                    FixedString64::from("load_profile"));
+        Result::Ok(self)
+    }
+
+    /// Find a profile entry for a function.
+    /// Effect: pure — lookup.
+    pub fn find_profile_entry(&self, function_name : FixedString256) -> Option<ProfileEntry> [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by profile entries.
+        for var i : u32 = 0u32; i < self.profile_entries.len(); i += 1u32 [self.profile_entries.len()] {
+            let entry : ProfileEntry = self.profile_entries.get(i);
+            if entry.function_name == function_name {
+                return Option::Some(entry);
+            }
+        }
+        Option::None
+    }
+
+    // ──────────────────────────────────────────
+    // Hot/Cold Function Splitting
+    // ──────────────────────────────────────────
+
+    /// Classify functions as hot or cold based on profile data.
+    /// Effect: pure — classification.
+    pub fn classify_functions(mut self) -> Result<ProfileGuidedOptimizationPass, FixedString256> [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by profile entries.
+        for var i : u32 = 0u32; i < self.profile_entries.len(); i += 1u32 [self.profile_entries.len()] {
+            let entry : ProfileEntry = self.profile_entries.get(i);
+
+            if self.hot_cold_functions.is_full() {
+                break;
+            }
+
+            let hc : HotColdFunction = HotColdFunction {
+                name: entry.function_name,
+                is_hot: entry.execution_count >= self.hot_threshold,
+                temperature: if entry.execution_count >= self.hot_threshold {
+                    100u32
+                } else if entry.execution_count >= self.cold_threshold {
+                    50u32
+                } else {
+                    0u32
+                },
+                execution_count: entry.execution_count,
+                size_bytes: entry.block_count * 16u32, // Estimate.
+                split_applied: false,
+            };
+            let _ = self.hot_cold_functions.push(hc);
+        }
+
+        self = self.record_residual(PGO_HOT_SPLIT,
+                                    FixedString256::from("functions classified as hot/cold"),
+                                    FixedString64::from("classify"));
+        Result::Ok(self)
+    }
+
+    /// Apply hot/cold function splitting.
+    /// Effect: pure — splitting optimization.
+    pub fn apply_hot_cold_splitting(mut self, ir_module : ref mut IrModule) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                                    [pure] {
+        if !self.splitting_enabled {
+            return Result::Ok(self);
+        }
+
+        // Iterate over module functions and decide splitting.
+        // loop: bounds[BOUND_MEDIUM] — bounded by module functions.
+        for var i : u32 = 0u32; i < ir_module.functions.len(); i += 1u32 [ir_module.functions.len()] {
+            let ir_fn : IrFunction = ir_module.functions.get(i);
+            let profile : Option<ProfileEntry> = self.find_profile_entry(ir_fn.name);
+
+            match profile {
+                Option::Some(entry) => {
+                    if entry.is_hot {
+                        // Mark function for hot section placement.
+                        let _ = ir_fn.section_name = FixedString64::from(".text.hot");
+                    } else if entry.execution_count < self.cold_threshold {
+                        // Mark function for cold section placement.
+                        let _ = ir_fn.section_name = FixedString64::from(".text.cold");
+                    }
+
+                    // Update hot/cold entry.
+                    // loop: bounds[BOUND_MEDIUM] — bounded by hot/cold functions.
+                    for var j : u32 = 0u32; j < self.hot_cold_functions.len(); j += 1u32 [self.hot_cold_functions.len()] {
+                        let mut hc : HotColdFunction = self.hot_cold_functions.get(j);
+                        if hc.name == ir_fn.name {
+                            hc.split_applied = true;
+                            let _ = self.hot_cold_functions.set(j, hc);
+                            break;
+                        }
+                    }
+
+                    self.optimizations_applied += 1u32;
+                },
+                Option::None => {
+                    // No profile data; keep default placement.
+                },
+            }
+        }
+
+        self = self.record_residual(PGO_HOT_SPLIT,
+                                    FixedString256::from("hot/cold splitting applied"),
+                                    FixedString64::from("apply_hot_cold"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Basic Block Reordering
+    // ──────────────────────────────────────────
+
+    /// Compute block profiles from function profile data.
+    /// Effect: pure — block profile computation.
+    pub fn compute_block_profiles(mut self, function_name : FixedString256) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                                  [pure] {
+        let profile_opt : Option<ProfileEntry> = self.find_profile_entry(function_name);
+        let entry : ProfileEntry = match profile_opt {
+            Option::Some(e) => e,
+            Option::None => return Result::Err(FixedString256::from("no profile for function")),
+        };
+
+        self.block_profiles.clear();
+        // loop: bounds[BOUND_MEDIUM] — bounded by block count.
+        for var i : u32 = 0u32; i < entry.block_count && i < 512u32; i += 1u32 [entry.block_count] {
+            let exec_count : u64 = if i < entry.block_counts.len() {
+                entry.block_counts.get(i)
+            } else {
+                0u64
+            };
+
+            let bp : BlockProfile = BlockProfile {
+                block_id: i,
+                execution_count: exec_count,
+                size: 1u32, // Placeholder.
+                is_hot: exec_count >= self.hot_threshold,
+                entry_probability: 0u32,
+            };
+            let _ = self.block_profiles.push(bp);
+        }
+
+        Result::Ok(self)
+    }
+
+    /// Reorder basic blocks based on profile data (hot blocks first).
+    /// Effect: pure — reordering.
+    pub fn reorder_blocks(mut self, function_name : FixedString256,
+                          ir_fn : ref mut IrFunction) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                          [pure] {
+        if !self.reordering_enabled {
+            return Result::Ok(self);
+        }
+
+        let profile_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+            self.compute_block_profiles(function_name);
+        match profile_result {
+            Result::Ok(pass) => { self = pass; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        // Sort blocks by hotness and emit in order: hot blocks, then cold blocks.
+        var sorted_body : Array64<IrInstruction> = Array64::new();
+
+        // First pass: emit hot blocks.
+        // loop: bounds[BOUND_MEDIUM] — bounded by block profiles.
+        for var i : u32 = 0u32; i < self.block_profiles.len(); i += 1u32 [self.block_profiles.len()] {
+            let bp : BlockProfile = self.block_profiles.get(i);
+            if bp.is_hot {
+                // Emit instructions for this block.
+                if bp.block_id < ir_fn.body.len() {
+                    let inst : IrInstruction = ir_fn.body.get(bp.block_id);
+                    let _ = sorted_body.push(inst);
+                }
+            }
+        }
+
+        // Second pass: emit cold blocks.
+        // loop: bounds[BOUND_MEDIUM] — bounded by block profiles.
+        for var i : u32 = 0u32; i < self.block_profiles.len(); i += 1u32 [self.block_profiles.len()] {
+            let bp : BlockProfile = self.block_profiles.get(i);
+            if !bp.is_hot {
+                if bp.block_id < ir_fn.body.len() {
+                    let inst : IrInstruction = ir_fn.body.get(bp.block_id);
+                    let _ = sorted_body.push(inst);
+                }
+            }
+        }
+
+        // Replace function body with reordered instructions.
+        if sorted_body.len() > 0u32 {
+            ir_fn.body = sorted_body;
+            self.optimizations_applied += 1u32;
+        }
+
+        self = self.record_residual(PGO_BLOCK_REORDER,
+                                    FixedString256::from("block reordering applied"),
+                                    FixedString64::from("reorder_blocks"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Inlining Heuristics
+    // ──────────────────────────────────────────
+
+    /// Evaluate inlining decision using profile data.
+    /// Effect: pure — inlining heuristic.
+    pub fn should_inline(&self, caller_name : FixedString256,
+                         callee_name : FixedString256, callee_size : u32) -> bool [pure] {
+        // Default: don't inline large functions.
+        if callee_size > self.inline_threshold {
+            // But override if callee is very hot and caller is also hot.
+            let callee_profile : Option<ProfileEntry> = self.find_profile_entry(callee_name);
+            let caller_profile : Option<ProfileEntry> = self.find_profile_entry(caller_name);
+
+            match (callee_profile, caller_profile) {
+                (Option::Some(callee), Option::Some(caller)) => {
+                    // Inline hot callee into hot caller regardless of size.
+                    if callee.is_hot && caller.is_hot {
+                        return true;
+                    }
+
+                    // Inline if callee is very small and called frequently.
+                    if callee_size < 50u32 && callee.execution_count > self.hot_threshold * 10u64 {
+                        return true;
+                    }
+
+                    // Don't inline cold functions.
+                    if callee.execution_count < self.cold_threshold {
+                        return false;
+                    }
+
+                    // Size-based fallback.
+                    callee_size <= self.inline_threshold
+                },
+                _ => {
+                    // No profile data: use size threshold.
+                    callee_size <= self.inline_threshold / 2u32
+                },
+            }
+        } else {
+            // Small enough to inline regardless of profile.
+            true
+        }
+    }
+
+    /// Apply inlining decisions based on profile heuristics.
+    /// Effect: pure — inlining pass.
+    pub fn apply_inlining(mut self, ir_module : ref mut IrModule) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                          [pure] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by module functions.
+        for var i : u32 = 0u32; i < ir_module.functions.len(); i += 1u32 [ir_module.functions.len()] {
+            let caller : IrFunction = ir_module.functions.get(i);
+
+            // loop: bounds[BOUND_MEDIUM] — bounded by call sites (simplified).
+            for var j : u32 = 0u32; j < ir_module.functions.len() && j < 50u32; j += 1u32 [ir_module.functions.len()] {
+                if i == j {
+                    continue;
+                }
+
+                let callee : IrFunction = ir_module.functions.get(j);
+                let callee_size : u32 = callee.body.len() as u32;
+
+                if self.should_inline(caller.name, callee.name, callee_size) {
+                    // Mark callee for inlining into caller.
+                    self.optimizations_applied += 1u32;
+                }
+            }
+        }
+
+        self = self.record_residual(PGO_INLINE_HEUR,
+                                    FixedString256::from("inlining heuristics applied"),
+                                    FixedString64::from("apply_inlining"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Function Specialization
+    // ──────────────────────────────────────────
+
+    /// Create a specialization of a function for hot parameter values.
+    /// Effect: pure — specialization creation.
+    pub fn create_specialization(mut self, function_name : FixedString256,
+                                 param_values : Array64<u64>,
+                                 estimated_benefit : u64) -> Result<ProfileGuidedOptimizationPass, FixedString256> [pure] {
+        if !self.specialization_enabled {
+            return Result::Ok(self);
+        }
+
+        if self.specializations.is_full() {
+            return Result::Err(FixedString256::from("specialization table full"));
+        }
+
+        let spec_name : FixedString256 = FixedString256::new();
+        let _ = spec_name.push_str(function_name);
+        let _ = spec_name.push_str(FixedString256::from(".spec"));
+
+        let spec : FunctionSpecialization = FunctionSpecialization {
+            original_name: function_name,
+            specialized_name: spec_name,
+            param_values: param_values,
+            estimated_benefit: estimated_benefit,
+            applied: false,
+        };
+        let _ = self.specializations.push(spec);
+
+        self = self.record_residual(PGO_FUNC_SPEC,
+                                    FixedString256::from("function specialization created"),
+                                    FixedString64::from("create_spec"));
+        Result::Ok(self)
+    }
+
+    /// Apply all specializations to the module.
+    /// Effect: pure — applies specializations.
+    pub fn apply_specializations(mut self, ir_module : ref mut IrModule) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                                 [pure] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by specializations.
+        for var i : u32 = 0u32; i < self.specializations.len(); i += 1u32 [self.specializations.len()] {
+            let mut spec : FunctionSpecialization = self.specializations.get(i);
+            if spec.applied {
+                continue;
+            }
+
+            // Find the original function and clone it.
+            // loop: bounds[BOUND_MEDIUM] — bounded by module functions.
+            for var j : u32 = 0u32; j < ir_module.functions.len(); j += 1u32 [ir_module.functions.len()] {
+                let original : IrFunction = ir_module.functions.get(j);
+                if original.name == spec.original_name {
+                    // Create a specialized clone with constant parameter values.
+                    let specialized_fn : IrFunction = IrFunction {
+                        name: spec.specialized_name,
+                        return_type: original.return_type,
+                        parameters: original.parameters,
+                        body: original.body, // Clone body (will be optimized with constant params).
+                        is_global: true,
+                        section_name: FixedString64::from(".text.hot"),
+                    };
+                    let _ = ir_module.functions.push(specialized_fn);
+                    spec.applied = true;
+                    let _ = self.specializations.set(i, spec);
+                    self.optimizations_applied += 1u32;
+                    break;
+                }
+            }
+        }
+
+        self = self.record_residual(PGO_FUNC_SPEC,
+                                    FixedString256::from("specializations applied"),
+                                    FixedString64::from("apply_specs"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Branch Probability Inference
+    // ──────────────────────────────────────────
+
+    /// Infer branch probabilities from profile data.
+    /// Effect: pure — probability inference.
+    pub fn infer_branch_probabilities(mut self, function_name : FixedString256) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                                      [pure] {
+        let profile_opt : Option<ProfileEntry> = self.find_profile_entry(function_name);
+        let entry : ProfileEntry = match profile_opt {
+            Option::Some(e) => e,
+            Option::None => return Result::Err(FixedString256::from("no profile for function")),
+        };
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by edge count.
+        for var i : u32 = 0u32; i < entry.edge_count && i < 512u32; i += 1u32 [entry.edge_count] {
+            let target_count : u64 = if i < entry.edge_counts.len() {
+                entry.edge_counts.get(i)
+            } else {
+                0u64
+            };
+
+            let total_count : u64 = entry.execution_count;
+            let probability : u32 = if total_count > 0u64 {
+                ((target_count * 10000u64) / total_count) as u32
+            } else {
+                0u32
+            };
+
+            let bp : BranchProbability = BranchProbability {
+                source_block: i, // Simplified: edge ID = source block.
+                target_block: i + 1u32, // Simplified: fall-through edge.
+                probability: if probability > 10000u32 { 10000u32 } else { probability },
+                total_count: total_count,
+                target_count: target_count,
+            };
+
+            if self.branch_probabilities.is_full() {
+                break;
+            }
+            let _ = self.branch_probabilities.push(bp);
+        }
+
+        self = self.record_residual(PGO_BRANCH_PROB,
+                                    FixedString256::from("branch probabilities inferred"),
+                                    FixedString64::from("infer_probs"));
+        Result::Ok(self)
+    }
+
+    /// Get the probability for a specific branch.
+    /// Effect: pure — probability lookup.
+    pub fn get_branch_probability(&self, source_block : u32,
+                                  target_block : u32) -> u32 [pure] {
+        // loop: bounds[BOUND_LARGE] — bounded by probabilities.
+        for var i : u32 = 0u32; i < self.branch_probabilities.len(); i += 1u32 [self.branch_probabilities.len()] {
+            let bp : BranchProbability = self.branch_probabilities.get(i);
+            if bp.source_block == source_block && bp.target_block == target_block {
+                return bp.probability;
+            }
+        }
+        // Default: 50% probability (unknown branch).
+        5000u32
+    }
+
+    // ──────────────────────────────────────────
+    // Profile Correlation
+    // ──────────────────────────────────────────
+
+    /// Correlate profile data with current compilation IR.
+    /// Effect: pure — correlation.
+    pub fn correlate_profile(mut self, ir_module : ref mut IrModule) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                             [pure] {
+        var matched : u32 = 0u32;
+        var unmatched : u32 = 0u32;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by module functions.
+        for var i : u32 = 0u32; i < ir_module.functions.len(); i += 1u32 [ir_module.functions.len()] {
+            let ir_fn : IrFunction = ir_module.functions.get(i);
+            let profile_opt : Option<ProfileEntry> = self.find_profile_entry(ir_fn.name);
+
+            match profile_opt {
+                Option::Some(_entry) => {
+                    matched += 1u32;
+                },
+                Option::None => {
+                    unmatched += 1u32;
+                },
+            }
+        }
+
+        self = self.record_residual(PGO_LOAD_DATA,
+                                    FixedString256::from("profile correlation complete"),
+                                    FixedString64::from("correlate"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Full Pass Execution
+    // ──────────────────────────────────────────
+
+    /// Run the complete PGO pass on a module.
+    /// Effect: pure — full pass.
+    pub fn run_pass(mut self, ir_module : ref mut IrModule) -> Result<ProfileGuidedOptimizationPass, FixedString256>
+                    [pure] {
+        if self.pass_completed {
+            return Result::Err(FixedString256::from("PGO pass already completed"));
+        }
+
+        // Step 1: Correlate profile data with module.
+        let correlate_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+            self.correlate_profile(ir_module);
+        match correlate_result {
+            Result::Ok(pass) => { self = pass; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        // Step 2: Classify functions as hot/cold.
+        let classify_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+            self.classify_functions();
+        match classify_result {
+            Result::Ok(pass) => { self = pass; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        // Step 3: Apply hot/cold splitting.
+        let split_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+            self.apply_hot_cold_splitting(ir_module);
+        match split_result {
+            Result::Ok(pass) => { self = pass; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        // Step 4: Apply inlining heuristics.
+        let inline_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+            self.apply_inlining(ir_module);
+        match inline_result {
+            Result::Ok(pass) => { self = pass; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        // Step 5: Apply block reordering for hot functions.
+        // loop: bounds[BOUND_MEDIUM] — bounded by hot/cold functions.
+        for var i : u32 = 0u32; i < self.hot_cold_functions.len(); i += 1u32 [self.hot_cold_functions.len()] {
+            let hc : HotColdFunction = self.hot_cold_functions.get(i);
+            if hc.is_hot {
+                // loop: bounds[BOUND_MEDIUM] — bounded by module functions.
+                for var j : u32 = 0u32; j < ir_module.functions.len(); j += 1u32 [ir_module.functions.len()] {
+                    let mut ir_fn : IrFunction = ir_module.functions.get_mut(j);
+                    if ir_fn.name == hc.name {
+                        let reorder_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+                            self.reorder_blocks(hc.name, &mut ir_fn);
+                        match reorder_result {
+                            Result::Ok(pass) => { self = pass; },
+                            Result::Err(_) => {},
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Step 6: Infer branch probabilities.
+        // loop: bounds[BOUND_MEDIUM] — bounded by profile entries.
+        for var i : u32 = 0u32; i < self.profile_entries.len(); i += 1u32 [self.profile_entries.len()] {
+            let entry : ProfileEntry = self.profile_entries.get(i);
+            let prob_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+                self.infer_branch_probabilities(entry.function_name);
+            match prob_result {
+                Result::Ok(pass) => { self = pass; },
+                Result::Err(_) => {},
+            }
+        }
+
+        // Step 7: Apply function specializations.
+        let spec_result : Result<ProfileGuidedOptimizationPass, FixedString256> =
+            self.apply_specializations(ir_module);
+        match spec_result {
+            Result::Ok(pass) => { self = pass; },
+            Result::Err(msg) => { return Result::Err(msg); },
+        }
+
+        self.pass_completed = true;
+
+        self = self.record_residual(PGO_LOAD_DATA,
+                                    FixedString256::from("PGO pass completed"),
+                                    FixedString64::from("run_pass"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────
+
+    /// Get pass statistics.
+    /// Effect: pure — statistics.
+    pub fn get_statistics(&self) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("Profile entries: "));
+        result.push_u32(self.profile_entries.len());
+        result.push_str(FixedString256::from("\nHot/cold functions: "));
+        result.push_u32(self.hot_cold_functions.len());
+        result.push_str(FixedString256::from("\nBranch probabilities: "));
+        result.push_u32(self.branch_probabilities.len());
+        result.push_str(FixedString256::from("\nSpecializations: "));
+        result.push_u32(self.specializations.len());
+        result.push_str(FixedString256::from("\nBlock profiles: "));
+        result.push_u32(self.block_profiles.len());
+        result.push_str(FixedString256::from("\nOptimizations applied: "));
+        result.push_u32(self.optimizations_applied);
+        result.push_str(FixedString256::from("\nData loaded: "));
+        result.push_str(if self.data_loaded { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result.push_str(FixedString256::from("\nPass completed: "));
+        result.push_str(if self.pass_completed { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result.push_str(FixedString256::from("\nSplitting: "));
+        result.push_str(if self.splitting_enabled { FixedString256::from("enabled") } else { FixedString256::from("disabled") });
+        result.push_str(FixedString256::from("\nReordering: "));
+        result.push_str(if self.reordering_enabled { FixedString256::from("enabled") } else { FixedString256::from("disabled") });
+        result.push_str(FixedString256::from("\nSpecialization: "));
+        result.push_str(if self.specialization_enabled { FixedString256::from("enabled") } else { FixedString256::from("disabled") });
+        result
+    }
+}
+
+/// IR function with section name support.
+pub struct IrFunction {
+    pub name : FixedString256,
+    pub return_type : u8,
+    pub parameters : Array64<IrParameter>,
+    pub body : Array64<IrInstruction>,
+    pub is_global : bool,
+    pub section_name : FixedString64,
+}
+
+impl IrFunction {
+    pub fn new() -> IrFunction [pure] {
+        IrFunction {
+            name: FixedString256::new(),
+            return_type: 0u8,
+            parameters: Array64::new(),
+            body: Array64::new(),
+            is_global: false,
+            section_name: FixedString64::from(".text"),
+        }
+    }
+}
+
+/// IR module.
+pub struct IrModule {
+    pub functions : Array256<IrFunction>,
+}
+
+impl IrModule {
+    pub fn new() -> IrModule [pure] {
+        IrModule {
+            functions: Array256::new(),
+        }
+    }
+
+    pub fn get(&self, index : u32) -> IrFunction [pure] {
+        self.functions.get(index)
+    }
+
+    pub fn get_mut(&mut self, index : u32) -> IrFunction [pure] {
+        self.functions.get(index)
+    }
+}
+
+/// IR instruction.
+pub struct IrInstruction {
+    pub opcode : u8,
+    pub operands : Array64<u64>,
+}
+
+impl IrInstruction {
+    pub fn new() -> IrInstruction [pure] {
+        IrInstruction {
+            opcode: 0u8,
+            operands: Array64::new(),
+        }
+    }
+}
+
+/// IR parameter.
+pub struct IrParameter {
+    pub name : FixedString64,
+    pub param_type : u8,
+}
+
+// ──────────────────────────────────────────────
+// Profile File Format Parsing
+// ──────────────────────────────────────────────
+
+/// Profile file format version.
+pub const PGO_FORMAT_VERSION : u32 = 1u32;
+
+/// Profile file header structure.
+pub struct ProfileFileHeader {
+    /// Magic bytes ("PHORPGO").
+    pub magic : u64,
+    /// Format version.
+    pub version : u32,
+    /// Number of profile entries.
+    pub entry_count : u32,
+    /// Total size of profile data.
+    pub total_size : u32,
+    /// Flags.
+    pub flags : u32,
+}
+
+impl ProfileFileHeader {
+    /// Create a new profile file header.
+    /// Effect: pure — construction.
+    pub fn new(entry_count : u32, total_size : u32) -> ProfileFileHeader [pure] {
+        ProfileFileHeader {
+            magic: 0x4F475250484F50u64, // "PHORPGO"
+            version: PGO_FORMAT_VERSION,
+            entry_count: entry_count,
+            total_size: total_size,
+            flags: 0u32,
+        }
+    }
+
+    /// Serialize header to bytes.
+    /// Effect: pure — serialization.
+    pub fn serialize(&self, buffer : ref mut Array64<u8>) -> Result<u32, FixedString256> [pure] {
+        var offset : u32 = 0u32;
+        // Magic (8 bytes).
+        // loop: bounds[BOUND_SMALL] — 8 bytes.
+        for var i : u32 = 0u32; i < 8u32 && offset < 64u32; i += 1u32 [8u32] {
+            let _ = buffer.set(offset, (self.magic >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+        // Version (4 bytes).
+        for var i : u32 = 0u32; i < 4u32 && offset < 64u32; i += 1u32 [4u32] {
+            let _ = buffer.set(offset, (self.version >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+        // Entry count (4 bytes).
+        for var i : u32 = 0u32; i < 4u32 && offset < 64u32; i += 1u32 [4u32] {
+            let _ = buffer.set(offset, (self.entry_count >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+        // Total size (4 bytes).
+        for var i : u32 = 0u32; i < 4u32 && offset < 64u32; i += 1u32 [4u32] {
+            let _ = buffer.set(offset, (self.total_size >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+        // Flags (4 bytes).
+        for var i : u32 = 0u32; i < 4u32 && offset < 64u32; i += 1u32 [4u32] {
+            let _ = buffer.set(offset, (self.flags >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+        Result::Ok(offset)
+    }
+
+    /// Parse header from bytes.
+    /// Effect: pure — parsing.
+    pub fn parse(data : Array64<u8>) -> Result<ProfileFileHeader, FixedString256> [pure] {
+        if data.len() < 24u32 {
+            return Result::Err(FixedString256::from("data too small for header"));
+        }
+
+        var magic : u64 = 0u64;
+        // loop: bounds[BOUND_SMALL] — 8 bytes.
+        for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+            magic |= (data.get(i) as u64) << (i * 8u32);
+        }
+
+        if magic != 0x4F475250484F50u64 {
+            return Result::Err(FixedString256::from("invalid magic in profile file"));
+        }
+
+        var version : u32 = 0u32;
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            version |= (data.get(8u32 + i) as u32) << (i * 8u32);
+        }
+
+        var entry_count : u32 = 0u32;
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            entry_count |= (data.get(12u32 + i) as u32) << (i * 8u32);
+        }
+
+        var total_size : u32 = 0u32;
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            total_size |= (data.get(16u32 + i) as u32) << (i * 8u32);
+        }
+
+        var flags : u32 = 0u32;
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            flags |= (data.get(20u32 + i) as u32) << (i * 8u32);
+        }
+
+        Result::Ok(ProfileFileHeader {
+            magic: magic,
+            version: version,
+            entry_count: entry_count,
+            total_size: total_size,
+            flags: flags,
+        })
+    }
+}
+
+/// Individual profile entry serialization format.
+pub struct ProfileEntrySerial {
+    /// Function name hash (for matching).
+    pub name_hash : u64,
+    /// Execution count.
+    pub exec_count : u64,
+    /// Number of block counters.
+    pub block_count : u32,
+    /// Number of edge counters.
+    pub edge_count : u32,
+    /// Block counter values.
+    pub block_values : Array256<u64>,
+    /// Edge counter values.
+    pub edge_values : Array256<u64>,
+}
+
+impl ProfileEntrySerial {
+    /// Serialize a profile entry to bytes.
+    /// Effect: pure — serialization.
+    pub fn serialize(&self, buffer : ref mut Array256<u8>) -> Result<u32, FixedString256> [pure] {
+        var offset : u32 = 0u32;
+
+        // Name hash.
+        for var i : u32 = 0u32; i < 8u32 && offset < 256u32; i += 1u32 [8u32] {
+            let _ = buffer.set(offset, (self.name_hash >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+
+        // Execution count.
+        for var i : u32 = 0u32; i < 8u32 && offset < 256u32; i += 1u32 [8u32] {
+            let _ = buffer.set(offset, (self.exec_count >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+
+        // Block and edge counts.
+        for var i : u32 = 0u32; i < 4u32 && offset < 256u32; i += 1u32 [4u32] {
+            let _ = buffer.set(offset, (self.block_count >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+        for var i : u32 = 0u32; i < 4u32 && offset < 256u32; i += 1u32 [4u32] {
+            let _ = buffer.set(offset, (self.edge_count >> (i * 8u32)) as u8);
+            offset += 1u32;
+        }
+
+        // Block values.
+        for var b : u32 = 0u32; b < self.block_count && b < 256u32 && offset < 256u32; b += 1u32 [self.block_count] {
+            let value : u64 = if b < self.block_values.len() { self.block_values.get(b) } else { 0u64 };
+            for var i : u32 = 0u32; i < 8u32 && offset < 256u32; i += 1u32 [8u32] {
+                let _ = buffer.set(offset, (value >> (i * 8u32)) as u8);
+                offset += 1u32;
+            }
+        }
+
+        // Edge values.
+        for var b : u32 = 0u32; b < self.edge_count && b < 256u32 && offset < 256u32; b += 1u32 [self.edge_count] {
+            let value : u64 = if b < self.edge_values.len() { self.edge_values.get(b) } else { 0u64 };
+            for var i : u32 = 0u32; i < 8u32 && offset < 256u32; i += 1u32 [8u32] {
+                let _ = buffer.set(offset, (value >> (i * 8u32)) as u8);
+                offset += 1u32;
+            }
+        }
+
+        Result::Ok(offset)
+    }
+}
+
+/// Compute a simple hash for a function name (for profile matching).
+pub fn hash_function_name(name : FixedString256) -> u64 [pure] {
+    var hash : u64 = 14695981039346656037u64;
+    // loop: bounds[BOUND_MEDIUM] — bounded by name length.
+    for var i : u32 = 0u32; i < name.len(); i += 1u32 [name.len()] {
+        hash ^= name.get_byte(i) as u64;
+        hash *= 1099511628211u64;
+    }
+    hash
+}
+
+// ──────────────────────────────────────────────
+// Profile Analysis Utilities
+// ──────────────────────────────────────────────
+
+/// Find the hottest function from a set of profile entries.
+pub fn find_hottest_function(entries : Array512<ProfileEntry>) -> Option<ProfileEntry> [pure] {
+    if entries.len() == 0u32 { return Option::None; }
+    var hottest : ProfileEntry = entries.get(0u32);
+    for var i : u32 = 1u32; i < entries.len(); i += 1u32 [entries.len()] {
+        let entry : ProfileEntry = entries.get(i);
+        if entry.execution_count > hottest.execution_count {
+            hottest = entry;
+        }
+    }
+    Option::Some(hottest)
+}
+
+/// Compute the total execution count across all profile entries.
+pub fn total_execution_count(entries : Array512<ProfileEntry>) -> u64 [pure] {
+    var total : u64 = 0u64;
+    for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+        total += entries.get(i).execution_count;
+    }
+    total
+}
+
+/// Compute the average execution count.
+pub fn average_execution_count(entries : Array512<ProfileEntry>) -> f64 [pure] {
+    let total : u64 = total_execution_count(entries);
+    if entries.len() == 0u32 { return 0.0f64; }
+    total as f64 / entries.len() as f64
+}
+
+/// Count the number of hot functions (above threshold).
+pub fn count_hot_functions(entries : Array512<ProfileEntry>, threshold : u64) -> u32 [pure] {
+    var count : u32 = 0u32;
+    for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+        if entries.get(i).execution_count >= threshold {
+            count += 1u32;
+        }
+    }
+    count
+}
+
+/// Count the number of cold functions (below threshold).
+pub fn count_cold_functions(entries : Array512<ProfileEntry>, threshold : u64) -> u32 [pure] {
+    var count : u32 = 0u32;
+    for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+        if entries.get(i).execution_count < threshold {
+            count += 1u32;
+        }
+    }
+    count
+}
+
+/// Compute the cumulative fraction of executions accounted for by the top N functions.
+pub fn top_n_fraction(entries : Array512<ProfileEntry>, n : u32) -> f64 [pure] {
+    let total : u64 = total_execution_count(entries);
+    if total == 0u64 { return 0.0f64; }
+    var top_sum : u64 = 0u64;
+    var count : u32 = 0u32;
+    // Simplified: take first N entries.
+    for var i : u32 = 0u32; i < entries.len() && count < n; i += 1u32 [entries.len()] {
+        top_sum += entries.get(i).execution_count;
+        count += 1u32;
+    }
+    top_sum as f64 / total as f64
+}
+
+/// Sort profile entries by execution count (simple bubble sort).
+pub fn sort_profile_by_hotness(mut entries : Array512<ProfileEntry>) -> Array512<ProfileEntry> [pure] {
+    let n : u32 = entries.len();
+    for var i : u32 = 0u32; i < n; i += 1u32 [n] {
+        for var j : u32 = 0u32; j < n - 1u32 - i; j += 1u32 [n] {
+            let a : ProfileEntry = entries.get(j);
+            let b : ProfileEntry = entries.get(j + 1u32);
+            if a.execution_count < b.execution_count {
+                let _ = entries.set(j, b);
+                let _ = entries.set(j + 1u32, a);
+            }
+        }
+    }
+    entries
+}
+
+/// Generate a human-readable profile summary.
+pub fn generate_profile_summary(entries : Array512<ProfileEntry>) -> FixedString1024 [io] {
+    var output : FixedString1024 = FixedString1024::new();
+    output.push_str(FixedString256::from("=== Profile Summary ===\n"));
+    output.push_str(FixedString256::from("Total functions: "));
+    output.push_u32(entries.len());
+    output.push_str(FixedString256::from("\nTotal executions: "));
+    output.push_u64(total_execution_count(entries));
+    output.push_str(FixedString256::from("\nAverage: "));
+    output.push_f64(average_execution_count(entries), 2u32);
+    output.push_str(FixedString256::from("\n"));
+
+    let sorted : Array512<ProfileEntry> = sort_profile_by_hotness(entries);
+    output.push_str(FixedString256::from("\nTop functions:\n"));
+    let top_n : u32 = if sorted.len() > 10u32 { 10u32 } else { sorted.len() };
+    for var i : u32 = 0u32; i < top_n; i += 1u32 [top_n] {
+        let entry : ProfileEntry = sorted.get(i);
+        output.push_str(FixedString256::from("  "));
+        output.push_str(entry.function_name);
+        output.push_str(FixedString256::from(": "));
+        output.push_u64(entry.execution_count);
+        output.push_str(FixedString256::from("\n"));
+    }
+    output
+}
+
+// ──────────────────────────────────────────────
+// Profile Conversion Utilities
+// ──────────────────────────────────────────────
+
+/// Convert a profile entry to JSON format.
+pub fn profile_to_json(entry : ProfileEntry) -> FixedString1024 [io] {
+    var out : FixedString1024 = FixedString1024::new();
+    out.push_str(FixedString256::from("{\"name\":\""));
+    out.push_str(entry.function_name);
+    out.push_str(FixedString256::from("\",\"count\":"));
+    out.push_u64(entry.execution_count);
+    out.push_str(FixedString256::from("}"));
+    out
+}
+
+/// Print profile summary to serial.
+pub fn print_summary(entries : Array512<ProfileEntry>) [io] {
+    let s : FixedString1024 = generate_profile_summary(entries);
+    __builtin_serial_write_string(s);
+}
+
+/// Detect if any function dominates the profile.
+pub fn has_dominator(entries : Array512<ProfileEntry>, threshold_pct : f64) -> bool [pure] {
+    let total : u64 = total_execution_count(entries);
+    if total == 0u64 { return false; }
+    for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+        let f : f64 = entries.get(i).execution_count as f64 / total as f64;
+        if f >= threshold_pct / 100.0f64 { return true; }
+    }
+    false
+}
+
+/// Find specialization candidates.
+pub fn spec_candidates(entries : Array512<ProfileEntry>, min_count : u64) -> Array128<ProfileEntry> [pure] {
+    var cand : Array128<ProfileEntry> = Array128::new();
+    for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+        let e : ProfileEntry = entries.get(i);
+        if e.execution_count >= min_count { let _ = cand.push(e); }
+    }
+    cand
+}
+
+/// Convert profile entries to a CSV header and rows.
+pub fn profile_to_csv(entries : Array512<ProfileEntry>) -> FixedString1024 [io] {
+    var out : FixedString1024 = FixedString1024::new();
+    out.push_str(FixedString256::from("name,exec_count,block_count,edge_count,is_hot,temp\n"));
+    for var i : u32 = 0u32; i < entries.len(); i += 1u32 [entries.len()] {
+        let e : ProfileEntry = entries.get(i);
+        out.push_str(e.function_name);
+        out.push_str(FixedString256::from(","));
+        out.push_u64(e.execution_count);
+        out.push_str(FixedString256::from(","));
+        out.push_u32(e.block_count);
+        out.push_str(FixedString256::from(","));
+        out.push_u32(e.edge_count);
+        out.push_str(FixedString256::from(","));
+        out.push_str(if e.is_hot { FixedString256::from("yes") } else { FixedString256::from("no") });
+        out.push_str(FixedString256::from(","));
+        out.push_u32(e.temperature);
+        out.push_str(FixedString256::from("\n"));
+    }
+    out
+}
+
+/// Compute the ratio of hottest to average function.
+pub fn hot_to_avg_ratio(entries : Array512<ProfileEntry>) -> f64 [pure] {
+    let avg : f64 = average_execution_count(entries);
+    if avg < 0.001f64 { return 0.0f64; }
+    match find_hottest_function(entries) {
+        Option::Some(h) => h.execution_count as f64 / avg,
+        Option::None => 0.0f64,
+    }
+}
+
+/// Estimate the potential speedup from PGO.
+pub fn estimate_pgo_speedup(entries : Array512<ProfileEntry>, optimized_fraction : f64) -> f64 [pure] {
+    let hot_total : u64 = 0u64;
+    let total : u64 = total_execution_count(entries);
+    if total == 0u64 { return 1.0f64; }
+    let sorted : Array512<ProfileEntry> = sort_profile_by_hotness(entries);
+    var hot_sum : u64 = 0u64;
+    let n : u32 = (sorted.len() as f64 * optimized_fraction) as u32;
+    for var i : u32 = 0u32; i < n && i < sorted.len(); i += 1u32 [sorted.len()] {
+        hot_sum += sorted.get(i).execution_count;
+    }
+    let hot_frac : f64 = hot_sum as f64 / total as f64;
+    // Amdahl's law: speedup = 1 / ((1 - hot_frac) + hot_frac / 1.2)
+    1.0f64 / ((1.0f64 - hot_frac) + hot_frac / 1.2f64)
+}
+
+/// Check if profile data is sufficient for PGO.
+pub fn is_profile_sufficient(entries : Array512<ProfileEntry>) -> bool [pure] {
+    if entries.len() < 5u32 { return false; }
+    let total : u64 = total_execution_count(entries);
+    total > 1000u64
+}
+
+/// Merge two profile entry lists (sum counts for matching functions).
+pub fn merge_profile_data(dest : Array512<ProfileEntry>, src : Array512<ProfileEntry>) -> Array512<ProfileEntry> [pure] {
+    // Simplified: append non-duplicate entries.
+    var result : Array512<ProfileEntry> = Array512::new();
+    for var i : u32 = 0u32; i < dest.len() && !result.is_full(); i += 1u32 [dest.len()] {
+        let _ = result.push(dest.get(i));
+    }
+    for var i : u32 = 0u32; i < src.len() && !result.is_full(); i += 1u32 [src.len()] {
+        let src_e : ProfileEntry = src.get(i);
+        var found : bool = false;
+        for var j : u32 = 0u32; j < result.len(); j += 1u32 [result.len()] {
+            if result.get(j).function_name == src_e.function_name {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            let _ = result.push(src_e);
+        }
+    }
+    result
+}
+
+/// Generate an optimization plan summary.
+pub fn generate_optimization_plan(entries : Array512<ProfileEntry>) -> FixedString1024 [io] {
+    var out : FixedString1024 = FixedString1024::new();
+    out.push_str(FixedString256::from("=== PGO Optimization Plan ===\n"));
+    out.push_str(FixedString256::from("Profiles: "));
+    out.push_u32(entries.len());
+    out.push_str(FixedString256::from("\nSufficient: "));
+    out.push_str(if is_profile_sufficient(entries) { FixedString256::from("yes") } else { FixedString256::from("no") });
+    out.push_str(FixedString256::from("\nEstimated speedup: "));
+    out.push_f64(estimate_pgo_speedup(entries, 0.1f64), 4u32);
+    out.push_str(FixedString256::from("x\n"));
+    out.push_str(FixedString256::from("Hot/avg ratio: "));
+    out.push_f64(hot_to_avg_ratio(entries), 2u32);
+    out.push_str(FixedString256::from("\n"));
+    let spec_list : Array128<ProfileEntry> = spec_candidates(entries, 1000u64);
+    out.push_str(FixedString256::from("Specialization candidates: "));
+    out.push_u32(spec_list.len());
+    out.push_str(FixedString256::from("\n"));
+    out
+}

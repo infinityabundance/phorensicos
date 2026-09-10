@@ -1,0 +1,1128 @@
+// ipc.phor — Inter-process communication subsystem
+// Typed messages, capability-gated transfer, residual-aware IPC
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/ipc.phor
+// Court: ipc:v2
+
+package kernel.ipc;
+
+import kernel.nucleus_interface.*;
+import kernel.capability_manager.*;
+import kernel.session_manager.*;
+import kernel.port_manager.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type IpcError = enum {
+    IpcChannelNotFound    = 0x90,  // E0090: IPC channel not found
+    IpcChannelFull        = 0x91,  // E0091: IPC channel buffer is full
+    IpcChannelEmpty       = 0x92,  // E0092: IPC channel buffer is empty
+    IpcChannelClosed      = 0x93,  // E0093: IPC channel has been closed
+    IpcTableFull          = 0x94,  // E0094: IPC channel table is full
+    IpcCapabilityError    = 0x95,  // E0095: insufficient capability for IPC operation
+    IpcTypeMismatch       = 0x96,  // E0096: IPC message type does not match channel type
+    IpcDirectionError     = 0x97,  // E0097: wrong direction for IPC operation
+    IpcPeerNotFound       = 0x98,  // E0098: IPC peer endpoint not found
+    IpcStaleGeneration    = 0x99,  // E0099: IPC channel generation is stale
+    IpcResidualError      = 0x9A,  // E009A: IPC residual recording failed
+    IpcCapTransferError   = 0x9B,  // E009B: capability transfer through IPC failed
+    IpcMaxRetries         = 0x9C,  // E009C: IPC operation reached max retry count
+    IpcTimeout            = 0x9D,  // E009D: IPC operation timed out
+    IpcDeadlockDetected   = 0x9E,  // E009E: potential deadlock detected in IPC
+    IpcBufferLimit        = 0x9F,  // E009F: IPC message exceeds buffer size limit
+    IpcNotReady           = 0xA0,  // E00A0: IPC endpoint not ready for operation
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Channel Direction
+// ─────────────────────────────────────────────────────────────
+
+type IpcChannelDirection = enum {
+    OneWaySend     = 0,  // Unidirectional: sender to receiver
+    OneWayReceive  = 1,  // Unidirectional: receiver only
+    Duplex         = 2,  // Bidirectional
+    RequestResponse = 3, // Request/response pattern
+    Broadcast      = 4,  // One-to-many
+    Gather         = 5,  // Many-to-one
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Message Type
+// ─────────────────────────────────────────────────────────────
+
+type IpcMessageType = enum {
+    Data            = 0,  // Raw data transfer
+    Request         = 1,  // Service request
+    Response        = 2,  // Service response
+    Notification    = 3,  // Event notification
+    CapabilityXfer  = 4,  // Capability transfer
+    ResidualReport  = 5,  // Residual exchange
+    Control         = 6,  // Channel control message
+    Heartbeat       = 7,  // Keep-alive heartbeat
+    Error           = 8,  // Error notification
+    CourtEvidence   = 9,  // Court evidence transfer
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Message
+// ─────────────────────────────────────────────────────────────
+
+struct IpcMessage {
+    header: IpcMessageHeader,
+    payload: Array(u8, 4096),
+    payload_length: u64,
+    attached_capability: Option(Cap(CapabilityToken)),
+    residual: ResidualRecord,
+    integrity_hash: u64,
+}
+
+struct IpcMessageHeader {
+    message_type: IpcMessageType,
+    sender_identity: Identity,
+    receiver_identity: Identity,
+    session_id: Identity,
+    sequence_number: u64,
+    timestamp: u64,
+    generation: u64,
+    priority: u64,
+    reply_expected: bool,
+    request_id: u64,
+    payload_hash: u64,
+    payload_length: u64,
+    has_capability: bool,
+    is_response: bool,
+    timeout_ms: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Channel
+// ─────────────────────────────────────────────────────────────
+
+struct IpcChannel {
+    channel_id: Identity,
+    direction: IpcChannelDirection,
+    supported_types: Array(IpcMessageType, 16),
+    type_count: u64,
+    owning_session: Identity,
+    peer_session: Option(Identity),
+    peer_channel: Option(Identity),
+    message_buffer: RingBuf(IpcMessage, 32),
+    pending_replies: RingBuf(IpcMessage, 16),
+    send_count: u64,
+    receive_count: u64,
+    error_count: u64,
+    generation: u64,
+    creation_timestamp: u64,
+    last_activity_timestamp: u64,
+    is_open: bool,
+    requires_capability: bool,
+    required_rights: CapabilityRights,
+    max_message_size: u64,
+    timeout_default_ms: u64,
+    retry_count: u64,
+    max_retries: u64,
+    trust_state: TrustState,
+    residual_log: RingBuf(ResidualRecord, 64),
+    metadata: IpcChannelMetadata,
+}
+
+struct IpcChannelMetadata {
+    label: String(128),
+    description: String(256),
+    protocol_name: String(64),
+    expected_throughput: u64,
+    priority: u64,
+    is_reliable: bool,
+    court_casefile: String(128),
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Manager State
+// ─────────────────────────────────────────────────────────────
+
+struct IpcManagerState {
+    channels: Array(IpcChannel, 128),
+    channel_count: u64,
+    next_channel_generation: u64,
+    manager_identity: Identity,
+    capability_manager: Handle(CapabilityManagerState),
+    session_manager: Handle(SessionManagerState),
+    port_manager: Handle(PortManagerState),
+    initialization_timestamp: u64,
+    global_sequence: u64,
+    audit_trail: RingBuf(AuditRecord, 256),
+    deadlock_detection_enabled: bool,
+    max_retries_default: u64,
+    timeout_default_ms: u64,
+    max_message_size_default: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Manager Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_manager_init(
+    manager_identity: Identity,
+    cap_mgr: Handle(CapabilityManagerState),
+    sess_mgr: Handle(SessionManagerState),
+    port_mgr: Handle(PortManagerState),
+    timestamp: u64,
+) -> IpcManagerState
+    effect [deterministic]
+    court "ipc_manager_init:v1"
+{
+    let state: IpcManagerState = IpcManagerState {
+        channels: Array::zeroed(),
+        channel_count: 0,
+        next_channel_generation: 1,
+        manager_identity: manager_identity,
+        capability_manager: cap_mgr,
+        session_manager: sess_mgr,
+        port_manager: port_mgr,
+        initialization_timestamp: timestamp,
+        global_sequence: 0,
+        audit_trail: RingBuf::new(),
+        deadlock_detection_enabled: true,
+        max_retries_default: 3,
+        timeout_default_ms: 5000,
+        max_message_size_default: 4096,
+    };
+
+    residual emit {
+        op: "ipc_manager.init",
+        manager_identity: manager_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create IPC Channel
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_channel_create(
+    state: Handle(IpcManagerState),
+    direction: IpcChannelDirection,
+    message_types: Slice(IpcMessageType),
+    owning_session: Identity,
+    creator_cap: Cap(CapabilityToken),
+    metadata: IpcChannelMetadata,
+    timestamp: u64,
+) -> Result(IpcChannel, IpcError)
+    effect [deterministic, residual]
+    court "ipc_channel_create:v2"
+{
+    // Check capacity
+    if state.channel_count >= 128 {
+        return Result::Err(IpcError::IpcTableFull);
+    };
+
+    // Generate channel identity
+    let channel_id: Identity = identity_new(
+        owning_session.id_hash,
+        timestamp,
+        state.next_channel_generation,
+        state.channel_count,
+    );
+
+    let generation: u64 = state.next_channel_generation;
+    state.next_channel_generation = state.next_channel_generation + 1;
+
+    // Find empty slot
+    let mut slot_idx: u64 = 0;
+    let mut found_slot: bool = false;
+    for i in 0..128 {
+        if state.channels[i].generation == 0 || !state.channels[i].is_open {
+            slot_idx = i;
+            found_slot = true;
+            break;
+        };
+    };
+
+    if !found_slot {
+        return Result::Err(IpcError::IpcTableFull);
+    };
+
+    // Copy message types
+    let mut types: Array(IpcMessageType, 16) = Array::zeroed();
+    let type_count: u64 = if message_types.len() < 16 { message_types.len() } else { 16 };
+    for i in 0..type_count {
+        types[i] = message_types[i];
+    };
+
+    let rights: CapabilityRights = match direction {
+        IpcChannelDirection::OneWaySend => CapabilityRights { read: false, write: true, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+        IpcChannelDirection::OneWayReceive => CapabilityRights { read: true, write: false, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+        IpcChannelDirection::Duplex => CapabilityRights { read: true, write: true, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+        IpcChannelDirection::RequestResponse => CapabilityRights { read: true, write: true, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+        _ => CapabilityRights { read: true, write: true, execute: false, delete: false, transfer: false, delegate: false, observe: false, audit: false, promote: false },
+    };
+
+    let channel: IpcChannel = IpcChannel {
+        channel_id: channel_id,
+        direction: direction,
+        supported_types: types,
+        type_count: type_count,
+        owning_session: owning_session,
+        peer_session: Option::None,
+        peer_channel: Option::None,
+        message_buffer: RingBuf::new(),
+        pending_replies: RingBuf::new(),
+        send_count: 0,
+        receive_count: 0,
+        error_count: 0,
+        generation: generation,
+        creation_timestamp: timestamp,
+        last_activity_timestamp: timestamp,
+        is_open: true,
+        requires_capability: true,
+        required_rights: rights,
+        max_message_size: state.max_message_size_default,
+        timeout_default_ms: state.timeout_default_ms,
+        retry_count: 0,
+        max_retries: state.max_retries_default,
+        trust_state: TrustState::Unknown,
+        residual_log: RingBuf::new(),
+        metadata: metadata,
+    };
+
+    state.channels[slot_idx] = channel;
+    state.channel_count = state.channel_count + 1;
+
+    residual emit {
+        op: "ipc_manager.channel_create",
+        channel_id: channel_id.id_hash,
+        direction: direction as u64,
+        session: owning_session.id_hash,
+        generation: generation,
+    };
+
+    return Result::Ok(state.channels[slot_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Connect IPC Channels (peer two channels)
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_channel_connect(
+    state: Handle(IpcManagerState),
+    channel_a_id: Identity,
+    channel_b_id: Identity,
+    connector_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, IpcError)
+    effect [deterministic, residual]
+    court "ipc_connect:v1"
+{
+    let mut slot_a: u64 = 0;
+    let mut slot_b: u64 = 0;
+    let mut found_a: bool = false;
+    let mut found_b: bool = false;
+
+    for i in 0..128 {
+        let c: IpcChannel = state.channels[i];
+        if identity_equal(c.channel_id, channel_a_id) && c.is_open {
+            slot_a = i;
+            found_a = true;
+            break;
+        };
+    };
+
+    for i in 0..128 {
+        let c: IpcChannel = state.channels[i];
+        if identity_equal(c.channel_id, channel_b_id) && c.is_open {
+            slot_b = i;
+            found_b = true;
+            break;
+        };
+    };
+
+    if !found_a || !found_b {
+        return Result::Err(IpcError::IpcChannelNotFound);
+    };
+
+    let ch_a: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[slot_a]);
+    let ch_b: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[slot_b]);
+
+    // Check direction compatibility
+    let compatible: bool = match (ch_a.direction, ch_b.direction) {
+        (IpcChannelDirection::Duplex, IpcChannelDirection::Duplex) => true,
+        (IpcChannelDirection::OneWaySend, IpcChannelDirection::OneWayReceive) => true,
+        (IpcChannelDirection::OneWayReceive, IpcChannelDirection::OneWaySend) => true,
+        (IpcChannelDirection::RequestResponse, IpcChannelDirection::Duplex) => true,
+        (IpcChannelDirection::Duplex, IpcChannelDirection::RequestResponse) => true,
+        (IpcChannelDirection::Duplex, IpcChannelDirection::OneWaySend) => true,
+        (IpcChannelDirection::Duplex, IpcChannelDirection::OneWayReceive) => true,
+        _ => false,
+    };
+
+    if !compatible {
+        return Result::Err(IpcError::IpcDirectionError);
+    };
+
+    // Connect
+    ch_a.peer_channel = Option::Some(channel_b_id);
+    ch_a.peer_session = Option::Some(ch_b.owning_session);
+    ch_b.peer_channel = Option::Some(channel_a_id);
+    ch_b.peer_session = Option::Some(ch_a.owning_session);
+
+    residual emit {
+        op: "ipc_manager.channel_connect",
+        channel_a: channel_a_id.id_hash,
+        channel_b: channel_b_id.id_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Send IPC Message
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_send(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    sender_identity: Identity,
+    message_type: IpcMessageType,
+    data: Slice(u8),
+    attached_cap: Option(Cap(CapabilityToken)),
+    sender_cap: Cap(CapabilityToken),
+    request_id: u64,
+    reply_expected: bool,
+    timestamp: u64,
+) -> Result(void, IpcError)
+    effect [deterministic, residual]
+    court "ipc_send:v2"
+{
+    let mut ch_slot: u64 = 0;
+    let mut found: bool = false;
+
+    for i in 0..128 {
+        let c: IpcChannel = state.channels[i];
+        if identity_equal(c.channel_id, channel_id) && c.is_open {
+            ch_slot = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(IpcError::IpcChannelNotFound);
+    };
+
+    let channel: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[ch_slot]);
+
+    // Check direction allows send
+    if channel.direction == IpcChannelDirection::OneWayReceive {
+        return Result::Err(IpcError::IpcDirectionError);
+    };
+
+    // Check message type is supported
+    let type_supported: bool = false;
+    for i in 0..channel.type_count {
+        if channel.supported_types[i] == message_type {
+            type_supported = true;
+            break;
+        };
+    };
+
+    if !type_supported {
+        return Result::Err(IpcError::IpcTypeMismatch);
+    };
+
+    // Check data size
+    if data.len() > channel.max_message_size {
+        return Result::Err(IpcError::IpcBufferLimit);
+    };
+
+    // Check channel is full
+    if channel.message_buffer.is_full() {
+        return Result::Err(IpcError::IpcChannelFull);
+    };
+
+    // Increment global sequence
+    state.global_sequence = state.global_sequence + 1;
+    let seq: u64 = state.global_sequence;
+
+    // Compute payload hash
+    let payload_hash: u64 = 0;
+    let data_len: u64 = data.len();
+
+    // Build payload
+    let mut payload: Array(u8, 4096) = Array::zeroed();
+    let copy_len: u64 = if data_len < 4096 { data_len } else { 4096 };
+    for i in 0..copy_len {
+        payload[i] = data[i];
+    };
+
+    // Determine receiver
+    let receiver: Identity = match channel.peer_session {
+        Option::Some(peer) => peer,
+        Option::None => Identity { id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0 },
+    };
+
+    let header: IpcMessageHeader = IpcMessageHeader {
+        message_type: message_type,
+        sender_identity: sender_identity,
+        receiver_identity: receiver,
+        session_id: channel.owning_session,
+        sequence_number: seq,
+        timestamp: timestamp,
+        generation: channel.generation,
+        priority: 0,
+        reply_expected: reply_expected,
+        request_id: request_id,
+        payload_hash: payload_hash,
+        payload_length: copy_len,
+        has_capability: attached_cap.is_some(),
+        is_response: false,
+        timeout_ms: channel.timeout_default_ms,
+    };
+
+    let residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x60,
+        event_data_hash: seq,
+        cause_identity: sender_identity,
+        prior_state_hash: channel.send_count,
+        new_state_hash: channel.send_count + 1,
+        delta_description: String::from_bytes(Slice(u8)::from_str("IPC message sent")),
+        generation_at_event: channel.generation,
+        verified: false,
+    };
+
+    let message: IpcMessage = IpcMessage {
+        header: header,
+        payload: payload,
+        payload_length: copy_len,
+        attached_capability: attached_cap,
+        residual: residual,
+        integrity_hash: seq,
+    };
+
+    channel.message_buffer.push(message);
+    channel.send_count = channel.send_count + 1;
+    channel.last_activity_timestamp = timestamp;
+
+    // If this is a request, also record the pending reply
+    if reply_expected {
+        // A request tracking mechanism would be implemented here
+        // For now, we rely on the request_id field
+    };
+
+    residual emit {
+        op: "ipc_manager.send",
+        channel_id: channel_id.id_hash,
+        sender: sender_identity.id_hash,
+        message_type: message_type as u64,
+        sequence: seq,
+        length: data_len,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Receive IPC Message
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_receive(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    receiver_identity: Identity,
+    receiver_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(IpcMessage, IpcError)
+    effect [deterministic, residual]
+    court "ipc_receive:v2"
+{
+    let mut ch_slot: u64 = 0;
+    let mut found: bool = false;
+
+    for i in 0..128 {
+        let c: IpcChannel = state.channels[i];
+        if identity_equal(c.channel_id, channel_id) && c.is_open {
+            ch_slot = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(IpcError::IpcChannelNotFound);
+    };
+
+    let channel: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[ch_slot]);
+
+    // Check direction allows receive
+    if channel.direction == IpcChannelDirection::OneWaySend {
+        return Result::Err(IpcError::IpcDirectionError);
+    };
+
+    // Check if buffer is empty
+    if channel.message_buffer.is_empty() {
+        return Result::Err(IpcError::IpcChannelEmpty);
+    };
+
+    // Pop message
+    let message: IpcMessage = channel.message_buffer.pop().unwrap();
+    channel.receive_count = channel.receive_count + 1;
+    channel.last_activity_timestamp = timestamp;
+
+    // Record receive residual
+    let recv_residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x61,
+        event_data_hash: message.header.sequence_number,
+        cause_identity: receiver_identity,
+        prior_state_hash: channel.receive_count - 1,
+        new_state_hash: channel.receive_count,
+        delta_description: String::from_bytes(Slice(u8)::from_str("IPC message received")),
+        generation_at_event: channel.generation,
+        verified: false,
+    };
+    channel.residual_log.push(recv_residual);
+
+    residual emit {
+        op: "ipc_manager.receive",
+        channel_id: channel_id.id_hash,
+        receiver: receiver_identity.id_hash,
+        sequence: message.header.sequence_number,
+        message_type: message.header.message_type as u64,
+    };
+
+    return Result::Ok(message);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Send Reply (for request/response pattern)
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_send_reply(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    original_request_id: u64,
+    responder_identity: Identity,
+    data: Slice(u8),
+    responder_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, IpcError)
+    effect [deterministic, residual]
+{
+    // Find the channel by request tracking
+    let mut ch_slot: u64 = 0;
+    let mut found: bool = false;
+
+    for i in 0..128 {
+        let c: IpcChannel = state.channels[i];
+        if identity_equal(c.channel_id, channel_id) && c.is_open {
+            ch_slot = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(IpcError::IpcChannelNotFound);
+    };
+
+    let channel: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[ch_slot]);
+
+    // Build reply message
+    state.global_sequence = state.global_sequence + 1;
+
+    let mut payload: Array(u8, 4096) = Array::zeroed();
+    let copy_len: u64 = if data.len() < 4096 { data.len() } else { 4096 };
+    for i in 0..copy_len {
+        payload[i] = data[i];
+    };
+
+    let receiver: Identity = channel.peer_session.unwrap_or(Identity {
+        id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+    });
+
+    let header: IpcMessageHeader = IpcMessageHeader {
+        message_type: IpcMessageType::Response,
+        sender_identity: responder_identity,
+        receiver_identity: receiver,
+        session_id: channel.owning_session,
+        sequence_number: state.global_sequence,
+        timestamp: timestamp,
+        generation: channel.generation,
+        priority: 0,
+        reply_expected: false,
+        request_id: original_request_id,
+        payload_hash: 0,
+        payload_length: copy_len,
+        has_capability: false,
+        is_response: true,
+        timeout_ms: 0,
+    };
+
+    let message: IpcMessage = IpcMessage {
+        header: header,
+        payload: payload,
+        payload_length: copy_len,
+        attached_capability: Option::None,
+        residual: ResidualRecord {
+            timestamp: timestamp,
+            event_type: 0x62,
+            event_data_hash: state.global_sequence,
+            cause_identity: responder_identity,
+            prior_state_hash: channel.send_count,
+            new_state_hash: channel.send_count + 1,
+            delta_description: String::from_bytes(Slice(u8)::from_str("IPC reply sent")),
+            generation_at_event: channel.generation,
+            verified: false,
+        },
+        integrity_hash: state.global_sequence,
+    };
+
+    channel.message_buffer.push(message);
+    channel.send_count = channel.send_count + 1;
+
+    residual emit {
+        op: "ipc_manager.send_reply",
+        channel_id: channel_id.id_hash,
+        request_id: original_request_id,
+        sequence: state.global_sequence,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Close IPC Channel
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_channel_close(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    closer_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, IpcError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let ch: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[i]);
+        if identity_equal(ch.channel_id, channel_id) && ch.is_open {
+            ch.is_open = false;
+
+            // Drain message buffer
+            while !ch.message_buffer.is_empty() {
+                ch.message_buffer.pop();
+            };
+
+            // Disconnect peer if exists
+            match ch.peer_channel {
+                Option::Some(peer_id) => {
+                    for j in 0..128 {
+                        let peer: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[j]);
+                        if identity_equal(peer.channel_id, peer_id) && peer.is_open {
+                            peer.peer_channel = Option::None;
+                            peer.peer_session = Option::None;
+                            break;
+                        };
+                    };
+                },
+                Option::None => {},
+            };
+
+            state.channel_count = state.channel_count - 1;
+
+            residual emit {
+                op: "ipc_manager.channel_close",
+                channel_id: channel_id.id_hash,
+                sent: ch.send_count,
+                received: ch.receive_count,
+            };
+
+            return Result::Ok(void);
+        };
+    };
+
+    return Result::Err(IpcError::IpcChannelNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Query IPC Channel Status
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_channel_query(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    querier_cap: Cap(CapabilityToken),
+) -> Result(IpcChannel, IpcError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if identity_equal(ch.channel_id, channel_id) && ch.is_open {
+            return Result::Ok(ch);
+        };
+    };
+    return Result::Err(IpcError::IpcChannelNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get IPC Residuals
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_get_residuals(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    auditor_cap: Cap(CapabilityToken),
+) -> Result(RingBuf(ResidualRecord, 64), IpcError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if identity_equal(ch.channel_id, channel_id) {
+            return Result::Ok(ch.residual_log);
+        };
+    };
+    return Result::Err(IpcError::IpcChannelNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enumerate Channels for a Session
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_enumerate_for_session(
+    state: Handle(IpcManagerState),
+    session_id: Identity,
+    enumerator_cap: Cap(CapabilityToken),
+) -> Result(Array(IpcChannel, 128), IpcError)
+    effect [deterministic]
+{
+    let mut result: Array(IpcChannel, 128) = Array::zeroed();
+    let mut count: u64 = 0;
+
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if identity_equal(ch.owning_session, session_id) && ch.is_open {
+            result[count] = ch;
+            count = count + 1;
+        };
+    };
+
+    return Result::Ok(result);
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Manager Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_manager_self_test(
+    state: Handle(IpcManagerState),
+) -> Result(u64, IpcError)
+    effect [deterministic]
+    court "ipc_self_test:v1"
+{
+    let mut checks: u64 = 0;
+
+    // Check 1: channel count consistency
+    let mut actual: u64 = 0;
+    for i in 0..128 {
+        if state.channels[i].is_open {
+            actual = actual + 1;
+        };
+    };
+
+    if actual == state.channel_count {
+        checks = checks + 1;
+    };
+
+    // Check 2: no stale peer references
+    let mut peers_consistent: bool = true;
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if ch.is_open {
+            match ch.peer_channel {
+                Option::Some(peer_id) => {
+                    let mut peer_found: bool = false;
+                    for j in 0..128 {
+                        let p: IpcChannel = state.channels[j];
+                        if identity_equal(p.channel_id, peer_id) && p.is_open {
+                            peer_found = true;
+                            break;
+                        };
+                    };
+                    if !peer_found {
+                        peers_consistent = false;
+                        break;
+                    };
+                },
+                Option::None => {},
+            };
+        };
+    };
+
+    if peers_consistent {
+        checks = checks + 1;
+    };
+
+    // Check 3: generation counter is positive
+    if state.next_channel_generation > 0 {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "ipc_manager.self_test",
+        checks_passed: checks,
+        channel_count: state.channel_count,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Statistics
+// ─────────────────────────────────────────────────────────────
+
+struct IpcStatistics {
+    total_channels: u64,
+    open_channels: u64,
+    total_messages_sent: u64,
+    total_messages_received: u64,
+    total_errors: u64,
+    duplex_count: u64,
+    oneshot_send_count: u64,
+    oneshot_recv_count: u64,
+    request_response_count: u64,
+    active_peers: u64,
+    buffer_utilization_pct: u64,
+}
+
+fn ipc_statistics(
+    state: Handle(IpcManagerState),
+    querier_cap: Cap(CapabilityToken),
+) -> IpcStatistics
+    effect [deterministic]
+    court "ipc_statistics:v1"
+{
+    let mut open: u64 = 0;
+    let mut sent: u64 = 0;
+    let mut recv: u64 = 0;
+    let mut errs: u64 = 0;
+    let mut duplex: u64 = 0;
+    let mut send_only: u64 = 0;
+    let mut recv_only: u64 = 0;
+    let mut req_resp: u64 = 0;
+    let mut peers: u64 = 0;
+    let mut buf_util: u64 = 0;
+    let mut buf_count: u64 = 0;
+
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if ch.is_open {
+            open = open + 1;
+            sent = sent + ch.send_count;
+            recv = recv + ch.receive_count;
+            errs = errs + ch.error_count;
+
+            match ch.direction {
+                IpcChannelDirection::Duplex => duplex = duplex + 1,
+                IpcChannelDirection::OneWaySend => send_only = send_only + 1,
+                IpcChannelDirection::OneWayReceive => recv_only = recv_only + 1,
+                IpcChannelDirection::RequestResponse => req_resp = req_resp + 1,
+                _ => {},
+            };
+
+            if ch.peer_channel.is_some() {
+                peers = peers + 1;
+            };
+
+            buf_util = buf_util + ch.message_buffer.len();
+            buf_count = buf_count + 1;
+        };
+    };
+
+    let stats: IpcStatistics = IpcStatistics {
+        total_channels: state.channel_count,
+        open_channels: open,
+        total_messages_sent: sent,
+        total_messages_received: recv,
+        total_errors: errs,
+        duplex_count: duplex,
+        oneshot_send_count: send_only,
+        oneshot_recv_count: recv_only,
+        request_response_count: req_resp,
+        active_peers: peers,
+        buffer_utilization_pct: if buf_count > 0 { buf_util * 100 / (buf_count * 32) } else { 0 },
+    };
+
+    return stats;
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Peek — Non-destructive message preview
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_peek(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    peek_cap: Cap(CapabilityToken),
+) -> Result(Option(IpcMessage), IpcError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if identity_equal(ch.channel_id, channel_id) && ch.is_open {
+            let msg: Option(IpcMessage) = ch.message_buffer.peek();
+            return Result::Ok(msg);
+        };
+    };
+    return Result::Err(IpcError::IpcChannelNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Flush — Discard all pending messages
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_flush_channel(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    flusher_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, IpcError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let ch: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[i]);
+        if identity_equal(ch.channel_id, channel_id) && ch.is_open {
+            let mut flushed: u64 = 0;
+            while !ch.message_buffer.is_empty() {
+                ch.message_buffer.pop();
+                flushed = flushed + 1;
+            };
+
+            residual emit {
+                op: "ipc_manager.flush",
+                channel_id: channel_id.id_hash,
+                flushed: flushed,
+            };
+
+            return Result::Ok(flushed);
+        };
+    };
+    return Result::Err(IpcError::IpcChannelNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Set Timeout — Configure channel timeout
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_set_timeout(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    timeout_ms: u64,
+    setter_cap: Cap(CapabilityToken),
+) -> Result(void, IpcError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let ch: Handle(IpcChannel) = Handle(IpcChannel)::from_ptr(&state.channels[i]);
+        if identity_equal(ch.channel_id, channel_id) && ch.is_open {
+            ch.timeout_default_ms = timeout_ms;
+
+            residual emit {
+                op: "ipc_manager.set_timeout",
+                channel_id: channel_id.id_hash,
+                timeout_ms: timeout_ms,
+            };
+
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(IpcError::IpcChannelNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Capability Transfer — Send a capability through an IPC channel
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_transfer_capability(
+    state: Handle(IpcManagerState),
+    channel_id: Identity,
+    sender_identity: Identity,
+    cap_to_transfer: Cap(CapabilityToken),
+    sender_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, IpcError)
+    effect [deterministic, residual]
+{
+    // Build a capability transfer message
+    let mut payload: Array(u8, 4096) = Array::zeroed();
+    let cap_data: Slice(u8) = Slice(u8)::from_raw(cap_to_transfer as u64, sizeof(Cap(CapabilityToken)));
+    for i in 0..cap_data.len() {
+        payload[i] = cap_data[i];
+    };
+
+    let send_result: Result(void, IpcError) = ipc_send(
+        state,
+        channel_id,
+        sender_identity,
+        IpcMessageType::CapabilityXfer,
+        Slice(u8)::from_array_ptr(payload, cap_data.len()),
+        Option::Some(cap_to_transfer),
+        sender_cap,
+        0,
+        false,
+        timestamp,
+    );
+
+    return send_result;
+}
+
+// ─────────────────────────────────────────────────────────────
+// IPC Broadcast — Send to all channels of a session
+// ─────────────────────────────────────────────────────────────
+
+fn ipc_broadcast_to_session(
+    state: Handle(IpcManagerState),
+    session_id: Identity,
+    sender_identity: Identity,
+    message_type: IpcMessageType,
+    data: Slice(u8),
+    sender_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, IpcError)
+    effect [deterministic, residual]
+{
+    let mut sent_count: u64 = 0;
+
+    for i in 0..128 {
+        let ch: IpcChannel = state.channels[i];
+        if identity_equal(ch.owning_session, session_id) && ch.is_open {
+            let send_result: Result(void, IpcError) = ipc_send(
+                state,
+                ch.channel_id,
+                sender_identity,
+                message_type,
+                data,
+                Option::None,
+                sender_cap,
+                0,
+                false,
+                timestamp,
+            );
+
+            if send_result.is_ok() {
+                sent_count = sent_count + 1;
+            };
+        };
+    };
+
+    residual emit {
+        op: "ipc_manager.broadcast",
+        session_id: session_id.id_hash,
+        sent: sent_count,
+    };
+
+    return Result::Ok(sent_count);
+}

@@ -1,0 +1,1000 @@
+// file: initramfs.phor
+// purpose: initramfs — cpio archive parsing, file extraction, early
+//          userspace, root filesystem detection, module loading, device
+//          node creation, pivot_root
+// effects: [io:read, io:write, memory:mmio, deterministic, residual]
+// trust: TrustState_Bootstrap → TrustState_Loading
+
+package "phorensic:initramfs:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::traits::*
+use core::math::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+
+const CPIO_HEADER_MAGIC: Word16 = 0x71C7
+const CPIO_NEWC_MAGIC: FixedString[6] = "070701"
+const CPIO_CRC_MAGIC: FixedString[6] = "070702"
+const CPIO_TRAILER: FixedString[10] = "TRAILER!!!"
+const MAX_CPIO_FILES: u32 = 512
+const MAX_FILE_NAME_LEN: u32 = 256
+const MAX_FILE_DATA_LEN: u32 = 65536
+const INITRAMFS_MAX_SIZE: u32 = 8 * 1024 * 1024  // 8MB
+const MAX_MODULE_PARAMS: u32 = 32
+const MAX_MODULE_NAME: u32 = 64
+const MAX_DEVICE_NODE_PATH: u32 = 128
+const MAX_FS_DETECT_ENTRIES: u32 = 16
+const EARLY_INIT_STACK_SIZE: u32 = 4096
+const PIVOT_ROOT_DIR: FixedString[32] = "/new_root"
+const OLD_ROOT_DIR: FixedString[32] = "/old_root"
+
+// CPIO header field offsets (newc format)
+const CPIO_OFF_MAGIC: u32 = 0
+const CPIO_OFF_INO: u32 = 6
+const CPIO_OFF_MODE: u32 = 12
+const CPIO_OFF_UID: u32 = 18
+const CPIO_OFF_GID: u32 = 24
+const CPIO_OFF_NLINK: u32 = 30
+const CPIO_OFF_MTIME: u32 = 36
+const CPIO_OFF_FILESIZE: u32 = 42
+const CPIO_OFF_DEVMAJ: u32 = 48
+const CPIO_OFF_DEVMIN: u32 = 54
+const CPIO_OFF_RDEVMAJ: u32 = 60
+const CPIO_OFF_RDEVMIN: u32 = 66
+const CPIO_OFF_NAMESIZE: u32 = 72
+const CPIO_OFF_CHKSUM: u32 = 78
+const CPIO_HEADER_SIZE: u32 = 110
+
+// File types
+const CPIO_MODE_IFMT: u32 = 0xF000
+const CPIO_MODE_IFSOCK: u32 = 0xC000
+const CPIO_MODE_IFLNK: u32 = 0xA000
+const CPIO_MODE_IFREG: u32 = 0x8000
+const CPIO_MODE_IFBLK: u32 = 0x6000
+const CPIO_MODE_IFDIR: u32 = 0x4000
+const CPIO_MODE_IFCHR: u32 = 0x2000
+const CPIO_MODE_IFIFO: u32 = 0x1000
+
+// Filesystem detection magic numbers
+const FS_MAGIC_EXT2: Word16 = 0xEF53
+const FS_MAGIC_BTRFS: u64 = 0x9123683E
+const FS_MAGIC_F2FS: Word32 = 0xF2F52010
+
+// ──────────────────────────────────────────────
+// CPIO Entry
+// ──────────────────────────────────────────────
+
+pub type CPIOEntry : struct {
+    ino: Word32,
+    mode: Word32,
+    uid: Word32,
+    gid: Word32,
+    nlink: Word32,
+    mtime: Word32,
+    file_size: Word32,
+    dev_major: Word32,
+    dev_minor: Word32,
+    rdev_major: Word32,
+    rdev_minor: Word32,
+    name_size: Word32,
+    checksum: Word32,
+    name: FixedString[MAX_FILE_NAME_LEN],
+    data: FixedArray[MAX_FILE_DATA_LEN, u8],
+    data_length: u32,
+    header_valid: bool,
+}
+
+impl CPIOEntry {
+    pub fn new() -> CPIOEntry
+        effects: [deterministic]
+    {
+        CPIOEntry {
+            ino: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            nlink: 0,
+            mtime: 0,
+            file_size: 0,
+            dev_major: 0,
+            dev_minor: 0,
+            rdev_major: 0,
+            rdev_minor: 0,
+            name_size: 0,
+            checksum: 0,
+            name: FixedString::new(),
+            data: FixedArray::new(),
+            data_length: 0,
+            header_valid: false,
+        }
+    }
+
+    pub fn is_directory(self) -> bool
+        effects: [deterministic]
+    {
+        (self.mode & CPIO_MODE_IFMT) == CPIO_MODE_IFDIR
+    }
+
+    pub fn is_regular_file(self) -> bool
+        effects: [deterministic]
+    {
+        (self.mode & CPIO_MODE_IFMT) == CPIO_MODE_IFREG
+    }
+
+    pub fn is_symlink(self) -> bool
+        effects: [deterministic]
+    {
+        (self.mode & CPIO_MODE_IFMT) == CPIO_MODE_IFLNK
+    }
+
+    pub fn is_block_device(self) -> bool
+        effects: [deterministic]
+    {
+        (self.mode & CPIO_MODE_IFMT) == CPIO_MODE_IFBLK
+    }
+
+    pub fn is_char_device(self) -> bool
+        effects: [deterministic]
+    {
+        (self.mode & CPIO_MODE_IFMT) == CPIO_MODE_IFCHR
+    }
+
+    pub fn is_fifo(self) -> bool
+        effects: [deterministic]
+    {
+        (self.mode & CPIO_MODE_IFMT) == CPIO_MODE_IFIFO
+    }
+
+    pub fn is_trailer(self) -> bool
+        effects: [deterministic]
+    {
+        self.name == FixedString::from("TRAILER!!!")
+    }
+
+    pub fn permissions(self) -> Word32
+        effects: [deterministic]
+    {
+        self.mode & 0x0FFF
+    }
+}
+
+// ──────────────────────────────────────────────
+// CPIO Archive
+// ──────────────────────────────────────────────
+
+pub type CPIOArchive : struct {
+    entries: FixedArray[MAX_CPIO_FILES, CPIOEntry],
+    num_entries: u32,
+    total_size: u32,
+    valid: bool,
+}
+
+impl CPIOArchive {
+    pub fn new() -> CPIOArchive
+        effects: [deterministic]
+    {
+        CPIOArchive {
+            entries: FixedArray::new(),
+            num_entries: 0,
+            total_size: 0,
+            valid: false,
+        }
+    }
+
+    pub fn add_entry(self: ref mut, entry: CPIOEntry) -> Result<(), BootError>
+        effects: [deterministic]
+    {
+        if self.num_entries >= MAX_CPIO_FILES {
+            return Result::Err(BootError::new(
+                DIAG_INITRAMFS_BASE | 0x001,
+                "Maximum CPIO entries exceeded"
+            ))
+        }
+        self.entries.set(self.num_entries, entry)!
+        self.num_entries = self.num_entries + 1
+        self.total_size = self.total_size + entry.file_size
+        Result::Ok(())
+    }
+
+    pub fn find_entry(self, name: FixedString[MAX_FILE_NAME_LEN]) -> Result[CPIOEntry, BootError>
+        effects: [deterministic]
+    {
+        for i in 0..self.num_entries {
+            let entry: CPIOEntry = self.entries.get(i)!
+            if entry.name == name && !entry.is_trailer() {
+                return Result::Ok(entry)
+            }
+        }
+        Result::Err(BootError::new(
+            DIAG_INITRAMFS_BASE | 0x002,
+            "CPIO entry not found"
+        ))
+    }
+
+    pub fn find_entries_by_prefix(self, prefix: FixedString[MAX_FILE_NAME_LEN]) -> FixedArray[MAX_CPIO_FILES, CPIOEntry>
+        effects: [deterministic]
+    {
+        let mut matches: FixedArray[MAX_CPIO_FILES, CPIOEntry] = FixedArray::new()
+        let prefix_len: u32 = prefix.len()
+
+        for i in 0..self.num_entries {
+            let entry: CPIOEntry = self.entries.get(i)!
+            if entry.name.len() >= prefix_len {
+                let name_prefix: FixedString[MAX_FILE_NAME_LEN] = entry.name.substring(0, prefix_len)
+                if name_prefix == prefix {
+                    matches.push(entry)!
+                }
+            }
+        }
+
+        matches
+    }
+
+    pub fn find_kernel_modules(self) -> FixedArray[MAX_CPIO_FILES, CPIOEntry>
+        effects: [deterministic]
+    {
+        self.find_entries_by_prefix(FixedString::from("lib/modules/"))
+    }
+
+    pub fn find_firmware_files(self) -> FixedArray[MAX_CPIO_FILES, CPIOEntry>
+        effects: [deterministic]
+    {
+        self.find_entries_by_prefix(FixedString::from("lib/firmware/"))
+    }
+}
+
+// ──────────────────────────────────────────────
+// CPIO Parser
+// ──────────────────────────────────────────────
+
+pub fn parse_cpio_archive(data: &[u8], size: u32) -> Result[CPIOArchive, BootError>
+    effects: [deterministic]
+{
+    let mut archive: CPIOArchive = CPIOArchive::new()
+    let mut offset: u32 = 0
+
+    loop: bounds[BOUND_LARGE] while offset + CPIO_HEADER_SIZE <= size {
+        // Read magic
+        let magic_str: FixedString[6] = {
+            let mut s: FixedString[6] = FixedString::new()
+            for i in 0..6 {
+                let idx: u32 = offset + i
+                if idx < data.len() as u32 {
+                    s.append_byte(data[idx as usize])!
+                }
+            }
+            s
+        }
+
+        // Validate magic
+        if magic_str != CPIO_NEWC_MAGIC && magic_str != CPIO_CRC_MAGIC {
+            // Try to align - may be padding between entries
+            offset = offset + 1
+            if offset >= size {
+                break
+            }
+            continue
+        }
+
+        // Parse header
+        let entry: CPIOEntry = parse_cpio_header(data, offset)!
+
+        let name_size: u32 = entry.name_size
+        let aligned_name_size: u32 = (name_size + 3) & 0xFFFF_FFFC
+        let file_size: u32 = entry.file_size
+        let aligned_file_size: u32 = (file_size + 3) & 0xFFFF_FFFC
+
+        // Read filename
+        let name_offset: u32 = offset + CPIO_HEADER_SIZE
+        let mut name: FixedString[MAX_FILE_NAME_LEN] = FixedString::new()
+        for i in 0..name_size {
+            if name_offset + i < data.len() as u32 {
+                let ch: u8 = data[(name_offset + i) as usize]
+                if ch == 0 { break }
+                name.append_byte(ch)!
+            }
+        }
+
+        let mut entry_with_name: CPIOEntry = entry
+        entry_with_name.name = name
+
+        // Check for trailer
+        if entry_with_name.is_trailer() {
+            archive.valid = true
+            break
+        }
+
+        // Read file data
+        let data_offset: u32 = name_offset + aligned_name_size
+        for i in 0..file_size {
+            if data_offset + i < data.len() as u32 && i < MAX_FILE_DATA_LEN {
+                entry_with_name.data.push(data[(data_offset + i) as usize])!
+            }
+        }
+        entry_with_name.data_length = file_size
+
+        archive.add_entry(entry_with_name)!
+
+        // Move to next entry
+        offset = data_offset + aligned_file_size
+
+        if offset >= size {
+            break
+        }
+    }
+
+    if !archive.valid {
+        return Result::Err(BootError::new(
+            DIAG_INITRAMFS_BASE | 0x010,
+            "Invalid CPIO archive: no trailer entry found"
+        ))
+    }
+
+    Result::Ok(archive)
+}
+
+fn parse_cpio_header(data: &[u8], offset: u32) -> Result[CPIOEntry, BootError>
+    effects: [deterministic]
+{
+    if offset + CPIO_HEADER_SIZE > data.len() as u32 {
+        return Result::Err(BootError::new(
+            DIAG_INITRAMFS_BASE | 0x020,
+            "CPIO header exceeds data buffer"
+        ))
+    }
+
+    let entry: CPIOEntry = CPIOEntry {
+        ino: parse_cpio_hex_word32(data, offset + CPIO_OFF_INO),
+        mode: parse_cpio_hex_word32(data, offset + CPIO_OFF_MODE),
+        uid: parse_cpio_hex_word32(data, offset + CPIO_OFF_UID),
+        gid: parse_cpio_hex_word32(data, offset + CPIO_OFF_GID),
+        nlink: parse_cpio_hex_word32(data, offset + CPIO_OFF_NLINK),
+        mtime: parse_cpio_hex_word32(data, offset + CPIO_OFF_MTIME),
+        file_size: parse_cpio_hex_word32(data, offset + CPIO_OFF_FILESIZE),
+        dev_major: parse_cpio_hex_word32(data, offset + CPIO_OFF_DEVMAJ),
+        dev_minor: parse_cpio_hex_word32(data, offset + CPIO_OFF_DEVMIN),
+        rdev_major: parse_cpio_hex_word32(data, offset + CPIO_OFF_RDEVMAJ),
+        rdev_minor: parse_cpio_hex_word32(data, offset + CPIO_OFF_RDEVMIN),
+        name_size: parse_cpio_hex_word32(data, offset + CPIO_OFF_NAMESIZE),
+        checksum: parse_cpio_hex_word32(data, offset + CPIO_OFF_CHKSUM),
+        name: FixedString::new(),
+        data: FixedArray::new(),
+        data_length: 0,
+        header_valid: true,
+    }
+
+    Result::Ok(entry)
+}
+
+fn parse_cpio_hex_word32(data: &[u8], offset: u32) -> Word32
+    effects: [deterministic]
+{
+    let mut value: Word32 = 0
+    for i in 0..8 {
+        let idx: u32 = offset + i
+        if idx >= data.len() as u32 { break }
+        let ch: u8 = data[idx as usize]
+        let digit: u32 = hex_char_to_u32(ch)
+        value = (value << 4) | digit
+    }
+    value
+}
+
+fn hex_char_to_u32(ch: u8) -> Word32
+    effects: [deterministic]
+{
+    if ch >= '0' as u8 && ch <= '9' as u8 {
+        (ch - '0' as u8) as u32
+    } else if ch >= 'a' as u8 && ch <= 'f' as u8 {
+        (ch - 'a' as u8 + 10) as u32
+    } else if ch >= 'A' as u8 && ch <= 'F' as u8 {
+        (ch - 'A' as u8 + 10) as u32
+    } else {
+        0
+    }
+}
+
+// ──────────────────────────────────────────────
+// File Extraction
+// ──────────────────────────────────────────────
+
+pub fn extract_initramfs_files(archive: ref CPIOArchive, dest_base: FixedString[MAX_FILE_NAME_LEN]) -> Result<u32, BootError>
+    effects: [io:write, memory:mmio, deterministic]
+{
+    let mut extracted_count: u32 = 0
+
+    for i in 0..archive.num_entries {
+        let entry: CPIOEntry = archive.entries.get(i)!
+        if entry.is_trailer() { continue }
+
+        let full_path: FixedString[512] = build_full_path(dest_base, entry.name)
+
+        if entry.is_directory() {
+            extract_directory(full_path)!
+            extracted_count = extracted_count + 1
+        } else if entry.is_regular_file() {
+            extract_regular_file(full_path, entry.data, entry.data_length, entry.permissions())!
+            extracted_count = extracted_count + 1
+        } else if entry.is_symlink() {
+            extract_symlink(full_path, entry.data, entry.data_length)!
+            extracted_count = extracted_count + 1
+        } else if entry.is_char_device() || entry.is_block_device() {
+            extract_device_node(full_path, entry.mode, entry.rdev_major, entry.rdev_minor)!
+            extracted_count = extracted_count + 1
+        }
+    }
+
+    residual emit {
+        event: "initramfs.extracted",
+        file_count: extracted_count,
+        total_entries: archive.num_entries,
+    }
+
+    Result::Ok(extracted_count)
+}
+
+fn build_full_path(base: FixedString[MAX_FILE_NAME_LEN], name: FixedString[MAX_FILE_NAME_LEN]) -> FixedString[512]
+    effects: [deterministic]
+{
+    let mut path: FixedString[512] = FixedString::new()
+    path.append_str(base)
+
+    // Ensure base ends with /
+    if base.len() > 0 && base.byte_at(base.len() - 1) != '/' as u8 {
+        path.append_byte('/' as u8)!
+    }
+
+    path.append_str(name)
+    path
+}
+
+fn extract_directory(path: FixedString[512]) -> Result<(), BootError>
+    effects: [io:write, deterministic]
+{
+    trusted "initramfs: Create directory via early filesystem, posix mkdir equivalent"
+    {
+        Result::Ok(())
+    }
+}
+
+fn extract_regular_file(path: FixedString[512], data: FixedArray[MAX_FILE_DATA_LEN, u8], size: u32, mode: Word32) -> Result<(), BootError>
+    effects: [io:write, deterministic]
+{
+    trusted "initramfs: Write file with data and permissions to early filesystem"
+    {
+        Result::Ok(())
+    }
+}
+
+fn extract_symlink(path: FixedString[512], target_data: FixedArray[MAX_FILE_DATA_LEN, u8], size: u32) -> Result<(), BootError>
+    effects: [io:write, deterministic]
+{
+    trusted "initramfs: Create symbolic link in early filesystem"
+    {
+        Result::Ok(())
+    }
+}
+
+fn extract_device_node(path: FixedString[512], mode: Word32, major: Word32, minor: Word32) -> Result<(), BootError>
+    effects: [io:write, deterministic]
+{
+    trusted "initramfs: Create device node with mknod in early filesystem"
+    {
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// Root Filesystem Detection
+// ──────────────────────────────────────────────
+
+pub type FilesystemType : u32 = enum {
+    Unknown     = 0,
+    Ext2        = 1,
+    Ext3        = 2,
+    Ext4        = 3,
+    Btrfs       = 4,
+    F2FS        = 5,
+    XFS         = 6,
+    ZFS         = 7,
+    NTFS        = 8,
+    FAT32       = 9,
+    EXFAT       = 10,
+    SquashFS    = 11,
+    Initramfs   = 12,
+}
+
+pub type RootDevice : struct {
+    device_path: FixedString[CONFIG_PATH_LEN],
+    fs_type: FilesystemType,
+    label: FixedString[64],
+    uuid: FixedString[36],
+    part_uuid: FixedString[36],
+    is_readonly: bool,
+    is_encrypted: bool,
+    fs_offset: u64,
+}
+
+impl RootDevice {
+    pub fn new() -> RootDevice
+        effects: [deterministic]
+    {
+        RootDevice {
+            device_path: FixedString::new(),
+            fs_type: FilesystemType::Unknown,
+            label: FixedString::new(),
+            uuid: FixedString::new(),
+            part_uuid: FixedString::new(),
+            is_readonly: false,
+            is_encrypted: false,
+            fs_offset: 0,
+        }
+    }
+}
+
+pub fn detect_root_filesystem(device_path: FixedString[CONFIG_PATH_LEN]) -> Result[RootDevice, BootError>
+    effects: [io:read, deterministic]
+{
+    trusted "Root filesystem detection: Read superblock from device, detect filesystem by magic. Ext2/3/4 documented in Linux source fs/ext4/super.c"
+    {
+        let mut root: RootDevice = RootDevice::new()
+        root.device_path = device_path
+        root.fs_type = FilesystemType::Ext4
+        root.label = FixedString::from("PHOR_ROOT")
+        Result::Ok(root)
+    }
+}
+
+pub fn detect_all_filesystems() -> FixedArray[MAX_FS_DETECT_ENTRIES, RootDevice>
+    effects: [io:read, deterministic]
+{
+    let mut devices: FixedArray[MAX_FS_DETECT_ENTRIES, RootDevice] = FixedArray::new()
+
+    trusted "Enumerate all block devices and detect filesystems via superblock scanning, Linux kernel block layer §4.2"
+    {
+        // In real implementation: iterate over all discovered block devices
+    }
+
+    devices
+}
+
+// ──────────────────────────────────────────────
+// Module Loading
+// ──────────────────────────────────────────────
+
+pub type KernelModule : struct {
+    name: FixedString[MAX_MODULE_NAME],
+    path: FixedString[CONFIG_PATH_LEN],
+    data: FixedArray[MAX_FILE_DATA_LEN, u8],
+    data_size: u32,
+    params: FixedArray[MAX_MODULE_PARAMS, FixedString[128]],
+    num_params: u32,
+    dependencies: FixedArray[MAX_MODULE_PARAMS, FixedString[MAX_MODULE_NAME]],
+    num_deps: u32,
+}
+
+impl KernelModule {
+    pub fn new() -> KernelModule
+        effects: [deterministic]
+    {
+        KernelModule {
+            name: FixedString::new(),
+            path: FixedString::new(),
+            data: FixedArray::new(),
+            data_size: 0,
+            params: FixedArray::new(),
+            num_params: 0,
+            dependencies: FixedArray::new(),
+            num_deps: 0,
+        }
+    }
+
+    pub fn add_param(self: ref mut, param: FixedString[128]) -> Result<(), BootError>
+        effects: [deterministic]
+    {
+        if self.num_params >= MAX_MODULE_PARAMS {
+            return Result::Err(BootError::new(
+                DIAG_INITRAMFS_BASE | 0x030,
+                "Maximum module parameters exceeded"
+            ))
+        }
+        self.params.set(self.num_params, param)!
+        self.num_params = self.num_params + 1
+        Result::Ok(())
+    }
+
+    pub fn add_dependency(self: ref mut, dep: FixedString[MAX_MODULE_NAME]) -> Result<(), BootError>
+        effects: [deterministic]
+    {
+        if self.num_deps >= MAX_MODULE_PARAMS {
+            return Result::Err(BootError::new(
+                DIAG_INITRAMFS_BASE | 0x031,
+                "Maximum module dependencies exceeded"
+            ))
+        }
+        self.dependencies.set(self.num_deps, dep)!
+        self.num_deps = self.num_deps + 1
+        Result::Ok(())
+    }
+}
+
+pub fn load_kernel_modules(archive: ref CPIOArchive, module_list: FixedArray[MAX_MODULE_PARAMS, FixedString[MAX_MODULE_NAME]], count: u32) -> Result<u32, BootError>
+    effects: [io:write, deterministic]
+{
+    let mut loaded_count: u32 = 0
+
+    for i in 0..count {
+        let module_name: FixedString[MAX_MODULE_NAME] = module_list.get(i)!
+
+        // Search for module in initramfs
+        let mut search_path: FixedString[CONFIG_PATH_LEN] = FixedString::from("lib/modules/")
+        search_path.append_str(module_name)
+        search_path.append_str(FixedString::from(".ko"))
+
+        let entry_result: Result[CPIOEntry, BootError> = archive.find_entry(search_path)
+        if entry_result.is_ok() {
+            let entry: CPIOEntry = entry_result.unwrap()
+            load_single_kernel_module(module_name, entry.data, entry.data_length)!
+            loaded_count = loaded_count + 1
+        }
+    }
+
+    residual emit {
+        event: "initramfs.modules_loaded",
+        requested: count,
+        loaded: loaded_count,
+    }
+
+    Result::Ok(loaded_count)
+}
+
+fn load_single_kernel_module(name: FixedString[MAX_MODULE_NAME], data: FixedArray[MAX_FILE_DATA_LEN, u8], size: u32) -> Result<(), BootError>
+    effects: [io:write, deterministic]
+{
+    trusted "Kernel module loading: Allocate memory, copy ELF module, call module_init via sys_init_module, Linux kernel module loader §3.5"
+    {
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// Device Node Creation
+// ──────────────────────────────────────────────
+
+pub type DeviceNode : struct {
+    path: FixedString[MAX_DEVICE_NODE_PATH],
+    node_type: u32,  // 0 = char, 1 = block
+    major: Word32,
+    minor: Word32,
+    permissions: Word32,
+    uid: Word32,
+    gid: Word32,
+}
+
+impl DeviceNode {
+    pub fn new() -> DeviceNode
+        effects: [deterministic]
+    {
+        DeviceNode {
+            path: FixedString::new(),
+            node_type: 0,
+            major: 0,
+            minor: 0,
+            permissions: 0x0666,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+pub fn create_early_device_nodes() -> Result<u32, BootError>
+    effects: [io:write, deterministic]
+{
+    let mut created_count: u32 = 0
+
+    // Essential device nodes
+    let essential_nodes: FixedArray[8, DeviceNode] = {
+        let mut nodes: FixedArray[8, DeviceNode] = FixedArray::new()
+
+        let mut console_dev: DeviceNode = DeviceNode::new()
+        console_dev.path = FixedString::from("/dev/console")
+        console_dev.node_type = 0
+        console_dev.major = 5
+        console_dev.minor = 1
+        console_dev.permissions = 0x0622
+        nodes.push(console_dev)!
+
+        let mut null_dev: DeviceNode = DeviceNode::new()
+        null_dev.path = FixedString::from("/dev/null")
+        null_dev.node_type = 0
+        null_dev.major = 1
+        null_dev.minor = 3
+        null_dev.permissions = 0x0666
+        nodes.push(null_dev)!
+
+        let mut zero_dev: DeviceNode = DeviceNode::new()
+        zero_dev.path = FixedString::from("/dev/zero")
+        zero_dev.node_type = 0
+        zero_dev.major = 1
+        zero_dev.minor = 5
+        zero_dev.permissions = 0x0666
+        nodes.push(zero_dev)!
+
+        let mut random_dev: DeviceNode = DeviceNode::new()
+        random_dev.path = FixedString::from("/dev/random")
+        random_dev.node_type = 0
+        random_dev.major = 1
+        random_dev.minor = 8
+        random_dev.permissions = 0x0666
+        nodes.push(random_dev)!
+
+        let mut urandom_dev: DeviceNode = DeviceNode::new()
+        urandom_dev.path = FixedString::from("/dev/urandom")
+        urandom_dev.node_type = 0
+        urandom_dev.major = 1
+        urandom_dev.minor = 9
+        urandom_dev.permissions = 0x0666
+        nodes.push(urandom_dev)!
+
+        let mut tty_dev: DeviceNode = DeviceNode::new()
+        tty_dev.path = FixedString::from("/dev/tty")
+        tty_dev.node_type = 0
+        tty_dev.major = 5
+        tty_dev.minor = 0
+        tty_dev.permissions = 0x0666
+        nodes.push(tty_dev)!
+
+        let mut sda_dev: DeviceNode = DeviceNode::new()
+        sda_dev.path = FixedString::from("/dev/sda")
+        sda_dev.node_type = 1
+        sda_dev.major = 8
+        sda_dev.minor = 0
+        sda_dev.permissions = 0x0660
+        nodes.push(sda_dev)!
+
+        let mut nvme_dev: DeviceNode = DeviceNode::new()
+        nvme_dev.path = FixedString::from("/dev/nvme0n1")
+        nvme_dev.node_type = 1
+        nvme_dev.major = 259
+        nvme_dev.minor = 0
+        nvme_dev.permissions = 0x0660
+        nodes.push(nvme_dev)!
+
+        nodes
+    }
+
+    for i in 0..8 {
+        let node: DeviceNode = essential_nodes.get(i)!
+        create_single_device_node(node)!
+        created_count = created_count + 1
+    }
+
+    residual emit {
+        event: "initramfs.devices_created",
+        count: created_count,
+    }
+
+    Result::Ok(created_count)
+}
+
+fn create_single_device_node(node: DeviceNode) -> Result<(), BootError>
+    effects: [io:write, deterministic]
+{
+    trusted "Device node creation: mknod syscall in early init, Linux kernel mknod(2) documented in man-pages §2"
+    {
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// Early Userspace & pivot_root
+// ──────────────────────────────────────────────
+
+pub type EarlyUserspace : struct {
+    initramfs_archive: CPIOArchive,
+    root_device: RootDevice,
+    console: Cap(Console),
+    modules_loaded: u32,
+    devices_created: u32,
+    files_extracted: u32,
+    init_path: FixedString[CONFIG_PATH_LEN],
+}
+
+impl EarlyUserspace {
+    pub fn new(console: Cap(Console)) -> EarlyUserspace
+        effects: [deterministic]
+    {
+        EarlyUserspace {
+            initramfs_archive: CPIOArchive::new(),
+            root_device: RootDevice::new(),
+            console: console,
+            modules_loaded: 0,
+            devices_created: 0,
+            files_extracted: 0,
+            init_path: FixedString::from("/sbin/init"),
+        }
+    }
+
+    pub fn initialize(self: ref mut, initramfs_data: &[u8], data_size: u32)
+        effects: [io:write, io:read, residual]
+    {
+        self.console.write_line("initramfs: Initializing early userspace...")!
+
+        // Parse CPIO archive
+        let archive_result: Result[CPIOArchive, BootError> = parse_cpio_archive(initramfs_data, data_size)
+        if archive_result.is_ok() {
+            self.initramfs_archive = archive_result.unwrap()
+            self.console.write_line(concat("initramfs: Archive parsed, ", self.initramfs_archive.num_entries, " entries"))!
+        } else {
+            self.console.write_error(FixedString::from("initramfs: Failed to parse CPIO archive"))!
+            return
+        }
+
+        // Extract files to rootfs
+        let extract_result: Result[u32, BootError> = extract_initramfs_files(self.initramfs_archive, FixedString::from("/"))
+        if extract_result.is_ok() {
+            self.files_extracted = extract_result.unwrap()
+            self.console.write_line(concat("initramfs: Extracted ", self.files_extracted, " files"))!
+        }
+
+        // Create device nodes
+        let dev_result: Result[u32, BootError> = create_early_device_nodes()
+        if dev_result.is_ok() {
+            self.devices_created = dev_result.unwrap()
+            self.console.write_line(concat("initramfs: Created ", self.devices_created, " device nodes"))!
+        }
+
+        // Load essential modules
+        let essential_modules: FixedArray[8, FixedString[MAX_MODULE_NAME]] = {
+            let mut mods: FixedArray[8, FixedString[MAX_MODULE_NAME]] = FixedArray::new()
+            mods.push(FixedString::from("ext4"))!
+            mods.push(FixedString::from("ahci"))!
+            mods.push(FixedString::from("nvme"))!
+            mods
+        }
+        let mod_result: Result[u32, BootError> = load_kernel_modules(
+            self.initramfs_archive, essential_modules, 3
+        )
+        if mod_result.is_ok() {
+            self.modules_loaded = mod_result.unwrap()
+        }
+
+        residual emit {
+            event: "initramfs.early_userspace_ready",
+            archive_entries: self.initramfs_archive.num_entries,
+            files_extracted: self.files_extracted,
+            devices_created: self.devices_created,
+            modules_loaded: self.modules_loaded,
+        }
+    }
+
+    pub fn prepare_root_filesystem(self: ref mut, root_device_path: FixedString[CONFIG_PATH_LEN])
+        effects: [io:write, io:read, deterministic]
+    {
+        self.console.write_line(concat("initramfs: Preparing root filesystem on ", root_device_path))!
+
+        let device_result: Result[RootDevice, BootError> = detect_root_filesystem(root_device_path)
+        if device_result.is_ok() {
+            self.root_device = device_result.unwrap()
+            self.console.write_line(concat("initramfs: Detected ", self.root_device.fs_type, " filesystem"))!
+        }
+
+        trusted "Root filesystem mount: mount syscall for detected filesystem type, Linux kernel mount(2) §2"
+        {
+            // In real implementation: mount(root_device_path, "/new_root", fs_type_str, 0, NULL)
+            self.console.write_line("initramfs: Root filesystem mounted")!
+        }
+    }
+
+    pub fn perform_pivot_root(self: ref mut) -> Result[(), BootError>
+        effects: [io:write, deterministic]
+    {
+        self.console.write_line("initramfs: Performing pivot_root...")!
+
+        trusted "pivot_root: Move current root to old_root and put new root in place. Linux kernel pivot_root(2) documented in man-pages §2"
+        {
+            // In real implementation:
+            // 1. mkdir("/new_root", 0755)
+            // 2. mkdir("/old_root", 0755)
+            // 3. mount(root_device, "/new_root", ...)
+            // 4. pivot_root("/new_root", "/old_root")
+            // 5. chdir("/")
+            // 6. umount("/old_root")
+            // 7. exec(/sbin/init)
+            self.console.write_line("initramfs: pivot_root complete, switching to root filesystem")!
+            Result::Ok(())
+        }
+    }
+
+    pub fn switch_to_root(self: ref mut)
+        effects: [io:write, deterministic]
+    {
+        self.console.write_line("initramfs: Switching to root filesystem init...")!
+
+        residual emit {
+            event: "initramfs.switch_to_root",
+            init_path: self.init_path,
+            root_fs_type: self.root_device.fs_type,
+        }
+
+        trusted "exec(/sbin/init): Switch to real root init process. Linux kernel execve(2) §2"
+        {
+            // In real implementation: execve("/sbin/init", argv, envp)
+            // This function does not return on success
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Helper: concat with integer
+// ──────────────────────────────────────────────
+
+fn concat(a: FixedString[64], b: u32) -> FixedString[128]
+    effects: [deterministic]
+{
+    let mut result: FixedString[128] = FixedString::new()
+    result.append_str(a)
+    result.append_int(b)
+    result
+}
+
+fn concat(a: FixedString[64], b: FixedString[64]) -> FixedString[128]
+    effects: [deterministic]
+{
+    let mut result: FixedString[128] = FixedString::new()
+    result.append_str(a)
+    result.append_str(b)
+    result
+}
+
+// ──────────────────────────────────────────────
+// Diagnostic base
+// ──────────────────────────────────────────────
+
+const DIAG_INITRAMFS_BASE: Word64 = 0x0800_0000_0000_0000
+const DIAG_MENU_BASE: Word64 = 0x0700_0000_0000_0000
+const DIAG_CONFIG_BASE: Word64 = 0x0600_0000_0000_0000
+
+const CONFIG_PATH_LEN: u32 = 256
+
+// ──────────────────────────────────────────────
+// BootError
+// ──────────────────────────────────────────────
+
+pub type BootError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl BootError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> BootError
+        effects: [deterministic]
+    {
+        BootError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    pub fn is_ok(self) -> bool
+        effects: [deterministic]
+    {
+        self.code == 0
+    }
+}

@@ -1,0 +1,308 @@
+// phor_live_revocation.phor — Live Driver Revocation & Recovery
+//
+// Demonstrates:
+//   - Active driver operation with periodic trust checks
+//   - Trust drift detection during live operation
+//   - Revocation flow: active -> error -> recovery attempt
+//   - Re-verification after revocation
+//   - Residual emission at every state transition
+//   - Bounded retry with max attempts
+//
+// Compilation: accepted
+// Trust state: Observed
+
+package "phorensic:phor_live_revocation:v1.0";
+
+// ── Constants ───────────────────────────────────────────
+
+const MAX_RETRY_ATTEMPTS: u64 = 3;
+const MAX_OPS_BEFORE_CHECK: u64 = 10;
+const MAX_HISTORY: u64 = 16;
+
+// ── Driver States ──────────────────────────────────────
+
+type DrvState = u8;
+
+const STATE_IDLE: DrvState = 0;
+const STATE_ACTIVE: DrvState = 1;
+const STATE_DRIFT: DrvState = 2;
+const STATE_REVOKED: DrvState = 3;
+const STATE_RECOVERING: DrvState = 4;
+const STATE_RESTORED: DrvState = 5;
+
+// ── Operation Record ───────────────────────────────────
+
+struct OpRecord {
+    op_id: u64,
+    state_before: DrvState,
+    state_after: DrvState,
+    tick: u64,
+    success: bool,
+}
+
+impl OpRecord {
+    fn new(id: u64, before: DrvState, after: DrvState, tick: u64, ok: bool) -> OpRecord
+        effect [compute]
+    {
+        return OpRecord {
+            op_id: id,
+            state_before: before,
+            state_after: after,
+            tick: tick,
+            success: ok,
+        };
+    }
+}
+
+// ── Live Driver ────────────────────────────────────────
+
+struct LiveDriver {
+    driver_id: u64,
+    name: Array(u8, 32),
+    name_len: u64,
+    state: DrvState,
+    ops_since_check: u64,
+    trust_ok: bool,
+    retry_count: u64,
+    history: Array(OpRecord, 16),
+    history_count: u64,
+    total_ops: u64,
+    revoked_count: u64,
+}
+
+impl LiveDriver {
+    fn new(id: u64, name: Array(u8, 32), nlen: u64) -> LiveDriver
+        effect [compute]
+    {
+        return LiveDriver {
+            driver_id: id,
+            name: name,
+            name_len: nlen,
+            state: STATE_IDLE,
+            ops_since_check: 0,
+            trust_ok: true,
+            retry_count: 0,
+            history: Array::splat_zeroed(),
+            history_count: 0,
+            total_ops: 0,
+            revoked_count: 0,
+        };
+    }
+
+    fn activate(mut self) -> LiveDriver
+        effect [compute, residual]
+    {
+        self.state = STATE_ACTIVE;
+        self.trust_ok = true;
+        self = self.record_op(0, STATE_IDLE, STATE_ACTIVE, true);
+
+        residual emit {
+            op: "live_drv.activated",
+            id: self.driver_id,
+        };
+
+        return self;
+    }
+
+    fn perform_op(mut self, tick: u64) -> LiveDriver
+        effect [compute, residual]
+    {
+        if self.state != STATE_ACTIVE { return self; }
+
+        self.total_ops = self.total_ops + 1;
+        self.ops_since_check = self.ops_since_check + 1;
+
+        // Periodic trust check
+        if self.ops_since_check >= MAX_OPS_BEFORE_CHECK {
+            self = self.check_trust(tick);
+            self.ops_since_check = 0;
+        }
+
+        if self.state == STATE_ACTIVE {
+            self = self.record_op(self.total_ops, STATE_ACTIVE, STATE_ACTIVE, true);
+        }
+
+        return self;
+    }
+
+    fn check_trust(mut self, tick: u64) -> LiveDriver
+        effect [compute, residual]
+    {
+        // Simulate trust check: every 4th check fails (drift)
+        let check_num: u64 = self.total_ops / MAX_OPS_BEFORE_CHECK;
+        if check_num > 0 && check_num % 4 == 0 {
+            self.trust_ok = false;
+            self.state = STATE_DRIFT;
+            self.revoked_count = self.revoked_count + 1;
+
+            residual emit {
+                op: "live_drv.drift_detected",
+                id: self.driver_id,
+                check: check_num,
+                tick: tick,
+            };
+        } else {
+            self.trust_ok = true;
+        }
+
+        return self;
+    }
+
+    fn revoke(mut self) -> LiveDriver
+        effect [compute, residual]
+    {
+        self.state = STATE_REVOKED;
+        self = self.record_op(0, STATE_DRIFT, STATE_REVOKED, false);
+
+        residual emit {
+            op: "live_drv.revoked",
+            id: self.driver_id,
+            total_ops: self.total_ops,
+            revoked_count: self.revoked_count,
+        };
+
+        return self;
+    }
+
+    fn recover(mut self) -> LiveDriver
+        effect [compute, residual]
+    {
+        if self.state != STATE_REVOKED { return self; }
+        if self.retry_count >= MAX_RETRY_ATTEMPTS { return self; }
+
+        self.retry_count = self.retry_count + 1;
+        self.state = STATE_RECOVERING;
+
+        residual emit {
+            op: "live_drv.recovery_attempt",
+            id: self.driver_id,
+            attempt: self.retry_count,
+        };
+
+        // Simulate successful recovery if retries remain
+        if self.retry_count < MAX_RETRY_ATTEMPTS {
+            self.trust_ok = true;
+            self.state = STATE_RESTORED;
+            self.ops_since_check = 0;
+
+            residual emit {
+                op: "live_drv.recovered",
+                id: self.driver_id,
+            };
+
+            // Reactivate
+            self = self.activate();
+        } else {
+            // Max retries exceeded — stay revoked
+            residual emit {
+                op: "live_drv.max_retries",
+                id: self.driver_id,
+            };
+        }
+
+        return self;
+    }
+
+    fn is_active(self) -> bool
+        effect [compute]
+    {
+        return self.state == STATE_ACTIVE;
+    }
+
+    fn is_revoked(self) -> bool
+        effect [compute]
+    {
+        return self.state == STATE_REVOKED;
+    }
+
+    fn state_label(self) -> u8
+        effect [compute]
+    {
+        return self.state;
+    }
+
+    fn total_ops(self) -> u64
+        effect [compute]
+    {
+        return self.total_ops;
+    }
+
+    fn record_op(mut self, op_id: u64, before: DrvState, after: DrvState, ok: bool) -> LiveDriver
+        effect [compute]
+    {
+        if self.history_count < MAX_HISTORY {
+            self.history[self.history_count] = OpRecord::new(op_id, before, after, 0, ok);
+            self.history_count = self.history_count + 1;
+        }
+        return self;
+    }
+}
+
+// ── Test ───────────────────────────────────────────────
+
+fn test_live_revocation() -> bool
+    effect [compute, residual]
+{
+    // Create driver
+    let mut name: Array(u8, 32) = Array::splat(0);
+    name[0] = 0x53; name[1] = 0x65; name[2] = 0x72; // "Ser"
+    name[3] = 0x69; name[4] = 0x61; name[5] = 0x6C; // "ial"
+    let mut drv: LiveDriver = LiveDriver::new(1, name, 6);
+
+    // Activate
+    drv = drv.activate();
+    assert(drv.is_active(), "live: driver activated");
+
+    // Perform operations (triggers periodic trust checks)
+    let mut tick: u64 = 0;
+    for i in 0..25 {
+        tick = tick + 1;
+        drv = drv.perform_op(tick);
+    }
+    assert(drv.total_ops() == 25, "live: 25 ops performed");
+
+    // The trust check at op 20 should have failed (20/10 = 2, 2%4 != 0)
+    // Actually: checks happen at ops 10, 20. 10/10=1 1%4!=0, 20/10=2 2%4!=0
+    // Check at op 30: 30/10=3 3%4!=0, check at op 40: 40/10=4 4%4==0 -> drift
+    // Let's do more ops to trigger drift
+    for i in 0..20 {
+        tick = tick + 1;
+        drv = drv.perform_op(tick);
+    }
+    // Now at 45 ops, check happened at 40 (40/10=4, 4%4==0) -> drift
+    assert(drv.state_label() == STATE_DRIFT, "live: drift detected after check");
+
+    // Revoke
+    drv = drv.revoke();
+    assert(drv.is_revoked(), "live: driver revoked");
+
+    // Recover
+    drv = drv.recover();
+    assert(drv.is_active(), "live: driver recovered and reactivated");
+
+    // Second drift + recovery
+    for i in 0..45 {
+        tick = tick + 1;
+        drv = drv.perform_op(tick);
+    }
+    drv = drv.revoke();
+    drv = drv.recover();
+    assert(drv.is_active(), "live: second recovery successful");
+
+    return true;
+}
+
+fn main(console: Cap(Console)) -> void
+    effect [io:write, compute, residual]
+{
+    let passed: bool = test_live_revocation();
+    assert(passed, "live revocation: all tests pass");
+
+    console.write(Str::from("Live Driver Revocation:"));
+    console.write(Str::from("  Driver activation and operation: PASS"));
+    console.write(Str::from("  Periodic trust checking: PASS"));
+    console.write(Str::from("  Drift detection during live ops: PASS"));
+    console.write(Str::from("  Revocation flow: PASS"));
+    console.write(Str::from("  Recovery and reactivation: PASS"));
+    console.write(Str::from("Live revocation demo passed!"));
+}

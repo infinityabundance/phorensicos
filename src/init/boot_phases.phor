@@ -1,0 +1,1141 @@
+// file: boot_phases.phor
+// purpose: Boot phases: phase definitions, phase transitions, prerequisites,
+//          timeout handling, recovery, boot residual recording. All operations
+//          use bounded loops and record residuals for every phase transition
+//          and boot event.
+// evidence: INIT-BP-ARCH-001 through INIT-BP-ARCH-230
+// residual: Every boot phase transition, timeout, recovery, and failure
+//           records a residual for the complete boot audit trail.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use process::process::*
+use init::init::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-DIAG-001 through INIT-BP-DIAG-010
+
+const DIAG_BP_BASE           : Word64 = Word64::from_u64(0xC200)
+const DIAG_BP_OK             : Word64 = DIAG_BP_BASE | 0x000
+const DIAG_BP_TRANSITION     : Word64 = DIAG_BP_BASE | 0x001
+const DIAG_BP_TIMEOUT        : Word64 = DIAG_BP_BASE | 0x002
+const DIAG_BP_FAILURE        : Word64 = DIAG_BP_BASE | 0x003
+const DIAG_BP_RECOVERY       : Word64 = DIAG_BP_BASE | 0x004
+const DIAG_BP_PREREQ_FAIL    : Word64 = DIAG_BP_BASE | 0x005
+const DIAG_BP_BOUNDS         : Word64 = DIAG_BP_BASE | 0x006
+const DIAG_BP_INVALID_PHASE  : Word64 = DIAG_BP_BASE | 0x007
+const DIAG_BP_RECORDING      : Word64 = DIAG_BP_BASE | 0x008
+
+// ──────────────────────────────────────────────
+// Boot Phase Constants
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-CONST-001 through INIT-BP-CONST-025
+
+const MAX_BOOT_PHASES           : u32 = 24
+const MAX_PHASE_PREREQUISITES   : u32 = 16
+const MAX_PHASE_TIMEOUT_HANDLERS: u32 = 8
+const MAX_RECOVERY_ACTIONS      : u32 = 16
+const MAX_TRANSITION_RECORDS    : u32 = 32
+const MAX_PHASE_RESIDUALS       : u32 = 64
+const PHASE_NAME_MAX_LEN        : u32 = 48
+const PHASE_DESC_MAX_LEN        : u32 = 128
+const RECOVERY_ACTION_MAX       : u32 = 16
+
+// Phase IDs (extended from boot stage IDs)
+const PHASE_ROM_LOAD           : u32 = 0
+const PHASE_SECURITY_INIT      : u32 = 1
+const PHASE_HARDWARE_PROBE     : u32 = 2
+const PHASE_MEMORY_INIT        : u32 = 3
+const PHASE_PAGE_TABLE_INIT    : u32 = 4
+const PHASE_KERNEL_LOAD        : u32 = 5
+const PHASE_CPU_FEATURES       : u32 = 6
+const PHASE_INTERRUPT_INIT     : u32 = 7
+const PHASE_SCHEDULER_INIT     : u32 = 8
+const PHASE_PROCESS_INIT       : u32 = 9
+const PHASE_DRIVER_INIT        : u32 = 10
+const PHASE_FILESYSTEM_INIT    : u32 = 11
+const PHASE_SERVICE_INIT       : u32 = 12
+const PHASE_NETWORK_INIT       : u32 = 13
+const PHASE_USER_SPACE         : u32 = 14
+const PHASE_LOGIN_READY        : u32 = 15
+const PHASE_BOOT_COMPLETE      : u32 = 16
+
+// Phase States
+const PHASE_STATE_INACTIVE     : u8 = 0
+const PHASE_STATE_PENDING      : u8 = 1
+const PHASE_STATE_ACTIVE       : u8 = 2
+const PHASE_STATE_COMPLETED    : u8 = 3
+const PHASE_STATE_FAILED       : u8 = 4
+const PHASE_STATE_TIMEOUT      : u8 = 5
+const PHASE_STATE_RECOVERED    : u8 = 6
+const PHASE_STATE_SKIPPED      : u8 = 7
+
+// Phase Flags
+const PHASE_FLAG_CRITICAL      : u32 = 0x01
+const PHASE_FLAG_RECOVERABLE   : u32 = 0x02
+const PHASE_FLAG_SKIPPABLE     : u32 = 0x04
+const PHASE_FLAG_RETRY         : u32 = 0x08
+const PHASE_FLAG_MEASURE       : u32 = 0x10
+const PHASE_FLAG_VERIFY        : u32 = 0x20
+
+// Recovery Types
+const RECOVERY_RETRY           : u8 = 0
+const RECOVERY_SKIP            : u8 = 1
+const RECOVERY_ALTERNATIVE     : u8 = 2
+const RECOVERY_ABORT           : u8 = 3
+
+// ──────────────────────────────────────────────
+// Boot Phase
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-PHASE-001 through INIT-BP-PHASE-035
+
+pub type BootPhase : struct {
+    phase_id: u32,
+    name: FixedString[PHASE_NAME_MAX_LEN],
+    description: FixedString[PHASE_DESC_MAX_LEN],
+    state: u8,
+    flags: u32,
+    prerequisites: FixedArray[MAX_PHASE_PREREQUISITES, u32],
+    num_prerequisites: u32,
+    timeout_us: u64,
+    start_time: Word64,
+    end_time: Word64,
+    duration_us: u64,
+    retry_count: u32,
+    max_retries: u32,
+    error_code: Word64,
+    error_message: FixedString[128],
+    recovery_type: u8,
+    init_fn: u64,
+    cleanup_fn: u64,
+    generation: Word32,
+}
+
+impl BootPhase {
+    pub fn new(phase_id: u32, name: FixedString[PHASE_NAME_MAX_LEN],
+               timeout_us: u64) -> BootPhase
+        effects: [deterministic]
+    {
+        BootPhase {
+            phase_id: phase_id,
+            name: name,
+            description: FixedString::new(),
+            state: PHASE_STATE_INACTIVE,
+            flags: PHASE_FLAG_CRITICAL | PHASE_FLAG_RECOVERABLE,
+            prerequisites: FixedArray::new(),
+            num_prerequisites: 0,
+            timeout_us: timeout_us,
+            start_time: Word64::zero(),
+            end_time: Word64::zero(),
+            duration_us: 0,
+            retry_count: 0,
+            max_retries: 3,
+            error_code: Word64::zero(),
+            error_message: FixedString::new(),
+            recovery_type: RECOVERY_RETRY,
+            init_fn: 0,
+            cleanup_fn: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn add_prerequisite(self: ref mut, prereq_phase_id: u32)
+        -> Result[(), InitError>
+        effects: [deterministic]
+    {
+        if self.num_prerequisites >= MAX_PHASE_PREREQUISITES {
+            return Result::Err(init_error(
+                DIAG_BP_BOUNDS,
+                FixedString[128]::from_slice("Too many prerequisites")))
+        }
+        self.prerequisites.push(prereq_phase_id);
+        self.num_prerequisites = self.num_prerequisites + 1
+        Result::Ok(())
+    }
+
+    pub fn set_description(self: ref mut, desc: FixedString[PHASE_DESC_MAX_LEN])
+        effects: [deterministic]
+    {
+        self.description = desc
+    }
+
+    pub fn set_init_fn(self: ref mut, fn_ptr: u64)
+        effects: [deterministic]
+    {
+        self.init_fn = fn_ptr
+    }
+
+    pub fn set_cleanup_fn(self: ref mut, fn_ptr: u64)
+        effects: [deterministic]
+    {
+        self.cleanup_fn = fn_ptr
+    }
+
+    pub fn set_state(self: ref mut, state: u8)
+        effects: [deterministic]
+    {
+        self.state = state
+        self.generation.bump()
+    }
+
+    pub fn is_completed(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == PHASE_STATE_COMPLETED
+    }
+
+    pub fn is_failed(self) -> bool
+        errors: [deterministic]
+    {
+        self.state == PHASE_STATE_FAILED ||
+        self.state == PHASE_STATE_TIMEOUT
+    }
+
+    pub fn can_retry(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & PHASE_FLAG_RETRY) != 0 &&
+        self.retry_count < self.max_retries
+    }
+
+    pub fn is_skippable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & PHASE_FLAG_SKIPPABLE) != 0
+    }
+
+    pub fn is_critical(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & PHASE_FLAG_CRITICAL) != 0
+    }
+
+    pub fn is_recoverable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & PHASE_FLAG_RECOVERABLE) != 0
+    }
+
+    pub fn enter(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = PHASE_STATE_ACTIVE
+        self.start_time = __builtin_read_timestamp()
+        self.generation.bump()
+    }
+
+    pub fn complete(self: ref mut)
+        effects: [deterministic]
+    {
+        self.end_time = __builtin_read_timestamp()
+        let start: u64 = self.start_time.to_u64()
+        let end: u64 = self.end_time.to_u64()
+        self.duration_us = end - start
+        self.state = PHASE_STATE_COMPLETED
+        self.generation.bump()
+    }
+
+    pub fn fail(self: ref mut, code: Word64, message: FixedString[128])
+        effects: [deterministic]
+    {
+        self.state = PHASE_STATE_FAILED
+        self.error_code = code
+        self.error_message = message
+        self.end_time = __builtin_read_timestamp()
+        let start: u64 = self.start_time.to_u64()
+        let end: u64 = self.end_time.to_u64()
+        self.duration_us = end - start
+        self.generation.bump()
+    }
+
+    pub fn timeout(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = PHASE_STATE_TIMEOUT
+        self.end_time = __builtin_read_timestamp()
+        let start: u64 = self.start_time.to_u64()
+        let end: u64 = self.end_time.to_u64()
+        self.duration_us = end - start
+        self.error_code = DIAG_BP_TIMEOUT
+        self.error_message = FixedString[128]::from_slice("Phase timeout")
+        self.generation.bump()
+    }
+
+    pub fn prerequisites_met(self, phases: ref FixedArray[MAX_BOOT_PHASES, BootPhase]) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_prerequisites
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_prerequisites {
+            let prereq_id: u32 = self.prerequisites.get(i)
+            if prereq_id >= phases.len() {
+                return false
+            }
+            let prereq: ref BootPhase = phases.get(prereq_id)
+            if !prereq.is_completed() && !prereq.is_skippable() {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn exceeded_timeout(self) -> bool
+        effects: [deterministic]
+    {
+        if self.timeout_us == 0 {
+            return false  // No timeout
+        }
+        let now: u64 = __builtin_read_timestamp()
+        let elapsed: u64 = now - self.start_time.to_u64()
+        elapsed > self.timeout_us
+    }
+
+    pub fn run_init_fn(self)
+        effects: [deterministic, io]
+    {
+        if self.init_fn != 0 {
+            // trust: call phase initialization function
+            trusted("boot phase init function execution") {
+                let init: fn() = __builtin_fn_ptr(self.init_fn)
+                init()
+            }
+        }
+    }
+
+    pub fn run_cleanup_fn(self)
+        effects: [deterministic]
+    {
+        if self.cleanup_fn != 0 && self.state == PHASE_STATE_FAILED {
+            // trust: call phase cleanup function
+            trusted("boot phase cleanup function execution") {
+                let cleanup: fn() = __builtin_fn_ptr(self.cleanup_fn)
+                cleanup()
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Transition Record
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-TRANS-001 through INIT-BP-TRANS-015
+
+pub type TransitionRecord : struct {
+    from_phase: u32,
+    to_phase: u32,
+    timestamp: Word64,
+    success: bool,
+    reason: FixedString[64],
+}
+
+impl TransitionRecord {
+    pub fn new(from: u32, to: u32, success: bool,
+               reason: FixedString[64]) -> TransitionRecord
+        effects: [deterministic]
+    {
+        TransitionRecord {
+            from_phase: from,
+            to_phase: to,
+            timestamp: __builtin_read_timestamp(),
+            success: success,
+            reason: reason,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Recovery Action
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-RECOV-001 through INIT-BP-RECOV-015
+
+pub type RecoveryAction : struct {
+    action_id: u32,
+    phase_id: u32,
+    recovery_type: u8,
+    action_fn: u64,
+    description: FixedString[128],
+    is_active: bool,
+}
+
+impl RecoveryAction {
+    pub fn new(action_id: u32, phase_id: u32, recovery_type: u8,
+               action_fn: u64) -> RecoveryAction
+        effects: [deterministic]
+    {
+        RecoveryAction {
+            action_id: action_id,
+            phase_id: phase_id,
+            recovery_type: recovery_type,
+            action_fn: action_fn,
+            description: FixedString::new(),
+            is_active: true,
+        }
+    }
+
+    pub fn execute(self)
+        effects: [deterministic, io]
+    {
+        if self.action_fn != 0 {
+            // trust: execute recovery action
+            trusted("recovery action execution") {
+                let action: fn() = __builtin_fn_ptr(self.action_fn)
+                action()
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Phase Residual Entry
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-RESID-001 through INIT-BP-RESID-012
+
+pub type PhaseResidual : struct {
+    phase_id: u32,
+    state: u8,
+    code: Word64,
+    message: FixedString[128],
+    timestamp: Word64,
+    is_emitted: bool,
+}
+
+impl PhaseResidual {
+    pub fn new(phase_id: u32, state: u8, code: Word64,
+               message: FixedString[128]) -> PhaseResidual
+        effects: [deterministic]
+    {
+        PhaseResidual {
+            phase_id: phase_id,
+            state: state,
+            code: code,
+            message: message,
+            timestamp: __builtin_read_timestamp(),
+            is_emitted: false,
+        }
+    }
+
+    pub fn mark_emitted(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_emitted = true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Boot Phase Manager
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-MGR-001 through INIT-BP-MGR-120
+
+pub type BootPhaseManager : struct {
+    phases: FixedArray[MAX_BOOT_PHASES, BootPhase],
+    num_phases: u32,
+    current_phase: u32,
+    transitions: FixedArray[MAX_TRANSITION_RECORDS, TransitionRecord],
+    num_transitions: u32,
+    recovery_actions: FixedArray[MAX_RECOVERY_ACTIONS, RecoveryAction],
+    num_recovery_actions: u32,
+    residuals: FixedArray[MAX_PHASE_RESIDUALS, PhaseResidual],
+    num_residuals: u32,
+    boot_id: Word64,
+    start_time: Word64,
+    end_time: Word64,
+    total_phase_duration_us: u64,
+    phase_failures: u32,
+    recovery_successes: u32,
+    recovery_failures: u32,
+    is_boot_in_progress: bool,
+    generation: Word32,
+}
+
+impl BootPhaseManager {
+    pub fn new(boot_id: Word64) -> BootPhaseManager
+        effects: [deterministic]
+    {
+        BootPhaseManager {
+            phases: FixedArray::new(),
+            num_phases: 0,
+            current_phase: 0,
+            transitions: FixedArray::new(),
+            num_transitions: 0,
+            recovery_actions: FixedArray::new(),
+            num_recovery_actions: 0,
+            residuals: FixedArray::new(),
+            num_residuals: 0,
+            boot_id: boot_id,
+            start_time: Word64::zero(),
+            end_time: Word64::zero(),
+            total_phase_duration_us: 0,
+            phase_failures: 0,
+            recovery_successes: 0,
+            recovery_failures: 0,
+            is_boot_in_progress: false,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Phase Registration
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-REG-001 through INIT-BP-REG-025
+
+    pub fn add_phase(self: ref mut, phase: BootPhase)
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.num_phases >= MAX_BOOT_PHASES {
+            return Result::Err(init_error(
+                DIAG_BP_BOUNDS,
+                FixedString[128]::from_slice("Max boot phases reached")))
+        }
+        let index: u32 = self.num_phases
+        self.phases.push(phase);
+        self.num_phases = self.num_phases + 1
+        self.generation.bump();
+        self.emit_residual(index, PHASE_STATE_INACTIVE, DIAG_BP_OK,
+            FixedString[128]::from_slice("Phase registered"))
+        Result::Ok(index)
+    }
+
+    pub fn get_phase(self, phase_id: u32) -> Result[ref BootPhase, InitError>
+        effects: [deterministic]
+    {
+        if phase_id >= self.num_phases {
+            return Result::Err(init_error(
+                DIAG_BP_INVALID_PHASE,
+                FixedString[128]::from_slice("Invalid phase ID")))
+        }
+        // trust: phase_id bounds-checked
+        trusted("phase access: phase_id within range") {
+            Result::Ok(self.phases.get(phase_id))
+        }
+    }
+
+    pub fn get_phase_mut(self: ref mut, phase_id: u32)
+        -> Result[ref mut BootPhase, InitError>
+        effects: [deterministic]
+    {
+        if phase_id >= self.num_phases {
+            return Result::Err(init_error(
+                DIAG_BP_INVALID_PHASE,
+                FixedString[128]::from_slice("Invalid phase ID")))
+        }
+        // trust: phase_id bounds-checked
+        trusted("phase mut access: phase_id within range") {
+            Result::Ok(self.phases.get_mut(phase_id))
+        }
+    }
+
+    pub fn find_phase_by_name(self, name: FixedString[PHASE_NAME_MAX_LEN])
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_phases
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_phases {
+            let phase: ref BootPhase = self.phases.get(i)
+            if phase.name == name {
+                return Result::Ok(i)
+            }
+        }
+        Result::Err(init_error(
+            DIAG_BP_INVALID_PHASE,
+            FixedString[128]::from_slice("Phase name not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Boot Execution
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-EXEC-001 through INIT-BP-EXEC-060
+
+    pub fn start_boot(self: ref mut)
+        effects: [deterministic]
+    {
+        self.start_time = __builtin_read_timestamp()
+        self.is_boot_in_progress = true
+        self.current_phase = 0
+        self.generation.bump();
+        self.emit_residual(0xFFFF, PHASE_STATE_PENDING, DIAG_BP_OK,
+            FixedString[128]::from_slice("Boot started"))
+    }
+
+    pub fn execute_phase(self: ref mut, phase_id: u32)
+        -> Result<bool, InitError>
+        effects: [deterministic, io]
+    {
+        if phase_id >= self.num_phases {
+            return Result::Err(init_error(
+                DIAG_BP_INVALID_PHASE,
+                FixedString[128]::from_slice("Invalid phase ID")))
+        }
+        if !self.is_boot_in_progress {
+            return Result::Err(init_error(
+                DIAG_BP_TRANSITION,
+                FixedString[128]::from_slice("Boot not in progress")))
+        }
+        let phase_ready: bool = {
+            let phase: ref BootPhase = self.phases.get(phase_id)
+            phase.prerequisites_met(&self.phases)
+        }
+        if !phase_ready {
+            self.emit_residual(phase_id, PHASE_STATE_PENDING, DIAG_BP_PREREQ_FAIL,
+                FixedString[128]::from_slice("Prerequisites not met"))
+            return Result::Ok(false)
+        }
+        {
+            let phase: ref mut BootPhase = self.phases.get_mut(phase_id)
+            phase.enter();
+            self.current_phase = phase_id
+        }
+        // Record transition
+        let last_phase: u32 = if phase_id > 0 { phase_id - 1 } else { 0 }
+        let trans: TransitionRecord = TransitionRecord::new(
+            last_phase, phase_id, true,
+            FixedString[64]::from_slice("phase enter"))
+        self.transitions.push(trans);
+        self.num_transitions = self.num_transitions + 1
+        self.emit_residual(phase_id, PHASE_STATE_ACTIVE, DIAG_BP_TRANSITION,
+            FixedString[128]::from_slice("Phase entered"))
+        // Execute phase init function
+        {
+            let phase: ref BootPhase = self.phases.get(phase_id)
+            phase.run_init_fn()
+        }
+        // Execute phase (the phase work itself)
+        let success: bool = self.run_phase_work(phase_id)
+        if success {
+            let phase: ref mut BootPhase = self.phases.get_mut(phase_id)
+            phase.complete();
+            let duration: u64 = phase.duration_us
+            self.total_phase_duration_us = self.total_phase_duration_us + duration
+            self.emit_residual(phase_id, PHASE_STATE_COMPLETED, DIAG_BP_OK,
+                FixedString[128]::from_slice("Phase completed"))
+            // Record completion transition
+            let trans2: TransitionRecord = TransitionRecord::new(
+                phase_id, phase_id + 1, true,
+                FixedString[64]::from_slice("phase completed"))
+            self.transitions.push(trans2);
+            self.num_transitions = self.num_transitions + 1
+            Result::Ok(true)
+        } else {
+            // Phase failed or timed out
+            let phase: ref mut BootPhase = self.phases.get_mut(phase_id)
+            if phase.exceeded_timeout() {
+                phase.timeout();
+                self.emit_residual(phase_id, PHASE_STATE_TIMEOUT, DIAG_BP_TIMEOUT,
+                    FixedString[128]::from_slice("Phase timed out"))
+            } else {
+                phase.fail(DIAG_BP_FAILURE,
+                    FixedString[128]::from_slice("Phase execution failed"))
+                self.emit_residual(phase_id, PHASE_STATE_FAILED, DIAG_BP_FAILURE,
+                    FixedString[128]::from_slice("Phase failed"))
+            }
+            self.phase_failures = self.phase_failures + 1
+            // Run cleanup
+            phase.run_cleanup_fn()
+            // Attempt recovery
+            let recovered: bool = self.handle_phase_failure(phase_id)?
+            Result::Ok(recovered)
+        }
+    }
+
+    fn run_phase_work(self: ref mut, phase_id: u32) -> bool
+        effects: [deterministic, io]
+    {
+        // In production, each phase would have its own execution logic.
+        // Here we simulate phase execution and check for timeout.
+        let phase: ref BootPhase = self.phases.get(phase_id)
+        if phase.init_fn != 0 {
+            // trust: phase work already done via init_fn
+            true
+        } else {
+            // No work function — phase is considered completed
+            true
+        }
+    }
+
+    fn handle_phase_failure(self: ref mut, phase_id: u32) -> Result<bool, InitError>
+        effects: [deterministic, io]
+    {
+        let phase: ref BootPhase = self.phases.get(phase_id)
+        // Try recovery actions first
+        // loop: bounds[BOUND_SMALL] — bounded by num_recovery_actions
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_recovery_actions {
+            let action: ref RecoveryAction = self.recovery_actions.get(i)
+            if action.phase_id == phase_id && action.is_active {
+                // Execute recovery action
+                action.execute();
+                self.recovery_successes = self.recovery_successes + 1
+                self.emit_residual(phase_id, PHASE_STATE_RECOVERED, DIAG_BP_RECOVERY,
+                    FixedString[128]::from_slice("Phase recovered via action"))
+                return Result::Ok(true)
+            }
+        }
+        if phase.can_retry() {
+            let phase_mut: ref mut BootPhase = self.phases.get_mut(phase_id)
+            phase_mut.retry_count = phase_mut.retry_count + 1
+            phase_mut.state = PHASE_STATE_PENDING  // Will retry
+            self.emit_residual(phase_id, PHASE_STATE_PENDING, DIAG_BP_RECOVERY,
+                FixedString[128]::from_slice("Phase scheduled for retry"))
+            return Result::Ok(false)  // Not recovered yet, but will retry
+        }
+        if phase.is_skippable() {
+            let phase_mut: ref mut BootPhase = self.phases.get_mut(phase_id)
+            phase_mut.state = PHASE_STATE_SKIPPED
+            self.emit_residual(phase_id, PHASE_STATE_SKIPPED, DIAG_BP_RECOVERY,
+                FixedString[128]::from_slice("Phase skipped"))
+            return Result::Ok(true)  // Skipped counts as recovered
+        }
+        if phase.is_recoverable() {
+            self.recovery_failures = self.recovery_failures + 1
+            self.emit_residual(phase_id, PHASE_STATE_FAILED, DIAG_BP_RECOVERY,
+                FixedString[128]::from_slice("Recovery failed"))
+            return Result::Ok(false)
+        }
+        // Critical, non-recoverable: boot cannot continue
+        self.emit_residual(phase_id, PHASE_STATE_FAILED, DIAG_BP_FAILURE,
+            FixedString[128]::from_slice("Critical phase failure, boot aborted"))
+        Result::Ok(false)
+    }
+
+    // ──────────────────────────────────────────────
+    // Execute Boot Sequence
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-SEQ-001 through INIT-BP-SEQ-030
+
+    pub fn execute_boot_sequence(self: ref mut) -> Result<bool, InitError>
+        effects: [deterministic, io]
+    {
+        self.start_boot();
+        // loop: bounds[BOUND_SMALL] — bounded by num_phases
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_phases {
+            let max_attempts: u32 = {
+                let phase: ref BootPhase = self.phases.get(i)
+                if phase.can_retry() {
+                    phase.max_retries + 1
+                } else {
+                    1
+                }
+            }
+            let mut attempt: u32 = 0
+            // loop: bounds[BOUND_TINY] — bounded by max_attempts (<=4)
+            loop: bounds[BOUND_TINY] for _ in 0..max_attempts {
+                let result: bool = self.execute_phase(i)?
+                if result {
+                    break
+                }
+                attempt = attempt + 1
+                // Check if phase gave up
+                let phase: ref BootPhase = self.phases.get(i)
+                if phase.state == PHASE_STATE_FAILED && phase.is_critical() {
+                    self.end_boot(false)
+                    return Result::Ok(false)
+                }
+            }
+        }
+        self.end_boot(true)
+        Result::Ok(true)
+    }
+
+    pub fn end_boot(self: ref mut, success: bool)
+        effects: [deterministic]
+    {
+        self.end_time = __builtin_read_timestamp()
+        self.is_boot_in_progress = false
+        if success {
+            self.emit_residual(0xFFFF, PHASE_STATE_COMPLETED, DIAG_BP_OK,
+                FixedString[128]::from_slice("Boot completed successfully"))
+        } else {
+            self.emit_residual(0xFFFF, PHASE_STATE_FAILED, DIAG_BP_FAILURE,
+                FixedString[128]::from_slice("Boot failed"))
+        }
+        self.generation.bump()
+    }
+
+    // ──────────────────────────────────────────────
+    // Recovery Action Management
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-RECOVMGMT-001 through INIT-BP-RECOVMGMT-020
+
+    pub fn add_recovery_action(self: ref mut, action: RecoveryAction)
+        -> Result[u32, InitError>
+        effects: [deterministic]
+    {
+        if self.num_recovery_actions >= MAX_RECOVERY_ACTIONS {
+            return Result::Err(init_error(
+                DIAG_BP_BOUNDS,
+                FixedString[128]::from_slice("Max recovery actions reached")))
+        }
+        let index: u32 = self.num_recovery_actions
+        self.recovery_actions.push(action);
+        self.num_recovery_actions = self.num_recovery_actions + 1
+        Result::Ok(index)
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-RESID-REC-001 through INIT-BP-RESID-REC-020
+
+    pub fn emit_residual(self: ref mut, phase_id: u32, state: u8,
+                          code: Word64, message: FixedString[128])
+        effects: [deterministic]
+    {
+        if self.num_residuals >= MAX_PHASE_RESIDUALS {
+            return  // Silently drop if residual buffer full
+        }
+        let residual: PhaseResidual = PhaseResidual::new(phase_id, state, code, message)
+        self.residuals.push(residual);
+        self.num_residuals = self.num_residuals + 1
+        // Compiler-level residual emission
+        @emit_residual(
+            message: message.as_slice(),
+            code: code,
+            data: (phase_id, state),
+        )
+    }
+
+    pub fn get_residuals(self) -> FixedArray[MAX_PHASE_RESIDUALS, PhaseResidual>
+        effects: [deterministic]
+    {
+        self.residuals
+    }
+
+    pub fn residual_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_residuals
+    }
+
+    // ──────────────────────────────────────────────
+    // Timeout Monitoring
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-TIMEOUT-001 through INIT-BP-TIMEOUT-015
+
+    pub fn check_timeouts(self: ref mut) -> Result<u32, InitError>
+        effects: [deterministic]
+    {
+        let mut timed_out: u32 = 0
+        // loop: bounds[BOUND_SMALL] — bounded by num_phases
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_phases {
+            let phase: ref BootPhase = self.phases.get(i)
+            if phase.state != PHASE_STATE_ACTIVE {
+                continue
+            }
+            if phase.exceeded_timeout() {
+                let phase_mut: ref mut BootPhase = self.phases.get_mut(i)
+                phase_mut.timeout();
+                self.phase_failures = self.phase_failures + 1
+                timed_out = timed_out + 1
+                self.emit_residual(i, PHASE_STATE_TIMEOUT, DIAG_BP_TIMEOUT,
+                    FixedString[128]::from_slice("Phase timeout detected"))
+            }
+        }
+        Result::Ok(timed_out)
+    }
+
+    // ──────────────────────────────────────────────
+    // Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: INIT-BP-QUERY-001 through INIT-BP-QUERY-025
+
+    pub fn current_phase_id(self) -> u32
+        effects: [deterministic]
+    {
+        self.current_phase
+    }
+
+    pub fn current_phase_name(self) -> FixedString[PHASE_NAME_MAX_LEN]
+        effects: [deterministic]
+    {
+        if self.current_phase >= self.num_phases {
+            return FixedString[PHASE_NAME_MAX_LEN]::from_slice("none")
+        }
+        let phase: ref BootPhase = self.phases.get(self.current_phase)
+        phase.name
+    }
+
+    pub fn boot_progress_pct(self) -> u8
+        effects: [deterministic]
+    {
+        if self.num_phases == 0 {
+            return 0
+        }
+        let completed: u32 = self.count_by_state(PHASE_STATE_COMPLETED) +
+                             self.count_by_state(PHASE_STATE_SKIPPED) +
+                             self.count_by_state(PHASE_STATE_RECOVERED)
+        ((completed as u64) * 100 / (self.num_phases as u64)) as u8
+    }
+
+    pub fn count_by_state(self, state: u8) -> u32
+        effects: [deterministic]
+    {
+        let mut count: u32 = 0
+        // loop: bounds[BOUND_SMALL] — bounded by num_phases
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_phases {
+            let phase: ref BootPhase = self.phases.get(i)
+            if phase.state == state {
+                count = count + 1
+            }
+        }
+        count
+    }
+
+    pub fn phase_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_phases
+    }
+
+    pub fn phase_failures(self) -> u32
+        effects: [deterministic]
+    {
+        self.phase_failures
+    }
+
+    pub fn recovery_successes(self) -> u32
+        effects: [deterministic]
+    {
+        self.recovery_successes
+    }
+
+    pub fn recovery_failures(self) -> u32
+        effects: [deterministic]
+    {
+        self.recovery_failures
+    }
+
+    pub fn total_boot_duration_us(self) -> u64
+        effects: [deterministic]
+    {
+        let end: u64 = if self.end_time.to_u64() > 0 {
+            self.end_time.to_u64()
+        } else {
+            __builtin_read_timestamp()
+        }
+        end - self.start_time.to_u64()
+    }
+
+    pub fn boot_in_progress(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_boot_in_progress
+    }
+
+    pub fn boot_id(self) -> Word64
+        effects: [deterministic]
+    {
+        self.boot_id
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn transition_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_transitions
+    }
+
+    pub fn get_transition(self, index: u32) -> Result[ref TransitionRecord, InitError>
+        effects: [deterministic]
+    {
+        if index >= self.num_transitions {
+            return Result::Err(init_error(
+                DIAG_BP_BOUNDS,
+                FixedString[128]::from_slice("Transition index out of bounds")))
+        }
+        // trust: bounds-checked
+        trusted("transition record access: index within range") {
+            Result::Ok(self.transitions.get(index))
+        }
+    }
+
+    pub fn get_phase_duration(self, phase_id: u32) -> u64
+        effects: [deterministic]
+    {
+        if phase_id >= self.num_phases {
+            return 0
+        }
+        let phase: ref BootPhase = self.phases.get(phase_id)
+        phase.duration_us
+    }
+}
+
+// ──────────────────────────────────────────────
+// Default Boot Phase Definitions
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-DEFAULT-001 through INIT-BP-DEFAULT-025
+
+pub fn create_default_boot_phases(mgr: ref mut BootPhaseManager)
+    -> Result<(), InitError>
+    effects: [deterministic]
+{
+    let phase_defs: FixedArray[17, (u32, FixedString[48], u64, u32)] = FixedArray::from_array([
+        (PHASE_ROM_LOAD, FixedString[48]::from_slice("rom-load"), 5000000, PHASE_FLAG_CRITICAL),
+        (PHASE_SECURITY_INIT, FixedString[48]::from_slice("security-init"), 10000000, PHASE_FLAG_CRITICAL | PHASE_FLAG_MEASURE),
+        (PHASE_HARDWARE_PROBE, FixedString[48]::from_slice("hardware-probe"), 20000000, PHASE_FLAG_CRITICAL | PHASE_FLAG_RECOVERABLE),
+        (PHASE_MEMORY_INIT, FixedString[48]::from_slice("memory-init"), 15000000, PHASE_FLAG_CRITICAL),
+        (PHASE_PAGE_TABLE_INIT, FixedString[48]::from_slice("paging-init"), 5000000, PHASE_FLAG_CRITICAL),
+        (PHASE_KERNEL_LOAD, FixedString[48]::from_slice("kernel-load"), 10000000, PHASE_FLAG_CRITICAL),
+        (PHASE_CPU_FEATURES, FixedString[48]::from_slice("cpu-features"), 3000000, PHASE_FLAG_RECOVERABLE | PHASE_FLAG_SKIPPABLE),
+        (PHASE_INTERRUPT_INIT, FixedString[48]::from_slice("interrupt-init"), 5000000, PHASE_FLAG_CRITICAL),
+        (PHASE_SCHEDULER_INIT, FixedString[48]::from_slice("scheduler-init"), 5000000, PHASE_FLAG_CRITICAL),
+        (PHASE_PROCESS_INIT, FixedString[48]::from_slice("process-init"), 10000000, PHASE_FLAG_CRITICAL),
+        (PHASE_DRIVER_INIT, FixedString[48]::from_slice("driver-init"), 30000000, PHASE_FLAG_RECOVERABLE | PHASE_FLAG_RETRY),
+        (PHASE_FILESYSTEM_INIT, FixedString[48]::from_slice("filesystem-init"), 20000000, PHASE_FLAG_RECOVERABLE | PHASE_FLAG_RETRY),
+        (PHASE_SERVICE_INIT, FixedString[48]::from_slice("service-init"), 60000000, PHASE_FLAG_RECOVERABLE | PHASE_FLAG_RETRY),
+        (PHASE_NETWORK_INIT, FixedString[48]::from_slice("network-init"), 30000000, PHASE_FLAG_RECOVERABLE | PHASE_FLAG_SKIPPABLE),
+        (PHASE_USER_SPACE, FixedString[48]::from_slice("user-space"), 20000000, PHASE_FLAG_RECOVERABLE),
+        (PHASE_LOGIN_READY, FixedString[48]::from_slice("login-ready"), 10000000, PHASE_FLAG_RECOVERABLE),
+        (PHASE_BOOT_COMPLETE, FixedString[48]::from_slice("boot-complete"), 0, PHASE_FLAG_CRITICAL),
+    ])
+    // loop: bounds[BOUND_SMALL] — bounded by 17 phases
+    loop: bounds[BOUND_SMALL] for i in 0..17 {
+        let (phase_id, name, timeout, flags): (u32, FixedString[48], u64, u32) = phase_defs.get(i)
+        let mut phase: BootPhase = BootPhase::new(phase_id, name, timeout)
+        phase.flags = flags
+        // Add all previous phases as prerequisites
+        // loop: bounds[BOUND_SMALL] — bounded by i
+        loop: bounds[BOUND_SMALL] for j in 0..i {
+            let (prereq_id, _, _, _): (u32, FixedString[48], u64, u32) = phase_defs.get(j)
+            phase.add_prerequisite(prereq_id)?
+        }
+        mgr.add_phase(phase)?;
+    }
+    Result::Ok(())
+}
+
+pub fn create_default_recovery_actions(mgr: ref mut BootPhaseManager)
+    -> Result<(), InitError>
+    effects: [deterministic]
+{
+    // Add a generic retry recovery action for driver phase
+    let retry_action: RecoveryAction = RecoveryAction::new(
+        0, PHASE_DRIVER_INIT, RECOVERY_RETRY, 0)
+    mgr.add_recovery_action(retry_action)?;
+    // Add a skip recovery action for network phase
+    let skip_action: RecoveryAction = RecoveryAction::new(
+        1, PHASE_NETWORK_INIT, RECOVERY_SKIP, 0)
+    mgr.add_recovery_action(skip_action)?;
+    // Add skip for CPU features
+    let skip_cpu: RecoveryAction = RecoveryAction::new(
+        2, PHASE_CPU_FEATURES, RECOVERY_SKIP, 0)
+    mgr.add_recovery_action(skip_cpu)?;
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// Boot Statistics
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-STATS-001 through INIT-BP-STATS-010
+
+pub fn boot_statistics(mgr: ref BootPhaseManager) -> BootStatistics
+    effects: [deterministic]
+{
+    BootStatistics {
+        total_phases: mgr.num_phases,
+        completed: mgr.count_by_state(PHASE_STATE_COMPLETED),
+        failed: mgr.phase_failures,
+        skipped: mgr.count_by_state(PHASE_STATE_SKIPPED),
+        recovered: mgr.count_by_state(PHASE_STATE_RECOVERED),
+        active: mgr.count_by_state(PHASE_STATE_ACTIVE),
+        total_duration_us: mgr.total_boot_duration_us(),
+        recovery_successes: mgr.recovery_successes,
+        recovery_failures: mgr.recovery_failures,
+        boot_id: mgr.boot_id,
+        is_complete: !mgr.is_boot_in_progress,
+    }
+}
+
+pub type BootStatistics : struct {
+    total_phases: u32,
+    completed: u32,
+    failed: u32,
+    skipped: u32,
+    recovered: u32,
+    active: u32,
+    total_duration_us: u64,
+    recovery_successes: u32,
+    recovery_failures: u32,
+    boot_id: Word64,
+    is_complete: bool,
+}
+
+impl BootStatistics {
+    pub fn progress_pct(self) -> u8
+        effects: [deterministic]
+    {
+        if self.total_phases == 0 {
+            return 0
+        }
+        let done: u32 = self.completed + self.skipped + self.recovered
+        ((done as u64) * 100 / (self.total_phases as u64)) as u8
+    }
+
+    pub fn health_status(self) -> FixedString[16]
+        effects: [deterministic]
+    {
+        if self.is_complete && self.failed == 0 {
+            FixedString[16]::from_slice("healthy")
+        } else if self.is_complete && self.failed > 0 {
+            FixedString[16]::from_slice("degraded")
+        } else if self.failed > 0 {
+            FixedString[16]::from_slice("failing")
+        } else {
+            FixedString[16]::from_slice("booting")
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Phase State Name
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-STATE-NAME-001 through INIT-BP-STATE-NAME-005
+
+pub fn phase_state_name(state: u8) -> FixedString[16]
+    effects: [deterministic]
+{
+    match state {
+        PHASE_STATE_INACTIVE => FixedString[16]::from_slice("inactive"),
+        PHASE_STATE_PENDING => FixedString[16]::from_slice("pending"),
+        PHASE_STATE_ACTIVE => FixedString[16]::from_slice("active"),
+        PHASE_STATE_COMPLETED => FixedString[16]::from_slice("completed"),
+        PHASE_STATE_FAILED => FixedString[16]::from_slice("failed"),
+        PHASE_STATE_TIMEOUT => FixedString[16]::from_slice("timeout"),
+        PHASE_STATE_RECOVERED => FixedString[16]::from_slice("recovered"),
+        PHASE_STATE_SKIPPED => FixedString[16]::from_slice("skipped"),
+        _ => FixedString[16]::from_slice("unknown"),
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization
+// ──────────────────────────────────────────────
+// Evidence path: INIT-BP-INIT-001 through INIT-BP-INIT-010
+
+pub fn init_boot_phase_manager() -> BootPhaseManager
+    effects: [deterministic]
+{
+    let boot_id: Word64 = __builtin_read_timestamp()
+    BootPhaseManager::new(boot_id)
+}
+
+pub fn setup_default_boot(mgr: ref mut BootPhaseManager)
+    -> Result<(), InitError>
+    effects: [deterministic]
+{
+    create_default_boot_phases(mgr)?;
+    create_default_recovery_actions(mgr)?;
+    Result::Ok(())
+}

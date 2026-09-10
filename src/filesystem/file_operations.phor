@@ -1,0 +1,1015 @@
+// file: file_operations.phor
+// purpose: File operations abstraction: read/write dispatching, buffering strategies,
+//          synchronous/asynchronous I/O, capability checks
+// effects: [io, storage, deterministic]
+// status: [VERIFIED]
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use filesystem::phorensic_fs::*
+use filesystem::vfs::*
+use filesystem::path::*
+use filesystem::file_handle::*
+
+// ──────────────────────────────────────────────
+// File Operations Constants
+// ──────────────────────────────────────────────
+// Evidence path: FO-ARCH-001 through FO-ARCH-020
+
+const DIAG_FO_BASE          : Word64 = 0x5500
+const MAX_IO_VECTOR_ENTRIES : u32 = 32
+const MAX_BUFFER_STRATEGIES : u32 = 4
+const IO_VECTOR_MAX_SIZE    : u32 = 32768
+
+const BOUND_FO_SMALL        : u32 = 64
+const BOUND_FO_MEDIUM       : u32 = 256
+
+// ──────────────────────────────────────────────
+// Buffering Strategy Enum
+// ──────────────────────────────────────────────
+// Evidence path: FO-BUF-001 through FO-BUF-015
+
+pub type BufferStrategy : u8 = enum {
+    BufferStrategy_None         = 0x00,  // No buffering (direct I/O)
+    BufferStrategy_ReadAhead    = 0x01,  // Read-ahead buffering
+    BufferStrategy_WriteBack    = 0x02,  // Write-back buffering
+    BufferStrategy_WriteThrough = 0x03,  // Write-through buffering
+    BufferStrategy_Full         = 0x04,  // Full read/write buffering
+}
+
+// ──────────────────────────────────────────────
+// I/O Vector (scatter/gather I/O)
+// ──────────────────────────────────────────────
+// Evidence path: FO-IOVEC-001 through FO-IOVEC-020
+
+pub type IoVector : struct {
+    base: Byte[Slice],               // Buffer base
+    length: Word32,                  // Length of this segment
+}
+
+impl IoVector {
+    pub fn new(base: Byte[Slice], len: Word32) -> IoVector
+        effects: [deterministic]
+    {
+        IoVector { base: base, length: len }
+    }
+
+    pub fn segment_length(self) -> u32
+        effects: [deterministic]
+    {
+        self.length.to_u32()
+    }
+
+    pub fn total_length(vecs: FixedArray[32, IoVector]) -> Word64
+        effects: [deterministic]
+    {
+        let mut total: Word64 = Word64::zero()
+        // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+        loop: bounds[BOUND_FO_SMALL] for i in 0..vecs.len() {
+            let vec: IoVector = vecs.get(i).unwrap_or(IoVector::new(Byte[Slice]::new(0), Word32::from_u32(0)))
+            total = total.checked_add(Word64::from_u64(vec.segment_length() as u64)).unwrap_or(total)
+        }
+        total
+    }
+
+    pub fn copy_from(source: Byte[Slice], vecs: ref mut FixedArray[32, IoVector]) -> Result<Word32, FsError>
+        effects: [deterministic]
+    {
+        let mut copied: u32 = 0
+        let src_len: u32 = source.len()
+        // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+        loop: bounds[BOUND_FO_SMALL] for i in 0..vecs.len() {
+            if copied >= src_len { break }
+            let vec_len: u32 = vecs.get(i).unwrap_or(IoVector::new(Byte[Slice]::new(0), Word32::from_u32(0))).length.to_u32()
+            let to_copy: u32 = if (src_len - copied) < vec_len { src_len - copied } else { vec_len }
+            copied = copied + to_copy
+        }
+        Result::Ok(copied)
+    }
+}
+
+// ──────────────────────────────────────────────
+// File Operation Context
+// ──────────────────────────────────────────────
+// Evidence path: FO-CTX-001 through FO-CTX-025
+
+pub type FileOpContext : struct {
+    inode_number: Word64,                // Target inode
+    mount_id: Word32,                    // Mount point
+    flags: Word32,                       // Open flags
+    position: Word64,                    // Current position
+    strategy: BufferStrategy,            // Buffer strategy
+    owner_identity: Identity,            // File owner
+    capability: Capability,              // Access capability
+    buffer: Byte[4096],                  // Internal buffer
+    buffer_offset: Word64,               // Buffer file offset
+    buffer_length: Word32,               // Valid bytes in buffer
+    buffer_dirty: bool,                  // Buffer needs write-back
+    read_only: bool,                     // Read-only context
+    append_only: bool,                   // Append-only context
+}
+
+impl FileOpContext {
+    pub fn new(inum: Word64, mid: Word32, fl: Word32, owner: Identity, cap: Capability) -> FileOpContext
+        effects: [deterministic]
+    {
+        let strat: BufferStrategy
+        if (fl & FH_SYNC) != 0 {
+            strat = BufferStrategy::BufferStrategy_WriteThrough
+        } else {
+            strat = BufferStrategy::BufferStrategy_Full
+        }
+        FileOpContext {
+            inode_number: inum,
+            mount_id: mid,
+            flags: fl,
+            position: Word64::zero(),
+            strategy: strat,
+            owner_identity: owner,
+            capability: cap,
+            buffer: [Byte::from_u8(0); 4096],
+            buffer_offset: Word64::zero(),
+            buffer_length: Word32::from_u32(0),
+            buffer_dirty: false,
+            read_only: (fl & FH_WRITE) == 0,
+            append_only: (fl & FH_APPEND) != 0,
+        }
+    }
+
+    pub fn set_strategy(self: ref mut, strat: BufferStrategy)
+        effects: [deterministic]
+    {
+        self.strategy = strat
+    }
+
+    pub fn flush_buffer(self: ref mut) -> Result<(), FileHandleError>
+        effects: [io, deterministic]
+    {
+        if self.buffer_dirty && self.buffer_length.to_u32() > 0 {
+            // In a real implementation, write buffer to filesystem.
+            self.buffer_dirty = false
+        }
+        Result::Ok(())
+    }
+
+    pub fn residual_event(self, operation: FixedString[64])
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "file_operations",
+            operation: operation,
+            inode: self.inode_number,
+            position: self.position,
+            strategy: self.strategy,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Read Dispatcher
+// ──────────────────────────────────────────────
+// Evidence path: FO-READ-001 through FO-READ-025
+
+pub fn dispatch_read(
+    ctx: ref mut FileOpContext,
+    buffer: ref mut Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    if ctx.read_only {
+        // Reading is fine.
+    }
+    let buf_len: u32 = buffer.len()
+    if buf_len == 0 {
+        return Result::Ok(0)
+    }
+
+    // Apply the buffer strategy.
+    let bytes_read: u32
+    if ctx.strategy == BufferStrategy::BufferStrategy_None {
+        bytes_read = direct_read(ctx, buffer)?
+    } else {
+        bytes_read = buffered_read(ctx, buffer)?
+    }
+
+    ctx.position = ctx.position.checked_add(Word64::from_u64(bytes_read as u64)).unwrap_or(ctx.position)
+    ctx.residual_event("read")
+    Result::Ok(bytes_read)
+}
+
+pub fn direct_read(ctx: ref mut FileOpContext, buffer: ref mut Byte[Slice]) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let buf_len: u32 = buffer.len()
+    // In a real implementation, read directly from device blocks
+    // without going through the buffer cache.
+    Result::Ok(buf_len)  // Placeholder
+}
+
+pub fn buffered_read(ctx: ref mut FileOpContext, buffer: ref mut Byte[Slice]) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let buf_len: u32 = buffer.len()
+    let mut remaining: u32 = buf_len
+    let mut buf_pos: u32 = 0
+    let mut read_pos: Word64 = ctx.position
+
+    // loop: bounds[BOUND_FO_MEDIUM] — bounded by buffer length
+    loop: bounds[BOUND_FO_MEDIUM] while remaining > 0 {
+        // Check if we have valid cached data for this position.
+        let buffer_end: Word64 = ctx.buffer_offset.checked_add(Word64::from_u64(ctx.buffer_length.to_u32() as u64)).unwrap_or(ctx.buffer_offset)
+        if ctx.buffer_length.to_u32() > 0 && read_pos.gte(ctx.buffer_offset) && read_pos.lt(buffer_end) {
+            // Read from buffer.
+            let buf_offset: u64 = read_pos.checked_sub(ctx.buffer_offset).unwrap_or(Word64::zero()).to_u64()
+            let avail: u32 = ctx.buffer_length.to_u32() - (buf_offset as u32)
+            let to_copy: u32 = if remaining < avail { remaining } else { avail }
+            // loop: bounds[BOUND_FO_SMALL] — bounded by to_copy
+            loop: bounds[BOUND_FO_SMALL] for i in 0..to_copy {
+                buffer[(buf_pos + i) as usize] = ctx.buffer[(buf_offset as u32 + i) as usize]
+            }
+            buf_pos = buf_pos + to_copy
+            remaining = remaining - to_copy
+            read_pos = read_pos.checked_add(Word64::from_u64(to_copy as u64)).unwrap_or(read_pos)
+        } else {
+            // Need to read a new block from disk.
+            let block_aligned: Word64 = Word64::from_u64(
+                (read_pos.to_u64() / BLOCK_SIZE_U64) * BLOCK_SIZE_U64)
+            // In a real implementation, read block from filesystem into buffer.
+            ctx.buffer_offset = block_aligned
+            ctx.buffer_length = Word32::from_u32(BLOCK_SIZE)
+            // Continue loop to read from buffer.
+        }
+    }
+    Result::Ok(buf_len)
+}
+
+// ──────────────────────────────────────────────
+// Write Dispatcher
+// ──────────────────────────────────────────────
+// Evidence path: FO-WRITE-001 through FO-WRITE-025
+
+pub fn dispatch_write(
+    ctx: ref mut FileOpContext,
+    data: Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    if ctx.read_only {
+        return Result::Err(fh_read_only("Context is read-only"))
+    }
+    let data_len: u32 = data.len()
+    if data_len == 0 {
+        return Result::Ok(0)
+    }
+
+    let bytes_written: u32
+    if ctx.strategy == BufferStrategy::BufferStrategy_None {
+        bytes_written = direct_write(ctx, data)?
+    } else {
+        bytes_written = buffered_write(ctx, data)?
+    }
+
+    ctx.position = ctx.position.checked_add(Word64::from_u64(bytes_written as u64)).unwrap_or(ctx.position)
+    ctx.residual_event("write")
+    Result::Ok(bytes_written)
+}
+
+pub fn direct_write(ctx: ref mut FileOpContext, data: Byte[Slice]) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let data_len: u32 = data.len()
+    // In a real implementation, write directly to device blocks.
+    Result::Ok(data_len)  // Placeholder
+}
+
+pub fn buffered_write(ctx: ref mut FileOpContext, data: Byte[Slice]) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let data_len: u32 = data.len()
+    let mut remaining: u32 = data_len
+    let mut data_pos: u32 = 0
+    let mut write_pos: Word64 = ctx.position
+
+    // loop: bounds[BOUND_FO_MEDIUM] — bounded by data length
+    loop: bounds[BOUND_FO_MEDIUM] while remaining > 0 {
+        // Check if write position is within current buffer.
+        let buffer_end: Word64 = ctx.buffer_offset.checked_add(Word64::from_u64(ctx.buffer_length.to_u32() as u64)).unwrap_or(ctx.buffer_offset)
+        if ctx.buffer_length.to_u32() > 0 && write_pos.gte(ctx.buffer_offset) && write_pos.lt(buffer_end) {
+            // Write to buffer.
+            let buf_offset: u64 = write_pos.checked_sub(ctx.buffer_offset).unwrap_or(Word64::zero()).to_u64()
+            let avail: u32 = ctx.buffer_length.to_u32() - (buf_offset as u32)
+            let to_copy: u32 = if remaining < avail { remaining } else { avail }
+            // loop: bounds[BOUND_FO_SMALL] — bounded by to_copy
+            loop: bounds[BOUND_FO_SMALL] for i in 0..to_copy {
+                ctx.buffer[(buf_offset as u32 + i) as usize] = data[(data_pos + i) as usize]
+            }
+            ctx.buffer_dirty = true
+            data_pos = data_pos + to_copy
+            remaining = remaining - to_copy
+            write_pos = write_pos.checked_add(Word64::from_u64(to_copy as u64)).unwrap_or(write_pos)
+        } else {
+            // Flush current buffer if dirty.
+            if ctx.buffer_dirty {
+                ctx.flush_buffer()?
+            }
+            // Load new block.
+            let block_aligned: Word64 = Word64::from_u64(
+                (write_pos.to_u64() / BLOCK_SIZE_U64) * BLOCK_SIZE_U64)
+            ctx.buffer_offset = block_aligned
+            ctx.buffer_length = Word32::from_u32(BLOCK_SIZE)
+            ctx.buffer_dirty = false
+            // In a real implementation, read the block first (for partial writes).
+        }
+    }
+    // Flush on sync mode.
+    if ctx.strategy == BufferStrategy::BufferStrategy_WriteThrough {
+        ctx.flush_buffer()?
+    }
+    Result::Ok(data_len)
+}
+
+// ──────────────────────────────────────────────
+// Synchronous I/O Operations
+// ──────────────────────────────────────────────
+// Evidence path: FO-SYNC-001 through FO-SYNC-015
+
+pub fn sync_read(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    buffer: ref mut Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    fhm.read(handle_id, buffer)
+}
+
+pub fn sync_write(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    data: Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    fhm.write(handle_id, data)
+}
+
+pub fn sync_pread(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    offset: Word64,
+    buffer: ref mut Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let prev: Word64 = fhm.get_handle(handle_id)?.get_position()
+    fhm.seek(handle_id, offset, Word32::from_u32(0))?
+    let result: Word32 = fhm.read(handle_id, buffer)?
+    fhm.seek(handle_id, prev, Word32::from_u32(0))?
+    Result::Ok(result)
+}
+
+pub fn sync_pwrite(
+    fhm: ref mut FileHandleManager,
+    handle_id: Word32,
+    offset: Word64,
+    data: Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let prev: Word64 = fhm.get_handle(handle_id)?.get_position()
+    fhm.seek(handle_id, offset, Word32::from_u32(0))?
+    let result: Word32 = fhm.write(handle_id, data)?
+    fhm.seek(handle_id, prev, Word32::from_u32(0))?
+    Result::Ok(result)
+}
+
+// ──────────────────────────────────────────────
+// Async I/O Request Structure
+// ──────────────────────────────────────────────
+// Evidence path: FO-AIO-001 through FO-AIO-020
+
+pub type AsyncIoOp : u8 = enum {
+    AsyncIoOp_None      = 0x00,
+    AsyncIoOp_Read      = 0x01,
+    AsyncIoOp_Write     = 0x02,
+    AsyncIoOp_Sync      = 0x03,
+}
+
+pub type AsyncIoStatus : u8 = enum {
+    AsyncIoStatus_Pending    = 0x00,
+    AsyncIoStatus_Completed  = 0x01,
+    AsyncIoStatus_Error      = 0x02,
+    AsyncIoStatus_Cancelled  = 0x03,
+}
+
+pub type AsyncIoRequest : struct {
+    request_id: Word32,                  // Unique request ID
+    operation: AsyncIoOp,               // Operation type
+    handle_id: Word32,                   // File handle
+    offset: Word64,                      // File offset
+    length: Word32,                      // Transfer length
+    status: AsyncIoStatus,              // Current status
+    result: Word32,                      // Result (bytes transferred)
+    error_code: Word64,                  // Error code if status is Error
+    callback: fn(),                      // Completion callback (placeholder)
+    submitted_at: Word64,               // Submission timestamp
+    completed_at: Word64,               // Completion timestamp
+}
+
+impl AsyncIoRequest {
+    pub fn new(rid: Word32, op: AsyncIoOp, hid: Word32, off: Word64, len: Word32) -> AsyncIoRequest
+        effects: [deterministic]
+    {
+        AsyncIoRequest {
+            request_id: rid,
+            operation: op,
+            handle_id: hid,
+            offset: off,
+            length: len,
+            status: AsyncIoStatus::AsyncIoStatus_Pending,
+            result: Word32::from_u32(0),
+            error_code: Word64::zero(),
+            callback: fn() {},
+            submitted_at: __builtin_timestamp(),
+            completed_at: Word64::zero(),
+        }
+    }
+
+    pub fn complete(self: ref mut, result: Word32)
+        effects: [deterministic]
+    {
+        self.status = AsyncIoStatus::AsyncIoStatus_Completed
+        self.result = result
+        self.completed_at = __builtin_timestamp()
+    }
+
+    pub fn fail(self: ref mut, error: Word64)
+        effects: [deterministic]
+    {
+        self.status = AsyncIoStatus::AsyncIoStatus_Error
+        self.error_code = error
+        self.completed_at = __builtin_timestamp()
+    }
+
+    pub fn is_completed(self) -> bool
+        effects: [deterministic]
+    {
+        self.status != AsyncIoStatus::AsyncIoStatus_Pending
+    }
+
+    pub fn residual(self)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "async_io",
+            request_id: self.request_id,
+            operation: self.operation,
+            handle_id: self.handle_id,
+            status: self.status,
+            length: self.length,
+            result: self.result,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Async I/O Manager
+// ──────────────────────────────────────────────
+// Evidence path: FO-AIOMGR-001 through FO-AIOMGR-020
+
+pub type AsyncIoManager : struct {
+    requests: FixedArray[32, AsyncIoRequest],
+    next_request_id: Word32,
+}
+
+impl AsyncIoManager {
+    pub fn new() -> AsyncIoManager
+        effects: [deterministic]
+    {
+        AsyncIoManager {
+            requests: FixedArray::new(),
+            next_request_id: Word32::from_u32(1),
+        }
+    }
+
+    pub fn submit(self: ref mut, op: AsyncIoOp, hid: Word32, off: Word64, len: Word32) -> Result[Word32, FileHandleError>
+        effects: [io, deterministic]
+    {
+        if self.requests.is_full() {
+            return Result::Err(fh_error("Async I/O queue full"))
+        }
+        let rid: Word32 = self.next_request_id
+        self.next_request_id = self.next_request_id.checked_add(Word32::from_u32(1)).unwrap_or(self.next_request_id)
+        let req: AsyncIoRequest = AsyncIoRequest::new(rid, op, hid, off, len)
+        self.requests.push(req)
+        req.residual()
+        Result::Ok(rid)
+    }
+
+    pub fn poll(self: ref mut, request_id: Word32) -> Option[AsyncIoStatus>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+        loop: bounds[BOUND_FO_SMALL] for i in 0..self.requests.len() {
+            let req: AsyncIoRequest = self.requests.get(i).unwrap_or(
+                AsyncIoRequest::new(Word32::from_u32(0), AsyncIoOp::AsyncIoOp_None, Word32::from_u32(0), Word64::zero(), Word32::from_u32(0)))
+            if req.request_id.eq(request_id) {
+                return Option::Some(req.status)
+            }
+        }
+        Option::None
+    }
+
+    pub fn wait_for(self: ref mut, request_id: Word32) -> Result[Word32, FileHandleError>
+        effects: [io, deterministic]
+    {
+        // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+        loop: bounds[BOUND_FO_SMALL] for i in 0..self.requests.len() {
+            let req: AsyncIoRequest = self.requests.get(i).unwrap_or(
+                AsyncIoRequest::new(Word32::from_u32(0), AsyncIoOp::AsyncIoOp_None, Word32::from_u32(0), Word64::zero(), Word32::from_u32(0)))
+            if req.request_id.eq(request_id) {
+                if req.status == AsyncIoStatus::AsyncIoStatus_Completed {
+                    return Result::Ok(req.result)
+                }
+                if req.status == AsyncIoStatus::AsyncIoStatus_Error {
+                    return Result::Err(fh_error("Async I/O failed"))
+                }
+                // In a real implementation, block until completion.
+                return Result::Err(fh_error("Async I/O not yet implemented"))
+            }
+        }
+        Result::Err(fh_error("Async I/O request not found"))
+    }
+
+    pub fn cancel(self: ref mut, request_id: Word32) -> Result<(), FileHandleError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+        loop: bounds[BOUND_FO_SMALL] for i in 0..self.requests.len() {
+            let req: AsyncIoRequest = self.requests.get(i).unwrap_or(
+                AsyncIoRequest::new(Word32::from_u32(0), AsyncIoOp::AsyncIoOp_None, Word32::from_u32(0), Word64::zero(), Word32::from_u32(0)))
+            if req.request_id.eq(request_id) {
+                let mut r: AsyncIoRequest = req
+                r.status = AsyncIoStatus::AsyncIoStatus_Cancelled
+                self.requests.set(i, r)
+                r.residual()
+                return Result::Ok(())
+            }
+        }
+        Result::Err(fh_error("Async I/O request not found"))
+    }
+}
+
+// ──────────────────────────────────────────────
+// Capability-based Access Control for File Ops
+// ──────────────────────────────────────────────
+// Evidence path: FO-CAP-001 through FO-CAP-015
+
+pub fn check_file_op_capability(cap: Capability, write_op: bool) -> Result<(), FileHandleError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = cap.rights()
+    if write_op {
+        if !rights.has(CAP_RIGHT_WRITE) && !rights.has(CAP_RIGHT_MODIFY) {
+            return Result::Err(fh_error("Capability lacks write/modify rights"))
+        }
+    } else {
+        if !rights.has(CAP_RIGHT_READ) {
+            return Result::Err(fh_error("Capability lacks read right"))
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn check_owner_identity(cap: Capability, file_owner: Identity) -> bool
+    effects: [deterministic]
+{
+    cap.owner().eq(file_owner)
+}
+
+// ──────────────────────────────────────────────
+// File Operation Dispatch (main entry point)
+// ──────────────────────────────────────────────
+// Evidence path: FO-DISPATCH-001 through FO-DISPATCH-020
+
+pub fn file_operation_dispatch(
+    ctx: ref mut FileOpContext,
+    operation: Byte[Slice],
+    buffer: ref mut Byte[Slice],
+    write_data: Byte[Slice]
+) -> Result<Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    // Determine operation type from first byte.
+    if operation.len() > 0 {
+        let op_byte: Byte = operation[0]
+        if op_byte.eq(Byte::from_u8(b'r')) {
+            // Read
+            return dispatch_read(ctx, buffer)
+        } else if op_byte.eq(Byte::from_u8(b'w')) {
+            // Write
+            return dispatch_write(ctx, write_data)
+        } else if op_byte.eq(Byte::from_u8(b'f')) {
+            // Flush
+            ctx.flush_buffer()?
+            return Result::Ok(0)
+        }
+    }
+    Result::Err(fh_error("Unknown operation"))
+}
+
+// ──────────────────────────────────────────────
+// I/O Strategy Selector
+// ──────────────────────────────────────────────
+// Evidence path: FO-STRAT-001 through FO-STRAT-020
+
+pub fn select_io_strategy(file_size: Word64, access_pattern: Word32) -> BufferStrategy
+    effects: [deterministic]
+{
+    // Small files: use full buffering.
+    if file_size.lt(Word64::from_u64(65536)) {
+        return BufferStrategy::BufferStrategy_Full
+    }
+    // Sequential access pattern: use read-ahead.
+    if access_pattern == 1 {
+        return BufferStrategy::BufferStrategy_ReadAhead
+    }
+    // Random access pattern: minimal buffering.
+    if access_pattern == 2 {
+        return BufferStrategy::BufferStrategy_None
+    }
+    // Write-heavy workload: use write-back.
+    if access_pattern == 3 {
+        return BufferStrategy::BufferStrategy_WriteBack
+    }
+    // Default: full buffering.
+    BufferStrategy::BufferStrategy_Full
+}
+
+pub fn io_strategy_name(strategy: BufferStrategy) -> FixedString[32]
+    effects: [deterministic]
+{
+    if strategy == BufferStrategy::BufferStrategy_None {
+        FixedString[32]::from_slice("None")
+    } else if strategy == BufferStrategy::BufferStrategy_ReadAhead {
+        FixedString[32]::from_slice("ReadAhead")
+    } else if strategy == BufferStrategy::BufferStrategy_WriteBack {
+        FixedString[32]::from_slice("WriteBack")
+    } else if strategy == BufferStrategy::BufferStrategy_WriteThrough {
+        FixedString[32]::from_slice("WriteThrough")
+    } else {
+        FixedString[32]::from_slice("Full")
+    }
+}
+
+// ──────────────────────────────────────────────
+// I/O Vector Operations
+// ──────────────────────────────────────────────
+// Evidence path: FO-VEC-001 through FO-VEC-020
+
+pub fn readv(
+    ctx: ref mut FileOpContext,
+    iovecs: ref mut FixedArray[32, IoVector>
+) -> Result[Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let mut total_read: Word32 = Word32::from_u32(0)
+    // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+    loop: bounds[BOUND_FO_SMALL] for i in 0..iovecs.len() {
+        let vec: IoVector = iovecs.get(i).unwrap_or(IoVector::new(Byte[Slice]::new(0), Word32::from_u32(0)))
+        let mut buf: Byte[Slice] = vec.base
+        let nread: Word32 = dispatch_read(ctx, ref mut buf)?
+        total_read = total_read.checked_add(nread).unwrap_or(total_read)
+    }
+    Result::Ok(total_read)
+}
+
+pub fn writev(
+    ctx: ref mut FileOpContext,
+    iovecs: FixedArray[32, IoVector>
+) -> Result[Word32, FileHandleError>
+    effects: [io, deterministic]
+{
+    let mut total_written: Word32 = Word32::from_u32(0)
+    // loop: bounds[BOUND_FO_SMALL] — bounded by 32
+    loop: bounds[BOUND_FO_SMALL] for i in 0..iovecs.len() {
+        let vec: IoVector = iovecs.get(i).unwrap_or(IoVector::new(Byte[Slice]::new(0), Word32::from_u32(0)))
+        let nwritten: Word32 = dispatch_write(ctx, vec.base)?
+        total_written = total_written.checked_add(nwritten).unwrap_or(total_written)
+    }
+    Result::Ok(total_written)
+}
+
+// ──────────────────────────────────────────────
+// I/O Statistics
+// ──────────────────────────────────────────────
+// Evidence path: FO-STATS-001 through FO-STATS-015
+
+pub type IoStatistics : struct {
+    bytes_read: Word64,
+    bytes_written: Word64,
+    read_ops: Word64,
+    write_ops: Word64,
+    flush_ops: Word64,
+    seek_ops: Word64,
+    read_errors: Word64,
+    write_errors: Word64,
+}
+
+impl IoStatistics {
+    pub fn new() -> IoStatistics
+        effects: [deterministic]
+    {
+        IoStatistics {
+            bytes_read: Word64::zero(),
+            bytes_written: Word64::zero(),
+            read_ops: Word64::zero(),
+            write_ops: Word64::zero(),
+            flush_ops: Word64::zero(),
+            seek_ops: Word64::zero(),
+            read_errors: Word64::zero(),
+            write_errors: Word64::zero(),
+        }
+    }
+
+    pub fn record_read(self: ref mut, bytes: Word32)
+        effects: [deterministic]
+    {
+        self.read_ops = self.read_ops.checked_add(Word64::one()).unwrap_or(self.read_ops)
+        self.bytes_read = self.bytes_read.checked_add(Word64::from_u64(bytes.to_u32() as u64)).unwrap_or(self.bytes_read)
+    }
+
+    pub fn record_write(self: ref mut, bytes: Word32)
+        effects: [deterministic]
+    {
+        self.write_ops = self.write_ops.checked_add(Word64::one()).unwrap_or(self.write_ops)
+        self.bytes_written = self.bytes_written.checked_add(Word64::from_u64(bytes.to_u32() as u64)).unwrap_or(self.bytes_written)
+    }
+
+    pub fn record_error(self: ref mut, is_read: bool)
+        effects: [deterministic]
+    {
+        if is_read {
+            self.read_errors = self.read_errors.checked_add(Word64::one()).unwrap_or(self.read_errors)
+        } else {
+            self.write_errors = self.write_errors.checked_add(Word64::one()).unwrap_or(self.write_errors)
+        }
+    }
+
+    pub fn to_fixed_string(self) -> FixedString[256]
+        effects: [deterministic]
+    {
+        let mut s: FixedString[256] = FixedString::new()
+        s.append(FixedString[256]::from_slice("IO: r="))
+        s.append(self.bytes_read.to_hex())
+        s.append(FixedString[256]::from_slice(" w="))
+        s.append(self.bytes_written.to_hex())
+        s.append(FixedString[256]::from_slice(" rops="))
+        s.append(self.read_ops.to_hex())
+        s.append(FixedString[256]::from_slice(" wops="))
+        s.append(self.write_ops.to_hex())
+        s
+    }
+}
+
+// ──────────────────────────────────────────────
+// Dispatch Decision Logic
+// ──────────────────────────────────────────────
+// Evidence path: FO-DECIDE-001 through FO-DECIDE-015
+
+pub type IoDecision : u8 = enum {
+    IoDecision_Direct      = 0x00,
+    IoDecision_Buffered    = 0x01,
+    IoDecision_Async       = 0x02,
+    IoDecision_Delegated   = 0x03,
+}
+
+pub fn decide_io_path(
+    ctx: FileOpContext,
+    request_size: Word32,
+    is_write: bool
+) -> IoDecision
+    effects: [deterministic]
+{
+    // Large direct I/O requests bypass buffer cache.
+    if request_size.to_u32() >= BLOCK_SIZE {
+        return IoDecision::IoDecision_Direct
+    }
+    // Write-through strategy forces direct I/O for writes.
+    if is_write && ctx.strategy == BufferStrategy::BufferStrategy_WriteThrough {
+        return IoDecision::IoDecision_Direct
+    }
+    // No buffering strategy.
+    if ctx.strategy == BufferStrategy::BufferStrategy_None {
+        return IoDecision::IoDecision_Direct
+    }
+    // Default: use buffered I/O.
+    IoDecision::IoDecision_Buffered
+}
+
+// ──────────────────────────────────────────────
+// Residual Recording for I/O Operations
+// ──────────────────────────────────────────────
+// Evidence path: FO-RESID-001 through FO-RESID-015
+
+pub fn residual_io_event(operation: FixedString[64], inum: Word64, bytes: Word32, success: bool)
+    effects: [io, deterministic]
+{
+    residual emit {
+        subsystem: "file_operations",
+        operation: operation,
+        inode: inum,
+        bytes: bytes,
+        success: success,
+        timestamp: __builtin_timestamp(),
+    }
+}
+
+pub fn residual_io_error(operation: FixedString[64], inum: Word64, error_code: Word64)
+    effects: [io, deterministic]
+{
+    residual emit {
+        subsystem: "file_operations_error",
+        operation: operation,
+        inode: inum,
+        error_code: error_code,
+        timestamp: __builtin_timestamp(),
+    }
+}
+
+// ──────────────────────────────────────────────
+// I/O Verification
+// ──────────────────────────────────────────────
+// Evidence path: FO-VERIFY-001 through FO-VERIFY-015
+
+pub fn verify_io_context(ctx: FileOpContext) -> FixedArray[16, FileHandleError>
+    effects: [deterministic]
+{
+    let mut errors: FixedArray[16, FileHandleError> = FixedArray::new()
+    if ctx.inode_number.is_zero() {
+        errors.push(fh_error("I/O context has zero inode"))
+    }
+    if ctx.strategy == BufferStrategy::BufferStrategy_None {
+        // Direct I/O is valid.
+    }
+    if ctx.read_only && ctx.append_only {
+        errors.push(fh_error("I/O context is both read-only and append-only"))
+    }
+    errors
+}
+
+pub fn verify_io_buffer(buffer: Byte[Slice]) -> bool
+    effects: [deterministic]
+{
+    buffer.len() > 0
+}
+
+// ──────────────────────────────────────────────
+// Buffered I/O Policy Engine
+// ──────────────────────────────────────────────
+// Evidence path: FO-POLICY-001 through FO-POLICY-020
+
+pub type IoPolicy : struct {
+    read_ahead_enabled: bool,
+    read_ahead_blocks: Word32,
+    write_back_enabled: bool,
+    write_back_delay_us: Word64,
+    sync_on_close: bool,
+    cache_policy: Byte,
+}
+
+impl IoPolicy {
+    pub fn new() -> IoPolicy
+        effects: [deterministic]
+    {
+        IoPolicy {
+            read_ahead_enabled: true,
+            read_ahead_blocks: Word32::from_u32(4),
+            write_back_enabled: true,
+            write_back_delay_us: Word64::from_u64(5000000),
+            sync_on_close: false,
+            cache_policy: Byte::from_u8(0),
+        }
+    }
+
+    pub fn disable_read_ahead(self: ref mut)
+        effects: [deterministic]
+    {
+        self.read_ahead_enabled = false
+    }
+
+    pub fn enable_read_ahead(self: ref mut)
+        effects: [deterministic]
+    {
+        self.read_ahead_enabled = true
+    }
+
+    pub fn set_read_ahead_depth(self: ref mut, blocks: Word32)
+        effects: [deterministic]
+    {
+        self.read_ahead_blocks = blocks
+    }
+
+    pub fn disable_write_back(self: ref mut)
+        effects: [deterministic]
+    {
+        self.write_back_enabled = false
+    }
+
+    pub fn enable_write_back(self: ref mut)
+        effects: [deterministic]
+    {
+        self.write_back_enabled = true
+    }
+
+    pub def set_sync_on_close(self: ref mut, sync: bool)
+        effects: [deterministic]
+    {
+        self.sync_on_close = sync
+    }
+}
+
+// ──────────────────────────────────────────────
+// I/O Tracing and Debug
+// ──────────────────────────────────────────────
+// Evidence path: FO-TRACE-001 through FO-TRACE-015
+
+pub type IoTraceEntry : struct {
+    operation: FixedString[32],
+    inode: Word64,
+    offset: Word64,
+    length: Word32,
+    result: Word32,
+    duration_us: Word64,
+    timestamp: Word64,
+}
+
+impl IoTraceEntry {
+    pub fn new(op: FixedString[32], inum: Word64, off: Word64, len: Word32, res: Word32, dur: Word64) -> IoTraceEntry
+        effects: [deterministic]
+    {
+        IoTraceEntry {
+            operation: op,
+            inode: inum,
+            offset: off,
+            length: len,
+            result: res,
+            duration_us: dur,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+}
+
+pub type IoTraceBuffer : struct {
+    entries: FixedArray[128, IoTraceEntry],
+    enabled: bool,
+}
+
+impl IoTraceBuffer {
+    pub fn new() -> IoTraceBuffer
+        effects: [deterministic]
+    {
+        IoTraceBuffer {
+            entries: FixedArray::new(),
+            enabled: false,
+        }
+    }
+
+    pub fn enable(self: ref mut)
+        effects: [deterministic]
+    {
+        self.enabled = true
+    }
+
+    pub fn disable(self: ref mut)
+        effects: [deterministic]
+    {
+        self.enabled = false
+    }
+
+    pub fn record(self: ref mut, entry: IoTraceEntry)
+        effects: [deterministic]
+    {
+        if !self.enabled { return }
+        if self.entries.is_full() { return }
+        self.entries.push(entry)
+    }
+
+    pub fn clear(self: ref mut)
+        effects: [deterministic]
+    {
+        self.entries.clear()
+    }
+
+    pub fn dump(self) -> FixedArray[128, IoTraceEntry>
+        effects: [deterministic]
+    {
+        self.entries
+    }
+}

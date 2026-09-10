@@ -1,0 +1,1187 @@
+// gc.phor — Evidence-aware garbage collector: reachability, retention, policy
+// Phorensic Forensic Store: garbage collection subsystem
+// Spec: FORENSIC_STORE.md — Evidence-Aware Garbage Collection
+// Grammar: PHORENSIC_GRAMMAR.md §43 (store_gc operation), §66
+
+package forensic_store.gc;
+
+use forensic_store.store_object::{
+    StoreObject, Hash256, hash256_zero, hash256_equal,
+    TrustState, TrustLevel,
+    Identity, identity_equal,
+    ResidualRecord, ResidualHistory, ResidualSeverity, CausalCategory,
+    ObjectRole,
+};
+use forensic_store.store_key::{
+    StoreKey, store_key_equal, store_key_zero,
+};
+use forensic_store.store_operations::{
+    Store, StoreEntry, StoreError, StoreCapabilities, capability_check,
+    store_find_slot, EnumFilter, EnumEntry, EnumResult, store_enumerate,
+};
+
+// ============================================================================
+// GC Policy
+// ============================================================================
+
+/// Garbage collection policy — configurable retention rules.
+/// Spec: FORENSIC_STORE.md — GC Policy section.
+struct GCPolicy
+    layout packed
+{
+    /// Retain receipts beyond object lifetime (in seconds, 0 = indefinitely)
+    retain_receipt_duration_seconds: u64,
+    /// Retain receipts as a boolean (overrides duration if true)
+    retain_receipts_indefinitely: bool,
+    /// Number of rollback generations to retain
+    retain_rollback_generations: u32,
+    /// Whether to retain court evidence
+    retain_court_evidence: bool,
+    /// Minimum trust state for GC exemption
+    min_trust_exemption: TrustLevel,
+    /// List of store keys to always retain (audit retention)
+    audit_retention_list: Array[StoreKey, 128],
+    audit_retention_count: u32,
+    /// Maximum object age before GC eligibility (seconds)
+    max_object_age_seconds: u64,
+    /// Whether to retain residual history
+    retain_residual_history: bool,
+    /// Maximum number of residual records to retain
+    max_residual_retention: u32,
+    /// Whether to run GC automatically on store full
+    auto_gc_on_full: bool,
+    /// GC aggressiveness (0 = conservative, 10 = aggressive)
+    aggressiveness: u8,
+}
+
+/// Default GC policy.
+fn gc_policy_default() -> GCPolicy
+    effect [compute]
+{
+    return GCPolicy {
+        retain_receipt_duration_seconds: 31536000,
+        retain_receipts_indefinitely: true,
+        retain_rollback_generations: 3,
+        retain_court_evidence: true,
+        min_trust_exemption: TrustLevel::SealVerified,
+        audit_retention_list: Array[StoreKey, 128]::zeroed(),
+        audit_retention_count: 0,
+        max_object_age_seconds: 0,
+        retain_residual_history: true,
+        max_residual_retention: 1024,
+        auto_gc_on_full: true,
+        aggressiveness: 5,
+    };
+}
+
+// ============================================================================
+// Reachability Analysis
+// ============================================================================
+
+/// Result of reachability analysis for a single object.
+struct ReachabilityResult
+    layout packed
+{
+    /// Whether the object is reachable from any root
+    reachable: bool,
+    /// Whether the object is an active trust root
+    is_trust_root: bool,
+    /// Whether the object is referenced by an active generation
+    is_active_gen_ref: bool,
+    /// Whether the object is a rollback target
+    is_rollback_target: bool,
+    /// Whether the object is audit-retained
+    is_audit_retained: bool,
+    /// Whether the object is court evidence
+    is_court_evidence: bool,
+    /// Whether the object is exempt due to trust level
+    trust_exempt: bool,
+    /// Whether the object is pinned
+    pinned: bool,
+    /// Retention priority score (higher = more important to retain)
+    retention_priority: u32,
+}
+
+/// Compute reachability for a single object against policy and context.
+fn compute_reachability(
+    obj: StoreObject,
+    policy: GCPolicy,
+    active_generations: Array[u64, 64],
+    active_gen_count: u32,
+    rollback_targets: Array[StoreKey, 64],
+    rollback_target_count: u32,
+    current_gen: u64,
+) -> ReachabilityResult
+    effect [compute, residual]
+{
+    let mut priority: u32 = 0;
+
+    // Check 1: Is the object pinned?
+    let pinned: bool = obj.pinned;
+    if pinned { priority = priority + 1000; }
+
+    // Check 2: Is the object a trust root (high trust level)?
+    let trust_exempt: bool = obj.trust_state.level >= policy.min_trust_exemption &&
+                             !obj.trust_state.decayed;
+    if trust_exempt { priority = priority + 500; }
+
+    // Check 3: Is the object referenced by an active generation?
+    let mut is_active_gen_ref: bool = false;
+    for i in 0..active_gen_count as u64 {
+        if obj.stored_at_gen == active_generations[i] {
+            is_active_gen_ref = true;
+        }
+    }
+    if is_active_gen_ref { priority = priority + 300; }
+
+    // Check 4: Is the object a rollback target?
+    let mut is_rollback_target: bool = false;
+    for i in 0..rollback_target_count as u64 {
+        if hash256_equal(obj.key, rollback_targets[i]) {
+            is_rollback_target = true;
+        }
+    }
+    if is_rollback_target { priority = priority + 200; }
+
+    // Check 5: Is the object in the audit retention list?
+    let mut is_audit_retained: bool = false;
+    for i in 0..policy.audit_retention_count as u64 {
+        if hash256_equal(obj.key, policy.audit_retention_list[i]) {
+            is_audit_retained = true;
+        }
+    }
+    if is_audit_retained { priority = priority + 400; }
+
+    // Check 6: Is the object court evidence?
+    let is_court_evidence: bool = obj.object_role == ObjectRole::CourtEvidence ||
+                                  obj.object_role == ObjectRole::OracleTrace ||
+                                  obj.object_role == ObjectRole::CourtVerdict;
+    if is_court_evidence && policy.retain_court_evidence {
+        priority = priority + 150;
+    }
+
+    // Check 7: Is the object reachable via its reference count?
+    let reachable: bool = obj.reference_count > 0 || pinned || trust_exempt ||
+                          is_active_gen_ref || is_rollback_target || is_audit_retained;
+
+    // Check 8: Is it a trust root?
+    let is_trust_root: bool = trust_exempt && (is_active_gen_ref || pinned);
+
+    residual emit {
+        op: "gc.reachability.computed",
+        key_prefix: obj.key.bytes[0] as u64,
+        reachable: reachable as u64,
+        priority: priority,
+        pinned: pinned as u64,
+    };
+
+    return ReachabilityResult {
+        reachable: reachable,
+        is_trust_root: is_trust_root,
+        is_active_gen_ref: is_active_gen_ref,
+        is_rollback_target: is_rollback_target,
+        is_audit_retained: is_audit_retained,
+        is_court_evidence: is_court_evidence,
+        trust_exempt: trust_exempt,
+        pinned: pinned,
+        retention_priority: priority,
+    };
+}
+
+// ============================================================================
+// GC Candidate Selection
+// ============================================================================
+
+/// A candidate for garbage collection.
+struct GCCandidate
+    layout packed
+{
+    /// The store key of the candidate
+    key: StoreKey,
+    /// Retention priority (lower = more eligible for GC)
+    retention_priority: u32,
+    /// Slot index in the store
+    slot_index: u64,
+    /// Causal category for this candidate
+    category: CausalCategory,
+    /// Whether this candidate can be safely removed
+    safe_to_remove: bool,
+}
+
+/// Result of a GC sweep — the set of candidates selected for removal.
+struct GCSweepResult
+    layout packed
+{
+    candidates: Array[GCCandidate, 4096],
+    candidate_count: u32,
+    total_examined: u32,
+    total_reachable: u32,
+    total_unreachable: u32,
+}
+
+/// Perform reachability analysis across the entire store.
+fn gc_sweep(
+    store: Store,
+    policy: GCPolicy,
+    active_generations: Array[u64, 64],
+    active_gen_count: u32,
+    rollback_targets: Array[StoreKey, 64],
+    rollback_target_count: u32,
+    current_timestamp: u64,
+) -> GCSweepResult
+    effect [compute, residual]
+{
+    let result: GCSweepResult = GCSweepResult {
+        candidates: Array[GCCandidate, 4096]::zeroed(),
+        candidate_count: 0,
+        total_examined: 0,
+        total_reachable: 0,
+        total_unreachable: 0,
+    };
+    let mut res: GCSweepResult = result;
+
+    // Bounded loop: 4096 entries max
+    for i in 0..4096 {
+        if !store.entries[i].occupied {
+            continue;
+        }
+        res.total_examined = res.total_examined + 1;
+
+        let obj: StoreObject = store.entries[i].object;
+
+        // Skip deleted entries (already marked)
+        if store.entries[i].deleted {
+            res.total_unreachable = res.total_unreachable + 1;
+            // Add to candidates
+            if res.candidate_count < 4096 {
+                res.candidates[res.candidate_count] = GCCandidate {
+                    key: obj.key,
+                    retention_priority: 0,
+                    slot_index: i,
+                    category: CausalCategory::Orphaned,
+                    safe_to_remove: true,
+                };
+                res.candidate_count = res.candidate_count + 1;
+            }
+            continue;
+        }
+
+        let rr: ReachabilityResult = compute_reachability(
+            obj, policy,
+            active_generations, active_gen_count,
+            rollback_targets, rollback_target_count,
+            store.current_generation,
+        );
+
+        if rr.reachable {
+            res.total_reachable = res.total_reachable + 1;
+        } else {
+            res.total_unreachable = res.total_unreachable + 1;
+            if res.candidate_count < 4096 {
+                let cat: CausalCategory;
+                if obj.object_role == ObjectRole::CourtEvidence ||
+                   obj.object_role == ObjectRole::OracleTrace {
+                    cat = CausalCategory::CourtRetained;
+                } else if obj.object_role == ObjectRole::CompilationReceipt ||
+                          obj.object_role == ObjectRole::ExpansionReceipt {
+                    cat = CausalCategory::LegalRetention;
+                } else {
+                    cat = CausalCategory::Orphaned;
+                }
+
+                res.candidates[res.candidate_count] = GCCandidate {
+                    key: obj.key,
+                    retention_priority: rr.retention_priority,
+                    slot_index: i,
+                    category: cat,
+                    safe_to_remove: !rr.is_court_evidence || !policy.retain_court_evidence,
+                };
+                res.candidate_count = res.candidate_count + 1;
+            }
+        }
+    }
+
+    residual emit {
+        op: "gc.sweep.complete",
+        examined: res.total_examined,
+        reachable: res.total_reachable,
+        unreachable: res.total_unreachable,
+        candidates: res.candidate_count,
+    };
+
+    return res;
+}
+
+// ============================================================================
+// GC Eviction
+// ============================================================================
+
+/// Result of a GC eviction cycle.
+struct GCEvictionResult
+    layout packed
+{
+    /// Number of objects evicted
+    evicted_count: u32,
+    /// Number of bytes freed
+    bytes_freed: u64,
+    /// Number of candidates that were skipped (protected)
+    skipped_count: u32,
+    /// Residual records produced
+    eviction_residuals: ResidualHistory,
+    /// Whether the store has space after eviction
+    has_space: bool,
+}
+
+/// Evict a set of GC candidates from the store.
+fn gc_evict(
+    store: Store,
+    sweep: GCSweepResult,
+    policy: GCPolicy,
+    timestamp: u64,
+) -> GCEvictionResult
+    effect [compute, residual]
+{
+    let zero_hash: Hash256 = hash256_zero();
+    let history: ResidualHistory = ResidualHistory {
+        records: Array[ResidualRecord, 1024]::zeroed(),
+        count: 0,
+        head: 0,
+        tail: 0,
+        total_emitted: 0,
+        owner_hash: zero_hash,
+    };
+    let result: GCEvictionResult = GCEvictionResult {
+        evicted_count: 0,
+        bytes_freed: 0,
+        skipped_count: 0,
+        eviction_residuals: history,
+        has_space: false,
+    };
+    let mut res: GCEvictionResult = result;
+
+    // Bounded loop: at most candidate_count entries (max 4096)
+    for i in 0..sweep.candidate_count as u64 {
+        let candidate: GCCandidate = sweep.candidates[i];
+
+        // Skip candidates that are not safe to remove
+        if !candidate.safe_to_remove {
+            res.skipped_count = res.skipped_count + 1;
+            let rec: ResidualRecord = ResidualRecord {
+                op_name: Array[u8, 128]::from_literal("gc_evict_skip"),
+                op_name_len: 13,
+                op_type: 4,
+                timestamp: timestamp,
+                generation: store.current_generation,
+                actor: store.store_identity,
+                object_hash: candidate.key,
+                severity: ResidualSeverity::Info,
+                field_keys: Array[Array[u8, 64], 16]::zeroed(),
+                field_values: Array[Array[u8, 256], 16]::zeroed(),
+                field_key_lens: Array[u32, 16]::zeroed(),
+                field_value_lens: Array[u32, 16]::zeroed(),
+                field_count: 0,
+                parent_residual_hash: hash256_zero(),
+                event_id: 0,
+                causal_category: CausalCategory::CourtRetained,
+                reserved: Array[u64, 8]::zeroed(),
+            };
+            res.eviction_residuals = residual_history_append(res.eviction_residuals, rec);
+            continue;
+        }
+
+        // Check retention policy: always retain audit-critical residuals
+        if policy.retain_receipts_indefinitely {
+            if candidate.category == CausalCategory::LegalRetention ||
+               candidate.category == CausalCategory::CourtRetained {
+                res.skipped_count = res.skipped_count + 1;
+                continue;
+            }
+        }
+
+        let slot: u64 = candidate.slot_index;
+        if slot < 4096 && store.entries[slot].occupied {
+            let obj: StoreObject = store.entries[slot].object;
+            res.bytes_freed = res.bytes_freed + obj.object_size;
+            res.evicted_count = res.evicted_count + 1;
+
+            // Record eviction residual
+            let rec: ResidualRecord = ResidualRecord {
+                op_name: Array[u8, 128]::from_literal("gc_evict"),
+                op_name_len: 9,
+                op_type: 4,
+                timestamp: timestamp,
+                generation: store.current_generation,
+                actor: store.store_identity,
+                object_hash: candidate.key,
+                severity: ResidualSeverity::Normal,
+                field_keys: Array[Array[u8, 64], 16]::zeroed(),
+                field_values: Array[Array[u8, 256], 16]::zeroed(),
+                field_key_lens: Array[u32, 16]::zeroed(),
+                field_value_lens: Array[u32, 16]::zeroed(),
+                field_count: 0,
+                parent_residual_hash: hash256_zero(),
+                event_id: 0,
+                causal_category: CausalCategory::Orphaned,
+                reserved: Array[u64, 8]::zeroed(),
+            };
+            res.eviction_residuals = residual_history_append(res.eviction_residuals, rec);
+        }
+    }
+
+    res.has_space = (store.max_capacity - store.occupied_count + res.evicted_count) > 0;
+
+    residual emit {
+        op: "gc.evict.complete",
+        evicted: res.evicted_count,
+        bytes_freed: res.bytes_freed,
+        skipped: res.skipped_count,
+    };
+
+    return res;
+}
+
+// ============================================================================
+// Full GC Cycle
+// ============================================================================
+
+/// Run a complete GC cycle: sweep + evict.
+fn gc_run(
+    store: Store,
+    policy: GCPolicy,
+    active_generations: Array[u64, 64],
+    active_gen_count: u32,
+    rollback_targets: Array[StoreKey, 64],
+    rollback_target_count: u32,
+    timestamp: u64,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, true, false, true, false, false, true) {
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    if store.gc_in_progress {
+        return Result[Store, StoreError]::Err(StoreError::GCInProgress);
+    }
+
+    let mut running_store: Store = store;
+    running_store.gc_in_progress = true;
+
+    residual emit {
+        op: "gc.run.start",
+        occupied: running_store.occupied_count,
+        deleted: running_store.deleted_count,
+    };
+
+    // Phase 1: Sweep — find unreachable objects
+    let sweep: GCSweepResult = gc_sweep(
+        running_store, policy,
+        active_generations, active_gen_count,
+        rollback_targets, rollback_target_count,
+        timestamp,
+    );
+
+    // Phase 2: Evict — remove unreachable objects
+    let eviction: GCEvictionResult = gc_evict(running_store, sweep, policy, timestamp);
+
+    // Apply evictions to the store
+    let mut new_store: Store = running_store;
+    // Bounded loop: candidates
+    for i in 0..sweep.candidate_count as u64 {
+        let candidate: GCCandidate = sweep.candidates[i];
+        if candidate.safe_to_remove {
+            let slot: u64 = candidate.slot_index;
+            if slot < 4096 && new_store.entries[slot].occupied {
+                // Check skip conditions again
+                let mut skip: bool = false;
+                if policy.retain_receipts_indefinitely {
+                    if candidate.category == CausalCategory::LegalRetention ||
+                       candidate.category == CausalCategory::CourtRetained {
+                        skip = true;
+                    }
+                }
+                if !skip {
+                    new_store.entries[slot].occupied = false;
+                    new_store.entries[slot].deleted = false;
+                    new_store.entries[slot].gc_mark = 0;
+                    new_store.occupied_count = new_store.occupied_count - 1;
+                    if new_store.occupied_count < 1 {
+                        new_store.occupied_count = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Update GC state
+    new_store.gc_mark_counter = new_store.gc_mark_counter + 1;
+    new_store.gc_in_progress = false;
+    new_store.deleted_count = 0;
+
+    // Merge eviction residuals into store residuals
+    for i in 0..eviction.eviction_residuals.count as u64 {
+        let idx: u32 = (eviction.eviction_residuals.head + i as u32) % 1024;
+        new_store.store_residuals = residual_history_append(
+            new_store.store_residuals,
+            eviction.eviction_residuals.records[idx],
+        );
+    }
+
+    residual emit {
+        op: "gc.run.complete",
+        evicted: eviction.evicted_count,
+        bytes_freed: eviction.bytes_freed,
+        remaining: new_store.occupied_count,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// GC Statistics
+// ============================================================================
+
+/// Statistics snapshot of GC state.
+struct GCStats
+    layout packed
+{
+    occupied_count: u32,
+    deleted_count: u32,
+    free_slots: u32,
+    utilization_percent: u32,
+    gc_mark_counter: u32,
+    gc_in_progress: bool,
+    policy_hash: Hash256,
+}
+
+/// Get current GC statistics from the store.
+fn gc_stats(store: Store) -> GCStats
+    effect [compute]
+{
+    let free: u32 = store.max_capacity - store.occupied_count;
+    let util: u32 = 0;
+    if store.max_capacity > 0 {
+        util = (store.occupied_count * 100) / store.max_capacity;
+    }
+    return GCStats {
+        occupied_count: store.occupied_count,
+        deleted_count: store.deleted_count,
+        free_slots: free,
+        utilization_percent: util,
+        gc_mark_counter: store.gc_mark_counter,
+        gc_in_progress: store.gc_in_progress,
+        policy_hash: store.gc_policy_hash,
+    };
+}
+
+// ============================================================================
+// Retention Policy Application
+// ============================================================================
+
+/// Check whether an object's residual history should be retained.
+fn should_retain_residuals(
+    obj: StoreObject,
+    policy: GCPolicy,
+) -> bool
+    effect [compute]
+{
+    if policy.retain_residual_history {
+        return true;
+    }
+    if obj.trust_state.level >= TrustLevel::CourtVerified {
+        return true;
+    }
+    if obj.pinned {
+        return true;
+    }
+    return false;
+}
+
+/// Trim residual history to policy maximum.
+fn trim_residual_history(
+    history: ResidualHistory,
+    policy: GCPolicy,
+) -> ResidualHistory
+    effect [compute, residual]
+{
+    if history.count <= policy.max_residual_retention {
+        return history;
+    }
+
+    let excess: u32 = history.count - policy.max_residual_retention;
+    let new_head: u32 = (history.head + excess) % 1024;
+    let new_count: u32 = policy.max_residual_retention;
+
+    residual emit {
+        op: "gc.trim_residuals",
+        original_count: history.count,
+        new_count: new_count,
+        trimmed: excess,
+    };
+
+    return ResidualHistory {
+        records: history.records,
+        count: new_count,
+        head: new_head,
+        tail: history.tail,
+        total_emitted: history.total_emitted,
+        owner_hash: history.owner_hash,
+    };
+}
+
+// ============================================================================
+// GC Mark Phase
+// ============================================================================
+
+/// Mark an object as reachable during the mark phase.
+fn gc_mark_object(
+    store: Store,
+    slot_index: u64,
+    mark_value: u32,
+) -> Store
+    effect [compute]
+{
+    if slot_index >= 4096 {
+        return store;
+    }
+    if !store.entries[slot_index].occupied {
+        return store;
+    }
+    if store.entries[slot_index].gc_mark == mark_value {
+        return store;
+    }
+
+    let mut new_store: Store = store;
+    new_store.entries[slot_index].gc_mark = mark_value;
+    return new_store;
+}
+
+/// Mark all objects reachable from a set of root keys.
+fn gc_mark_from_roots(
+    store: Store,
+    root_keys: Array[StoreKey, 128],
+    root_count: u32,
+    mark_value: u32,
+) -> Store
+    effect [compute, residual]
+{
+    let mut new_store: Store = store;
+    let mut marked: u32 = 0;
+
+    // Mark roots
+    for i in 0..root_count as u64 {
+        let key: StoreKey = root_keys[i];
+        if store_key_is_zero(key) {
+            continue;
+        }
+        let slot: u64 = store_find_slot_internal(new_store, key);
+        if slot < 4096 {
+            new_store.entries[slot].gc_mark = mark_value;
+            marked = marked + 1;
+        }
+    }
+
+    residual emit {
+        op: "gc.mark_from_roots",
+        roots: root_count,
+        marked: marked,
+        mark_value: mark_value,
+    };
+
+    return new_store;
+}
+
+/// Find slot for a key (internal version without capability check).
+fn store_find_slot_internal(store: Store, key: StoreKey) -> u64
+    effect [compute]
+{
+    for i in 0..4096 {
+        if store.entries[i].occupied {
+            if store_key_equal(store.entries[i].object.key, key) {
+                return i;
+            }
+        }
+    }
+    return 4096;
+}
+
+fn store_key_is_zero(key: StoreKey) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if key.bytes[i] != 0 { return false; }
+    }
+    return true;
+}
+
+// ============================================================================
+// Generational GC — Tenuring
+// ============================================================================
+
+/// Age classification for tenured GC.
+type GCAge = enum {
+    /// Newly allocated object
+    Young = 0,
+    /// Survived one GC cycle
+    Survivor = 1,
+    /// Survived multiple GC cycles
+    Tenured = 2,
+    /// Permanently retained
+    Permanent = 3,
+}
+
+/// Tenuring policy — determines when objects are promoted between age classes.
+struct GCTenuringPolicy
+    layout packed
+{
+    /// Number of GC cycles a young object must survive to become survivor
+    young_survive_cycles: u32,
+    /// Number of GC cycles a survivor must survive to become tenured
+    survivor_tenure_cycles: u32,
+    /// Maximum age before forced GC (0 = no forced GC)
+    max_age_before_gc: u32,
+    /// Whether to use age-based tenuring
+    use_tenuring: bool,
+}
+
+/// Default tenuring policy.
+fn gc_tenuring_policy_default() -> GCTenuringPolicy
+    effect [compute]
+{
+    return GCTenuringPolicy {
+        young_survive_cycles: 2,
+        survivor_tenure_cycles: 5,
+        max_age_before_gc: 0,
+        use_tenuring: true,
+    };
+}
+
+// ============================================================================
+// GC Scheduling
+// ============================================================================
+
+/// GC scheduling policy.
+struct GCSchedule
+    layout packed
+{
+    /// Run GC when utilization exceeds this percentage
+    utilization_threshold_percent: u32,
+    /// Run GC every N store operations
+    operations_between_gc: u64,
+    /// Minimum interval between GC runs (seconds)
+    min_interval_seconds: u64,
+    /// Whether to run GC on explicit request only
+    manual_only: bool,
+}
+
+/// Default GC schedule.
+fn gc_schedule_default() -> GCSchedule
+    effect [compute]
+{
+    return GCSchedule {
+        utilization_threshold_percent: 85,
+        operations_between_gc: 1000,
+        min_interval_seconds: 60,
+        manual_only: false,
+    };
+}
+
+/// Check whether GC should be triggered based on schedule and store state.
+fn gc_should_run(
+    store: Store,
+    schedule: GCSchedule,
+    last_gc_time: u64,
+    current_time: u64,
+    operations_since_gc: u64,
+) -> bool
+    effect [compute]
+{
+    if schedule.manual_only {
+        return false;
+    }
+
+    // Check utilization
+    if store.max_capacity > 0 {
+        let util: u32 = (store.occupied_count * 100) / store.max_capacity;
+        if util >= schedule.utilization_threshold_percent {
+            return true;
+        }
+    }
+
+    // Check operation count
+    if operations_since_gc >= schedule.operations_between_gc {
+        return true;
+    }
+
+    // Check time interval
+    if current_time >= last_gc_time + schedule.min_interval_seconds {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// GC — Evidence Retention Query
+// ============================================================================
+
+/// Query whether a specific residual should be retained.
+fn gc_should_retain_residual(
+    residual: ResidualRecord,
+    policy: GCPolicy,
+) -> bool
+    effect [compute]
+{
+    // Court evidence is always retained if configured
+    if residual.causal_category == CausalCategory::CourtRetained {
+        return policy.retain_court_evidence;
+    }
+
+    // Audit-critical residuals are always retained
+    if residual.severity == ResidualSeverity::AuditCritical {
+        return true;
+    }
+
+    // Critical residuals are retained if policy retains residuals
+    if residual.severity == ResidualSeverity::Critical {
+        return policy.retain_residual_history;
+    }
+
+    // Info and debug residuals can be GC'd early
+    if residual.severity == ResidualSeverity::Info ||
+       residual.severity == ResidualSeverity::Debug {
+        return false;
+    }
+
+    // Default to policy setting
+    return policy.retain_residual_history;
+}
+
+// ============================================================================
+// GC — Policy Serialization
+// ============================================================================
+
+/// Serialize a GC policy into a byte array for hashing/storage.
+fn gc_policy_serialize(
+    policy: GCPolicy,
+    output: Array[u8, 256],
+) -> u32
+    effect [compute]
+{
+    let mut pos: u32 = 0;
+
+    output[pos as u64] = policy.retain_receipt_duration_seconds & 0xFF;
+    pos = pos + 1;
+    output[pos as u64] = (policy.retain_receipt_duration_seconds >> 8) & 0xFF;
+    pos = pos + 1;
+
+    if policy.retain_receipts_indefinitely {
+        output[pos as u64] = 1;
+    } else {
+        output[pos as u64] = 0;
+    }
+    pos = pos + 1;
+
+    output[pos as u64] = policy.retain_rollback_generations & 0xFF;
+    pos = pos + 1;
+
+    if policy.retain_court_evidence {
+        output[pos as u64] = 1;
+    } else {
+        output[pos as u64] = 0;
+    }
+    pos = pos + 1;
+
+    output[pos as u64] = policy.min_trust_exemption as u8;
+    pos = pos + 1;
+
+    output[pos as u64] = policy.aggressiveness;
+    pos = pos + 1;
+
+    return pos;
+}
+
+// ============================================================================
+// GC — Compaction
+// ============================================================================
+
+/// Compact the store by defragmenting entries (moving occupied slots together).
+fn gc_compact(store: Store) -> Store
+    effect [compute, residual]
+{
+    let mut new_store: Store = store;
+    let mut write_pos: u64 = 0;
+    let mut moved: u32 = 0;
+
+    // Scan and compact
+    for read_pos in 0..4096 {
+        if new_store.entries[read_pos].occupied && !new_store.entries[read_pos].deleted {
+            if read_pos != write_pos {
+                new_store.entries[write_pos] = new_store.entries[read_pos];
+                new_store.entries[read_pos].occupied = false;
+                moved = moved + 1;
+            }
+            write_pos = write_pos + 1;
+        }
+    }
+
+    // Zero out remaining entries
+    while write_pos < 4096 {
+        new_store.entries[write_pos].occupied = false;
+        new_store.entries[write_pos].deleted = false;
+        new_store.entries[write_pos].gc_mark = 0;
+        new_store.entries[write_pos].insert_order = 0;
+        write_pos = write_pos + 1;
+    }
+
+    residual emit {
+        op: "gc.compact",
+        moved: moved,
+        occupied: new_store.occupied_count,
+    };
+
+    return new_store;
+}
+
+// ============================================================================
+// GC — Pinned Object Management
+// ============================================================================
+
+/// Pin an object — exempt it from GC until unpinned.
+fn gc_pin_object(
+    store: Store,
+    key: StoreKey,
+    pinner: Identity,
+    timestamp: u64,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, false, true, false, false, false, true) {
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot_internal(store, key);
+    if slot >= 4096 {
+        return Result[Store, StoreError]::Err(StoreError::NotFound);
+    }
+
+    let mut new_store: Store = store;
+    new_store.entries[slot].object = store_object_pin(new_store.entries[slot].object);
+
+    let rec: ResidualRecord = ResidualRecord {
+        op_name: Array[u8, 128]::from_literal("gc_pin_object"),
+        op_name_len: 14,
+        op_type: 4,
+        timestamp: timestamp,
+        generation: store.current_generation,
+        actor: pinner,
+        object_hash: key,
+        severity: 2,
+        field_keys: Array[Array[u8, 64], 16]::zeroed(),
+        field_values: Array[Array[u8, 256], 16]::zeroed(),
+        field_key_lens: Array[u32, 16]::zeroed(),
+        field_value_lens: Array[u32, 16]::zeroed(),
+        field_count: 0,
+        parent_residual_hash: hash256_zero(),
+        event_id: 0,
+        causal_category: 0,
+        reserved: Array[u64, 8]::zeroed(),
+    };
+    new_store.store_residuals = residual_history_append(new_store.store_residuals, rec);
+
+    residual emit {
+        op: "gc.pin",
+        key_prefix: key.bytes[0] as u64,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+/// Unpin an object — allow GC to collect it.
+fn gc_unpin_object(
+    store: Store,
+    key: StoreKey,
+    unpinner: Identity,
+    timestamp: u64,
+) -> Result[Store, StoreError]
+    effect [compute, residual]
+{
+    if !capability_check(store.capabilities, false, true, false, false, false, true) {
+        return Result[Store, StoreError]::Err(StoreError::CapabilityDenied);
+    }
+
+    let slot: u64 = store_find_slot_internal(store, key);
+    if slot >= 4096 {
+        return Result[Store, StoreError]::Err(StoreError::NotFound);
+    }
+
+    let mut new_store: Store = store;
+    let obj: StoreObject = new_store.entries[slot].object;
+    new_store.entries[slot].object = StoreObject {
+        key: obj.key, content: obj.content, content_len: obj.content_len,
+        content_hash: obj.content_hash,
+        source_snapshot_hash: obj.source_snapshot_hash,
+        dialect_profile: obj.dialect_profile,
+        trust_state: obj.trust_state,
+        provenance: obj.provenance,
+        identity: obj.identity,
+        residual_history: obj.residual_history,
+        build_recipe: obj.build_recipe,
+        expansion_receipts: obj.expansion_receipts,
+        expansion_receipt_count: obj.expansion_receipt_count,
+        compilation_receipts: obj.compilation_receipts,
+        compilation_receipt_count: obj.compilation_receipt_count,
+        replay_checkpoints: obj.replay_checkpoints,
+        replay_checkpoint_count: obj.replay_checkpoint_count,
+        residual_edges: obj.residual_edges,
+        residual_edge_count: obj.residual_edge_count,
+        signatures: obj.signatures,
+        object_role: obj.object_role,
+        object_size: obj.object_size,
+        stored_at_gen: obj.stored_at_gen,
+        stored_at_timestamp: obj.stored_at_timestamp,
+        sealed: obj.sealed,
+        reference_count: obj.reference_count,
+        pinned: false,
+        reserved: obj.reserved,
+    };
+
+    residual emit {
+        op: "gc.unpin",
+        key_prefix: key.bytes[0] as u64,
+    };
+
+    return Result[Store, StoreError]::Ok(new_store);
+}
+
+// ============================================================================
+// GC — Policy Application to Specific Objects
+// ============================================================================
+
+/// Apply the GC policy to a specific object and determine its fate.
+fn gc_apply_policy_to_object(
+    obj: StoreObject,
+    policy: GCPolicy,
+    current_timestamp: u64,
+) -> GCAction
+    effect [compute, residual]
+{
+    // Pinned objects are always retained
+    if obj.pinned {
+        return GCAction::Retain;
+    }
+
+    // Objects above trust threshold are retained
+    if obj.trust_state.level >= policy.min_trust_exemption && !obj.trust_state.decayed {
+        return GCAction::Retain;
+    }
+
+    // Objects with reference counts are retained
+    if obj.reference_count > 0 {
+        return GCAction::Retain;
+    }
+
+    // Sealed objects with high trust are retained
+    if obj.sealed && obj.trust_state.level >= TrustLevel::CourtVerified {
+        return GCAction::Retain;
+    }
+
+    // Court evidence retained per policy
+    if obj.object_role == ObjectRole::CourtEvidence && policy.retain_court_evidence {
+        return GCAction::Retain;
+    }
+
+    // Receipts retained per policy
+    if (obj.object_role == ObjectRole::CompilationReceipt ||
+        obj.object_role == ObjectRole::ExpansionReceipt) &&
+        policy.retain_receipts_indefinitely {
+        return GCAction::Retain;
+    }
+
+    // Mark for collection
+    return GCAction::Collect;
+}
+
+/// Action the GC should take on an object.
+type GCAction = enum {
+    Retain = 0,
+    Collect = 1,
+    MarkForReview = 2,
+}
+
+// ============================================================================
+// GC — Diagnostic Dump
+// ============================================================================
+
+/// A dump of GC state for diagnostic purposes.
+struct GCDiagnosticDump
+    layout packed
+{
+    policy: GCPolicy,
+    reachable_count: u32,
+    unreachable_count: u32,
+    pinned_count: u32,
+    trust_exempt_count: u32,
+    court_evidence_count: u32,
+    receipt_count: u32,
+    orphaned_count: u32,
+    recent_collections: u64,
+    bytes_freed: u64,
+}
+
+fn gc_diagnostic_dump(
+    store: Store,
+    policy: GCPolicy,
+) -> GCDiagnosticDump
+    effect [compute, residual]
+{
+    let mut reachable: u32 = 0;
+    let mut unreachable: u32 = 0;
+    let mut pinned: u32 = 0;
+    let mut trust_exempt: u32 = 0;
+    let mut court_evidence: u32 = 0;
+    let mut receipts: u32 = 0;
+    let mut orphaned: u32 = 0;
+
+    for i in 0..4096 {
+        if store.entries[i].occupied && !store.entries[i].deleted {
+            let obj: StoreObject = store.entries[i].object;
+
+            if obj.pinned { pinned = pinned + 1; }
+            if obj.trust_state.level >= policy.min_trust_exemption { trust_exempt = trust_exempt + 1; }
+            if obj.object_role == ObjectRole::CourtEvidence { court_evidence = court_evidence + 1; }
+            if obj.object_role == ObjectRole::CompilationReceipt ||
+               obj.object_role == ObjectRole::ExpansionReceipt { receipts = receipts + 1; }
+            if obj.reference_count > 0 { reachable = reachable + 1; }
+
+            let action: GCAction = gc_apply_policy_to_object(obj, policy, 0);
+            if action == GCAction::Collect {
+                orphaned = orphaned + 1;
+            }
+            if action == GCAction::Retain || obj.reference_count > 0 {
+                reachable = reachable + 1;
+            } else {
+                unreachable = unreachable + 1;
+            }
+        }
+    }
+
+    residual emit {
+        op: "gc.diagnostic_dump",
+        reachable: reachable,
+        unreachable: unreachable,
+    };
+
+    return GCDiagnosticDump {
+        policy: policy,
+        reachable_count: reachable,
+        unreachable_count: unreachable,
+        pinned_count: pinned,
+        trust_exempt_count: trust_exempt,
+        court_evidence_count: court_evidence,
+        receipt_count: receipts,
+        orphaned_count: orphaned,
+        recent_collections: store.total_stored,
+        bytes_freed: 0,
+    };
+}

@@ -1,0 +1,1054 @@
+// file: process.phor
+// purpose: Process lifecycle management: create, fork, exec, exit, wait,
+//          process identity, credential management, capability inheritance,
+//          process groups. All operations use bounded loops and record
+//          residuals for all process state changes.
+// evidence: PROC-PROC-ARCH-001 through PROC-PROC-ARCH-250
+// residual: Every process creation, fork, exec, exit, and state change
+//           records a residual for the audit trail.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-DIAG-001 through PROC-PROC-DIAG-010
+
+const DIAG_PROC_BASE         : Word64 = Word64::from_u64(0xB000)
+const DIAG_PROC_OK           : Word64 = DIAG_PROC_BASE | 0x000
+const DIAG_PROC_NO_MEM       : Word64 = DIAG_PROC_BASE | 0x001
+const DIAG_PROC_INVALID_ID   : Word64 = DIAG_PROC_BASE | 0x002
+const DIAG_PROC_NOT_FOUND    : Word64 = DIAG_PROC_BASE | 0x003
+const DIAG_PROC_FORK_FAIL    : Word64 = DIAG_PROC_BASE | 0x004
+const DIAG_PROC_EXEC_FAIL    : Word64 = DIAG_PROC_BASE | 0x005
+const DIAG_PROC_EXIT_FAIL    : Word64 = DIAG_PROC_BASE | 0x006
+const DIAG_PROC_PERM_DENIED  : Word64 = DIAG_PROC_BASE | 0x007
+const DIAG_PROC_MAX_REACHED  : Word64 = DIAG_PROC_BASE | 0x008
+const DIAG_PROC_INVALID_STATE: Word64 = DIAG_PROC_BASE | 0x009
+const DIAG_PROC_BOUNDS       : Word64 = DIAG_PROC_BASE | 0x00A
+
+// ──────────────────────────────────────────────
+// Process Constants
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-CONST-001 through PROC-PROC-CONST-020
+
+const MAX_PROCESSES              : u32 = 256
+const MAX_CREDENTIAL_GROUPS      : u32 = 16
+const MAX_CAPABILITIES_PER_PROC  : u32 = 64
+const MAX_PROCESS_ARGS           : u32 = 32
+const MAX_PROCESS_ENV            : u32 = 64
+const MAX_CHILD_PROCESSES        : u32 = 64
+const MAX_OPEN_HANDLES           : u32 = 128
+const PROCESS_STACK_SIZE_MIN     : u64 = 4096
+const PROCESS_STACK_SIZE_DEFAULT : u64 = 1048576  // 1MB
+const PROCESS_STACK_SIZE_MAX     : u64 = 8388608  // 8MB
+const PROCESS_NAME_MAX_LEN       : u32 = 64
+const PRIORITY_MIN               : u8 = 0
+const PRIORITY_DEFAULT           : u8 = 16
+const PRIORITY_MAX               : u8 = 31
+const EXIT_CODE_SUCCESS          : i32 = 0
+const EXIT_CODE_FAILURE          : i32 = -1
+const EXIT_CODE_KILLED           : i32 = -2
+
+// Process State
+const PROC_STATE_CREATED    : u8 = 0
+const PROC_STATE_READY      : u8 = 1
+const PROC_STATE_RUNNING    : u8 = 2
+const PROC_STATE_SLEEPING   : u8 = 3
+const PROC_STATE_STOPPED    : u8 = 4
+const PROC_STATE_ZOMBIE     : u8 = 5
+const PROC_STATE_TERMINATED : u8 = 6
+
+// Process Flags
+const PROC_FLAG_SYSTEM      : u32 = 0x01
+const PROC_FLAG_USER        : u32 = 0x02
+const PROC_FLAG_IDLE        : u32 = 0x04
+const PROC_FLAG_NO_FORK     : u32 = 0x08
+const PROC_FLAG_NO_EXEC     : u32 = 0x10
+const PROC_FLAG_CRITICAL    : u32 = 0x20
+const PROC_FLAG_SERVICE     : u32 = 0x40
+const PROC_FLAG_PANIC       : u32 = 0x80
+
+// ──────────────────────────────────────────────
+// Process ID
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-PID-001 through PROC-PROC-PID-012
+
+pub type Pid : u32 = struct {
+    value: u32,
+}
+
+impl Pid {
+    pub fn new(value: u32) -> Pid
+        effects: [deterministic]
+    {
+        Pid { value: value % (MAX_PROCESSES as u32) }
+    }
+
+    pub fn zero() -> Pid
+        effects: [deterministic]
+    {
+        Pid { value: 0 }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        self.value > 0 && self.value < MAX_PROCESSES
+    }
+
+    pub fn eq(self, other: Pid) -> bool
+        effects: [deterministic]
+    {
+        self.value == other.value
+    }
+
+    pub fn hash(self) -> Word64
+        effects: [deterministic]
+    {
+        Word64::from_u64(self.value as u64)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Credentials
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-CRED-001 through PROC-PROC-CRED-020
+
+pub type Credentials : struct {
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    egid: u32,
+    saved_uid: u32,
+    saved_gid: u32,
+    supplementary_groups: FixedArray[MAX_CREDENTIAL_GROUPS, u32],
+    num_supplementary: u32,
+    securebits: u32,
+}
+
+impl Credentials {
+    pub fn new(uid: u32, gid: u32) -> Credentials
+        effects: [deterministic]
+    {
+        Credentials {
+            uid: uid,
+            gid: gid,
+            euid: uid,
+            egid: gid,
+            saved_uid: uid,
+            saved_gid: gid,
+            supplementary_groups: FixedArray::new(),
+            num_supplementary: 0,
+            securebits: 0,
+        }
+    }
+
+    pub fn kernel_default() -> Credentials
+        effects: [deterministic]
+    {
+        Credentials::new(0, 0)
+    }
+
+    pub fn is_privileged(self) -> bool
+        effects: [deterministic]
+    {
+        self.euid == 0
+    }
+
+    pub fn has_capability(self, cap: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.is_privileged()  // Simplified: root has all caps
+    }
+
+    pub fn set_euid(self: ref mut, uid: u32)
+        effects: [deterministic]
+    {
+        self.euid = uid
+    }
+
+    pub fn set_egid(self: ref mut, gid: u32)
+        effects: [deterministic]
+    {
+        self.egid = gid
+    }
+
+    pub fn add_group(self: ref mut, gid: u32)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_supplementary >= MAX_CREDENTIAL_GROUPS {
+            return Result::Err(proc_error(
+                DIAG_PROC_BOUNDS,
+                FixedString[128]::from_slice("Max supplementary groups")))
+        }
+        self.supplementary_groups.push(gid);
+        self.num_supplementary = self.num_supplementary + 1
+        Result::Ok(())
+    }
+
+    pub fn is_in_group(self, gid: u32) -> bool
+        effects: [deterministic]
+    {
+        if self.gid == gid || self.egid == gid {
+            return true
+        }
+        // loop: bounds[BOUND_SMALL] — bounded by num_supplementary
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_supplementary {
+            if self.supplementary_groups.get(i) == gid {
+                return true
+            }
+        }
+        false
+    }
+}
+
+// ──────────────────────────────────────────────
+// Process Error
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-ERR-001 through PROC-PROC-ERR-008
+
+pub type ProcessError : struct {
+    code: Word64,
+    message: FixedString[128],
+}
+
+impl ProcessError {
+    pub fn new(code: Word64, message: FixedString[128]) -> ProcessError
+        effects: [deterministic]
+    {
+        ProcessError { code: code, message: message }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.message
+    }
+}
+
+pub fn proc_error(code: Word64, message: FixedString[128]) -> ProcessError
+    effects: [deterministic]
+{
+    ProcessError::new(code, message)
+}
+
+// ──────────────────────────────────────────────
+// Process Capability
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-CAP-001 through PROC-PROC-CAP-015
+
+pub type ProcessCapability : struct {
+    capability: Capability,
+    cap_rights: RightsSet,
+    generation: Word32,
+}
+
+impl ProcessCapability {
+    pub fn new(cap: Capability, rights: RightsSet) -> ProcessCapability
+        effects: [deterministic]
+    {
+        ProcessCapability {
+            capability: cap,
+            cap_rights: rights,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn has_right(self, right: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.cap_rights.has(right)
+    }
+
+    pub fn move_to(self: ref mut, other: ref mut ProcessCapability)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        // Affine: move capability from self to other
+        other.capability = self.capability
+        other.cap_rights = self.cap_rights
+        other.generation = self.generation
+        // Invalidate self (affine semantics)
+        self.capability = Capability::null()
+        self.cap_rights = RightsSet::none()
+        Result::Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────
+// Process Control Block
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-PCB-001 through PROC-PROC-PCB-060
+
+pub type ProcessControlBlock : struct {
+    pid: Pid,
+    parent_pid: Pid,
+    process_group: Pid,
+    session_id: u32,
+    state: u8,
+    flags: u32,
+    credentials: Credentials,
+    name: FixedString[PROCESS_NAME_MAX_LEN],
+    priority: u8,
+    capabilities: FixedArray[MAX_CAPABILITIES_PER_PROC, ProcessCapability],
+    num_capabilities: u32,
+    children: FixedArray[MAX_CHILD_PROCESSES, Pid],
+    num_children: u32,
+    open_handles: FixedArray[MAX_OPEN_HANDLES, Handle],
+    num_handles: u32,
+    exit_code: i32,
+    user_stack_base: u64,
+    user_stack_size: u64,
+    heap_base: u64,
+    heap_size: u64,
+    entry_point: u64,
+    address_space_id: u32,
+    cpu_time_used: Word64,
+    start_time: Word64,
+    generation: Word32,
+}
+
+impl ProcessControlBlock {
+    pub fn new(pid: Pid, parent_pid: Pid, credentials: Credentials,
+               name: FixedString[PROCESS_NAME_MAX_LEN]) -> ProcessControlBlock
+        effects: [deterministic]
+    {
+        ProcessControlBlock {
+            pid: pid,
+            parent_pid: parent_pid,
+            process_group: pid,
+            session_id: 0,
+            state: PROC_STATE_CREATED,
+            flags: PROC_FLAG_USER,
+            credentials: credentials,
+            name: name,
+            priority: PRIORITY_DEFAULT,
+            capabilities: FixedArray::new(),
+            num_capabilities: 0,
+            children: FixedArray::new(),
+            num_children: 0,
+            open_handles: FixedArray::new(),
+            num_handles: 0,
+            exit_code: 0,
+            user_stack_base: 0,
+            user_stack_size: PROCESS_STACK_SIZE_DEFAULT,
+            heap_base: 0,
+            heap_size: 0,
+            entry_point: 0,
+            address_space_id: 0,
+            cpu_time_used: Word64::zero(),
+            start_time: Word64::zero(),
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn set_state(self: ref mut, state: u8)
+        effects: [deterministic]
+    {
+        self.state = state
+        self.generation.bump()
+    }
+
+    pub fn is_alive(self) -> bool
+        effects: [deterministic]
+    {
+        self.state != PROC_STATE_ZOMBIE &&
+        self.state != PROC_STATE_TERMINATED
+    }
+
+    pub fn is_runnable(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == PROC_STATE_READY ||
+        self.state == PROC_STATE_RUNNING
+    }
+
+    pub fn is_zombie(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == PROC_STATE_ZOMBIE
+    }
+
+    pub fn can_receive_signals(self) -> bool
+        effects: [deterministic]
+    {
+        self.state != PROC_STATE_ZOMBIE &&
+        self.state != PROC_STATE_TERMINATED
+    }
+
+    pub fn add_child(self: ref mut, child_pid: Pid) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_children >= MAX_CHILD_PROCESSES {
+            return Result::Err(proc_error(
+                DIAG_PROC_BOUNDS,
+                FixedString[128]::from_slice("Max children per process")))
+        }
+        self.children.push(child_pid);
+        self.num_children = self.num_children + 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn remove_child(self: ref mut, child_pid: Pid)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_children
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_children {
+            let child: ref Pid = self.children.get(i)
+            if child.value() == child_pid.value() {
+                // Shift remaining
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_children - 1) {
+                    let next: Pid = self.children.get(j + 1)
+                    self.children.set(j, next)
+                }
+                self.num_children = self.num_children - 1
+                self.generation.bump()
+                return
+            }
+        }
+    }
+
+    pub fn add_handle(self: ref mut, handle: Handle) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_handles >= MAX_OPEN_HANDLES {
+            return Result::Err(proc_error(
+                DIAG_PROC_BOUNDS,
+                FixedString[128]::from_slice("Max open handles")))
+        }
+        self.open_handles.push(handle);
+        self.num_handles = self.num_handles + 1
+        Result::Ok(())
+    }
+
+    pub fn close_handle(self: ref mut, index: u32) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if index >= self.num_handles {
+            return Result::Err(proc_error(
+                DIAG_PROC_INVALID_ID,
+                FixedString[128]::from_slice("Invalid handle index")))
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+        loop: bounds[BOUND_MEDIUM] for j in index..(self.num_handles - 1) {
+            let next: Handle = self.open_handles.get(j + 1)
+            self.open_handles.set(j, next)
+        }
+        self.num_handles = self.num_handles - 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn add_capability(self: ref mut, proc_cap: ProcessCapability)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_capabilities >= MAX_CAPABILITIES_PER_PROC {
+            return Result::Err(proc_error(
+                DIAG_PROC_BOUNDS,
+                FixedString[128]::from_slice("Max capabilities per process")))
+        }
+        self.capabilities.push(proc_cap);
+        self.num_capabilities = self.num_capabilities + 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn set_exit_code(self: ref mut, code: i32)
+        effects: [deterministic]
+    {
+        self.exit_code = code
+    }
+
+    pub fn accumulate_cpu_time(self: ref mut, delta: Word64)
+        effects: [deterministic]
+    {
+        let current: u64 = self.cpu_time_used.to_u64()
+        let delta_val: u64 = delta.to_u64()
+        self.cpu_time_used = Word64::from_u64(current + delta_val)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Process Table
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-TABLE-001 through PROC-PROC-TABLE-050
+
+pub type ProcessTable : struct {
+    processes: FixedArray[MAX_PROCESSES, ProcessControlBlock],
+    num_processes: u32,
+    next_pid: u32,
+    idle_pid: Pid,
+    init_pid: Pid,
+    total_processes_created: u64,
+    total_processes_exited: u64,
+    fork_count: u64,
+    exec_count: u64,
+    exit_count: u64,
+    generation: Word32,
+}
+
+impl ProcessTable {
+    pub fn new() -> ProcessTable
+        effects: [deterministic]
+    {
+        ProcessTable {
+            processes: FixedArray::new(),
+            num_processes: 0,
+            next_pid: 1,
+            idle_pid: Pid::zero(),
+            init_pid: Pid::zero(),
+            total_processes_created: 0,
+            total_processes_exited: 0,
+            fork_count: 0,
+            exec_count: 0,
+            exit_count: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn create_process(self: ref mut, parent_pid: Pid,
+                            credentials: Credentials,
+                            name: FixedString[PROCESS_NAME_MAX_LEN])
+        -> Result[Pid, ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_processes >= MAX_PROCESSES {
+            return Result::Err(proc_error(
+                DIAG_PROC_MAX_REACHED,
+                FixedString[128]::from_slice("Max processes reached")))
+        }
+        let pid_value: u32 = self.next_pid
+        self.next_pid = self.next_pid + 1
+        if self.next_pid >= MAX_PROCESSES {
+            self.next_pid = 1  // Wrap around, skip 0
+        }
+        let pid: Pid = Pid::new(pid_value)
+        let proc: ProcessControlBlock = ProcessControlBlock::new(
+            pid, parent_pid, credentials, name)
+        self.processes.push(proc);
+        self.num_processes = self.num_processes + 1
+        self.total_processes_created = self.total_processes_created + 1
+        self.generation.bump();
+        // Add to parent's child list
+        if parent_pid.is_valid() {
+            let parent_result: Result[ref mut ProcessControlBlock, ProcessError> =
+                self.get_process_mut(parent_pid)
+            match parent_result {
+                Result::Ok(parent) => {
+                    let _ = parent.add_child(pid)
+                },
+                Result::Err(_) => {},
+            }
+        }
+        self.record_create_residual(pid, parent_pid, name)
+        Result::Ok(pid)
+    }
+
+    pub fn get_process(self, pid: Pid) -> Result[ref ProcessControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            let proc: ref ProcessControlBlock = self.processes.get(i)
+            if proc.pid.value() == pid.value() {
+                return Result::Ok(proc)
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PROC_NOT_FOUND,
+            FixedString[128]::from_slice("Process not found")))
+    }
+
+    pub fn get_process_mut(self: ref mut, pid: Pid)
+        -> Result[ref mut ProcessControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            // Direct array access for simplicity; in production use hash map
+            // trust: loop bounds-checked by num_processes
+            trusted("process table lookup: pid comparison within bounds") {
+                let proc: ref ProcessControlBlock = self.processes.get(i)
+                if proc.pid.value() == pid.value() {
+                    // Can't easily return mutable ref from loop, so use index
+                }
+            }
+        }
+        // Simpler approach: linear scan
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            // trust: direct index access
+            let pcb: ref ProcessControlBlock = trusted("process mut lookup") {
+                self.processes.get(i)
+            }
+            if pcb.pid.value() == pid.value() {
+                return Result::Ok(self.processes.get_mut(i))
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PROC_NOT_FOUND,
+            FixedString[128]::from_slice("Process not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Fork
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-FORK-001 through PROC-PROC-FORK-025
+
+    pub fn fork(self: ref mut, parent_pid: Pid)
+        -> Result[Pid, ProcessError>
+        effects: [deterministic]
+    {
+        let parent: ref ProcessControlBlock = self.get_process(parent_pid)?
+        if (parent.flags & PROC_FLAG_NO_FORK) != 0 {
+            return Result::Err(proc_error(
+                DIAG_PROC_PERM_DENIED,
+                FixedString[128]::from_slice("Process cannot fork")))
+        }
+        let child_name: FixedString[PROCESS_NAME_MAX_LEN] = parent.name
+        let child_pid: Pid = self.create_process(
+            parent_pid, parent.credentials, child_name)?
+        // Inherit capabilities (affine: copy, not move)
+        let child: ref mut ProcessControlBlock = self.get_process_mut(child_pid)?
+        // loop: bounds[BOUND_MEDIUM] — bounded by parent.num_capabilities
+        loop: bounds[BOUND_MEDIUM] for i in 0..parent.num_capabilities {
+            let cap: ref ProcessCapability = parent.capabilities.get(i)
+            if child.num_capabilities < MAX_CAPABILITIES_PER_PROC {
+                let inherited: ProcessCapability = ProcessCapability::new(
+                    cap.capability, cap.cap_rights)
+                child.capabilities.push(inherited);
+                child.num_capabilities = child.num_capabilities + 1
+            }
+        }
+        child.address_space_id = parent.address_space_id  // COW on write
+        child.user_stack_base = parent.user_stack_base
+        child.user_stack_size = parent.user_stack_size
+        child.heap_base = parent.heap_base
+        child.heap_size = parent.heap_size
+        child.entry_point = parent.entry_point
+        child.priority = parent.priority
+        child.process_group = parent.process_group
+        child.session_id = parent.session_id
+        child.flags = parent.flags
+        child.set_state(PROC_STATE_READY)
+        self.fork_count = self.fork_count + 1
+        self.generation.bump();
+        self.record_fork_residual(parent_pid, child_pid)
+        Result::Ok(child_pid)
+    }
+
+    // ──────────────────────────────────────────────
+    // Exec
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-EXEC-001 through PROC-PROC-EXEC-020
+
+    pub fn exec(self: ref mut, pid: Pid, entry_point: u64,
+                 stack_base: u64, stack_size: u64,
+                 heap_base: u64, heap_size: u64,
+                 args: FixedArray[MAX_PROCESS_ARGS, FixedString[128]],
+                 num_args: u32)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let proc: ref mut ProcessControlBlock = self.get_process_mut(pid)?
+        if (proc.flags & PROC_FLAG_NO_EXEC) != 0 {
+            return Result::Err(proc_error(
+                DIAG_PROC_PERM_DENIED,
+                FixedString[128]::from_slice("Process cannot exec")))
+        }
+        // Reset process state for new program
+        proc.entry_point = entry_point
+        proc.user_stack_base = stack_base
+        proc.user_stack_size = stack_size
+        proc.heap_base = heap_base
+        proc.heap_size = heap_size
+        proc.set_state(PROC_STATE_READY)
+        // Clear old capabilities, keep inheritable ones
+        // In production, this would filter based on inheritable cap sets
+        self.exec_count = self.exec_count + 1
+        self.generation.bump();
+        self.record_exec_residual(pid, entry_point)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Exit
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-EXIT-001 through PROC-PROC-EXIT-020
+
+    pub fn exit(self: ref mut, pid: Pid, exit_code: i32)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let proc: ref mut ProcessControlBlock = self.get_process_mut(pid)?
+        proc.set_exit_code(exit_code);
+        proc.set_state(PROC_STATE_ZOMBIE);
+        self.exit_count = self.exit_count + 1
+        self.total_processes_exited = self.total_processes_exited + 1
+        // Notify parent
+        let parent_result: Result[ref mut ProcessControlBlock, ProcessError> =
+            self.get_process_mut(proc.parent_pid)
+        match parent_result {
+            Result::Ok(parent) => {
+                parent.remove_child(pid)
+            },
+            Result::Err(_) => {
+                // Parent is gone; reparent to init
+                // (handled by process_tree module)
+            },
+        }
+        self.generation.bump();
+        self.record_exit_residual(pid, exit_code)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Wait
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-WAIT-001 through PROC-PROC-WAIT-015
+
+    pub fn wait(self: ref mut, parent_pid: Pid) -> Result[(Pid, i32), ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            let proc: ref ProcessControlBlock = self.processes.get(i)
+            if proc.parent_pid.value() == parent_pid.value() &&
+               proc.is_zombie() {
+                let child_pid: Pid = proc.pid
+                let exit_code: i32 = proc.exit_code
+                // Remove the zombie process
+                self.remove_process(child_pid)?;
+                self.record_wait_residual(parent_pid, child_pid, exit_code)
+                return Result::Ok((child_pid, exit_code))
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PROC_NOT_FOUND,
+            FixedString[128]::from_slice("No zombie children to wait on")))
+    }
+
+    fn remove_process(self: ref mut, pid: Pid) -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            let proc: ref ProcessControlBlock = self.processes.get(i)
+            if proc.pid.value() == pid.value() {
+                // Shift remaining processes
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_processes - 1) {
+                    let next: ProcessControlBlock = self.processes.get(j + 1)
+                    self.processes.set(j, next)
+                }
+                self.num_processes = self.num_processes - 1
+                self.generation.bump()
+                return Result::Ok(())
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PROC_NOT_FOUND,
+            FixedString[128]::from_slice("Process to remove not found")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Process State Transitions
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-TRANS-001 through PROC-PROC-TRANS-015
+
+    pub fn set_process_state(self: ref mut, pid: Pid, state: u8)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let proc: ref mut ProcessControlBlock = self.get_process_mut(pid)?
+        proc.set_state(state);
+        self.generation.bump();
+        self.record_state_change_residual(pid, state)
+        Result::Ok(())
+    }
+
+    pub fn set_process_priority(self: ref mut, pid: Pid, priority: u8)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if priority < PRIORITY_MIN || priority > PRIORITY_MAX {
+            return Result::Err(proc_error(
+                DIAG_PROC_BOUNDS,
+                FixedString[128]::from_slice("Invalid priority")))
+        }
+        let proc: ref mut ProcessControlBlock = self.get_process_mut(pid)?
+        proc.priority = priority
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Capability Management
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-CAP-MGMT-001 through PROC-PROC-CAP-MGMT-015
+
+    pub fn grant_capability(self: ref mut, pid: Pid, cap: Capability, rights: RightsSet)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let proc: ref mut ProcessControlBlock = self.get_process_mut(pid)?
+        let proc_cap: ProcessCapability = ProcessCapability::new(cap, rights)
+        proc.add_capability(proc_cap)?;
+        self.generation.bump();
+        self.record_cap_grant_residual(pid, rights)
+        Result::Ok(())
+    }
+
+    pub fn revoke_capability(self: ref mut, pid: Pid, index: u32)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let proc: ref mut ProcessControlBlock = self.get_process_mut(pid)?
+        if index >= proc.num_capabilities {
+            return Result::Err(proc_error(
+                DIAG_PROC_INVALID_ID,
+                FixedString[128]::from_slice("Invalid capability index")))
+        }
+        // Affine: drop the capability (it's consumed/moved away)
+        // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+        loop: bounds[BOUND_MEDIUM] for j in index..(proc.num_capabilities - 1) {
+            let next: ProcessCapability = proc.capabilities.get(j + 1)
+            proc.capabilities.set(j, next)
+        }
+        proc.num_capabilities = proc.num_capabilities - 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-QUERY-001 through PROC-PROC-QUERY-020
+
+    pub fn process_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_processes
+    }
+
+    pub fn get_process_by_index(self, index: u32)
+        -> Result[ref ProcessControlBlock, ProcessError>
+        effects: [deterministic]
+    {
+        if index >= self.num_processes {
+            return Result::Err(proc_error(
+                DIAG_PROC_BOUNDS,
+                FixedString[128]::from_slice("Process index out of bounds")))
+        }
+        // trust: index bounds-checked
+        trusted("process by index: index verified") {
+            Result::Ok(self.processes.get(index))
+        }
+    }
+
+    pub fn find_process_by_name(self, name: FixedString[PROCESS_NAME_MAX_LEN])
+        -> Result[Pid, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            let proc: ref ProcessControlBlock = self.processes.get(i)
+            if proc.name == name {
+                return Result::Ok(proc.pid)
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PROC_NOT_FOUND,
+            FixedString[128]::from_slice("Process name not found")))
+    }
+
+    pub fn count_by_state(self, state: u8) -> u32
+        effects: [deterministic]
+    {
+        let mut count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_processes
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_processes {
+            let proc: ref ProcessControlBlock = self.processes.get(i)
+            if proc.state == state {
+                count = count + 1
+            }
+        }
+        count
+    }
+
+    pub fn fork_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.fork_count
+    }
+
+    pub fn exec_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.exec_count
+    }
+
+    pub fn exit_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.exit_count
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PROC-RESID-001 through PROC-PROC-RESID-020
+
+    fn record_create_residual(self, pid: Pid, parent: Pid,
+                               name: FixedString[PROCESS_NAME_MAX_LEN])
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process created",
+            code: DIAG_PROC_OK,
+            data: (pid.value(), parent.value(), name),
+        )
+    }
+
+    fn record_fork_residual(self, parent: Pid, child: Pid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process forked",
+            code: DIAG_PROC_OK,
+            data: (parent.value(), child.value()),
+        )
+    }
+
+    fn record_exec_residual(self, pid: Pid, entry: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process exec'd",
+            code: DIAG_PROC_OK,
+            data: (pid.value(), entry),
+        )
+    }
+
+    fn record_exit_residual(self, pid: Pid, exit_code: i32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process exited",
+            code: DIAG_PROC_OK,
+            data: (pid.value(), exit_code),
+        )
+    }
+
+    fn record_wait_residual(self, parent: Pid, child: Pid, exit_code: i32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process wait completed",
+            code: DIAG_PROC_OK,
+            data: (parent.value(), child.value(), exit_code),
+        )
+    }
+
+    fn record_state_change_residual(self, pid: Pid, state: u8)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process state change",
+            code: DIAG_PROC_OK,
+            data: (pid.value(), state),
+        )
+    }
+
+    fn record_cap_grant_residual(self, pid: Pid, rights: RightsSet)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Capability granted to process",
+            code: DIAG_PROC_OK,
+            data: (pid.value(), rights.raw()),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module-Level Initialization
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PROC-INIT-001 through PROC-PROC-INIT-015
+
+pub fn init_process_table() -> ProcessTable
+    effects: [deterministic]
+{
+    let mut table: ProcessTable = ProcessTable::new()
+    // Create the idle process (PID 0)
+    let idle_creds: Credentials = Credentials::kernel_default()
+    let idle_name: FixedString[PROCESS_NAME_MAX_LEN] = FixedString::from_slice("idle")
+    let idle_pid: Pid = Pid::new(0)
+    let idle_proc: ProcessControlBlock = ProcessControlBlock::new(
+        idle_pid, Pid::zero(), idle_creds, idle_name)
+    // Mark as idle/system process
+    table.processes.push(idle_proc);
+    table.num_processes = 1
+    table.idle_pid = idle_pid
+    table
+}
+
+pub fn create_init_process(table: ref mut ProcessTable)
+    -> Result[Pid, ProcessError>
+    effects: [deterministic]
+{
+    let init_creds: Credentials = Credentials::kernel_default()
+    let init_name: FixedString[PROCESS_NAME_MAX_LEN] = FixedString::from_slice("init")
+    let init_pid: Pid = table.create_process(Pid::zero(), init_creds, init_name)?
+    table.init_pid = init_pid
+    // Grant all capabilities to init
+    let all_rights: RightsSet = RightsSet::from_u64(CAP_RIGHT_ALL)
+    let all_cap: ProcessCapability = ProcessCapability::new(
+        Capability::new(0, all_rights), all_rights)
+    let init: ref mut ProcessControlBlock = table.get_process_mut(init_pid)?
+    init.add_capability(all_cap)?;
+    init.flags = PROC_FLAG_SYSTEM | PROC_FLAG_CRITICAL
+    Result::Ok(init_pid)
+}
+
+pub fn is_valid_pid(pid: Pid) -> bool
+    effects: [deterministic]
+{
+    pid.is_valid()
+}
+
+pub fn pid_from_u32(value: u32) -> Pid
+    effects: [deterministic]
+{
+    Pid::new(value)
+}

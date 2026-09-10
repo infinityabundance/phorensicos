@@ -1,0 +1,1118 @@
+// perf_counters.phor — Performance Counters: CPU PMU Configuration, Event Counting,
+//                       Sampling, Counter Multiplexing, Event Groups, Overflow Handling,
+//                       Counter Virtualization, Performance Analysis Reports
+// Phorensic OS — Debug Subsystem
+//
+// This module implements performance monitoring counter (PMU) management for the
+// Phorensic OS kernel. It configures CPU performance counters for event counting
+// and sampling, handles counter multiplexing when more events than counters are
+// requested, manages event groups for coordinated measurement, handles counter
+// overflow conditions, and generates performance analysis reports.
+//
+// Operations:
+// 1. PMU configuration — program CPU performance counters with event selectors
+// 2. Event counting — fixed-function and general-purpose counter management
+// 3. Sampling — overflow-based instruction pointer sampling (PEBS-like)
+// 4. Counter multiplexing — time-multiplex events across limited counters
+// 5. Event groups — coordinated start/stop of event groups
+// 6. Overflow handling — counter overflow detection and interrupt management
+// 7. Counter virtualization — virtual counter contexts for processes
+// 8. Performance analysis reports — metric computation and report generation
+//
+// Boundedness: Event counters 8 max (typical x86-64). Virtual counters 64.
+// Event groups 16. All loops bounded.
+//
+// Effect declarations:
+//   [pure]    — metric computation, report formatting
+//   [io]      — report output
+//   [pmu]     — PMU register access, counter programming
+//   [diag]    — residual recording
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const PMU_COUNTER_CONFIG  : u64 = 0x16000u64;
+const PMU_OVERFLOW        : u64 = 0x16001u64;
+const PMU_SAMPLE          : u64 = 0x16002u64;
+const PMU_REPORT          : u64 = 0x16003u64;
+const PMU_ERROR           : u64 = 0x1600Fu64;
+
+// ──────────────────────────────────────────────
+// PMU Types
+// ──────────────────────────────────────────────
+
+/// Performance counter type.
+pub sealdatatype CounterType : u8 {
+    /// Fixed-function counter (e.g., instructions retired).
+    Fixed = 0u8,
+    /// Programmable general-purpose counter.
+    Programmable = 1u8,
+    /// PEBS (Precise Event-Based Sampling) counter.
+    Precise = 2u8,
+}
+
+/// Counter privilege level filter.
+pub sealdatatype CounterPrivilege : u8 {
+    /// Count only OS/kernel mode events.
+    OS = 0u8,
+    /// Count only user mode events.
+    User = 1u8,
+    /// Count all privilege levels.
+    All = 2u8,
+}
+
+/// Performance event identifier.
+pub sealdatatype PerfEventId : u16 {
+    // Architectural performance events (x86-64).
+    CPU_CLOCKS_UNHALTED = 0x003Cu,
+    INSTRUCTIONS_RETIRED = 0x00C0u16,
+    LLC_REFERENCES = 0x002Eu16,
+    LLC_MISSES = 0x0041u16,
+    BRANCH_INSTRUCTIONS = 0x00C4u16,
+    BRANCH_MISSES = 0x00C5u16,
+    L1D_READS = 0x0051u16,
+    L1D_MISSES = 0x0055u16,
+    L1I_READS = 0x0080u16,
+    L1I_MISSES = 0x0085u16,
+    STALLS_MEM_ANY = 0x00A2u16,
+    FP_ARITH_INST = 0x00C7u16,
+    PAGE_WALKS = 0x00B7u16,
+    // Custom/phorensic events.
+    SYSCALLS = 0xF000u16,
+    CONTEXT_SWITCHES = 0xF001u16,
+    CAPABILITY_CHECKS = 0xF002u16,
+    EFFECT_VERIFICATIONS = 0xF003u16,
+    RESIDUAL_EMISSIONS = 0xF004u16,
+    IPC_MESSAGES = 0xF005u16,
+    MEMORY_ALLOCATIONS = 0xF006u16,
+    CAGE_TRANSITIONS = 0xF007u16,
+}
+
+/// A single performance counter descriptor.
+pub struct PerfCounter {
+    /// Counter index (0-7 for physical, or virtual index).
+    pub index : u32,
+    /// Event being counted.
+    pub event : PerfEventId,
+    /// Counter type.
+    pub counter_type : CounterType,
+    /// Current raw counter value.
+    pub value : u64,
+    /// Previous snapshot value.
+    pub previous_value : u64,
+    /// Enabled flag.
+    pub enabled : bool,
+    /// Overflow count.
+    pub overflow_count : u32,
+    /// Overflow threshold (0 = no threshold).
+    pub overflow_threshold : u64,
+    /// Privilege level filter.
+    pub privilege : CounterPrivilege,
+    /// User-defined name for this counter.
+    pub name : FixedString64,
+    /// Whether this is a sampling counter.
+    pub sampling : bool,
+    /// Sample period (for sampling counters).
+    pub sample_period : u64,
+}
+
+/// A group of counters that start/stop together.
+pub struct CounterGroup {
+    /// Group name.
+    pub name : FixedString64,
+    /// Indices of counters in this group.
+    pub counter_indices : Array16<u32>,
+    /// Whether the group is running.
+    pub running : bool,
+}
+
+/// A virtualized counter context for a process.
+pub struct VirtualCounterContext {
+    /// Process/thread ID.
+    pub thread_id : u32,
+    /// Virtualized counter values.
+    pub counters : Array64<PerfCounter>,
+    /// Saved physical counter values on context switch.
+    pub saved_values : Array64<u64>,
+    /// Whether this context is active.
+    pub active : bool,
+}
+
+/// Performance metric computed from counter deltas.
+pub struct PerfMetric {
+    /// Metric name.
+    pub name : FixedString64,
+    /// Metric value.
+    pub value : f64,
+    /// Unit string.
+    pub unit : FixedString64,
+}
+
+/// PMU residual.
+pub struct PmuResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub counter_index : u32,
+    pub event_id : u16,
+    pub timestamp : u64,
+}
+
+/// Main PMU manager.
+pub struct PmuManager {
+    /// Physical counters (max 8).
+    pub counters : Array16<PerfCounter>,
+    /// Counter groups.
+    pub groups : Array16<CounterGroup>,
+    /// Virtual counter contexts (max 64).
+    pub virtual_contexts : Array64<VirtualCounterContext>,
+    /// Counter multiplexing factor (% of time each counter gets).
+    pub multiplex_factor : u8,
+    /// Whether multiplexing is enabled.
+    pub multiplexing_enabled : bool,
+    /// Whether the PMU is globally enabled.
+    pub enabled : bool,
+    /// Total overflow count across all counters.
+    pub total_overflows : u32,
+    /// Residual log.
+    pub residual_log : Array128<PmuResidual>,
+}
+
+impl PmuManager {
+    /// Create a new PMU manager.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> PmuManager [pure] {
+        PmuManager {
+            counters: Array16::new(),
+            groups: Array16::new(),
+            virtual_contexts: Array64::new(),
+            multiplex_factor: 100u8,
+            multiplexing_enabled: false,
+            enabled: false,
+            total_overflows: 0u32,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a PMU residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, counter_idx : u32,
+                       event_id : u16) -> PmuManager [diag] {
+        let residual : PmuResidual = PmuResidual {
+            code: code,
+            message: message,
+            action: action,
+            counter_index: counter_idx,
+            event_id: event_id,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Counter Configuration
+    // ──────────────────────────────────────────
+
+    /// Add a performance counter.
+    /// Effect: pure — counter registration.
+    pub fn add_counter(mut self, event : PerfEventId, name : FixedString64,
+                       privilege : CounterPrivilege) -> Result<PmuManager, FixedString256> [pure] {
+        if self.counters.is_full() {
+            return Result::Err(FixedString256::from("physical counter limit reached"));
+        }
+
+        let counter : PerfCounter = PerfCounter {
+            index: self.counters.len(),
+            event: event,
+            counter_type: CounterType::Programmable,
+            value: 0u64,
+            previous_value: 0u64,
+            enabled: false,
+            overflow_count: 0u32,
+            overflow_threshold: 0u64,
+            privilege: privilege,
+            name: name,
+            sampling: false,
+            sample_period: 0u64,
+        };
+        let _ = self.counters.push(counter);
+        Result::Ok(self)
+    }
+
+    /// Configure a fixed-function counter.
+    /// Effect: pure — fixed counter setup.
+    pub fn add_fixed_counter(mut self, event : PerfEventId,
+                             name : FixedString64) -> Result<PmuManager, FixedString256> [pure] {
+        if self.counters.is_full() {
+            return Result::Err(FixedString256::from("counter limit reached"));
+        }
+
+        let counter : PerfCounter = PerfCounter {
+            index: self.counters.len(),
+            event: event,
+            counter_type: CounterType::Fixed,
+            value: 0u64,
+            previous_value: 0u64,
+            enabled: false,
+            overflow_count: 0u32,
+            overflow_threshold: 0u64,
+            privilege: CounterPrivilege::All,
+            name: name,
+            sampling: false,
+            sample_period: 0u64,
+        };
+        let _ = self.counters.push(counter);
+        Result::Ok(self)
+    }
+
+    /// Set overflow threshold for a counter.
+    /// Effect: pure — threshold configuration.
+    pub fn set_overflow_threshold(mut self, index : u32,
+                                  threshold : u64) -> Result<PmuManager, FixedString256> [pure] {
+        if index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+        let mut counter : PerfCounter = self.counters.get(index);
+        counter.overflow_threshold = threshold;
+        let _ = self.counters.set(index, counter);
+        Result::Ok(self)
+    }
+
+    /// Configure a counter for sampling mode.
+    /// Effect: pure — sampling configuration.
+    pub fn configure_sampling(mut self, index : u32,
+                              period : u64) -> Result<PmuManager, FixedString256> [pure] {
+        if index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+        let mut counter : PerfCounter = self.counters.get(index);
+        counter.sampling = true;
+        counter.sample_period = period;
+        let _ = self.counters.set(index, counter);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // PMU Lifecycle
+    // ──────────────────────────────────────────
+
+    /// Start all counters.
+    /// Effect: pmu — programs PMU hardware.
+    pub fn start(mut self) -> Result<PmuManager, FixedString256> [pmu, diag] {
+        if self.enabled {
+            return Result::Err(FixedString256::from("PMU already enabled"));
+        }
+
+        self.enabled = true;
+
+        // Program each counter into the hardware.
+        // loop: bounds[BOUND_SMALL] — bounded by counter count (max 16).
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let mut counter : PerfCounter = self.counters.get(i);
+            if counter.enabled {
+                continue;
+            }
+            counter.enabled = true;
+
+            // Program the physical counter.
+            let event_code : u64 = counter.event as u64;
+            let umask : u64 = 0xFFu64; // Default unit mask
+            let privilege_bits : u64 = match counter.privilege {
+                CounterPrivilege::OS => 0x2u64,
+                CounterPrivilege::User => 0x1u64,
+                CounterPrivilege::All => 0x3u64,
+            };
+            let counter_cfg : u64 = (event_code & 0xFFu64) |
+                                    ((umask & 0xFFu64) << 8u64) |
+                                    (privilege_bits << 22u64) |
+                                    (1u64 << 22u64); // enable
+
+            __builtin_pmu_write_control(i, counter_cfg);
+            __builtin_pmu_write_counter(i, 0u64);
+            let _ = self.counters.set(i, counter);
+
+            self = self.record_residual(PMU_COUNTER_CONFIG,
+                                        FixedString256::from("counter started"),
+                                        FixedString64::from("start"),
+                                        i, counter.event as u16);
+        }
+
+        // Enable global PMU control.
+        __builtin_pmu_enable();
+
+        Result::Ok(self)
+    }
+
+    /// Stop all counters.
+    /// Effect: pmu — disables PMU hardware.
+    pub fn stop(mut self) -> Result<PmuManager, FixedString256> [pmu, diag] {
+        if !self.enabled {
+            return Result::Err(FixedString256::from("PMU not enabled"));
+        }
+
+        // Disable and read final values.
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let mut counter : PerfCounter = self.counters.get(i);
+            if !counter.enabled {
+                continue;
+            }
+            let final_value : u64 = __builtin_pmu_read_counter(i);
+            counter.previous_value = counter.value;
+            counter.value = final_value;
+            counter.enabled = false;
+            let _ = self.counters.set(i, counter);
+        }
+
+        __builtin_pmu_disable();
+        self.enabled = false;
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Counter Reading
+    // ──────────────────────────────────────────
+
+    /// Read the current value of a counter.
+    /// Effect: pmu — reads hardware counter.
+    pub fn read_counter(mut self, index : u32) -> Result<(PmuManager, u64), FixedString256> [pmu] {
+        if index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+
+        let mut counter : PerfCounter = self.counters.get(index);
+        if !counter.enabled {
+            return Result::Err(FixedString256::from("counter not enabled"));
+        }
+
+        let raw_value : u64 = __builtin_pmu_read_counter(index);
+        counter.previous_value = counter.value;
+        counter.value = raw_value;
+        let _ = self.counters.set(index, counter);
+
+        Result::Ok((self, raw_value))
+    }
+
+    /// Read the delta (since last read) for a counter.
+    /// Effect: pmu — reads and computes delta.
+    pub fn read_counter_delta(mut self, index : u32) -> Result<(PmuManager, u64), FixedString256> [pmu] {
+        if index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+
+        let mut counter : PerfCounter = self.counters.get(index);
+        if !counter.enabled {
+            return Result::Err(FixedString256::from("counter not enabled"));
+        }
+
+        let raw_value : u64 = __builtin_pmu_read_counter(index);
+        let delta : u64 = raw_value - counter.value;
+        counter.previous_value = counter.value;
+        counter.value = raw_value;
+        let _ = self.counters.set(index, counter);
+
+        // Check for overflow.
+        if counter.overflow_threshold > 0u64 && delta > counter.overflow_threshold {
+            counter.overflow_count += 1u32;
+            self.total_overflows += 1u32;
+            let _ = self.counters.set(index, counter);
+            self = self.record_residual(PMU_OVERFLOW,
+                                        FixedString256::from("counter overflow"),
+                                        FixedString64::from("overflow"),
+                                        index, counter.event as u16);
+        }
+
+        Result::Ok((self, delta))
+    }
+
+    /// Read all counter deltas at once.
+    /// Effect: pmu — reads all hardware counters.
+    pub fn read_all_deltas(mut self) -> Result<(PmuManager, Array64<(FixedString64, u64, u64)>), FixedString256>
+                           [pmu] {
+        var results : Array64<(FixedString64, u64, u64)> = Array64::new(); // name, value, delta
+
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let read_result : Result<(PmuManager, u64), FixedString256> = self.read_counter_delta(i);
+            match read_result {
+                Result::Ok((manager, delta)) => {
+                    self = manager;
+                    let counter : PerfCounter = self.counters.get(i);
+                    let _ = results.push((counter.name, counter.value, delta));
+                },
+                Result::Err(_) => {},
+            }
+        }
+
+        Result::Ok((self, results))
+    }
+
+    /// Reset a counter's value to zero.
+    /// Effect: pmu — resets hardware counter.
+    pub fn reset_counter(mut self, index : u32) -> Result<PmuManager, FixedString256> [pmu] {
+        if index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+
+        let mut counter : PerfCounter = self.counters.get(index);
+        counter.previous_value = 0u64;
+        counter.value = 0u64;
+        let _ = self.counters.set(index, counter);
+
+        __builtin_pmu_write_counter(index, 0u64);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Counter Groups
+    // ──────────────────────────────────────────
+
+    /// Create a counter group.
+    /// Effect: pure — group creation.
+    pub fn create_group(mut self, name : FixedString64,
+                        indices : Array16<u32>) -> Result<PmuManager, FixedString256> [pure] {
+        if self.groups.is_full() {
+            return Result::Err(FixedString256::from("group limit reached"));
+        }
+
+        let group : CounterGroup = CounterGroup {
+            name: name,
+            counter_indices: indices,
+            running: false,
+        };
+        let _ = self.groups.push(group);
+        Result::Ok(self)
+    }
+
+    /// Start a counter group (enables all counters in the group).
+    /// Effect: pmu — programs multiple counters.
+    pub fn start_group(mut self, index : u32) -> Result<PmuManager, FixedString256> [pmu, diag] {
+        if index >= self.groups.len() {
+            return Result::Err(FixedString256::from("group index out of range"));
+        }
+
+        let mut group : CounterGroup = self.groups.get(index);
+        if group.running {
+            return Result::Err(FixedString256::from("group already running"));
+        }
+
+        // Enable all counters in the group.
+        // loop: bounds[BOUND_SMALL] — bounded by counter indices.
+        for var i : u32 = 0u32; i < group.counter_indices.len(); i += 1u32 [group.counter_indices.len()] {
+            let counter_idx : u32 = group.counter_indices.get(i);
+            if counter_idx < self.counters.len() {
+                let mut counter : PerfCounter = self.counters.get(counter_idx);
+                counter.enabled = true;
+                let event_code : u64 = counter.event as u64;
+                let cfg : u64 = (event_code & 0xFFu64) |
+                                0x02u64 | // OS mode
+                                (1u64 << 22u64); // enable
+                __builtin_pmu_write_control(counter_idx, cfg);
+                __builtin_pmu_write_counter(counter_idx, 0u64);
+                let _ = self.counters.set(counter_idx, counter);
+            }
+        }
+
+        group.running = true;
+        let _ = self.groups.set(index, group);
+
+        __builtin_pmu_enable();
+
+        self = self.record_residual(PMU_COUNTER_CONFIG,
+                                    FixedString256::from("group started"),
+                                    FixedString64::from("group_start"),
+                                    index, 0u16);
+        Result::Ok(self)
+    }
+
+    /// Stop a counter group.
+    /// Effect: pmu — disables group counters.
+    pub fn stop_group(mut self, index : u32) -> Result<PmuManager, FixedString256> [pmu, diag] {
+        if index >= self.groups.len() {
+            return Result::Err(FixedString256::from("group index out of range"));
+        }
+
+        let mut group : CounterGroup = self.groups.get(index);
+        if !group.running {
+            return Result::Err(FixedString256::from("group not running"));
+        }
+
+        // loop: bounds[BOUND_SMALL] — bounded by counter indices.
+        for var i : u32 = 0u32; i < group.counter_indices.len(); i += 1u32 [group.counter_indices.len()] {
+            let counter_idx : u32 = group.counter_indices.get(i);
+            if counter_idx < self.counters.len() {
+                let mut counter : PerfCounter = self.counters.get(counter_idx);
+                counter.value = __builtin_pmu_read_counter(counter_idx);
+                counter.enabled = false;
+                let _ = self.counters.set(counter_idx, counter);
+            }
+        }
+
+        group.running = false;
+        let _ = self.groups.set(index, group);
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Counter Multiplexing
+    // ──────────────────────────────────────────
+
+    /// Enable counter multiplexing.
+    /// Effect: pure — multiplexing configuration.
+    pub fn enable_multiplexing(mut self, factor : u8) -> Result<PmuManager, FixedString256> [pure] {
+        if factor > 100u8 {
+            return Result::Err(FixedString256::from("multiplex factor must be <= 100"));
+        }
+        self.multiplexing_enabled = true;
+        self.multiplex_factor = factor;
+        Result::Ok(self)
+    }
+
+    /// Perform a multiplexing switch: rotate active counters.
+    /// Effect: pmu — switches active counter set.
+    pub fn multiplex_switch(mut self) -> PmuManager [pmu] {
+        if !self.multiplexing_enabled {
+            return self;
+        }
+
+        let total_counters : u32 = self.counters.len();
+        if total_counters <= 4u32 {
+            return self; // No multiplexing needed for <= 4 counters.
+        }
+
+        // Read current values and compute which set to enable next.
+        var active_set : u32 = 0u32;
+        // Count active counters.
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < total_counters; i += 1u32 [total_counters] {
+            let counter : PerfCounter = self.counters.get(i);
+            if counter.enabled {
+                active_set = i / 4u32; // Determine which group of 4 is active.
+            }
+        }
+
+        // Disable all counters.
+        __builtin_pmu_disable();
+
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < total_counters; i += 1u32 [total_counters] {
+            let mut counter : PerfCounter = self.counters.get(i);
+            if counter.enabled {
+                counter.value = __builtin_pmu_read_counter(i);
+                counter.enabled = false;
+            }
+            let _ = self.counters.set(i, counter);
+        }
+
+        // Enable next set of counters.
+        let next_set : u32 = (active_set + 1u32) % ((total_counters + 3u32) / 4u32);
+        var start_idx : u32 = next_set * 4u32;
+        var end_idx : u32 = start_idx + 4u32;
+        if end_idx > total_counters {
+            end_idx = total_counters;
+        }
+
+        // loop: bounds[BOUND_SMALL] — bounded by 4 counters.
+        for var i : u32 = start_idx; i < end_idx; i += 1u32 [4u32] {
+            let mut counter : PerfCounter = self.counters.get(i);
+            counter.enabled = true;
+            let event_code : u64 = counter.event as u64;
+            let cfg : u64 = (event_code & 0xFFu64) | (1u64 << 22u64);
+            __builtin_pmu_write_control(i, cfg);
+            __builtin_pmu_write_counter(i, 0u64);
+            let _ = self.counters.set(i, counter);
+        }
+
+        __builtin_pmu_enable();
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Overflow Handling
+    // ──────────────────────────────────────────
+
+    /// Handle a PMU overflow interrupt.
+    /// Effect: pmu, diag — processes overflow.
+    pub fn handle_overflow(mut self, counter_index : u32) -> Result<PmuManager, FixedString256>
+                           [pmu, diag] {
+        if counter_index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+
+        let mut counter : PerfCounter = self.counters.get(counter_index);
+        counter.overflow_count += 1u32;
+        self.total_overflows += 1u32;
+
+        // Reset the counter for the next period.
+        __builtin_pmu_write_counter(counter_index, 0u64 - counter.sample_period);
+        counter.value = __builtin_pmu_read_counter(counter_index);
+
+        let _ = self.counters.set(counter_index, counter);
+
+        self = self.record_residual(PMU_OVERFLOW,
+                                    FixedString256::from("overflow handled"),
+                                    FixedString64::from("overflow"),
+                                    counter_index, counter.event as u16);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Counter Virtualization
+    // ──────────────────────────────────────────
+
+    /// Create a virtual counter context for a thread.
+    /// Effect: pure — virtual context creation.
+    pub fn create_virtual_context(mut self, thread_id : u32) -> Result<PmuManager, FixedString256> [pure] {
+        if self.virtual_contexts.is_full() {
+            return Result::Err(FixedString256::from("virtual context limit reached"));
+        }
+
+        let ctx : VirtualCounterContext = VirtualCounterContext {
+            thread_id: thread_id,
+            counters: Array64::new(),
+            saved_values: Array64::new(),
+            active: false,
+        };
+        let _ = self.virtual_contexts.push(ctx);
+        Result::Ok(self)
+    }
+
+    /// Save physical counter state to a virtual context.
+    /// Effect: pmu — reads hardware counters.
+    pub fn save_virtual_context(mut self, thread_id : u32) -> Result<PmuManager, FixedString256>
+                                [pmu] {
+        // Find virtual context.
+        var ctx_idx : u32 = 0u32;
+        var found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by virtual contexts.
+        for var i : u32 = 0u32; i < self.virtual_contexts.len(); i += 1u32 [self.virtual_contexts.len()] {
+            let ctx : VirtualCounterContext = self.virtual_contexts.get(i);
+            if ctx.thread_id == thread_id {
+                ctx_idx = i;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("virtual context not found"));
+        }
+
+        let mut ctx : VirtualCounterContext = self.virtual_contexts.get(ctx_idx);
+        ctx.saved_values.clear();
+
+        // Read current counter values.
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let value : u64 = __builtin_pmu_read_counter(i);
+            let _ = ctx.saved_values.push(value);
+        }
+
+        ctx.active = true;
+        let _ = self.virtual_contexts.set(ctx_idx, ctx);
+        Result::Ok(self)
+    }
+
+    /// Restore physical counter state from a virtual context.
+    /// Effect: pmu — writes hardware counters.
+    pub fn restore_virtual_context(mut self, thread_id : u32) -> Result<PmuManager, FixedString256>
+                                   [pmu] {
+        var ctx_idx : u32 = 0u32;
+        var found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by virtual contexts.
+        for var i : u32 = 0u32; i < self.virtual_contexts.len(); i += 1u32 [self.virtual_contexts.len()] {
+            let ctx : VirtualCounterContext = self.virtual_contexts.get(i);
+            if ctx.thread_id == thread_id {
+                ctx_idx = i;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Result::Err(FixedString256::from("virtual context not found"));
+        }
+
+        let ctx : VirtualCounterContext = self.virtual_contexts.get(ctx_idx);
+        if !ctx.active {
+            return Result::Err(FixedString256::from("virtual context not active"));
+        }
+
+        // Restore counter values.
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < ctx.saved_values.len() && i < self.counters.len(); i += 1u32 [ctx.saved_values.len()] {
+            let value : u64 = ctx.saved_values.get(i);
+            __builtin_pmu_write_counter(i, value);
+        }
+
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Performance Metrics & Reports
+    // ──────────────────────────────────────────
+
+    /// Compute performance metrics from counter deltas.
+    /// Effect: pure — metric computation.
+    pub fn compute_metrics(&self, elapsed_ns : u64) -> Array64<PerfMetric> [pure] {
+        var metrics : Array64<PerfMetric> = Array64::new();
+        var instructions : u64 = 0u64;
+        var cycles : u64 = 0u64;
+        var branches : u64 = 0u64;
+        var branch_misses : u64 = 0u64;
+        var l1d_misses : u64 = 0u64;
+        var llc_misses : u64 = 0u64;
+
+        // Gather counter values.
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let counter : PerfCounter = self.counters.get(i);
+            let delta : u64 = counter.value - counter.previous_value;
+            match counter.event {
+                PerfEventId::INSTRUCTIONS_RETIRED => { instructions = delta; },
+                PerfEventId::CPU_CLOCKS_UNHALTED => { cycles = delta; },
+                PerfEventId::BRANCH_INSTRUCTIONS => { branches = delta; },
+                PerfEventId::BRANCH_MISSES => { branch_misses = delta; },
+                PerfEventId::L1D_MISSES => { l1d_misses = delta; },
+                PerfEventId::LLC_MISSES => { llc_misses = delta; },
+                _ => {},
+            }
+        }
+
+        let elapsed_sec : f64 = elapsed_ns as f64 / 1_000_000_000.0f64;
+
+        // CPI (Cycles Per Instruction).
+        if instructions > 0u64 {
+            let cpi : f64 = cycles as f64 / instructions as f64;
+            let _ = metrics.push(PerfMetric {
+                name: FixedString64::from("CPI"),
+                value: cpi,
+                unit: FixedString64::from("cycles/inst"),
+            });
+        }
+
+        // IPC (Instructions Per Cycle).
+        if cycles > 0u64 {
+            let ipc : f64 = instructions as f64 / cycles as f64;
+            let _ = metrics.push(PerfMetric {
+                name: FixedString64::from("IPC"),
+                value: ipc,
+                unit: FixedString64::from("inst/cycle"),
+            });
+        }
+
+        // Branch miss rate.
+        if branches > 0u64 {
+            let bmr : f64 = branch_misses as f64 / branches as f64 * 100.0f64;
+            let _ = metrics.push(PerfMetric {
+                name: FixedString64::from("Branch Miss Rate"),
+                value: bmr,
+                unit: FixedString64::from("%"),
+            });
+        }
+
+        // L1D miss rate.
+        if instructions > 0u64 {
+            let l1d_per_k : f64 = (l1d_misses as f64 / instructions as f64) * 1000.0f64;
+            let _ = metrics.push(PerfMetric {
+                name: FixedString64::from("L1D Misses/KInst"),
+                value: l1d_per_k,
+                unit: FixedString64::from("misses/KInst"),
+            });
+        }
+
+        // LLC miss rate.
+        if llc_misses > 0u64 && instructions > 0u64 {
+            let llc_per_k : f64 = (llc_misses as f64 / instructions as f64) * 1000.0f64;
+            let _ = metrics.push(PerfMetric {
+                name: FixedString64::from("LLC Misses/KInst"),
+                value: llc_per_k,
+                unit: FixedString64::from("misses/KInst"),
+            });
+        }
+
+        // Frequency estimation.
+        if elapsed_sec > 0.0f64 && cycles > 0u64 {
+            let freq_mhz : f64 = (cycles as f64 / elapsed_sec) / 1_000_000.0f64;
+            let _ = metrics.push(PerfMetric {
+                name: FixedString64::from("Estimated Frequency"),
+                value: freq_mhz,
+                unit: FixedString64::from("MHz"),
+            });
+        }
+
+        metrics
+    }
+
+    /// Generate a performance analysis report.
+    /// Effect: io — report output.
+    pub fn generate_report(&self, elapsed_ns : u64) -> FixedString1024 [io] {
+        var report : FixedString1024 = FixedString1024::new();
+
+        report.push_str(FixedString256::from("=== PMU Performance Report ===\n\n"));
+        report.push_str(FixedString256::from("Counters:\n"));
+
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let counter : PerfCounter = self.counters.get(i);
+            report.push_str(FixedString256::from("  ["));
+            report.push_u32(i);
+            report.push_str(FixedString256::from("] "));
+            report.push_str(FixedString256::from_buffer(counter.name));
+            report.push_str(FixedString256::from(": "));
+            report.push_u64(counter.value);
+            report.push_str(FixedString256::from(" (delta: "));
+            report.push_u64(counter.value - counter.previous_value);
+            report.push_str(FixedString256::from(")\n"));
+        }
+
+        report.push_str(FixedString256::from("\nMetrics:\n"));
+        let metrics : Array64<PerfMetric> = self.compute_metrics(elapsed_ns);
+        // loop: bounds[BOUND_SMALL] — bounded by metrics.
+        for var i : u32 = 0u32; i < metrics.len(); i += 1u32 [metrics.len()] {
+            let metric : PerfMetric = metrics.get(i);
+            report.push_str(FixedString256::from("  "));
+            report.push_str(FixedString256::from_buffer(metric.name));
+            report.push_str(FixedString256::from(": "));
+            report.push_f64(metric.value, 4u32);
+            report.push_str(FixedString256::from(" "));
+            report.push_str(FixedString256::from_buffer(metric.unit));
+            report.push_str(FixedString256::from("\n"));
+        }
+
+        report.push_str(FixedString256::from("\nOverflows: "));
+        report.push_u32(self.total_overflows);
+        report.push_str(FixedString256::from("\nElapsed: "));
+        report.push_u64(elapsed_ns);
+        report.push_str(FixedString256::from(" ns\n"));
+        report.push_str(FixedString256::from("\n=== End of Report ===\n"));
+
+        report
+    }
+
+    // ──────────────────────────────────────────
+    // Counter State Management
+    // ──────────────────────────────────────────
+
+    /// Save the complete PMU state (for context switch).
+    /// Effect: pmu — reads all counter values.
+    pub fn save_state(mut self) -> (PmuManager, Array64<u64>) [pmu] {
+        var saved_state : Array64<u64> = Array64::new();
+
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let value : u64 = __builtin_pmu_read_counter(i);
+            let _ = saved_state.push(value);
+        }
+
+        (self, saved_state)
+    }
+
+    /// Restore the complete PMU state (from context switch).
+    /// Effect: pmu — writes counter values.
+    pub fn restore_state(mut self, state : Array64<u64>) -> PmuManager [pmu] {
+        // loop: bounds[BOUND_SMALL] — bounded by state entries.
+        for var i : u32 = 0u32; i < state.len() && i < self.counters.len(); i += 1u32 [state.len()] {
+            let value : u64 = state.get(i);
+            __builtin_pmu_write_counter(i, value);
+        }
+        self
+    }
+
+    /// Disable all counters (temporarily).
+    /// Effect: pmu — disables PMU.
+    pub fn disable_all(mut self) -> PmuManager [pmu] {
+        __builtin_pmu_disable();
+        self.enabled = false;
+        self
+    }
+
+    /// Enable all previously configured counters.
+    /// Effect: pmu — enables PMU.
+    pub fn enable_all(mut self) -> PmuManager [pmu] {
+        __builtin_pmu_enable();
+        self.enabled = true;
+        self
+    }
+
+    /// Reset all counter values to zero.
+    /// Effect: pmu — zeroes counters.
+    pub fn reset_all_counters(mut self) -> PmuManager [pmu] {
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            __builtin_pmu_write_counter(i, 0u64);
+            let mut counter : PerfCounter = self.counters.get(i);
+            counter.value = 0u64;
+            counter.previous_value = 0u64;
+            let _ = self.counters.set(i, counter);
+        }
+        self
+    }
+
+    /// Get the name and value of a specific counter.
+    /// Effect: pure — data query.
+    pub fn get_counter_info(&self, index : u32) -> Result<(FixedString64, u64, u64, u32), FixedString256> [pure] {
+        if index >= self.counters.len() {
+            return Result::Err(FixedString256::from("counter index out of range"));
+        }
+        let counter : PerfCounter = self.counters.get(index);
+        Result::Ok((counter.name, counter.value, counter.value - counter.previous_value, counter.overflow_count))
+    }
+
+    /// List all counters as a formatted string.
+    /// Effect: io — formatting.
+    pub fn list_counters(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("PMU Counters:\n"));
+
+        // loop: bounds[BOUND_SMALL] — bounded by counter count.
+        for var i : u32 = 0u32; i < self.counters.len(); i += 1u32 [self.counters.len()] {
+            let counter : PerfCounter = self.counters.get(i);
+            result.push_str(FixedString256::from("  ["));
+            result.push_u32(i);
+            result.push_str(FixedString256::from("] "));
+            result.push_str(FixedString256::from_buffer(counter.name));
+            result.push_str(FixedString256::from(" = "));
+            result.push_u64(counter.value);
+            result.push_str(FixedString256::from(" (overflow: "));
+            result.push_u32(counter.overflow_count);
+            result.push_str(FixedString256::from(")\n"));
+        }
+
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// PMU Event Configuration Helpers
+// ──────────────────────────────────────────────
+
+/// Configure the IA32_PERF_GLOBAL_CTRL MSR.
+pub fn pmu_global_ctrl_enable(enable_mask : u64) [pmu] {
+    __builtin_write_msr(0x38Fu64, enable_mask); // IA32_PERF_GLOBAL_CTRL
+}
+
+/// Read the current counter value for a fixed-function counter.
+pub fn read_fixed_counter(counter_idx : u32) -> u64 [pmu] {
+    let msr_addr : u64 = 0x309u64 + counter_idx as u64; // IA32_FIXED_CTR0
+    __builtin_read_msr(msr_addr)
+}
+
+/// Configure a fixed-function counter.
+pub fn configure_fixed_counter(counter_idx : u32, os_mode : bool, usr_mode : bool) [pmu] {
+    let mut ctrl_val : u64 = 0u64;
+    let shift : u64 = counter_idx as u64 * 4u64;
+    if os_mode { ctrl_val |= 1u64 << shift; }
+    if usr_mode { ctrl_val |= 2u64 << shift; }
+    // Read-modify-write the fixed counter control MSR.
+    let current : u64 = __builtin_read_msr(0x38Du64); // IA32_FIXED_CTR_CTRL
+    __builtin_write_msr(0x38Du64, current | ctrl_val);
+}
+
+/// Disable all running counters.
+pub fn disable_all_counters() [pmu] {
+    __builtin_write_msr(0x38Fu64, 0u64); // Clear global control
+}
+
+/// Enable a specific counter in the global control.
+pub fn enable_counter(counter_idx : u32) [pmu] {
+    let current : u64 = __builtin_read_msr(0x38Fu64);
+    __builtin_write_msr(0x38Fu64, current | (1u64 << counter_idx as u64));
+}
+
+/// Disable a specific counter in the global control.
+pub fn disable_counter(counter_idx : u32) [pmu] {
+    let current : u64 = __builtin_read_msr(0x38Fu64);
+    __builtin_write_msr(0x38Fu64, current & !(1u64 << counter_idx as u64));
+}
+
+/// Reset a counter to zero.
+pub fn reset_counter_value(counter_idx : u32) [pmu] {
+    let msr_addr : u64 = 0xC1u64 + counter_idx as u64; // IA32_PMC0
+    __builtin_write_msr(msr_addr, 0u64);
+}
+
+/// Get the counter width in bits (architectural).
+pub fn counter_width() -> u8 [pure] {
+    48u8 // Most modern x86-64 PMUs have 48-bit counters.
+}
+
+/// Compute the max counter value.
+pub fn counter_max_value() -> u64 [pure] {
+    (1u64 << 48u64) - 1u64
+}
+
+/// Check if a counter has overflowed by comparing to a period.
+pub fn counter_has_overflowed(current : u64, previous : u64) -> bool [pure] {
+    current < previous
+}
+
+/// Compute the delta of a counter, handling overflow.
+pub fn counter_delta(current : u64, previous : u64, width_bits : u8) -> u64 [pure] {
+    if current >= previous {
+        current - previous
+    } else {
+        let mask : u64 = (1u64 << width_bits as u64) - 1u64;
+        (current + (mask - previous + 1u64)) & mask
+    }
+}
+
+/// Read a performance counter and mask it to the valid width.
+pub fn read_counter_masked(counter_idx : u32) -> u64 [pmu] {
+    let raw : u64 = __builtin_pmu_read_counter(counter_idx);
+    raw & counter_max_value()
+}
+
+/// Initialize the PMU with default settings.
+pub fn pmu_init() [pmu] {
+    // Disable all counters first.
+    __builtin_write_msr(0x38Fu64, 0u64);
+    // Clear any pending overflow conditions.
+    __builtin_write_msr(0x38Cu64, 0xFFFFFFFFFFFFFFFFu64); // IA32_PMC_OVERFLOW_STATUS
+}
+
+/// Set up precise event-based sampling (PEBS) for a counter.
+pub fn configure_pebs(counter_idx : u32, ds_area_base : u64) [pmu] {
+    // Configure the DS (Debug Store) area for PEBS.
+    __builtin_write_msr(0x60u64, ds_area_base); // IA32_DS_AREA
+    // Enable PEBS for the counter.
+    let pebs_ctrl : u64 = 1u64 << counter_idx as u64;
+    __builtin_write_msr(0x3F1u64, pebs_ctrl); // IA32_PEBS_ENABLE
+}
+
+/// Read the IA32_PERF_GLOBAL_STATUS MSR.
+pub fn read_global_status() -> u64 [pmu] {
+    __builtin_read_msr(0x38Eu64)
+}
+
+/// Acknowledge overflow on a specific counter.
+pub fn ack_overflow(counter_idx : u32) [pmu] {
+    let mask : u64 = 1u64 << counter_idx as u64;
+    __builtin_write_msr(0x38Cu64, mask); // Write 1 to clear overflow status.
+}
+
+/// Check if a counter overflowed by reading global status.
+pub fn counter_overflowed(counter_idx : u32) -> bool [pmu] {
+    let status : u64 = read_global_status();
+    (status & (1u64 << counter_idx as u64)) != 0u64
+}

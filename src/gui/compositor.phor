@@ -1,0 +1,1185 @@
+// compositor.phor — PhorensicCompositor
+// Surface management, compositing, presentation scheduling, output management
+// Capability-based compositing display server core. All operations bounded.
+// Every function declares effects. Part of the Phorensic OS GUI subsystem.
+
+package gui.compositor;
+
+import gui.protocol;
+import gui.surface;
+
+// ──────────────────────────────────────────────
+// Compositor Constants
+// ──────────────────────────────────────────────
+
+const MAX_COMPOSITE_SURFACES: u64 = 128;
+const MAX_OUTPUTS: u64 = 16;
+const MAX_PENDING_PRESENTS: u64 = 8;
+const MAX_COMPOSITE_LAYERS: u64 = 256;
+const MAX_FRAME_HISTORY: u64 = 64;
+const MAX_SURFACE_DIRTY: u64 = 256;
+const DEFAULT_REFRESH_HZ: u64 = 60;
+const COMPOSITE_TIMEOUT_US: u64 = 16000; // ~1ms at 60Hz
+const MAX_PRESENT_RESIDUALS: u64 = 128;
+
+// ──────────────────────────────────────────────
+// Output State
+// ──────────────────────────────────────────────
+
+struct OutputState {
+    info: protocol.OutputInfo,
+    fb_addr: u64,
+    fb_size: u64,
+    fb_stride: u32,
+    front_buffer: u64,
+    back_buffer: u64,
+    buffer_swapped: bool,
+    vsync_enabled: bool,
+    current_vsync: u64,
+    frame_count: u64,
+    last_present_ns: u64,
+    refresh_interval_ns: u64,
+    damaged: bool,
+    damage_region: protocol.Rectangle,
+    composited: bool,
+    pending_present: bool,
+}
+
+// ──────────────────────────────────────────────
+// Compositing Layer
+// ──────────────────────────────────────────────
+
+struct CompositeLayer {
+    surface_id: u64,
+    type_: protocol.SurfaceType,
+    position: protocol.Point,
+    size: protocol.Size,
+    opacity: f64,
+    visible: bool,
+    has_buffer: bool,
+    buffer_data: Array(u8, 4194304),
+    buffer_stride: u32,
+    z_order: u64,
+    transform: protocol.OutputTransform,
+    source_rect: protocol.Rectangle,
+    dest_rect: protocol.Rectangle,
+    damage_area: protocol.Rectangle,
+    cursor_hotspot_x: i32,
+    cursor_hotspot_y: i32,
+    is_cursor: bool,
+    is_overlay: bool,
+    blend_mode: u64,
+    color_key: Option(protocol.ColorRGBA),
+}
+
+// ──────────────────────────────────────────────
+// Frame Schedule
+// ──────────────────────────────────────────────
+
+struct FrameSchedule {
+    frame_id: u64,
+    output_id: u64,
+    target_timestamp_ns: u64,
+    vsync_interval_ns: u64,
+    scheduled: bool,
+    completed: bool,
+    presentation_mode: protocol.PresentMode,
+    compositing_start_ns: u64,
+    compositing_end_ns: u64,
+    present_start_ns: u64,
+    present_end_ns: u64,
+    surfaces_composited: u64,
+    damage_area: u64,
+    missed_vsync: bool,
+    receipt: Option(protocol.PresentReceipt),
+}
+
+// ──────────────────────────────────────────────
+// PhorensicCompositor — Core Compositor State
+// ──────────────────────────────────────────────
+
+struct PhorensicCompositor {
+    initialized: bool,
+    outputs: RingBuf(OutputState, MAX_OUTPUTS),
+    output_count: u64,
+    active_output: u64,
+    primary_output_id: u64,
+
+    // Surface tracking for compositing
+    composite_layers: RingBuf(CompositeLayer, MAX_COMPOSITE_LAYERS),
+    layer_count: u64,
+    dirty_surfaces: RingBuf(u64, MAX_SURFACE_DIRTY),
+    dirty_count: u64,
+
+    // Presentation scheduling
+    pending_presents: RingBuf(FrameSchedule, MAX_PENDING_PRESENTS),
+    present_count: u64,
+    frame_history: RingBuf(FrameSchedule, MAX_FRAME_HISTORY),
+    history_count: u64,
+    global_frame_seq: u64,
+    global_vsync_count: u64,
+
+    // Timing
+    refresh_rate_hz: u64,
+    refresh_interval_ns: u64,
+    last_vsync_time_ns: u64,
+    compositing_mode: protocol.CompositingMode,
+    vsync_enabled: bool,
+    software_fallback: bool,
+
+    // Residual tracking
+    present_residuals: RingBuf(u64, MAX_PRESENT_RESIDUALS),
+    residual_count: u64,
+}
+
+// ──────────────────────────────────────────────
+// Compositor Initialization
+// ──────────────────────────────────────────────
+
+fn compositor_init(mode: protocol.CompositingMode, refresh_hz: u64, now: u64) -> PhorensicCompositor
+    effect [compute, io:write, residual]
+{
+    let interval: u64 = 1000000000 / refresh_hz;
+    let comp: PhorensicCompositor = PhorensicCompositor {
+        initialized: true,
+        outputs: RingBuf::new(),
+        output_count: 0,
+        active_output: 0,
+        primary_output_id: 0,
+        composite_layers: RingBuf::new(),
+        layer_count: 0,
+        dirty_surfaces: RingBuf::new(),
+        dirty_count: 0,
+        pending_presents: RingBuf::new(),
+        present_count: 0,
+        frame_history: RingBuf::new(),
+        history_count: 0,
+        global_frame_seq: 0,
+        global_vsync_count: 0,
+        refresh_rate_hz: refresh_hz,
+        refresh_interval_ns: interval,
+        last_vsync_time_ns: now,
+        compositing_mode: mode,
+        vsync_enabled: true,
+        software_fallback: mode == protocol.CompositingMode::Software,
+        present_residuals: RingBuf::new(),
+        residual_count: 0,
+    };
+    residual emit {
+        op: "compositor:init",
+        mode: mode as u64,
+        refresh_hz: refresh_hz,
+        timestamp: now,
+    };
+    return comp;
+}
+
+// ──────────────────────────────────────────────
+// Output Management
+// ──────────────────────────────────────────────
+
+fn compositor_add_output(comp: PhorensicCompositor, info: protocol.OutputInfo, fb_addr: u64, fb_size: u64, now: u64) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write, io:read, residual]
+    bound iterations MAX_OUTPUTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    let slot: u64 = 0;
+    let found: bool = false;
+    for i in 0..MAX_OUTPUTS {
+        let out_opt: Option(OutputState) = updated.outputs[i];
+        match out_opt {
+            Option::None => {
+                slot = i;
+                found = true;
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    if !found {
+        return Result::Err(1); // no output slots
+    }
+    let interval: u64 = if info.modes[info.current_mode].refresh_mHz > 0 {
+        1000000000000 / (info.modes[info.current_mode].refresh_mHz as u64)
+    } else {
+        updated.refresh_interval_ns
+    };
+    let out: OutputState = OutputState {
+        info: info,
+        fb_addr: fb_addr,
+        fb_size: fb_size,
+        fb_stride: 0,
+        front_buffer: 0,
+        back_buffer: 1,
+        buffer_swapped: false,
+        vsync_enabled: true,
+        current_vsync: 0,
+        frame_count: 0,
+        last_present_ns: 0,
+        refresh_interval_ns: interval,
+        damaged: false,
+        damage_region: protocol.make_rect(0, 0, 0, 0),
+        composited: false,
+        pending_present: false,
+    };
+    updated.outputs[slot] = Option::Some(out);
+    updated.output_count = updated.output_count + 1;
+    if updated.output_count == 1 {
+        updated.primary_output_id = info.output_id;
+        updated.active_output = slot;
+    }
+    residual emit {
+        op: "compositor:add_output",
+        output_id: info.output_id,
+        slot: slot,
+        timestamp: now,
+    };
+    return Result::Ok(updated);
+}
+
+fn compositor_remove_output(comp: PhorensicCompositor, output_id: u64, now: u64) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write, residual]
+    bound iterations MAX_OUTPUTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_OUTPUTS {
+        let out_opt: Option(OutputState) = updated.outputs[i];
+        match out_opt {
+            Option::Some(out) => {
+                if out.info.output_id == output_id {
+                    updated.outputs[i] = Option::None;
+                    updated.output_count = updated.output_count - 1;
+                    if updated.active_output == i && updated.output_count > 0 {
+                        // Switch active output
+                        for j in 0..MAX_OUTPUTS {
+                            let o_opt: Option(OutputState) = updated.outputs[j];
+                            match o_opt {
+                                Option::Some(o) => {
+                                    updated.active_output = j;
+                                    updated.primary_output_id = o.info.output_id;
+                                    break;
+                                }
+                                Option::None => {}
+                            }
+                        }
+                    }
+                    residual emit {
+                        op: "compositor:remove_output",
+                        output_id: output_id,
+                        timestamp: now,
+                    };
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(2); // output not found
+}
+
+fn compositor_get_output(comp: PhorensicCompositor, output_id: u64) -> Option(OutputState)
+    effect [compute]
+    bound iterations MAX_OUTPUTS
+{
+    for i in 0..MAX_OUTPUTS {
+        let out_opt: Option(OutputState) = comp.outputs[i];
+        match out_opt {
+            Option::Some(out) => {
+                if out.info.output_id == output_id {
+                    return Option::Some(out);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Option::None;
+}
+
+// ──────────────────────────────────────────────
+// Surface Registration for Compositing
+// ──────────────────────────────────────────────
+
+fn compositor_add_surface(comp: PhorensicCompositor, surface_id: u64, type_: protocol.SurfaceType, pos: protocol.Point, sz: protocol.Size, z: u64) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write]
+    bound iterations MAX_COMPOSITE_LAYERS
+{
+    let mut updated: PhorensicCompositor = comp;
+    let slot: u64 = 0;
+    let found: bool = false;
+    for i in 0..MAX_COMPOSITE_LAYERS {
+        let lay_opt: Option(CompositeLayer) = updated.composite_layers[i];
+        match lay_opt {
+            Option::None => {
+                slot = i;
+                found = true;
+                break;
+            }
+            Option::Some(l) => {
+                if l.surface_id == surface_id {
+                    slot = i;
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !found {
+        return Result::Err(3); // no layer slots
+    }
+    let layer: CompositeLayer = CompositeLayer {
+        surface_id: surface_id,
+        type_: type_,
+        position: pos,
+        size: sz,
+        opacity: 1.0,
+        visible: true,
+        has_buffer: false,
+        buffer_data: Array::zeroed(),
+        buffer_stride: 0,
+        z_order: z,
+        transform: protocol.OutputTransform::Normal,
+        source_rect: protocol.make_rect(0, 0, sz.width as i32, sz.height as i32),
+        dest_rect: protocol.make_rect(pos.x, pos.y, sz.width, sz.height),
+        damage_area: protocol.make_rect(0, 0, sz.width as i32, sz.height as i32),
+        cursor_hotspot_x: 0,
+        cursor_hotspot_y: 0,
+        is_cursor: type_ == protocol.SurfaceType::Cursor,
+        is_overlay: type_ == protocol.SurfaceType::Overlay,
+        blend_mode: 0,
+        color_key: Option::None,
+    };
+    updated.composite_layers[slot] = Option::Some(layer);
+    updated.layer_count = updated.layer_count + 1;
+    updated = compositor_mark_dirty(updated, surface_id);
+    return Result::Ok(updated);
+}
+
+fn compositor_remove_surface(comp: PhorensicCompositor, surface_id: u64) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write]
+    bound iterations MAX_COMPOSITE_LAYERS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_COMPOSITE_LAYERS {
+        let lay_opt: Option(CompositeLayer) = updated.composite_layers[i];
+        match lay_opt {
+            Option::Some(l) => {
+                if l.surface_id == surface_id {
+                    updated.composite_layers[i] = Option::None;
+                    updated.layer_count = updated.layer_count - 1;
+                    break;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Ok(updated);
+}
+
+fn compositor_update_layer(comp: PhorensicCompositor, surface_id: u64, pos: protocol.Point, sz: protocol.Size, opacity: f64, visible: bool) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write]
+    bound iterations MAX_COMPOSITE_LAYERS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_COMPOSITE_LAYERS {
+        let lay_opt: Option(CompositeLayer) = updated.composite_layers[i];
+        match lay_opt {
+            Option::Some(l) => {
+                if l.surface_id == surface_id {
+                    let updated_layer: CompositeLayer = CompositeLayer {
+                        surface_id: l.surface_id,
+                        type_: l.type_,
+                        position: pos,
+                        size: sz,
+                        opacity: opacity,
+                        visible: visible,
+                        has_buffer: l.has_buffer,
+                        buffer_data: l.buffer_data,
+                        buffer_stride: l.buffer_stride,
+                        z_order: l.z_order,
+                        transform: l.transform,
+                        source_rect: l.source_rect,
+                        dest_rect: protocol.make_rect(pos.x, pos.y, sz.width, sz.height),
+                        damage_area: l.damage_area,
+                        cursor_hotspot_x: l.cursor_hotspot_x,
+                        cursor_hotspot_y: l.cursor_hotspot_y,
+                        is_cursor: l.is_cursor,
+                        is_overlay: l.is_overlay,
+                        blend_mode: l.blend_mode,
+                        color_key: l.color_key,
+                    };
+                    updated.composite_layers[i] = Option::Some(updated_layer);
+                    updated = compositor_mark_dirty(updated, surface_id);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(4); // surface not in composite layers
+}
+
+fn compositor_mark_dirty(comp: PhorensicCompositor, surface_id: u64) -> PhorensicCompositor
+    effect [compute]
+    bound iterations MAX_SURFACE_DIRTY
+{
+    let mut updated: PhorensicCompositor = comp;
+    // Check if already dirty
+    for i in 0..MAX_SURFACE_DIRTY {
+        let dirty_opt: Option(u64) = updated.dirty_surfaces[i];
+        match dirty_opt {
+            Option::Some(id) => {
+                if id == surface_id {
+                    return updated; // already marked
+                }
+            }
+            Option::None => { break; }
+        }
+    }
+    // Mark as dirty
+    for i in 0..MAX_SURFACE_DIRTY {
+        let dirty_opt: Option(u64) = updated.dirty_surfaces[i];
+        match dirty_opt {
+            Option::None => {
+                updated.dirty_surfaces[i] = Option::Some(surface_id);
+                updated.dirty_count = updated.dirty_count + 1;
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+    return updated;
+}
+
+fn compositor_clear_dirty(comp: PhorensicCompositor) -> PhorensicCompositor
+    effect [compute]
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_SURFACE_DIRTY {
+        updated.dirty_surfaces[i] = Option::None;
+    }
+    updated.dirty_count = 0;
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Layer Buffer Update
+// ──────────────────────────────────────────────
+
+fn compositor_set_layer_buffer(comp: PhorensicCompositor, surface_id: u64, data: Slice(u8), stride: u32) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write]
+    bound iterations MAX_COMPOSITE_LAYERS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_COMPOSITE_LAYERS {
+        let lay_opt: Option(CompositeLayer) = updated.composite_layers[i];
+        match lay_opt {
+            Option::Some(l) => {
+                if l.surface_id == surface_id {
+                    let mut layer_data: Array(u8, 4194304) = Array::zeroed();
+                    let copy_len: u64 = if data.len() < 4194304 { data.len() } else { 4194304 };
+                    for j in 0..copy_len {
+                        layer_data[j] = data[j];
+                    }
+                    let updated_layer: CompositeLayer = CompositeLayer {
+                        surface_id: l.surface_id,
+                        type_: l.type_,
+                        position: l.position,
+                        size: l.size,
+                        opacity: l.opacity,
+                        visible: l.visible,
+                        has_buffer: true,
+                        buffer_data: layer_data,
+                        buffer_stride: stride,
+                        z_order: l.z_order,
+                        transform: l.transform,
+                        source_rect: l.source_rect,
+                        dest_rect: l.dest_rect,
+                        damage_area: protocol.make_rect(0, 0, l.size.width as i32, l.size.height as i32),
+                        cursor_hotspot_x: l.cursor_hotspot_x,
+                        cursor_hotspot_y: l.cursor_hotspot_y,
+                        is_cursor: l.is_cursor,
+                        is_overlay: l.is_overlay,
+                        blend_mode: l.blend_mode,
+                        color_key: l.color_key,
+                    };
+                    updated.composite_layers[i] = Option::Some(updated_layer);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(5); // surface not found
+}
+
+// ──────────────────────────────────────────────
+// Z-Order Operations
+// ──────────────────────────────────────────────
+
+fn compositor_set_z_order(comp: PhorensicCompositor, surface_id: u64, z: u64) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write]
+    bound iterations MAX_COMPOSITE_LAYERS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_COMPOSITE_LAYERS {
+        let lay_opt: Option(CompositeLayer) = updated.composite_layers[i];
+        match lay_opt {
+            Option::Some(l) => {
+                if l.surface_id == surface_id {
+                    let updated_layer: CompositeLayer = CompositeLayer {
+                        surface_id: l.surface_id,
+                        type_: l.type_,
+                        position: l.position,
+                        size: l.size,
+                        opacity: l.opacity,
+                        visible: l.visible,
+                        has_buffer: l.has_buffer,
+                        buffer_data: l.buffer_data,
+                        buffer_stride: l.buffer_stride,
+                        z_order: z,
+                        transform: l.transform,
+                        source_rect: l.source_rect,
+                        dest_rect: l.dest_rect,
+                        damage_area: l.damage_area,
+                        cursor_hotspot_x: l.cursor_hotspot_x,
+                        cursor_hotspot_y: l.cursor_hotspot_y,
+                        is_cursor: l.is_cursor,
+                        is_overlay: l.is_overlay,
+                        blend_mode: l.blend_mode,
+                        color_key: l.color_key,
+                    };
+                    updated.composite_layers[i] = Option::Some(updated_layer);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(6);
+}
+
+// ──────────────────────────────────────────────
+// Core Compositing
+// ──────────────────────────────────────────────
+
+fn compositor_build_layer_list(comp: PhorensicCompositor, output_id: u64, now: u64) -> (PhorensicCompositor, Array(CompositeLayer, MAX_COMPOSITE_LAYERS), u64)
+    effect [compute, io:read, io:write]
+    bound iterations MAX_COMPOSITE_LAYERS
+{
+    let mut updated: PhorensicCompositor = comp;
+    let mut sorted_layers: Array(CompositeLayer, MAX_COMPOSITE_LAYERS) = Array::zeroed();
+    let mut count: u64 = 0;
+    // Collect visible layers
+    for i in 0..MAX_COMPOSITE_LAYERS {
+        let lay_opt: Option(CompositeLayer) = updated.composite_layers[i];
+        match lay_opt {
+            Option::Some(l) => {
+                if l.visible {
+                    sorted_layers[count] = l;
+                    count = count + 1;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    // Simple insertion sort by z_order
+    let mut sorted: bool = false;
+    while !sorted {
+        sorted = true;
+        for j in 0..count {
+            if j + 1 < count {
+                let a: CompositeLayer = sorted_layers[j];
+                let b: CompositeLayer = sorted_layers[j + 1];
+                if a.z_order > b.z_order {
+                    sorted_layers[j] = b;
+                    sorted_layers[j + 1] = a;
+                    sorted = false;
+                }
+            }
+        }
+    }
+    return (updated, sorted_layers, count);
+}
+
+fn compositor_composite_frame(comp: PhorensicCompositor, output_id: u64, now: u64) -> (PhorensicCompositor, Option(FrameSchedule))
+    effect [compute, io:read, io:write, residual]
+{
+    let mut updated: PhorensicCompositor = comp;
+    let out_opt: Option(OutputState) = compositor_get_output(updated, output_id);
+    match out_opt {
+        Option::Some(out) => {
+            let (new_comp, layers, count) = compositor_build_layer_list(updated, output_id, now);
+            updated = new_comp;
+
+            // Create a frame schedule
+            let frame_id: u64 = updated.global_frame_seq + 1;
+            updated.global_frame_seq = frame_id;
+
+            let schedule: FrameSchedule = FrameSchedule {
+                frame_id: frame_id,
+                output_id: output_id,
+                target_timestamp_ns: now + out.refresh_interval_ns,
+                vsync_interval_ns: out.refresh_interval_ns,
+                scheduled: true,
+                completed: false,
+                presentation_mode: if updated.vsync_enabled {
+                    protocol.PresentMode::Fifo
+                } else {
+                    protocol.PresentMode::Immediate
+                },
+                compositing_start_ns: now,
+                compositing_end_ns: 0,
+                present_start_ns: 0,
+                present_end_ns: 0,
+                surfaces_composited: count,
+                damage_area: 0,
+                missed_vsync: false,
+                receipt: Option::None,
+            };
+
+            // Add to pending
+            for i in 0..MAX_PENDING_PRESENTS {
+                let p_opt: Option(FrameSchedule) = updated.pending_presents[i];
+                match p_opt {
+                    Option::None => {
+                        updated.pending_presents[i] = Option::Some(schedule);
+                        updated.present_count = updated.present_count + 1;
+                        break;
+                    }
+                    Option::Some(_) => {}
+                }
+            }
+
+            residual emit {
+                op: "compositor:composite_frame",
+                frame: frame_id,
+                output: output_id,
+                surfaces: count,
+                timestamp: now,
+            };
+
+            return (updated, Option::Some(schedule));
+        }
+        Option::None => {
+            return (updated, Option::None);
+        }
+    }
+}
+
+fn compositor_present_frame(comp: PhorensicCompositor, output_id: u64, now: u64) -> (PhorensicCompositor, bool)
+    effect [compute, io:read, io:write, residual]
+    bound iterations MAX_PENDING_PRESENTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    let mut found: bool = false;
+
+    for i in 0..MAX_PENDING_PRESENTS {
+        let sched_opt: Option(FrameSchedule) = updated.pending_presents[i];
+        match sched_opt {
+            Option::Some(sched) => {
+                if sched.output_id == output_id && !sched.completed {
+                    let completed_sched: FrameSchedule = FrameSchedule {
+                        frame_id: sched.frame_id,
+                        output_id: sched.output_id,
+                        target_timestamp_ns: sched.target_timestamp_ns,
+                        vsync_interval_ns: sched.vsync_interval_ns,
+                        scheduled: sched.scheduled,
+                        completed: true,
+                        presentation_mode: sched.presentation_mode,
+                        compositing_start_ns: sched.compositing_start_ns,
+                        compositing_end_ns: sched.compositing_start_ns,
+                        present_start_ns: now,
+                        present_end_ns: now,
+                        surfaces_composited: sched.surfaces_composited,
+                        damage_area: sched.damage_area,
+                        missed_vsync: sched.missed_vsync,
+                        receipt: Option::Some(protocol.make_present_receipt(
+                            0, 0, sched.presentation_mode, now,
+                            sched.frame_id, updated.global_vsync_count)),
+                    };
+                    updated.pending_presents[i] = Option::None;
+                    updated.present_count = updated.present_count - 1;
+
+                    // Add to frame history
+                    for j in 0..MAX_FRAME_HISTORY {
+                        let hist_opt: Option(FrameSchedule) = updated.frame_history[j];
+                        match hist_opt {
+                            Option::None => {
+                                updated.frame_history[j] = Option::Some(completed_sched);
+                                updated.history_count = updated.history_count + 1;
+                                break;
+                            }
+                            Option::Some(_) => {}
+                        }
+                    }
+
+                    // Update output state
+                    for k in 0..MAX_OUTPUTS {
+                        let out_opt: Option(OutputState) = updated.outputs[k];
+                        match out_opt {
+                            Option::Some(out) => {
+                                if out.info.output_id == output_id {
+                                    let updated_out: OutputState = OutputState {
+                                        info: out.info,
+                                        fb_addr: out.fb_addr,
+                                        fb_size: out.fb_size,
+                                        fb_stride: out.fb_stride,
+                                        front_buffer: out.back_buffer,
+                                        back_buffer: out.front_buffer,
+                                        buffer_swapped: true,
+                                        vsync_enabled: out.vsync_enabled,
+                                        current_vsync: out.current_vsync + 1,
+                                        frame_count: out.frame_count + 1,
+                                        last_present_ns: now,
+                                        refresh_interval_ns: out.refresh_interval_ns,
+                                        damaged: false,
+                                        damage_region: protocol.make_rect(0, 0, 0, 0),
+                                        composited: true,
+                                        pending_present: false,
+                                    };
+                                    updated.outputs[k] = Option::Some(updated_out);
+                                    break;
+                                }
+                            }
+                            Option::None => {}
+                        }
+                    }
+
+                    updated.global_vsync_count = updated.global_vsync_count + 1;
+                    updated.last_vsync_time_ns = now;
+
+                    residual emit {
+                        op: "compositor:present",
+                        frame: completed_sched.frame_id,
+                        output: output_id,
+                        vsync: updated.global_vsync_count,
+                        timestamp: now,
+                    };
+
+                    found = true;
+                    break;
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return (updated, found);
+}
+
+// ──────────────────────────────────────────────
+// Vsync and Frame Scheduling
+// ──────────────────────────────────────────────
+
+fn compositor_handle_vsync(comp: PhorensicCompositor, now: u64) -> PhorensicCompositor
+    effect [compute, io:write, residual]
+    bound iterations MAX_OUTPUTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    updated.global_vsync_count = updated.global_vsync_count + 1;
+    updated.last_vsync_time_ns = now;
+
+    // Update each output vsync state
+    for i in 0..MAX_OUTPUTS {
+        let out_opt: Option(OutputState) = updated.outputs[i];
+        match out_opt {
+            Option::Some(out) => {
+                let updated_out: OutputState = OutputState {
+                    info: out.info,
+                    fb_addr: out.fb_addr,
+                    fb_size: out.fb_size,
+                    fb_stride: out.fb_stride,
+                    front_buffer: out.front_buffer,
+                    back_buffer: out.back_buffer,
+                    buffer_swapped: false,
+                    vsync_enabled: out.vsync_enabled,
+                    current_vsync: out.current_vsync,
+                    frame_count: out.frame_count,
+                    last_present_ns: out.last_present_ns,
+                    refresh_interval_ns: out.refresh_interval_ns,
+                    damaged: out.damaged,
+                    damage_region: out.damage_region,
+                    composited: out.composited,
+                    pending_present: false,
+                };
+                updated.outputs[i] = Option::Some(updated_out);
+            }
+            Option::None => {}
+        }
+    }
+
+    residual emit {
+        op: "compositor:vsync",
+        count: updated.global_vsync_count,
+        timestamp: now,
+    };
+    return updated;
+}
+
+fn compositor_schedule_frame(comp: PhorensicCompositor, output_id: u64, now: u64) -> (PhorensicCompositor, bool)
+    effect [compute, io:write]
+    bound iterations MAX_PENDING_PRESENTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    // Check if any pending present exists for this output
+    for i in 0..MAX_PENDING_PRESENTS {
+        let sched_opt: Option(FrameSchedule) = updated.pending_presents[i];
+        match sched_opt {
+            Option::Some(s) => {
+                if s.output_id == output_id {
+                    return (updated, false); // already scheduled
+                }
+            }
+            Option::None => {}
+        }
+    }
+
+    let frame_id: u64 = updated.global_frame_seq + 1;
+    updated.global_frame_seq = frame_id;
+
+    let schedule: FrameSchedule = FrameSchedule {
+        frame_id: frame_id,
+        output_id: output_id,
+        target_timestamp_ns: now + updated.refresh_interval_ns,
+        vsync_interval_ns: updated.refresh_interval_ns,
+        scheduled: true,
+        completed: false,
+        presentation_mode: protocol.PresentMode::Fifo,
+        compositing_start_ns: now,
+        compositing_end_ns: 0,
+        present_start_ns: 0,
+        present_end_ns: 0,
+        surfaces_composited: 0,
+        damage_area: 0,
+        missed_vsync: false,
+        receipt: Option::None,
+    };
+
+    for i in 0..MAX_PENDING_PRESENTS {
+        let p_opt: Option(FrameSchedule) = updated.pending_presents[i];
+        match p_opt {
+            Option::None => {
+                updated.pending_presents[i] = Option::Some(schedule);
+                updated.present_count = updated.present_count + 1;
+                break;
+            }
+            Option::Some(_) => {}
+        }
+    }
+
+    return (updated, true);
+}
+
+// ──────────────────────────────────────────────
+// Compositor Info and Status
+// ──────────────────────────────────────────────
+
+struct CompositorInfo {
+    initialized: bool,
+    mode: protocol.CompositingMode,
+    refresh_hz: u64,
+    output_count: u64,
+    layer_count: u64,
+    dirty_count: u64,
+    pending_presents: u64,
+    frame_count: u64,
+    vsync_count: u64,
+    vsync_enabled: bool,
+    software_fallback: bool,
+    uptime_ns: u64,
+}
+
+fn compositor_get_info(comp: PhorensicCompositor, now: u64) -> CompositorInfo
+    effect [compute]
+{
+    return CompositorInfo {
+        initialized: comp.initialized,
+        mode: comp.compositing_mode,
+        refresh_hz: comp.refresh_rate_hz,
+        output_count: comp.output_count,
+        layer_count: comp.layer_count,
+        dirty_count: comp.dirty_count,
+        pending_presents: comp.present_count,
+        frame_count: comp.global_frame_seq,
+        vsync_count: comp.global_vsync_count,
+        vsync_enabled: comp.vsync_enabled,
+        software_fallback: comp.software_fallback,
+        uptime_ns: now - if comp.initialized { comp.last_vsync_time_ns } else { 0 },
+    };
+}
+
+fn compositor_toggle_vsync(comp: PhorensicCompositor, enabled: bool) -> PhorensicCompositor
+    effect [compute, residual]
+{
+    residual emit {
+        op: "compositor:vsync_toggle",
+        enabled: enabled,
+    };
+    return PhorensicCompositor {
+        initialized: comp.initialized,
+        outputs: comp.outputs,
+        output_count: comp.output_count,
+        active_output: comp.active_output,
+        primary_output_id: comp.primary_output_id,
+        composite_layers: comp.composite_layers,
+        layer_count: comp.layer_count,
+        dirty_surfaces: comp.dirty_surfaces,
+        dirty_count: comp.dirty_count,
+        pending_presents: comp.pending_presents,
+        present_count: comp.present_count,
+        frame_history: comp.frame_history,
+        history_count: comp.history_count,
+        global_frame_seq: comp.global_frame_seq,
+        global_vsync_count: comp.global_vsync_count,
+        refresh_rate_hz: comp.refresh_rate_hz,
+        refresh_interval_ns: comp.refresh_interval_ns,
+        last_vsync_time_ns: comp.last_vsync_time_ns,
+        compositing_mode: comp.compositing_mode,
+        vsync_enabled: enabled,
+        software_fallback: comp.software_fallback,
+        present_residuals: comp.present_residuals,
+        residual_count: comp.residual_count,
+    };
+}
+
+fn compositor_set_mode(comp: PhorensicCompositor, mode: protocol.CompositingMode) -> PhorensicCompositor
+    effect [compute, residual]
+{
+    residual emit {
+        op: "compositor:mode_change",
+        mode: mode as u64,
+    };
+    return PhorensicCompositor {
+        initialized: comp.initialized,
+        outputs: comp.outputs,
+        output_count: comp.output_count,
+        active_output: comp.active_output,
+        primary_output_id: comp.primary_output_id,
+        composite_layers: comp.composite_layers,
+        layer_count: comp.layer_count,
+        dirty_surfaces: comp.dirty_surfaces,
+        dirty_count: comp.dirty_count,
+        pending_presents: comp.pending_presents,
+        present_count: comp.present_count,
+        frame_history: comp.frame_history,
+        history_count: comp.history_count,
+        global_frame_seq: comp.global_frame_seq,
+        global_vsync_count: comp.global_vsync_count,
+        refresh_rate_hz: comp.refresh_rate_hz,
+        refresh_interval_ns: comp.refresh_interval_ns,
+        last_vsync_time_ns: comp.last_vsync_time_ns,
+        compositing_mode: mode,
+        vsync_enabled: comp.vsync_enabled,
+        software_fallback: mode == protocol.CompositingMode::Software,
+        present_residuals: comp.present_residuals,
+        residual_count: comp.residual_count,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Frame History and Debug
+// ──────────────────────────────────────────────
+
+fn compositor_get_last_frame(comp: PhorensicCompositor) -> Option(FrameSchedule)
+    effect [compute]
+    bound iterations MAX_FRAME_HISTORY
+{
+    let mut latest: Option(FrameSchedule) = Option::None;
+    for i in 0..MAX_FRAME_HISTORY {
+        let sched_opt: Option(FrameSchedule) = comp.frame_history[i];
+        match sched_opt {
+            Option::Some(s) => {
+                match latest {
+                    Option::Some(l) => {
+                        if s.frame_id > l.frame_id {
+                            latest = Option::Some(s);
+                        }
+                    }
+                    Option::None => {
+                        latest = Option::Some(s);
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return latest;
+}
+
+fn compositor_frame_count(comp: PhorensicCompositor) -> u64
+    effect [compute]
+{
+    return comp.global_frame_seq;
+}
+
+fn compositor_vsync_count(comp: PhorensicCompositor) -> u64
+    effect [compute]
+{
+    return comp.global_vsync_count;
+}
+
+// ──────────────────────────────────────────────
+// Output Mode Setting
+// ──────────────────────────────────────────────
+
+fn compositor_set_output_mode(comp: PhorensicCompositor, output_id: u64, mode_idx: u32) -> Result(PhorensicCompositor, u64)
+    effect [compute, io:write, io:read, residual]
+    bound iterations MAX_OUTPUTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_OUTPUTS {
+        let out_opt: Option(OutputState) = updated.outputs[i];
+        match out_opt {
+            Option::Some(out) => {
+                if out.info.output_id == output_id {
+                    if mode_idx >= 64 {
+                        return Result::Err(7); // invalid mode index
+                    }
+                    let mode_opt: Option(protocol.OutputMode) = out.info.modes[mode_idx];
+                    match mode_opt {
+                        Option::Some(m) => {
+                            let updated_info: protocol.OutputInfo = protocol.OutputInfo {
+                                output_id: out.info.output_id,
+                                name: out.info.name,
+                                description: out.info.description,
+                                make: out.info.make,
+                                model: out.info.model,
+                                serial: out.info.serial,
+                                physical_width_mm: out.info.physical_width_mm,
+                                physical_height_mm: out.info.physical_height_mm,
+                                subpixel: out.info.subpixel,
+                                transform: out.info.transform,
+                                scale: out.info.scale,
+                                modes: out.info.modes,
+                                current_mode: mode_idx,
+                                enabled: true,
+                                x: out.info.x,
+                                y: out.info.y,
+                            };
+                            let interval: u64 = if m.refresh_mHz > 0 {
+                                1000000000000 / (m.refresh_mHz as u64)
+                            } else {
+                                updated.refresh_interval_ns
+                            };
+                            let updated_out: OutputState = OutputState {
+                                info: updated_info,
+                                fb_addr: out.fb_addr,
+                                fb_size: out.fb_size,
+                                fb_stride: out.fb_stride,
+                                front_buffer: out.front_buffer,
+                                back_buffer: out.back_buffer,
+                                buffer_swapped: out.buffer_swapped,
+                                vsync_enabled: out.vsync_enabled,
+                                current_vsync: out.current_vsync,
+                                frame_count: out.frame_count,
+                                last_present_ns: out.last_present_ns,
+                                refresh_interval_ns: interval,
+                                damaged: true,
+                                damage_region: protocol.make_rect(0, 0, m.width as i32, m.height as i32),
+                                composited: false,
+                                pending_present: false,
+                            };
+                            updated.outputs[i] = Option::Some(updated_out);
+                            residual emit {
+                                op: "compositor:set_mode",
+                                output: output_id,
+                                mode: mode_idx,
+                                width: m.width,
+                                height: m.height,
+                                refresh: m.refresh_mHz,
+                            };
+                            return Result::Ok(updated);
+                        }
+                        Option::None => {
+                            return Result::Err(8); // mode not found
+                        }
+                    }
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(9); // output not found
+}
+
+// ──────────────────────────────────────────────
+// Damage Tracking Per Output
+// ──────────────────────────────────────────────
+
+fn compositor_mark_output_damaged(comp: PhorensicCompositor, output_id: u64, rect: protocol.Rectangle) -> Result(PhorensicCompositor, u64)
+    effect [compute]
+    bound iterations MAX_OUTPUTS
+{
+    let mut updated: PhorensicCompositor = comp;
+    for i in 0..MAX_OUTPUTS {
+        let out_opt: Option(OutputState) = updated.outputs[i];
+        match out_opt {
+            Option::Some(out) => {
+                if out.info.output_id == output_id {
+                    let updated_out: OutputState = OutputState {
+                        info: out.info,
+                        fb_addr: out.fb_addr,
+                        fb_size: out.fb_size,
+                        fb_stride: out.fb_stride,
+                        front_buffer: out.front_buffer,
+                        back_buffer: out.back_buffer,
+                        buffer_swapped: out.buffer_swapped,
+                        vsync_enabled: out.vsync_enabled,
+                        current_vsync: out.current_vsync,
+                        frame_count: out.frame_count,
+                        last_present_ns: out.last_present_ns,
+                        refresh_interval_ns: out.refresh_interval_ns,
+                        damaged: true,
+                        damage_region: rect,
+                        composited: out.composited,
+                        pending_present: out.pending_present,
+                    };
+                    updated.outputs[i] = Option::Some(updated_out);
+                    return Result::Ok(updated);
+                }
+            }
+            Option::None => {}
+        }
+    }
+    return Result::Err(10); // output not found
+}
+
+// ──────────────────────────────────────────────
+// Cleanup and Shutdown
+// ──────────────────────────────────────────────
+
+fn compositor_shutdown(comp: PhorensicCompositor, now: u64) -> PhorensicCompositor
+    effect [compute, io:write, residual]
+{
+    residual emit {
+        op: "compositor:shutdown",
+        frames_composited: comp.global_frame_seq,
+        outputs_active: comp.output_count,
+        layers_active: comp.layer_count,
+        timestamp: now,
+    };
+    return PhorensicCompositor {
+        initialized: false,
+        outputs: RingBuf::new(),
+        output_count: 0,
+        active_output: 0,
+        primary_output_id: 0,
+        composite_layers: RingBuf::new(),
+        layer_count: 0,
+        dirty_surfaces: RingBuf::new(),
+        dirty_count: 0,
+        pending_presents: RingBuf::new(),
+        present_count: 0,
+        frame_history: comp.frame_history,
+        history_count: comp.history_count,
+        global_frame_seq: comp.global_frame_seq,
+        global_vsync_count: comp.global_vsync_count,
+        refresh_rate_hz: comp.refresh_rate_hz,
+        refresh_interval_ns: comp.refresh_interval_ns,
+        last_vsync_time_ns: now,
+        compositing_mode: comp.compositing_mode,
+        vsync_enabled: comp.vsync_enabled,
+        software_fallback: comp.software_fallback,
+        present_residuals: comp.present_residuals,
+        residual_count: comp.residual_count,
+    };
+}

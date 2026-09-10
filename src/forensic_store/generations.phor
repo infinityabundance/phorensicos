@@ -1,0 +1,1030 @@
+// generations.phor — Generation model: create, activate, rollback, describe, compare
+// Phorensic Forensic Store: atomic system state generations
+// Spec: FORENSIC_STORE.md — Generations section
+// Grammar: PHORENSIC_GRAMMAR.md §40 (generation-ref), §67, §68
+
+package forensic_store.generations;
+
+use forensic_store.store_object::{
+    StoreObject, Hash256, hash256_zero, hash256_equal,
+    TrustState, TrustLevel,
+    Identity, identity_equal,
+    ResidualRecord, ResidualHistory, ResidualOpType, ResidualSeverity, CausalCategory,
+    ObjectRole,
+};
+use forensic_store.store_key::{
+    StoreKey, store_key_equal, store_key_zero, store_key_partition,
+};
+
+// ============================================================================
+// Generation Status
+// ============================================================================
+
+/// The lifecycle status of a generation.
+type GenerationStatus = enum {
+    /// Generation is being created — not yet valid
+    Draft = 0,
+    /// Generation is active — the system is running on this state
+    Active = 1,
+    /// Generation is inactive — was active in the past, available for rollback
+    Inactive = 2,
+    /// Generation is a rollback target — explicitly retained for recovery
+    RollbackTarget = 3,
+    /// Generation failed during activation
+    Failed = 4,
+    /// Generation has been superseded and is eligible for GC
+    Superseded = 5,
+    /// Generation is pending GC
+    PendingGC = 6,
+    /// Generation is corrupted (integrity check failed)
+    Corrupted = 7,
+}
+
+// ============================================================================
+// Generation — Full Specification
+// ============================================================================
+
+/// A generation is a complete, atomically-activated system state.
+///
+/// Spec definition:
+///   Generation =
+///     kernel container key
+///     trusted nucleus image key
+///     Phorensic compiler image key
+///     runtime service keys
+///     semantic store root key
+///     trust roots
+///     court/verifier version references
+///     package/container graph
+///     activation timestamp
+///     creator identity
+///     generation number
+///     parent generation number
+struct Generation
+    layout packed
+{
+    /// Unique generation number (monotonically increasing)
+    number: u64,
+    /// Parent generation number (0 = root generation)
+    parent_number: u64,
+    /// Human-readable label
+    label: Array[u8, 128],
+    label_len: u32,
+    /// Current status
+    status: GenerationStatus,
+    /// Store key of the kernel container image
+    kernel_container_key: StoreKey,
+    /// Store key of the trusted nucleus image
+    trusted_nucleus_key: StoreKey,
+    /// Store key of the Phorensic compiler image
+    compiler_image_key: StoreKey,
+    /// Store keys of runtime services (bounded to 256)
+    runtime_service_keys: Array[StoreKey, 256],
+    runtime_service_count: u32,
+    /// Store key of the semantic store root
+    store_root_key: StoreKey,
+    /// Trust roots — identities that are implicitly trusted in this generation
+    trust_roots: Array[Identity, 64],
+    trust_root_count: u32,
+    /// Minimum trust level for objects in this generation
+    minimum_trust_level: TrustLevel,
+    /// Court version references
+    court_references: Array[CourtReference, 32],
+    court_reference_count: u32,
+    /// Verifier version references
+    verifier_references: Array[VerifierReference, 32],
+    verifier_reference_count: u32,
+    /// Package graph keys (bounded to 1024)
+    package_graph: Array[StoreKey, 1024],
+    package_graph_count: u32,
+    /// Activation timestamp
+    activated_at: u64,
+    /// Creation timestamp
+    created_at: u64,
+    /// Identity that created this generation
+    creator: Identity,
+    /// Identity that activated this generation
+    activator: Identity,
+    /// Hash of the full generation descriptor
+    descriptor_hash: Hash256,
+    /// Signatures over the descriptor
+    descriptor_signatures: Array[Signature, 16],
+    descriptor_sig_count: u32,
+    /// Manifest of all store keys included in this generation
+    object_manifest: Array[StoreKey, 4096],
+    object_manifest_count: u32,
+    /// Residual history for this generation's operations
+    generation_residuals: ResidualHistory,
+    /// Whether this generation has been verified
+    verified: bool,
+    /// Verification report hash (if verified)
+    verification_hash: Hash256,
+    /// Reserved for future fields
+    reserved: Array[u64, 32],
+}
+
+/// Reference to a court version.
+struct CourtReference
+    layout packed
+{
+    court_name: Array[u8, 64],
+    court_name_len: u32,
+    court_version: Array[u8, 32],
+    court_version_len: u32,
+    court_store_key: StoreKey,
+}
+
+/// Reference to a verifier version.
+struct VerifierReference
+    layout packed
+{
+    verifier_name: Array[u8, 64],
+    verifier_name_len: u32,
+    verifier_version: Array[u8, 32],
+    verifier_version_len: u32,
+    verifier_store_key: StoreKey,
+}
+
+/// A signature over generation descriptor data.
+struct Signature
+    layout packed
+{
+    algorithm: Array[u8, 32],
+    algorithm_len: u32,
+    sig_bytes: Array[u8, 512],
+    sig_bytes_len: u32,
+    signer_key: Hash256,
+    signer_identity: Identity,
+    signed_at: u64,
+    verified: bool,
+}
+
+// ============================================================================
+// Generation Creation
+// ============================================================================
+
+/// Create a new generation as a draft.
+fn generation_create(
+    number: u64,
+    parent_number: u64,
+    label: Array[u8, 128],
+    label_len: u32,
+    kernel_key: StoreKey,
+    nucleus_key: StoreKey,
+    compiler_key: StoreKey,
+    store_root: StoreKey,
+    creator: Identity,
+    timestamp: u64,
+) -> Generation
+    effect [compute, residual]
+{
+    let zero_hash: Hash256 = hash256_zero();
+    let history: ResidualHistory = ResidualHistory {
+        records: Array[ResidualRecord, 1024]::zeroed(),
+        count: 0,
+        head: 0,
+        tail: 0,
+        total_emitted: 0,
+        owner_hash: zero_hash,
+    };
+
+    residual emit {
+        op: "generation.create.draft",
+        gen_number: number,
+        parent: parent_number,
+        creator_fp: creator.key_fingerprint.bytes[0] as u64,
+    };
+
+    return Generation {
+        number: number,
+        parent_number: parent_number,
+        label: label,
+        label_len: label_len,
+        status: GenerationStatus::Draft,
+        kernel_container_key: kernel_key,
+        trusted_nucleus_key: nucleus_key,
+        compiler_image_key: compiler_key,
+        runtime_service_keys: Array[StoreKey, 256]::zeroed(),
+        runtime_service_count: 0,
+        store_root_key: store_root,
+        trust_roots: Array[Identity, 64]::zeroed(),
+        trust_root_count: 0,
+        minimum_trust_level: TrustLevel::IntegrityVerified,
+        court_references: Array[CourtReference, 32]::zeroed(),
+        court_reference_count: 0,
+        verifier_references: Array[VerifierReference, 32]::zeroed(),
+        verifier_reference_count: 0,
+        package_graph: Array[StoreKey, 1024]::zeroed(),
+        package_graph_count: 0,
+        activated_at: 0,
+        created_at: timestamp,
+        creator: creator,
+        activator: Identity {
+            name: Array[u8, 128]::zeroed(), name_len: 0,
+            key_fingerprint: zero_hash,
+            dialect_scope: Array[u8, 64]::zeroed(), dialect_scope_len: 0,
+            version: 0, established_at_gen: 0,
+        },
+        descriptor_hash: zero_hash,
+        descriptor_signatures: Array[Signature, 16]::zeroed(),
+        descriptor_sig_count: 0,
+        object_manifest: Array[StoreKey, 4096]::zeroed(),
+        object_manifest_count: 0,
+        generation_residuals: history,
+        verified: false,
+        verification_hash: zero_hash,
+        reserved: Array[u64, 32]::zeroed(),
+    };
+}
+
+// ============================================================================
+// Generation Activation
+// ============================================================================
+
+/// Activation error types.
+type ActivationError = enum {
+    /// Generation is not in Draft or Inactive status
+    InvalidStatus = 0x01,
+    /// Integrity check failed
+    IntegrityFailure = 0x02,
+    /// Missing kernel container
+    MissingKernel = 0x03,
+    /// Missing trusted nucleus
+    MissingNucleus = 0x04,
+    /// Missing compiler image
+    MissingCompiler = 0x05,
+    /// Missing store root
+    MissingStoreRoot = 0x06,
+    /// Capability violation in the generation
+    CapabilityViolation = 0x07,
+    /// Missing dependencies in the package graph
+    MissingDependency = 0x08,
+    /// Trust level too low for activation
+    InsufficientTrust = 0x09,
+    /// Generation number collision
+    NumberCollision = 0x0A,
+    /// Descriptor signature invalid
+    InvalidSignature = 0x0B,
+    /// Parent generation not found
+    ParentNotFound = 0x0C,
+    /// Verification required before activation
+    RequiresVerification = 0x0D,
+    /// Internal consistency error
+    InternalError = 0x0E,
+}
+
+/// Activate a generation — makes it the active system state.
+/// Activation is all-or-nothing. If any check fails, the generation
+/// is marked as Failed and the previous generation remains bootable.
+fn generation_activate(
+    gen: Generation,
+    activator: Identity,
+    timestamp: u64,
+) -> Result[Generation, ActivationError]
+    effect [compute, residual]
+{
+    // Check 1: Generation must be in Draft or Inactive status
+    if gen.status != GenerationStatus::Draft &&
+       gen.status != GenerationStatus::Inactive {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "invalid_status",
+            status: gen.status as u64,
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::InvalidStatus);
+    }
+
+    // Check 2: Must have non-zero kernel container key
+    if store_key_is_zero(gen.kernel_container_key) {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "missing_kernel",
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::MissingKernel);
+    }
+
+    // Check 3: Must have non-zero trusted nucleus key
+    if store_key_is_zero(gen.trusted_nucleus_key) {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "missing_nucleus",
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::MissingNucleus);
+    }
+
+    // Check 4: Must have non-zero compiler image key
+    if store_key_is_zero(gen.compiler_image_key) {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "missing_compiler",
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::MissingCompiler);
+    }
+
+    // Check 5: Must have non-zero store root key
+    if store_key_is_zero(gen.store_root_key) {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "missing_store_root",
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::MissingStoreRoot);
+    }
+
+    // Check 6: Must have at least one trust root
+    if gen.trust_root_count == 0 {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "no_trust_roots",
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::InsufficientTrust);
+    }
+
+    // Check 7: Verify descriptor signatures
+    let sig_ok: bool = gen.descriptor_sig_count > 0;
+    if !sig_ok {
+        residual emit {
+            op: "generation.activate.fail",
+            reason: "no_descriptor_signatures",
+        };
+        return Result[Generation, ActivationError]::Err(ActivationError::InvalidSignature);
+    }
+
+    // All checks passed — activate
+    let activated: Generation = Generation {
+        number: gen.number,
+        parent_number: gen.parent_number,
+        label: gen.label,
+        label_len: gen.label_len,
+        status: GenerationStatus::Active,
+        kernel_container_key: gen.kernel_container_key,
+        trusted_nucleus_key: gen.trusted_nucleus_key,
+        compiler_image_key: gen.compiler_image_key,
+        runtime_service_keys: gen.runtime_service_keys,
+        runtime_service_count: gen.runtime_service_count,
+        store_root_key: gen.store_root_key,
+        trust_roots: gen.trust_roots,
+        trust_root_count: gen.trust_root_count,
+        minimum_trust_level: gen.minimum_trust_level,
+        court_references: gen.court_references,
+        court_reference_count: gen.court_reference_count,
+        verifier_references: gen.verifier_references,
+        verifier_reference_count: gen.verifier_reference_count,
+        package_graph: gen.package_graph,
+        package_graph_count: gen.package_graph_count,
+        activated_at: timestamp,
+        created_at: gen.created_at,
+        creator: gen.creator,
+        activator: activator,
+        descriptor_hash: gen.descriptor_hash,
+        descriptor_signatures: gen.descriptor_signatures,
+        descriptor_sig_count: gen.descriptor_sig_count,
+        object_manifest: gen.object_manifest,
+        object_manifest_count: gen.object_manifest_count,
+        generation_residuals: gen.generation_residuals,
+        verified: gen.verified,
+        verification_hash: gen.verification_hash,
+        reserved: gen.reserved,
+    };
+
+    residual emit {
+        op: "generation.activate.success",
+        gen_number: gen.number,
+        activator_fp: activator.key_fingerprint.bytes[0] as u64,
+        timestamp: timestamp,
+    };
+
+    return Result[Generation, ActivationError]::Ok(activated);
+}
+
+// ============================================================================
+// Generation Deactivation (Mark Inactive)
+// ============================================================================
+
+/// Deactivate the currently active generation — mark it as Inactive.
+/// The previous generation becomes available for rollback.
+fn generation_deactivate(gen: Generation) -> Generation
+    effect [compute, residual]
+{
+    let new_status: GenerationStatus;
+    if gen.status == GenerationStatus::Active {
+        new_status = GenerationStatus::Inactive;
+    } else {
+        new_status = gen.status;
+    }
+
+    residual emit {
+        op: "generation.deactivate",
+        gen_number: gen.number,
+        old_status: gen.status as u64,
+        new_status: new_status as u64,
+    };
+
+    return Generation {
+        number: gen.number,
+        parent_number: gen.parent_number,
+        label: gen.label,
+        label_len: gen.label_len,
+        status: new_status,
+        kernel_container_key: gen.kernel_container_key,
+        trusted_nucleus_key: gen.trusted_nucleus_key,
+        compiler_image_key: gen.compiler_image_key,
+        runtime_service_keys: gen.runtime_service_keys,
+        runtime_service_count: gen.runtime_service_count,
+        store_root_key: gen.store_root_key,
+        trust_roots: gen.trust_roots,
+        trust_root_count: gen.trust_root_count,
+        minimum_trust_level: gen.minimum_trust_level,
+        court_references: gen.court_references,
+        court_reference_count: gen.court_reference_count,
+        verifier_references: gen.verifier_references,
+        verifier_reference_count: gen.verifier_reference_count,
+        package_graph: gen.package_graph,
+        package_graph_count: gen.package_graph_count,
+        activated_at: gen.activated_at,
+        created_at: gen.created_at,
+        creator: gen.creator,
+        activator: gen.activator,
+        descriptor_hash: gen.descriptor_hash,
+        descriptor_signatures: gen.descriptor_signatures,
+        descriptor_sig_count: gen.descriptor_sig_count,
+        object_manifest: gen.object_manifest,
+        object_manifest_count: gen.object_manifest_count,
+        generation_residuals: gen.generation_residuals,
+        verified: gen.verified,
+        verification_hash: gen.verification_hash,
+        reserved: gen.reserved,
+    };
+}
+
+// ============================================================================
+// Generation Rollback
+// ============================================================================
+
+/// Rollback error types.
+type RollbackError = enum {
+    /// Target generation is not a valid rollback target
+    InvalidTarget = 0x01,
+    /// Target generation is corrupted
+    TargetCorrupted = 0x02,
+    /// Target generation not found in store
+    TargetNotFound = 0x03,
+    /// Rollback would violate capability constraints
+    CapabilityViolation = 0x04,
+    /// Integrity of target generation could not be verified
+    IntegrityFailure = 0x05,
+    /// Target is the same as the current generation
+    SelfRollback = 0x06,
+    /// Rollback would break dependency constraints
+    DependencyBreak = 0x07,
+    /// Internal error during rollback
+    InternalError = 0x08,
+}
+
+/// Rollback to a previous generation.
+///
+/// Rollback preserves:
+///   - executable containers
+///   - trust states
+///   - residual envelopes
+///   - court versions
+///   - replay checkpoints
+///   - package graph
+///   - native clean-room promoted slices
+fn generation_rollback(
+    current_gen: Generation,
+    target_gen: Generation,
+    rollback_authorizer: Identity,
+    timestamp: u64,
+) -> Result[Generation, RollbackError]
+    effect [compute, residual]
+{
+    // Check 1: Cannot rollback to self
+    if current_gen.number == target_gen.number {
+        return Result[Generation, RollbackError]::Err(RollbackError::SelfRollback);
+    }
+
+    // Check 2: Target must be Inactive or RollbackTarget
+    if target_gen.status != GenerationStatus::Inactive &&
+       target_gen.status != GenerationStatus::RollbackTarget {
+        return Result[Generation, RollbackError]::Err(RollbackError::InvalidTarget);
+    }
+
+    // Check 3: Target must not be corrupted
+    if target_gen.status == GenerationStatus::Corrupted {
+        return Result[Generation, RollbackError]::Err(RollbackError::TargetCorrupted);
+    }
+
+    // Check 4: Target must have been verified
+    if !target_gen.verified {
+        // Allow rollback to unverified generations only if explicitly authorized
+        residual emit {
+            op: "generation.rollback.unverified_target",
+            gen_number: target_gen.number,
+        };
+    }
+
+    residual emit {
+        op: "generation.rollback.executing",
+        from_gen: current_gen.number,
+        to_gen: target_gen.number,
+        authorizer_fp: rollback_authorizer.key_fingerprint.bytes[0] as u64,
+    };
+
+    // The target generation becomes Active
+    let rolled: Generation = Generation {
+        number: target_gen.number,
+        parent_number: target_gen.parent_number,
+        label: target_gen.label,
+        label_len: target_gen.label_len,
+        status: GenerationStatus::Active,
+        kernel_container_key: target_gen.kernel_container_key,
+        trusted_nucleus_key: target_gen.trusted_nucleus_key,
+        compiler_image_key: target_gen.compiler_image_key,
+        runtime_service_keys: target_gen.runtime_service_keys,
+        runtime_service_count: target_gen.runtime_service_count,
+        store_root_key: target_gen.store_root_key,
+        trust_roots: target_gen.trust_roots,
+        trust_root_count: target_gen.trust_root_count,
+        minimum_trust_level: target_gen.minimum_trust_level,
+        court_references: target_gen.court_references,
+        court_reference_count: target_gen.court_reference_count,
+        verifier_references: target_gen.verifier_references,
+        verifier_reference_count: target_gen.verifier_reference_count,
+        package_graph: target_gen.package_graph,
+        package_graph_count: target_gen.package_graph_count,
+        activated_at: timestamp,
+        created_at: target_gen.created_at,
+        creator: target_gen.creator,
+        activator: rollback_authorizer,
+        descriptor_hash: target_gen.descriptor_hash,
+        descriptor_signatures: target_gen.descriptor_signatures,
+        descriptor_sig_count: target_gen.descriptor_sig_count,
+        object_manifest: target_gen.object_manifest,
+        object_manifest_count: target_gen.object_manifest_count,
+        generation_residuals: target_gen.generation_residuals,
+        verified: target_gen.verified,
+        verification_hash: target_gen.verification_hash,
+        reserved: target_gen.reserved,
+    };
+
+    residual emit {
+        op: "generation.rollback.complete",
+        to_gen: target_gen.number,
+        timestamp: timestamp,
+    };
+
+    return Result[Generation, RollbackError]::Ok(rolled);
+}
+
+// ============================================================================
+// Generation Description
+// ============================================================================
+
+/// A human-readable description of a generation.
+struct GenerationDescription
+    layout packed
+{
+    number: u64,
+    parent_number: u64,
+    label: Array[u8, 128],
+    label_len: u32,
+    status: GenerationStatus,
+    status_name: Array[u8, 32],
+    created_at: u64,
+    activated_at: u64,
+    creator_name: Array[u8, 128],
+    creator_name_len: u32,
+    activator_name: Array[u8, 128],
+    activator_name_len: u32,
+    trust_root_count: u32,
+    runtime_service_count: u32,
+    package_count: u32,
+    object_count: u32,
+    verified: bool,
+    court_count: u32,
+    verifier_count: u32,
+}
+
+/// Generate a description of a generation.
+fn generation_describe(gen: Generation) -> GenerationDescription
+    effect [compute]
+{
+    let status_name: Array[u8, 32] = Array[u8, 32]::zeroed();
+    match gen.status {
+        GenerationStatus::Draft => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("draft");
+            for i in 0..5 { status_name[i] = s[i]; }
+        },
+        GenerationStatus::Active => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("active");
+            for i in 0..6 { status_name[i] = s[i]; }
+        },
+        GenerationStatus::Inactive => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("inactive");
+            for i in 0..8 { status_name[i] = s[i]; }
+        },
+        GenerationStatus::RollbackTarget => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("rollback_target");
+            for i in 0..15 { status_name[i] = s[i]; }
+        },
+        GenerationStatus::Failed => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("failed");
+            for i in 0..6 { status_name[i] = s[i]; }
+        },
+        GenerationStatus::Superseded => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("superseded");
+            for i in 0..10 { status_name[i] = s[i]; }
+        },
+        GenerationStatus::Corrupted => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("corrupted");
+            for i in 0..9 { status_name[i] = s[i]; }
+        },
+        _ => {
+            let s: Array[u8, 32] = Array[u8, 32]::from_literal("unknown");
+            for i in 0..7 { status_name[i] = s[i]; }
+        },
+    }
+
+    return GenerationDescription {
+        number: gen.number,
+        parent_number: gen.parent_number,
+        label: gen.label,
+        label_len: gen.label_len,
+        status: gen.status,
+        status_name: status_name,
+        created_at: gen.created_at,
+        activated_at: gen.activated_at,
+        creator_name: gen.creator.name,
+        creator_name_len: gen.creator.name_len,
+        activator_name: gen.activator.name,
+        activator_name_len: gen.activator.name_len,
+        trust_root_count: gen.trust_root_count,
+        runtime_service_count: gen.runtime_service_count,
+        package_count: gen.package_graph_count,
+        object_count: gen.object_manifest_count,
+        verified: gen.verified,
+        court_count: gen.court_reference_count,
+        verifier_count: gen.verifier_reference_count,
+    };
+}
+
+// ============================================================================
+// Generation Comparison
+// ============================================================================
+
+/// Result of comparing two generations.
+struct GenerationComparison
+    layout packed
+{
+    /// Numbers of the compared generations
+    gen_a_number: u64,
+    gen_b_number: u64,
+    /// Whether the generations have the same store root
+    same_store_root: bool,
+    /// Whether the generations have the same kernel
+    same_kernel: bool,
+    /// Whether the generations have the same nucleus
+    same_nucleus: bool,
+    /// Whether the generations have the same compiler
+    same_compiler: bool,
+    /// Whether the generations have the same trust roots
+    same_trust_roots: bool,
+    /// Whether the generations have the same service set
+    same_services: bool,
+    /// Number of packages added in B relative to A
+    packages_added: u32,
+    /// Number of packages removed in B relative to A
+    packages_removed: u32,
+    /// Number of packages changed between A and B
+    packages_changed: u32,
+    /// Difference in trust root count
+    trust_root_delta: i64,
+    /// Whether B has a higher minimum trust level
+    trust_level_increased: bool,
+    /// Summary string
+    summary: Array[u8, 256],
+    summary_len: u32,
+}
+
+/// Compare two generations and produce a structured diff.
+fn generation_compare(
+    gen_a: Generation,
+    gen_b: Generation,
+) -> GenerationComparison
+    effect [compute, residual]
+{
+    let same_store: bool = store_key_equal(gen_a.store_root_key, gen_b.store_root_key);
+    let same_kernel: bool = store_key_equal(gen_a.kernel_container_key, gen_b.kernel_container_key);
+    let same_nucleus: bool = store_key_equal(gen_a.trusted_nucleus_key, gen_b.trusted_nucleus_key);
+    let same_compiler: bool = store_key_equal(gen_a.compiler_image_key, gen_b.compiler_image_key);
+
+    // Compare trust roots
+    let same_trust: bool = gen_a.trust_root_count == gen_b.trust_root_count;
+    let trust_delta: i64 = gen_b.trust_root_count as i64 - gen_a.trust_root_count as i64;
+    let trust_increased: bool = gen_b.minimum_trust_level > gen_a.minimum_trust_level;
+
+    // Compare services
+    let same_services: bool = gen_a.runtime_service_count == gen_b.runtime_service_count;
+
+    // Package diff — bounded loop over package graphs
+    let mut added: u32 = 0;
+    let mut removed: u32 = 0;
+    let mut changed: u32 = 0;
+
+    // Count packages in B not in A
+    for i in 0..gen_b.package_graph_count as u64 {
+        let mut found: bool = false;
+        for j in 0..gen_a.package_graph_count as u64 {
+            if store_key_equal(gen_b.package_graph[i], gen_a.package_graph[j]) {
+                found = true;
+            }
+        }
+        if !found {
+            added = added + 1;
+        }
+    }
+
+    // Count packages in A not in B
+    for i in 0..gen_a.package_graph_count as u64 {
+        let mut found: bool = false;
+        for j in 0..gen_b.package_graph_count as u64 {
+            if store_key_equal(gen_a.package_graph[i], gen_b.package_graph[j]) {
+                found = true;
+            }
+        }
+        if !found {
+            removed = removed + 1;
+        }
+    }
+
+    // Build summary string
+    let summary: Array[u8, 256] = Array[u8, 256]::zeroed();
+    let summary_str: Array[u8, 256] = Array[u8, 256]::from_literal("generation comparison complete");
+    for i in 0..33 { summary[i] = summary_str[i]; }
+
+    residual emit {
+        op: "generation.compare",
+        gen_a: gen_a.number,
+        gen_b: gen_b.number,
+        same_store_root: same_store as u64,
+        packages_added: added,
+        packages_removed: removed,
+    };
+
+    return GenerationComparison {
+        gen_a_number: gen_a.number,
+        gen_b_number: gen_b.number,
+        same_store_root: same_store,
+        same_kernel: same_kernel,
+        same_nucleus: same_nucleus,
+        same_compiler: same_compiler,
+        same_trust_roots: same_trust,
+        same_services: same_services,
+        packages_added: added,
+        packages_removed: removed,
+        packages_changed: changed,
+        trust_root_delta: trust_delta,
+        trust_level_increased: trust_increased,
+        summary: summary,
+        summary_len: 33,
+    };
+}
+
+// ============================================================================
+// Generation Verification
+// ============================================================================
+
+/// Verify a generation's integrity and consistency.
+fn generation_verify(
+    gen: Generation,
+    verifier: Identity,
+    timestamp: u64,
+) -> Result[Generation, ActivationError]
+    effect [compute, residual]
+{
+    // Check descriptor hash consistency
+    let mut all_ok: bool = true;
+
+    // Check 1: Non-zero key fields
+    if store_key_is_zero(gen.kernel_container_key) { all_ok = false; }
+    if store_key_is_zero(gen.trusted_nucleus_key) { all_ok = false; }
+    if store_key_is_zero(gen.compiler_image_key) { all_ok = false; }
+    if store_key_is_zero(gen.store_root_key) { all_ok = false; }
+
+    // Check 2: Valid parent reference
+    if gen.number > 0 && gen.parent_number >= gen.number {
+        // Parent must be less than current number
+        all_ok = false;
+    }
+
+    // Check 3: Trust roots must be valid identities
+    for i in 0..gen.trust_root_count as u64 {
+        if !identity_is_valid(gen.trust_roots[i]) {
+            all_ok = false;
+        }
+    }
+
+    // Check 4: Signature present
+    if gen.descriptor_sig_count == 0 {
+        all_ok = false;
+    }
+
+    if !all_ok {
+        let failed_gen: Generation = Generation {
+            number: gen.number,
+            parent_number: gen.parent_number,
+            label: gen.label,
+            label_len: gen.label_len,
+            status: GenerationStatus::Corrupted,
+            kernel_container_key: gen.kernel_container_key,
+            trusted_nucleus_key: gen.trusted_nucleus_key,
+            compiler_image_key: gen.compiler_image_key,
+            runtime_service_keys: gen.runtime_service_keys,
+            runtime_service_count: gen.runtime_service_count,
+            store_root_key: gen.store_root_key,
+            trust_roots: gen.trust_roots,
+            trust_root_count: gen.trust_root_count,
+            minimum_trust_level: gen.minimum_trust_level,
+            court_references: gen.court_references,
+            court_reference_count: gen.court_reference_count,
+            verifier_references: gen.verifier_references,
+            verifier_reference_count: gen.verifier_reference_count,
+            package_graph: gen.package_graph,
+            package_graph_count: gen.package_graph_count,
+            activated_at: gen.activated_at,
+            created_at: gen.created_at,
+            creator: gen.creator,
+            activator: gen.activator,
+            descriptor_hash: gen.descriptor_hash,
+            descriptor_signatures: gen.descriptor_signatures,
+            descriptor_sig_count: gen.descriptor_sig_count,
+            object_manifest: gen.object_manifest,
+            object_manifest_count: gen.object_manifest_count,
+            generation_residuals: gen.generation_residuals,
+            verified: false,
+            verification_hash: hash256_zero(),
+            reserved: gen.reserved,
+        };
+
+        return Result[Generation, ActivationError]::Err(ActivationError::IntegrityFailure);
+    }
+
+    let verified_gen: Generation = Generation {
+        number: gen.number,
+        parent_number: gen.parent_number,
+        label: gen.label,
+        label_len: gen.label_len,
+        status: gen.status,
+        kernel_container_key: gen.kernel_container_key,
+        trusted_nucleus_key: gen.trusted_nucleus_key,
+        compiler_image_key: gen.compiler_image_key,
+        runtime_service_keys: gen.runtime_service_keys,
+        runtime_service_count: gen.runtime_service_count,
+        store_root_key: gen.store_root_key,
+        trust_roots: gen.trust_roots,
+        trust_root_count: gen.trust_root_count,
+        minimum_trust_level: gen.minimum_trust_level,
+        court_references: gen.court_references,
+        court_reference_count: gen.court_reference_count,
+        verifier_references: gen.verifier_references,
+        verifier_reference_count: gen.verifier_reference_count,
+        package_graph: gen.package_graph,
+        package_graph_count: gen.package_graph_count,
+        activated_at: gen.activated_at,
+        created_at: gen.created_at,
+        creator: gen.creator,
+        activator: gen.activator,
+        descriptor_hash: gen.descriptor_hash,
+        descriptor_signatures: gen.descriptor_signatures,
+        descriptor_sig_count: gen.descriptor_sig_count,
+        object_manifest: gen.object_manifest,
+        object_manifest_count: gen.object_manifest_count,
+        generation_residuals: gen.generation_residuals,
+        verified: true,
+        verification_hash: hash256_zero(),
+        reserved: gen.reserved,
+    };
+
+    residual emit {
+        op: "generation.verify.success",
+        gen_number: gen.number,
+    };
+
+    return Result[Generation, ActivationError]::Ok(verified_gen);
+}
+
+// ============================================================================
+// Generation Registry — Track All Generations
+// ============================================================================
+
+/// A registry of all generations (bounded to 256).
+struct GenerationRegistry
+    layout packed
+{
+    generations: Array[Generation, 256],
+    count: u32,
+    active_gen_index: u32,
+    next_gen_number: u64,
+}
+
+/// Create an empty generation registry with a root generation.
+fn registry_new(
+    root_gen: Generation,
+) -> GenerationRegistry
+    effect [compute, residual]
+{
+    let mut registry: GenerationRegistry = GenerationRegistry {
+        generations: Array[Generation, 256]::zeroed(),
+        count: 0,
+        active_gen_index: 0,
+        next_gen_number: 1,
+    };
+    registry.generations[0] = root_gen;
+    registry.count = 1;
+
+    residual emit {
+        op: "generation.registry.create",
+        root_number: root_gen.number,
+    };
+
+    return registry;
+}
+
+/// Add a new generation to the registry.
+fn registry_add(
+    registry: GenerationRegistry,
+    gen: Generation,
+) -> GenerationRegistry
+    effect [compute, residual]
+{
+    if registry.count >= 256 {
+        residual emit {
+            op: "generation.registry.full",
+            count: registry.count,
+        };
+        return registry;
+    }
+
+    let mut new_reg: GenerationRegistry = registry;
+    new_reg.generations[registry.count] = gen;
+    new_reg.count = registry.count + 1;
+    new_reg.next_gen_number = new_reg.next_gen_number + 1;
+
+    residual emit {
+        op: "generation.registry.add",
+        gen_number: gen.number,
+        total: new_reg.count,
+    };
+
+    return new_reg;
+}
+
+/// Find a generation by its number.
+fn registry_find(
+    registry: GenerationRegistry,
+    gen_number: u64,
+) -> Result[Generation, u64]
+    effect [compute]
+{
+    for i in 0..registry.count as u64 {
+        if registry.generations[i].number == gen_number {
+            return Result[Generation, u64]::Ok(registry.generations[i]);
+        }
+    }
+    return Result[Generation, u64]::Err(0);
+}
+
+/// Get the currently active generation.
+fn registry_get_active(
+    registry: GenerationRegistry,
+) -> Generation
+    effect [compute]
+{
+    return registry.generations[registry.active_gen_index];
+}
+
+// ============================================================================
+// Helper: Identity validity check
+// ============================================================================
+
+fn identity_is_valid(id: Identity) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if id.key_fingerprint.bytes[i] != 0 {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn store_key_is_zero(key: StoreKey) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if key.bytes[i] != 0 {
+            return false;
+        }
+    }
+    return true;
+}

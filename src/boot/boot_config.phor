@@ -1,0 +1,1040 @@
+// file: boot_config.phor
+// purpose: Boot configuration — configuration file parsing (key=value),
+//          boot entries, timeout, default entry, kernel parameters, device
+//          tree overlay loading, initramfs selection
+// effects: [io:read, io:write, deterministic, residual]
+// trust: TrustState_Bootstrap
+
+package "phorensic:boot_config:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::traits::*
+use core::math::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+
+const MAX_CONFIG_ENTRIES: u32 = 32
+const MAX_CONFIG_LINE_LEN: u32 = 512
+const MAX_CONFIG_FILE_SIZE: u32 = 65536
+const MAX_SECTION_DEPTH: u32 = 4
+const MAX_PARAMETERS: u32 = 64
+const MAX_OVERLAY_PATHS: u32 = 16
+const MAX_INITRAMFS_PATHS: u32 = 8
+const CONFIG_PATH_LEN: u32 = 256
+
+// Configuration keys
+const CFG_KEY_TIMEOUT: FixedString[16] = "timeout"
+const CFG_KEY_DEFAULT: FixedString[16] = "default"
+const CFG_KEY_TITLE: FixedString[16] = "title"
+const CFG_KEY_KERNEL: FixedString[16] = "kernel"
+const CFG_KEY_INITRAMFS: FixedString[16] = "initramfs"
+const CFG_KEY_CMDLINE: FixedString[16] = "cmdline"
+const CFG_KEY_DTB: FixedString[16] = "devicetree"
+const CFG_KEY_OVERLAY: FixedString[16] = "overlay"
+const CFG_KEY_RECOVERY: FixedString[16] = "recovery"
+const CFG_KEY_FALLBACK: FixedString[16] = "fallback"
+const CFG_KEY_GRAPHICS: FixedString[16] = "graphics"
+const CFG_KEY_SERIAL: FixedString[16] = "serial"
+const CFG_KEY_ROOT: FixedString[16] = "root"
+
+// Config file paths (tried in order)
+const CONFIG_PATHS: FixedArray[4, FixedString[64]] = {
+    let mut paths: FixedArray[4, FixedString[64]] = FixedArray::new()
+    paths.push(FixedString::from("\\EFI\\BOOT\\boot.cfg"))!
+    paths.push(FixedString::from("\\boot\\boot.cfg"))!
+    paths.push(FixedString::from("\\boot.cfg"))!
+    paths.push(FixedString::from("\\EFI\\phorensic\\boot.cfg"))!
+    paths
+}
+
+// ──────────────────────────────────────────────
+// Boot Config Entry
+// ──────────────────────────────────────────────
+
+pub type BootConfigEntry : struct {
+    name: FixedString[64],
+    kernel_path: FixedString[CONFIG_PATH_LEN],
+    cmdline: FixedString[512],
+    initramfs_path: FixedString[CONFIG_PATH_LEN],
+    dtb_path: FixedString[CONFIG_PATH_LEN],
+    overlay_paths: FixedArray[MAX_OVERLAY_PATHS, FixedString[CONFIG_PATH_LEN]],
+    num_overlays: u32,
+    initramfs_paths: FixedArray[MAX_INITRAMFS_PATHS, FixedString[CONFIG_PATH_LEN]],
+    num_initramfs: u32,
+    is_recovery: bool,
+    is_factory_reset: bool,
+    graphics_mode: FixedString[32],
+    serial_port: FixedString[16],
+    root_device: FixedString[64],
+}
+
+impl BootConfigEntry {
+    pub fn new() -> BootConfigEntry
+        effects: [deterministic]
+    {
+        BootConfigEntry {
+            name: FixedString::new(),
+            kernel_path: FixedString::new(),
+            cmdline: FixedString::new(),
+            initramfs_path: FixedString::new(),
+            dtb_path: FixedString::new(),
+            overlay_paths: FixedArray::new(),
+            num_overlays: 0,
+            initramfs_paths: FixedArray::new(),
+            num_initramfs: 0,
+            is_recovery: false,
+            is_factory_reset: false,
+            graphics_mode: FixedString::new(),
+            serial_port: FixedString::new(),
+            root_device: FixedString::new(),
+        }
+    }
+
+    pub fn add_overlay(self: ref mut, path: FixedString[CONFIG_PATH_LEN]) -> Result[(), BootError>
+        effects: [deterministic]
+    {
+        if self.num_overlays >= MAX_OVERLAY_PATHS {
+            return Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x001,
+                "Maximum overlay paths exceeded"
+            ))
+        }
+        self.overlay_paths.set(self.num_overlays, path)!
+        self.num_overlays = self.num_overlays + 1
+        Result::Ok(())
+    }
+
+    pub fn add_initramfs(self: ref mut, path: FixedString[CONFIG_PATH_LEN]) -> Result[(), BootError>
+        effects: [deterministic]
+    {
+        if self.num_initramfs >= MAX_INITRAMFS_PATHS {
+            return Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x002,
+                "Maximum initramfs paths exceeded"
+            ))
+        }
+        self.initramfs_paths.set(self.num_initramfs, path)!
+        self.num_initramfs = self.num_initramfs + 1
+        Result::Ok(())
+    }
+
+    pub fn get_kernel_cmdline(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        self.cmdline
+    }
+
+    pub fn get_primary_initramfs(self) -> FixedString[CONFIG_PATH_LEN]
+        effects: [deterministic]
+    {
+        if self.num_initramfs > 0 {
+            self.initramfs_paths.get(0)!
+        } else {
+            self.initramfs_path
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Boot Configuration
+// ──────────────────────────────────────────────
+
+pub type BootConfiguration : struct {
+    entries: FixedArray[MAX_CONFIG_ENTRIES, BootConfigEntry],
+    num_entries: u32,
+    default_entry: u32,
+    timeout_seconds: u32,
+    fallback_entry: u32,
+    serial_port_config: FixedString[16],
+    graphics_config: FixedString[32],
+    disable_timeout: bool,
+    recovery_mode: bool,
+    loaded_from: FixedString[CONFIG_PATH_LEN],
+}
+
+impl BootConfiguration {
+    pub fn new() -> BootConfiguration
+        effects: [deterministic]
+    {
+        BootConfiguration {
+            entries: FixedArray::new(),
+            num_entries: 0,
+            default_entry: 0,
+            timeout_seconds: 10,
+            fallback_entry: 0,
+            serial_port_config: FixedString::from("com1,9600,8n1"),
+            graphics_config: FixedString::new(),
+            disable_timeout: false,
+            recovery_mode: false,
+            loaded_from: FixedString::new(),
+        }
+    }
+
+    pub fn add_boot_entry(self: ref mut, entry: BootConfigEntry) -> Result[(), BootError>
+        effects: [deterministic]
+    {
+        if self.num_entries >= MAX_CONFIG_ENTRIES {
+            return Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x010,
+                "Maximum boot entries exceeded"
+            ))
+        }
+        self.entries.set(self.num_entries, entry)!
+        self.num_entries = self.num_entries + 1
+        Result::Ok(())
+    }
+
+    pub fn get_entry(self, index: u32) -> Result[BootConfigEntry, BootError>
+        effects: [deterministic]
+    {
+        if index >= self.num_entries {
+            return Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x011,
+                "Boot entry index out of range"
+            ))
+        }
+        Result::Ok(self.entries.get(index)!)
+    }
+
+    pub fn get_default_entry(self) -> Result[BootConfigEntry, BootError>
+        effects: [deterministic]
+    {
+        self.get_entry(self.default_entry)
+    }
+
+    pub fn get_kernel_path(self, entry_index: u32) -> FixedString[CONFIG_PATH_LEN]
+        effects: [deterministic]
+    {
+        if entry_index < self.num_entries {
+            let entry: BootConfigEntry = self.entries.get(entry_index)!
+            return entry.kernel_path
+        }
+        FixedString::new()
+    }
+
+    pub fn get_kernel_cmdline(self, entry_index: u32) -> FixedString[512]
+        effects: [deterministic]
+    {
+        if entry_index < self.num_entries {
+            let entry: BootConfigEntry = self.entries.get(entry_index)!
+            return entry.get_kernel_cmdline()
+        }
+        FixedString::new()
+    }
+
+    pub fn get_initramfs_path(self, entry_index: u32) -> FixedString[CONFIG_PATH_LEN]
+        effects: [deterministic]
+    {
+        if entry_index < self.num_entries {
+            let entry: BootConfigEntry = self.entries.get(entry_index)!
+            return entry.get_primary_initramfs()
+        }
+        FixedString::new()
+    }
+
+    pub fn get_dtb_path(self, entry_index: u32) -> FixedString[CONFIG_PATH_LEN]
+        effects: [deterministic]
+    {
+        if entry_index < self.num_entries {
+            let entry: BootConfigEntry = self.entries.get(entry_index)!
+            return entry.dtb_path
+        }
+        FixedString::new()
+    }
+
+    pub fn get_overlay_paths(self, entry_index: u32) -> Result[FixedArray[MAX_OVERLAY_PATHS, FixedString[CONFIG_PATH_LEN]], BootError>
+        effects: [deterministic]
+    {
+        if entry_index >= self.num_entries {
+            return Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x012,
+                "Entry index out of range for overlays"
+            ))
+        }
+        let entry: BootConfigEntry = self.entries.get(entry_index)!
+        Result::Ok(entry.overlay_paths)
+    }
+
+    pub fn entry_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_entries
+    }
+
+    // ──────────────────────────────────────────────
+    // Configuration File Parsing
+    // ──────────────────────────────────────────────
+
+    pub fn parse_from_string(self: ref mut, content: FixedString[MAX_CONFIG_FILE_SIZE]) -> Result<(), BootError>
+        effects: [deterministic]
+    {
+        let lines: FixedArray[512, FixedString[MAX_CONFIG_LINE_LEN]] = self.split_lines(content)
+        let line_count: u32 = lines.len()
+
+        let mut current_entry: BootConfigEntry = BootConfigEntry::new()
+        let mut in_entry: bool = false
+        let mut line_number: u32 = 0
+
+        for i in 0..line_count {
+            line_number = i + 1
+            let raw_line: FixedString[MAX_CONFIG_LINE_LEN] = lines.get(i)!
+            let trimmed: FixedString[MAX_CONFIG_LINE_LEN] = self.trim_line(raw_line)
+
+            // Skip empty lines and comments
+            if trimmed.len() == 0 {
+                continue
+            }
+            let first_char: u8 = trimmed.byte_at(0)
+            if first_char == '#' as u8 || first_char == ';' as u8 {
+                continue
+            }
+
+            // Section headers [entryname]
+            if first_char == '[' as u8 {
+                // Save previous entry if any
+                if in_entry {
+                    if current_entry.name.len() > 0 {
+                        self.add_boot_entry(current_entry)!
+                    }
+                }
+
+                current_entry = BootConfigEntry::new()
+                in_entry = true
+
+                // Extract entry name between brackets
+                let end_bracket: u32 = self.find_char(trimmed, ']' as u8, 1)
+                if end_bracket > 1 {
+                    current_entry.name = trimmed.substring(1, end_bracket)
+                }
+                continue
+            }
+
+            // Key=value parsing
+            let eq_pos: u32 = self.find_char(trimmed, '=' as u8, 0)
+            if eq_pos == 0 || eq_pos >= trimmed.len() {
+                continue
+            }
+
+            let key: FixedString[32] = trimmed.substring(0, eq_pos)
+            let value: FixedString[MAX_CONFIG_LINE_LEN] = trimmed.substring(eq_pos + 1, trimmed.len())
+
+            let parse_result: Result<(), BootError> = self.parse_key_value(key, value, in_entry, current_entry)
+            if parse_result.is_err() {
+                return parse_result
+            }
+        }
+
+        // Save last entry
+        if in_entry && current_entry.name.len() > 0 {
+            self.add_boot_entry(current_entry)!
+        }
+
+        Result::Ok(())
+    }
+
+    fn parse_key_value(self: ref mut, key: FixedString[32], value: FixedString[MAX_CONFIG_LINE_LEN], in_entry: bool, current_entry: ref mut BootConfigEntry) -> Result<(), BootError>
+        effects: [deterministic]
+    {
+        if !in_entry {
+            // Global keys
+            if key == CFG_KEY_TIMEOUT {
+                let parsed: Result[u32, BootError] = self.parse_u32(value)
+                if parsed.is_ok() {
+                    self.timeout_seconds = parsed.unwrap()
+                }
+            } else if key == CFG_KEY_DEFAULT {
+                // Try to parse as index number first
+                let index_result: Result[u32, BootError> = self.parse_u32(value)
+                if index_result.is_ok() {
+                    self.default_entry = index_result.unwrap()
+                }
+            } else if key == CFG_KEY_SERIAL {
+                self.serial_port_config = value
+            } else if key == CFG_KEY_GRAPHICS {
+                self.graphics_config = value
+            }
+            return Result::Ok(())
+        }
+
+        // Entry-specific keys
+        if key == CFG_KEY_KERNEL {
+            current_entry.kernel_path = value
+        } else if key == CFG_KEY_CMDLINE {
+            current_entry.cmdline = value
+        } else if key == CFG_KEY_INITRAMFS {
+            current_entry.initramfs_path = value
+            current_entry.num_initramfs = 0
+            current_entry.add_initramfs(value)!
+        } else if key == CFG_KEY_DTB {
+            current_entry.dtb_path = value
+        } else if key == CFG_KEY_OVERLAY {
+            current_entry.add_overlay(value)!
+        } else if key == CFG_KEY_RECOVERY {
+            current_entry.is_recovery = value == FixedString::from("true") ||
+                                        value == FixedString::from("1") ||
+                                        value == FixedString::from("yes")
+        } else if key == CFG_KEY_ROOT {
+            current_entry.root_device = value
+        }
+
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Configuration File Loading
+    // ──────────────────────────────────────────────
+
+    pub fn load_from_firmware(self: ref mut) -> Result<(), BootError>
+        effects: [io:read, deterministic]
+    {
+        // Try each config path
+        for i in 0..4 {
+            let config_path: FixedString[64] = CONFIG_PATHS.get(i)!
+            let load_result: Result[FixedString[MAX_CONFIG_FILE_SIZE], BootError> = self.read_config_file(config_path)
+            if load_result.is_ok() {
+                let content: FixedString[MAX_CONFIG_FILE_SIZE] = load_result.unwrap()
+                self.parse_from_string(content)!
+                self.loaded_from = config_path
+
+                residual emit {
+                    event: "boot_config.loaded",
+                    path: config_path,
+                    num_entries: self.num_entries,
+                    default_entry: self.default_entry,
+                    timeout: self.timeout_seconds,
+                }
+
+                return Result::Ok(())
+            }
+        }
+
+        Result::Err(BootError::new(
+            DIAG_CONFIG_BASE | 0x020,
+            "No boot configuration file found"
+        ))
+    }
+
+    fn read_config_file(self: ref mut, path: FixedString[64]) -> Result[FixedString[MAX_CONFIG_FILE_SIZE], BootError>
+        effects: [io:read, deterministic]
+    {
+        trusted "Read boot config file from firmware filesystem, UEFI Spec §13.5"
+        {
+            Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x021,
+                "Config file not found"
+            ))
+        }
+    }
+
+    pub fn save_to_firmware(self: ref mut) -> Result<(), BootError>
+        effects: [io:write, deterministic]
+    {
+        let serialized: FixedString[MAX_CONFIG_FILE_SIZE] = self.serialize_to_string()
+
+        trusted "Write boot config to UEFI variable or filesystem, UEFI Spec §8.2"
+        {
+            Result::Ok(())
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Serialization
+    // ──────────────────────────────────────────────
+
+    pub fn serialize_to_string(self: ref BootConfiguration) -> FixedString[MAX_CONFIG_FILE_SIZE]
+        effects: [deterministic]
+    {
+        let mut result: FixedString[MAX_CONFIG_FILE_SIZE] = FixedString::new()
+
+        // Header
+        result.append_str(FixedString::from("# Phorensic OS Boot Configuration\n"))
+        result.append_str(FixedString::from("# Generated by boot_menu\n\n"))
+
+        // Global settings
+        result.append_str(FixedString::from("timeout="))
+        result.append_int(self.timeout_seconds)
+        result.append_str(FixedString::from("\n"))
+
+        result.append_str(FixedString::from("default="))
+        result.append_int(self.default_entry)
+        result.append_str(FixedString::from("\n"))
+
+        if self.serial_port_config.len() > 0 {
+            result.append_str(FixedString::from("serial="))
+            result.append_str(self.serial_port_config)
+            result.append_str(FixedString::from("\n"))
+        }
+
+        if self.graphics_config.len() > 0 {
+            result.append_str(FixedString::from("graphics="))
+            result.append_str(self.graphics_config)
+            result.append_str(FixedString::from("\n"))
+        }
+
+        result.append_str(FixedString::from("\n"))
+
+        // Boot entries
+        for i in 0..self.num_entries {
+            let entry: BootConfigEntry = self.entries.get(i)!
+            result.append_str(FixedString::from("["))
+            result.append_str(entry.name)
+            result.append_str(FixedString::from("]\n"))
+
+            result.append_str(FixedString::from("kernel="))
+            result.append_str(entry.kernel_path)
+            result.append_str(FixedString::from("\n"))
+
+            if entry.cmdline.len() > 0 {
+                result.append_str(FixedString::from("cmdline="))
+                result.append_str(entry.cmdline)
+                result.append_str(FixedString::from("\n"))
+            }
+
+            if entry.initramfs_path.len() > 0 {
+                result.append_str(FixedString::from("initramfs="))
+                result.append_str(entry.initramfs_path)
+                result.append_str(FixedString::from("\n"))
+            }
+
+            if entry.dtb_path.len() > 0 {
+                result.append_str(FixedString::from("devicetree="))
+                result.append_str(entry.dtb_path)
+                result.append_str(FixedString::from("\n"))
+            }
+
+            for j in 0..entry.num_overlays {
+                let overlay: FixedString[CONFIG_PATH_LEN] = entry.overlay_paths.get(j)!
+                result.append_str(FixedString::from("overlay="))
+                result.append_str(overlay)
+                result.append_str(FixedString::from("\n"))
+            }
+
+            if entry.root_device.len() > 0 {
+                result.append_str(FixedString::from("root="))
+                result.append_str(entry.root_device)
+                result.append_str(FixedString::from("\n"))
+            }
+
+            if entry.is_recovery {
+                result.append_str(FixedString::from("recovery=true\n"))
+            }
+
+            result.append_str(FixedString::from("\n"))
+        }
+
+        result
+    }
+
+    // ──────────────────────────────────────────────
+    // String Helpers
+    // ──────────────────────────────────────────────
+
+    fn split_lines(self: ref BootConfiguration, content: FixedString[MAX_CONFIG_FILE_SIZE]) -> FixedArray[512, FixedString[MAX_CONFIG_LINE_LEN]]
+        effects: [deterministic]
+    {
+        let mut lines: FixedArray[512, FixedString[MAX_CONFIG_LINE_LEN]] = FixedArray::new()
+        let mut current_line: FixedString[MAX_CONFIG_LINE_LEN] = FixedString::new()
+        let len: u32 = content.len()
+
+        for i in 0..len {
+            let ch: u8 = content.byte_at(i)
+            if ch == '\n' as u8 {
+                lines.push(current_line)!
+                current_line = FixedString::new()
+            } else if ch == '\r' as u8 {
+                // Skip CR
+            } else {
+                if current_line.len() < MAX_CONFIG_LINE_LEN {
+                    current_line.append_byte(ch)!
+                }
+            }
+        }
+
+        // Push last line if non-empty
+        if current_line.len() > 0 {
+            lines.push(current_line)!
+        }
+
+        lines
+    }
+
+    fn trim_line(self: ref BootConfiguration, line: FixedString[MAX_CONFIG_LINE_LEN]) -> FixedString[MAX_CONFIG_LINE_LEN]
+        effects: [deterministic]
+    {
+        let len: u32 = line.len()
+        let mut start: u32 = 0
+        let mut end: u32 = len
+
+        // Trim leading whitespace
+        for i in 0..len {
+            let ch: u8 = line.byte_at(i)
+            if ch != ' ' as u8 && ch != '\t' as u8 {
+                start = i
+                break
+            }
+        }
+
+        // Trim trailing whitespace
+        let mut j: u32 = len
+        loop: bounds[BOUND_MEDIUM] while j > start {
+            j = j - 1
+            let ch: u8 = line.byte_at(j)
+            if ch != ' ' as u8 && ch != '\t' as u8 && ch != '\r' as u8 {
+                end = j + 1
+                break
+            }
+        }
+
+        if start >= end {
+            return FixedString::new()
+        }
+
+        line.substring(start, end)
+    }
+
+    fn find_char(self: ref BootConfiguration, s: FixedString[MAX_CONFIG_LINE_LEN], ch: u8, start_from: u32) -> u32
+        effects: [deterministic]
+    {
+        let len: u32 = s.len()
+        for i in start_from..len {
+            if s.byte_at(i) == ch {
+                return i
+            }
+        }
+        len
+    }
+
+    fn parse_u32(self: ref BootConfiguration, s: FixedString[MAX_CONFIG_LINE_LEN]) -> Result[u32, BootError>
+        effects: [deterministic]
+    {
+        let len: u32 = s.len()
+        if len == 0 {
+            return Result::Err(BootError::new(
+                DIAG_CONFIG_BASE | 0x030,
+                "Cannot parse empty string as u32"
+            ))
+        }
+
+        let mut value: u32 = 0
+        for i in 0..len {
+            let ch: u8 = s.byte_at(i)
+            if ch >= '0' as u8 && ch <= '9' as u8 {
+                let digit: u32 = (ch - '0' as u8) as u32
+                value = value * 10 + digit
+            } else {
+                return Result::Err(BootError::new(
+                    DIAG_CONFIG_BASE | 0x031,
+                    "Non-digit character in number"
+                ))
+            }
+        }
+
+        Result::Ok(value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Top-level parsing function
+// ──────────────────────────────────────────────
+
+pub fn parse_boot_config(env: ref BootEnvironment) -> Result[BootConfiguration, BootError>
+    effects: [io:read, deterministic]
+{
+    let mut config: BootConfiguration = BootConfiguration::new()
+
+    let load_result: Result[(), BootError> = config.load_from_firmware()
+    if load_result.is_err() {
+        // Use built-in defaults
+        config.timeout_seconds = MENU_TIMEOUT_DEFAULT
+        config.default_entry = 0
+
+        let mut default_entry: BootConfigEntry = BootConfigEntry::new()
+        default_entry.name = FixedString::from("Phorensic OS")
+        default_entry.kernel_path = FixedString::from("\\kernel\\kernel.phor")
+        default_entry.cmdline = FixedString::from("root=/dev/sda1 quiet splash")
+        config.add_boot_entry(default_entry)!
+
+        let mut recovery_entry: BootConfigEntry = BootConfigEntry::new()
+        recovery_entry.name = FixedString::from("Recovery Mode")
+        recovery_entry.kernel_path = FixedString::from("\\kernel\\kernel.recovery")
+        recovery_entry.cmdline = FixedString::from("recovery=1")
+        recovery_entry.is_recovery = true
+        config.add_boot_entry(recovery_entry)!
+    }
+
+    residual emit {
+        event: "boot_config.parsed",
+        num_entries: config.num_entries,
+        default: config.default_entry,
+        timeout: config.timeout_seconds,
+        loaded_from: config.loaded_from,
+    }
+
+    Result::Ok(config)
+}
+
+// ──────────────────────────────────────────────
+// DIAG Constants
+// ──────────────────────────────────────────────
+
+const DIAG_CONFIG_BASE: Word64 = 0x0600_0000_0000_0000
+const DIAG_MENU_BASE: Word64 = 0x0700_0000_0000_0000
+
+const MENU_TIMEOUT_DEFAULT: u32 = 10
+
+// ──────────────────────────────────────────────
+// BootError
+// ──────────────────────────────────────────────
+
+pub type BootError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl BootError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> BootError
+        effects: [deterministic]
+    {
+        BootError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    pub fn is_ok(self) -> bool
+        effects: [deterministic]
+    {
+        self.code == 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Boot Configuration Validation
+// ──────────────────────────────────────────────
+
+pub fn validate_boot_config(config: ref BootConfiguration) -> FixedArray[8, FixedString[128]]
+    effects: [deterministic]
+{
+    let mut warnings: FixedArray[8, FixedString[128]] = FixedArray::new()
+
+    if config.num_entries == 0 {
+        warnings.push(FixedString::from("No boot entries defined"))!
+    }
+
+    if config.default_entry >= config.num_entries && config.num_entries > 0 {
+        warnings.push(FixedString::from("Default entry index out of range, reset to 0"))!
+    }
+
+    if config.timeout_seconds > 300 {
+        warnings.push(FixedString::from("Timeout > 300s, clamping to 300"))!
+    }
+
+    for i in 0..config.num_entries {
+        let entry: BootConfigEntry = config.entries.get(i)!
+        if entry.kernel_path.len() == 0 {
+            warnings.push(FixedString::from("Entry missing kernel path"))!
+        }
+        if entry.name.len() == 0 {
+            warnings.push(FixedString::from("Entry missing name"))!
+        }
+    }
+
+    warnings
+}
+
+// ──────────────────────────────────────────────
+// Configuration Merge
+// ──────────────────────────────────────────────
+
+pub fn merge_boot_configs(base: ref mut BootConfiguration, override_cfg: ref BootConfiguration) -> Result<(), BootError>
+    effects: [deterministic]
+{
+    // Merge entries from override into base, deduplicating by name
+    for i in 0..override_cfg.num_entries {
+        let override_entry: BootConfigEntry = override_cfg.entries.get(i)!
+        let mut found: bool = false
+
+        for j in 0..base.num_entries {
+            let base_entry: BootConfigEntry = base.entries.get(j)!
+            if base_entry.name == override_entry.name {
+                // Replace existing entry with override
+                base.entries.set(j, override_entry)!
+                found = true
+                break
+            }
+        }
+
+        if !found {
+            base.add_boot_entry(override_entry)!
+        }
+    }
+
+    // Override global settings if present in override
+    if override_cfg.timeout_seconds != MENU_TIMEOUT_DEFAULT || override_cfg.timeout_seconds != 10 {
+        base.timeout_seconds = override_cfg.timeout_seconds
+    }
+    if override_cfg.serial_port_config.len() > 0 {
+        base.serial_port_config = override_cfg.serial_port_config
+    }
+    if override_cfg.graphics_config.len() > 0 {
+        base.graphics_config = override_cfg.graphics_config
+    }
+
+    residual emit {
+        event: "boot_config.merged",
+        base_entries: base.num_entries,
+        override_entries: override_cfg.num_entries,
+    }
+
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// Configuration Upgrade / Migration
+// ──────────────────────────────────────────────
+
+pub fn upgrade_config_format(old_config: FixedString[MAX_CONFIG_FILE_SIZE]) -> Result[FixedString[MAX_CONFIG_FILE_SIZE], BootError>
+    effects: [deterministic]
+{
+    // Parse old format, convert to new format with defaults for missing fields
+    let mut new_config: FixedString[MAX_CONFIG_FILE_SIZE] = FixedString::new()
+    new_config.append_str(FixedString::from("# Phorensic OS Boot Configuration v2\n"))
+    new_config.append_str(FixedString::from("# Upgraded from legacy format\n\n"))
+
+    let mut parser: BootConfiguration = BootConfiguration::new()
+    let parse_result: Result<(), BootError> = parser.parse_from_string(old_config)
+
+    if parse_result.is_ok() {
+        // Add missing defaults
+        if parser.timeout_seconds == 0 {
+            parser.timeout_seconds = MENU_TIMEOUT_DEFAULT
+        }
+        new_config = parser.serialize_to_string()
+    }
+
+    Result::Ok(new_config)
+}
+
+// ──────────────────────────────────────────────
+// Global Override Configuration
+// ──────────────────────────────────────────────
+
+pub fn get_global_default_config() -> BootConfiguration
+    effects: [deterministic]
+{
+    let mut config: BootConfiguration = BootConfiguration::new()
+    config.timeout_seconds = 5
+
+    let mut entry: BootConfigEntry = BootConfigEntry::new()
+    entry.name = FixedString::from("Phorensic OS")
+    entry.kernel_path = FixedString::from("\\kernel\\kernel.phor")
+    entry.cmdline = FixedString::from("root=UUID=xxxxxxxx quiet splash")
+    entry.initramfs_path = FixedString::from("\\initramfs\\initramfs.cpio")
+    config.add_boot_entry(entry)!
+
+    config
+}
+
+// ──────────────────────────────────────────────
+// Configuration File Format Detection
+// ──────────────────────────────────────────────
+
+pub type ConfigFormat : u32 = enum {
+    Unknown     = 0,
+    KeyValue    = 1,
+    INIStyle    = 2,
+    JSON        = 3,
+    YAML        = 4,
+    Binary      = 5,
+}
+
+pub fn detect_config_format(data: FixedString[MAX_CONFIG_FILE_SIZE]) -> ConfigFormat
+    effects: [deterministic]
+{
+    let len: u32 = data.len()
+    if len == 0 { return ConfigFormat::Unknown }
+
+    let first_char: u8 = data.byte_at(0)
+    let second_char: u8 = if len > 1 { data.byte_at(1) } else { 0 }
+
+    if first_char == '{' as u8 {
+        return ConfigFormat::JSON
+    }
+    if first_char == '[' as u8 {
+        // Could be INI-style or JSON array
+        for i in 0..len {
+            let ch: u8 = data.byte_at(i)
+            if ch == '=' as u8 {
+                return ConfigFormat::INIStyle
+            }
+            if ch == '"' as u8 {
+                return ConfigFormat::JSON
+            }
+        }
+    }
+    if first_char == '#' as u8 || first_char == ';' as u8 {
+        return ConfigFormat::INIStyle
+    }
+
+    ConfigFormat::KeyValue
+}
+
+// ──────────────────────────────────────────────
+// Boot Entry Sorting and Filtering
+// ──────────────────────────────────────────────
+
+pub fn sort_boot_entries(config: ref mut BootConfiguration)
+    effects: [deterministic]
+{
+    // Bubble sort entries by name (bounded)
+    for i in 0..config.num_entries {
+        for j in 0..(config.num_entries - 1) {
+            let a: BootConfigEntry = config.entries.get(j)!
+            let b: BootConfigEntry = config.entries.get(j + 1)!
+            if a.name.len() > 0 && b.name.len() > 0 {
+                if a.name.byte_at(0) > b.name.byte_at(0) {
+                    config.entries.set(j, b)!
+                    config.entries.set(j + 1, a)!
+                }
+            }
+        }
+    }
+}
+
+pub fn filter_recovery_entries(config: ref BootConfiguration) -> FixedArray[MAX_CONFIG_ENTRIES, u32>
+    effects: [deterministic]
+{
+    let mut indices: FixedArray[MAX_CONFIG_ENTRIES, u32] = FixedArray::new()
+    for i in 0..config.num_entries {
+        let entry: BootConfigEntry = config.entries.get(i)!
+        if entry.is_recovery {
+            indices.push(i)!
+        }
+    }
+    indices
+}
+
+pub fn filter_bootable_entries(config: ref BootConfiguration) -> FixedArray[MAX_CONFIG_ENTRIES, u32>
+    effects: [deterministic]
+{
+    let mut indices: FixedArray[MAX_CONFIG_ENTRIES, u32] = FixedArray::new()
+    for i in 0..config.num_entries {
+        let entry: BootConfigEntry = config.entries.get(i)!
+        if entry.kernel_path.len() > 0 && !entry.is_factory_reset {
+            indices.push(i)!
+        }
+    }
+    indices
+}
+
+// ──────────────────────────────────────────────
+// Configuration Export/Import
+// ──────────────────────────────────────────────
+
+pub fn export_config_to_binary(config: ref BootConfiguration) -> FixedArray[4096, u8]
+    effects: [deterministic]
+{
+    let mut binary: FixedArray[4096, u8] = FixedArray::new()
+    // Magic header
+    binary.push(0x50)!
+    binary.push(0x48)!
+    binary.push(0x4F)!
+    binary.push(0x52)!
+    // Version
+    binary.push(0x01)!
+    binary.push(0x00)!
+    binary.push(0x00)!
+    binary.push(0x00)!
+    // Number of entries
+    binary.push(config.num_entries as u8)!
+    binary
+}
+
+pub fn import_config_from_binary(data: &[u8], data_size: u32) -> Result[BootConfiguration, BootError>
+    effects: [deterministic]
+{
+    if data_size < 9 {
+        return Result::Err(BootError::new(
+            DIAG_CONFIG_BASE | 0x040,
+            "Binary config too small"
+        ))
+    }
+    if data[0] != 0x50 || data[1] != 0x48 || data[2] != 0x4F || data[3] != 0x52 {
+        return Result::Err(BootError::new(
+            DIAG_CONFIG_BASE | 0x041,
+            "Invalid binary config magic"
+        ))
+    }
+    let mut config: BootConfiguration = BootConfiguration::new()
+    Result::Ok(config)
+}
+
+// ──────────────────────────────────────────────
+// Configuration Comparison
+// ──────────────────────────────────────────────
+
+pub fn compare_boot_configs(a: ref BootConfiguration, b: ref BootConfiguration) -> bool
+    effects: [deterministic]
+{
+    if a.num_entries != b.num_entries { return false }
+    if a.default_entry != b.default_entry { return false }
+    if a.timeout_seconds != b.timeout_seconds { return false }
+    for i in 0..a.num_entries {
+        let ea: BootConfigEntry = a.entries.get(i)!
+        let eb: BootConfigEntry = b.entries.get(i)!
+        if ea.kernel_path != eb.kernel_path { return false }
+        if ea.cmdline != eb.cmdline { return false }
+        if ea.initramfs_path != eb.initramfs_path { return false }
+    }
+    true
+}
+
+// ──────────────────────────────────────────────
+// Default Configuration Builder
+// ──────────────────────────────────────────────
+
+pub fn build_minimal_config() -> BootConfiguration
+    effects: [deterministic]
+{
+    let mut config: BootConfiguration = BootConfiguration::new()
+    config.timeout_seconds = 0  // No timeout
+
+    let mut entry: BootConfigEntry = BootConfigEntry::new()
+    entry.name = FixedString::from("Phorensic OS (Minimal)")
+    entry.kernel_path = FixedString::from("\kernel\kernel.phor")
+    entry.cmdline = FixedString::from("root=/dev/sda1 ro quiet")
+    config.add_boot_entry(entry)!
+
+    config
+}
+
+pub fn build_recovery_config() -> BootConfiguration
+    effects: [deterministic]
+{
+    let mut config: BootConfiguration = BootConfiguration::new()
+    config.timeout_seconds = 30
+
+    let mut entry: BootConfigEntry = BootConfigEntry::new()
+    entry.name = FixedString::from("Recovery Mode")
+    entry.kernel_path = FixedString::from("\kernel\kernel.recovery")
+    entry.cmdline = FixedString::from("recovery=1 loglevel=7")
+    entry.is_recovery = true
+    config.add_boot_entry(entry)!
+
+    config
+}

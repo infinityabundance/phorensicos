@@ -1,0 +1,1188 @@
+// acpi.phor — ACPI support driver
+// RSDP/XSDT parsing, MADT, HPET, FADT, DSDT/SSDT headers, power state management
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/acpi.phor
+// Court: acpi_driver:v2
+
+package drivers.acpi;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type AcpiError = enum {
+    AcpiNotInitialized         = 0x300,  // E0300: ACPI driver not initialized
+    AcpiRsdpNotFound           = 0x301,  // E0301: RSDP not found in memory
+    AcpiRsdpInvalid            = 0x302,  // E0302: RSDP signature or checksum invalid
+    AcpiXsdtNotFound           = 0x303,  // E0303: XSDT not found or invalid
+    AcpiTableInvalid           = 0x304,  // E0304: ACPI table signature invalid
+    AcpiTableChecksumError     = 0x305,  // E0305: ACPI table checksum mismatch
+    AcpiMadtNotFound           = 0x306,  // E0306: MADT (APIC) table not found
+    AcpiHpetNotFound           = 0x307,  // E0307: HPET table not found
+    AcpiFadtNotFound           = 0x308,  // E0308: FADT table not found
+    AcpiDsdtNotFound           = 0x309,  // E0309: DSDT not found or invalid
+    AcpiPowerStateError        = 0x30A,  // E030A: power state transition error
+    AcpiCapabilityError        = 0x30B,  // E030B: insufficient capability
+    AcpiTableTooLarge          = 0x30C,  // E030C: ACPI table exceeds maximum size
+    AcpiInvalidRevision        = 0x30D,  // E030D: unsupported ACPI revision
+    AcpiXsdt64Required         = 0x30E,  // E030E: 64-bit XSDT required for this platform
+    AcpiMadtEntryUnknown       = 0x30F,  // E030F: unknown MADT entry type
+    AcpiNotReady               = 0x310,  // E0310: ACPI subsystem not ready
+}
+
+// ─────────────────────────────────────────────────────────────
+// ACPI Table Signatures
+// ─────────────────────────────────────────────────────────────
+
+type AcpiSignature = u32;
+
+struct AcpiSignatures {
+    rsdp: AcpiSignature,
+    xsdt: AcpiSignature,
+    madt: AcpiSignature,
+    hpet: AcpiSignature,
+    fadt: AcpiSignature,
+    dsdt: AcpiSignature,
+    ssdt: AcpiSignature,
+    mcfg: AcpiSignature,
+    facs: AcpiSignature,
+    srat: AcpiSignature,
+    slit: AcpiSignature,
+    apeic: AcpiSignature,
+    bert: AcpiSignature,
+    erst: AcpiSignature,
+    hest: AcpiSignature,
+}
+
+fn acpi_make_sig(s: Slice(u8)) -> AcpiSignature
+    effect [deterministic]
+{
+    let mut sig: u32 = 0;
+    let len: u64 = s.len();
+    if len >= 4 {
+        sig = sig | ((s[0] as u32) << 0);
+        sig = sig | ((s[1] as u32) << 8);
+        sig = sig | ((s[2] as u32) << 16);
+        sig = sig | ((s[3] as u32) << 24);
+    };
+    return sig;
+}
+
+// ─────────────────────────────────────────────────────────────
+// RSDP (Root System Description Pointer)
+// ─────────────────────────────────────────────────────────────
+
+struct Rsdp {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: u32,
+    // ACPI v2.0+ fields:
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
+}
+
+impl Rsdp {
+    fn validate(self) -> bool
+        effect [deterministic]
+        court "rsdp_validate:v1"
+    {
+        // Check signature "RSD PTR "
+        let expected: [u8; 8] = [0x52, 0x53, 0x44, 0x20, 0x50, 0x54, 0x52, 0x20];
+        for i in 0..8 {
+            if self.signature[i] != expected[i] {
+                return false;
+            };
+        };
+        // Validate v1 checksum (sum of first 20 bytes must be 0)
+        let mut sum: u8 = 0;
+        let ptr: *(u8) = (self as *Rsdp) as *(u8);
+        for i in 0..20 {
+            sum = sum + *ptr;
+            ptr = ptr + 1;
+        };
+        if sum != 0 {
+            return false;
+        };
+        // For v2+, validate extended checksum
+        if self.revision >= 2 {
+            let ext_sum: u8 = 0;
+            let ext_ptr: *(u8) = (self as *Rsdp) as *(u8);
+            for i in 0..self.length {
+                ext_sum = ext_sum + *ext_ptr;
+                ext_ptr = ext_ptr + 1;
+            };
+            if ext_sum != 0 {
+                return false;
+            };
+        };
+        return true;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// SDT Header (System Description Table)
+// ─────────────────────────────────────────────────────────────
+
+struct SdtHeader {
+    signature: [u8; 4],
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [u8; 6],
+    oem_table_id: [u8; 8],
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+}
+
+impl SdtHeader {
+    fn validate(self) -> bool
+        effect [deterministic]
+    {
+        let mut sum: u8 = 0;
+        let ptr: *(u8) = (self as *SdtHeader) as *(u8);
+        for i in 0..self.length {
+            sum = sum + *ptr;
+            ptr = ptr + 1;
+        };
+        return sum == 0;
+    }
+
+    fn sig_eq(self, sig: AcpiSignature) -> bool
+        effect [deterministic]
+    {
+        let self_sig: u32 = ((self.signature[0] as u32) << 0)
+                           | ((self.signature[1] as u32) << 8)
+                           | ((self.signature[2] as u32) << 16)
+                           | ((self.signature[3] as u32) << 24);
+        return self_sig == sig;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MADT (Multiple APIC Description Table)
+// ─────────────────────────────────────────────────────────────
+
+struct MadtHeader {
+    header: SdtHeader,
+    local_apic_address: u32,
+    flags: u32,
+}
+
+type MadtEntryType = enum {
+    LocalApic        = 0x00,
+    IoApic           = 0x01,
+    IsoOverride      = 0x02,
+    NmiSource        = 0x03,
+    LocalNmi         = 0x04,
+    LocalApicAddressOverride = 0x05,
+    IoApicSapic       = 0x06,
+    LocalSapic        = 0x07,
+    PlatformInterrupt = 0x08,
+    LocalX2Apic       = 0x09,
+    LocalX2ApicNmi    = 0x0A,
+    GiccCpuInterface  = 0x0B,
+    GicDistributor    = 0x0C,
+    GicMsiFrame       = 0x0D,
+    GicRedistributor  = 0x0E,
+    GicInterruptTranslation = 0x0F,
+    Unknown           = 0xFF,
+}
+
+struct MadtEntry {
+    entry_type: MadtEntryType,
+    record_length: u8,
+    data: Array(u32, 8),
+    data_dwords: u64,
+}
+
+struct MadtInfo {
+    header: MadtHeader,
+    entries: Array(MadtEntry, 64),
+    entry_count: u64,
+    local_apic_count: u64,
+    io_apic_count: u64,
+    iso_override_count: u64,
+    local_x2apic_count: u64,
+    has_8259_pic: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// HPET Table
+// ─────────────────────────────────────────────────────────────
+
+struct HpetTable {
+    header: SdtHeader,
+    hardware_rev_id: u8,
+    comparator_count: u8,
+    counter_size: u16,
+    minimum_tick: u16,
+    page_protection: u8,
+    legacy_replacement: bool,
+    pci_vendor_id: u16,
+    address: u64,  // Base address of HPET MMIO
+    hpet_number: u8,
+    minimum_period: u16,
+}
+
+// ─────────────────────────────────────────────────────────────
+// FADT (Fixed ACPI Description Table)
+// ─────────────────────────────────────────────────────────────
+
+struct FadtTable {
+    header: SdtHeader,
+    firmware_ctrl: u32,
+    dsdt_address: u32,
+    // Field used in ACPI 1.0 only
+    model: u8,
+    facs_address: u32,  // 32-bit FACS address (deprecated)
+    boot_arch_flags: u8,
+    reserved1: u8,
+    flags: u32,
+    // ACPI 2.0+ extended fields:
+    reset_register: GenericAddressStructure,
+    reset_value: u8,
+    arm_boot_arch: u16,
+    fadt_minor_version: u8,
+    x_firmware_ctrl: u64,
+    x_dsdt_address: u64,
+    x_facs_address: u64,
+    sci_interrupt: u32,
+    smi_command_port: u32,
+    acpi_enable: u8,
+    acpi_disable: u8,
+    s4bios_request: u8,
+    pstate_control: u8,
+    pm1a_event_block: u32,
+    pm1b_event_block: u32,
+    pm1a_control_block: u32,
+    pm1b_control_block: u32,
+    pm2_control_block: u32,
+    pm_timer_block: u32,
+    gpe0_block: u32,
+    gpe1_block: u32,
+    pm1_event_length: u8,
+    pm1_control_length: u8,
+    pm2_control_length: u8,
+    pm_timer_length: u8,
+    gpe0_block_length: u8,
+    gpe1_block_length: u8,
+    gpe1_base: u8,
+    cst_control: u8,
+    c2_latency: u16,
+    c3_latency: u16,
+    flush_size: u16,
+    flush_stride: u16,
+    duty_offset: u8,
+    duty_width: u8,
+    day_alarm: u8,
+    month_alarm: u8,
+    century: u8,
+    iapoic_boot_flag: u16,
+    flags2: u32,
+}
+
+struct GenericAddressStructure {
+    address_space: u8,
+    bit_width: u8,
+    bit_offset: u8,
+    access_size: u8,
+    address: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// DSDT/SSDT Differentiated System Description Table
+// ─────────────────────────────────────────────────────────────
+
+struct DsdtInfo {
+    header: SdtHeader,
+    table_address: u64,
+    aml_data_offset: u64,
+    aml_length: u64,
+    validated: bool,
+}
+
+struct SsdtInfo {
+    header: SdtHeader,
+    table_address: u64,
+    aml_data_offset: u64,
+    aml_length: u64,
+    table_index: u64,
+    validated: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Power State
+// ─────────────────────────────────────────────────────────────
+
+type AcpiPowerState = enum {
+    G0Working    = 0,  // S0: Working
+    G1Sleeping   = 1,  // S1: Sleep (standby)
+    G2Sleeping   = 2,  // S2: Sleep (deeper)
+    G3Sleeping   = 3,  // S3: Sleep (suspend-to-RAM)
+    G4Hibernate  = 4,  // S4: Hibernate (suspend-to-disk)
+    G5SoftOff    = 5,  // S5: Soft-off
+    G6Legacy     = 6,  // Legacy state
+}
+
+struct AcpiPowerCapability {
+    object_id: Identity,
+    generation: u64,
+    can_sleep: bool,
+    can_hibernate: bool,
+    can_reboot: bool,
+    can_shutdown: bool,
+    max_sleep_state: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// ACPI Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct AcpiDriverState {
+    driver_identity: Identity,
+    rsdp_address: u64,
+    rsdp: Rsdp,
+    rsdp_valid: bool,
+    xsdt_count: u64,
+    madt: MadtInfo,
+    hpet: HpetTable,
+    fadt: FadtTable,
+    dsdt: DsdtInfo,
+    ssdt_tables: Array(SsdtInfo, 16),
+    ssdt_count: u64,
+    power_cap: AcpiPowerCapability,
+    initialized: bool,
+    initialization_timestamp: u64,
+    sci_interrupt: u32,
+    pm1a_cnt_blk: u32,
+    pm1b_cnt_blk: u32,
+    smi_cmd_port: u32,
+    acpi_enable_value: u8,
+    acpi_disable_value: u8,
+    acpi_mode_enabled: bool,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Find RSDP in Memory
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_find_rsdp() -> Result(u64, AcpiError)
+    effect [memory:mmio, deterministic]
+    court "acpi_find_rsdp:v1"
+{
+    // RSDP is typically located in the EBDA (Extended BIOS Data Area)
+    // or in the main BIOS area between 0x000E0000 and 0x000FFFFF
+    let ebda_ptr: *(u16) = 0x00040E as *(u16);
+    let ebda_seg: u16 = trusted reason "EBDA segment read from BDA at 0x40E, IBM PC/AT spec" {
+        return *ebda_ptr;
+    };
+    let ebda_base: u64 = (ebda_seg as u64) * 16;
+
+    // Check EBDA: first 1KB
+    let mut addr: u64 = ebda_base;
+    loop bound 1024 {
+        if addr >= ebda_base + 1024 {
+            break;
+        };
+        let first_byte: u8 = trusted reason "ACPI RSDP scan in EBDA" {
+            let ptr: *(u8) = addr as *(u8);
+            return *ptr;
+        };
+        if first_byte == 0x52 {  // 'R'
+            // Check full signature
+            let match_sig: bool = trusted reason "RSDP signature check" {
+                let sig_ptr: *(u64) = addr as *(u64);
+                let sig_val: u64 = *sig_ptr;
+                let expected_sig: u64 = 0x2052545020445352;  // "RSD PTR "
+                return sig_val == expected_sig;
+            };
+            if match_sig {
+                return Result::Ok(addr);
+            };
+        };
+        addr = addr + 16;  // Search on 16-byte boundaries
+    };
+
+    // Check BIOS area 0xE0000 - 0xFFFFF
+    addr = 0x000E0000;
+    loop bound 8192 {
+        if addr >= 0x000FFFFF {
+            break;
+        };
+        let first_byte: u8 = trusted reason "ACPI RSDP scan in BIOS area" {
+            let ptr: *(u8) = addr as *(u8);
+            return *ptr;
+        };
+        if first_byte == 0x52 {
+            let match_sig: bool = trusted reason "RSDP signature check in BIOS" {
+                let sig_ptr: *(u64) = addr as *(u64);
+                let sig_val: u64 = *sig_ptr;
+                let expected_sig: u64 = 0x2052545020445352;
+                return sig_val == expected_sig;
+            };
+            if match_sig {
+                return Result::Ok(addr);
+            };
+        };
+        addr = addr + 16;
+    };
+
+    return Result::Err(AcpiError::AcpiRsdpNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read RSDP from Memory
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_read_rsdp(address: u64) -> Rsdp
+    effect [memory:mmio, deterministic]
+    court "acpi_read_rsdp:v1"
+{
+    return trusted reason "RSDP structure read from verified physical address" {
+        let ptr: *(Rsdp) = address as *(Rsdp);
+        return *ptr;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read SDT Header from Memory
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_read_sdt_header(address: u64) -> SdtHeader
+    effect [memory:mmio, deterministic]
+{
+    return trusted reason "ACPI SDT header read from verified physical address" {
+        let ptr: *(SdtHeader) = address as *(SdtHeader);
+        return *ptr;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse XSDT
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_parse_xsdt(
+    state: Handle(AcpiDriverState),
+    xsdt_address: u64,
+) -> Result(u64, AcpiError)
+    effect [memory:mmio, deterministic, residual]
+    court "acpi_parse_xsdt:v1"
+{
+    let header: SdtHeader = acpi_read_sdt_header(xsdt_address);
+
+    if !header.sig_eq(acpi_make_sig(Slice(u8)::from_str("XSDT")))
+        && !header.sig_eq(acpi_make_sig(Slice(u8)::from_str("RSDT")))
+    {
+        return Result::Err(AcpiError::AcpiXsdtNotFound);
+    };
+
+    if !header.validate() {
+        return Result::Err(AcpiError::AcpiTableChecksumError);
+    };
+
+    let is_xsdt: bool = header.sig_eq(acpi_make_sig(Slice(u8)::from_str("XSDT")));
+    let entry_offset: u64 = xsdt_address + 36;  // 36 = sizeof(SdtHeader)
+    let data_len: u64 = (header.length as u64) - 36;
+    let entry_size: u64 = if is_xsdt { 8 } else { 4 };
+    let entry_count: u64 = data_len / entry_size;
+
+    let mut tables_found: u64 = 0;
+
+    loop bound 128 {
+        if tables_found >= entry_count || tables_found >= 128 {
+            break;
+        };
+
+        let table_addr: u64 = if is_xsdt {
+            trusted reason "XSDT entry read (64-bit)" {
+                let ptr: *(u64) = (entry_offset + tables_found * 8) as *(u64);
+                return *ptr;
+            }
+        } else {
+            trusted reason "RSDT entry read (32-bit)" {
+                let ptr: *(u32) = (entry_offset + tables_found * 4) as *(u32);
+                return *ptr as u64;
+            }
+        };
+
+        if table_addr == 0 {
+            tables_found = tables_found + 1;
+            continue;
+        };
+
+        let table_header: SdtHeader = acpi_read_sdt_header(table_addr);
+        let sig: AcpiSignature = ((table_header.signature[0] as u32) << 0)
+                                | ((table_header.signature[1] as u32) << 8)
+                                | ((table_header.signature[2] as u32) << 16)
+                                | ((table_header.signature[3] as u32) << 24);
+
+        let madt_sig: AcpiSignature = acpi_make_sig(Slice(u8)::from_str("APIC"));
+        let hpet_sig: AcpiSignature = acpi_make_sig(Slice(u8)::from_str("HPET"));
+        let fadt_sig: AcpiSignature = acpi_make_sig(Slice(u8)::from_str("FACP"));
+        let dsdt_sig: AcpiSignature = acpi_make_sig(Slice(u8)::from_str("DSDT"));
+        let ssdt_sig: AcpiSignature = acpi_make_sig(Slice(u8)::from_str("SSDT"));
+
+        if sig == madt_sig {
+            let result: Result(void, AcpiError) = acpi_parse_madt(state, table_addr);
+            match result {
+                Result::Ok(_) => {},
+                Result::Err(e) => {
+                    residual emit { op: "acpi.madt_parse_error", table_addr: table_addr, error: e as u64 };
+                },
+            };
+        } else if sig == hpet_sig {
+            let result: Result(void, AcpiError) = acpi_parse_hpet(state, table_addr);
+            match result {
+                Result::Ok(_) => {},
+                Result::Err(e) => {
+                    residual emit { op: "acpi.hpet_parse_error", table_addr: table_addr, error: e as u64 };
+                },
+            };
+        } else if sig == fadt_sig {
+            let result: Result(void, AcpiError) = acpi_parse_fadt(state, table_addr);
+            match result {
+                Result::Ok(_) => {},
+                Result::Err(e) => {
+                    residual emit { op: "acpi.fadt_parse_error", table_addr: table_addr, error: e as u64 };
+                },
+            };
+        } else if sig == ssdt_sig {
+            if state.ssdt_count < 16 {
+                let ssdt: SsdtInfo = SsdtInfo {
+                    header: table_header,
+                    table_address: table_addr,
+                    aml_data_offset: table_addr + 36,
+                    aml_length: (table_header.length as u64) - 36,
+                    table_index: state.ssdt_count,
+                    validated: true,
+                };
+                state.ssdt_tables[state.ssdt_count] = ssdt;
+                state.ssdt_count = state.ssdt_count + 1;
+            };
+        };
+
+        tables_found = tables_found + 1;
+    };
+
+    residual emit {
+        op: "acpi.parse_xsdt",
+        xsdt_address: xsdt_address,
+        tables_found: tables_found,
+        madt_found: if state.madt.entry_count > 0 { 1 } else { 0 },
+        hpet_found: if state.hpet.header.length > 0 { 1 } else { 0 },
+        fadt_found: if state.fadt.header.length > 0 { 1 } else { 0 },
+        ssdt_found: state.ssdt_count,
+    };
+
+    return Result::Ok(tables_found);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse MADT Table
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_parse_madt(
+    state: Handle(AcpiDriverState),
+    madt_address: u64,
+) -> Result(void, AcpiError)
+    effect [memory:mmio, deterministic, residual]
+    court "acpi_parse_madt:v1"
+{
+    let header: MadtHeader = trusted reason "MADT header read from memory" {
+        let ptr: *(MadtHeader) = madt_address as *(MadtHeader);
+        return *ptr;
+    };
+
+    if !header.header.sig_eq(acpi_make_sig(Slice(u8)::from_str("APIC"))) {
+        return Result::Err(AcpiError::AcpiMadtNotFound);
+    };
+
+    state.madt.header = header;
+    state.madt.local_apic_address = header.local_apic_address as u64;
+    state.madt.has_8259_pic = (header.flags & 0x01) == 0x01;
+
+    let entry_offset: u64 = madt_address + 44;  // sizeof(MadtHeader)
+    let remaining: u64 = (header.header.length as u64) - 44;
+    let mut offset: u64 = 0;
+    let mut entry_idx: u64 = 0;
+
+    loop bound 64 {
+        if offset >= remaining || entry_idx >= 64 {
+            break;
+        };
+
+        let entry_addr: u64 = entry_offset + offset;
+        let entry_type_byte: u8 = trusted reason "MADT entry type read" {
+            let ptr: *(u8) = entry_addr as *(u8);
+            return *ptr;
+        };
+        let entry_len: u8 = trusted reason "MADT entry length read" {
+            let ptr: *(u8) = (entry_addr + 1) as *(u8);
+            return *ptr;
+        };
+
+        if entry_len < 2 {
+            break;
+        };
+
+        let entry_type: MadtEntryType;
+        match entry_type_byte {
+            0x00 => entry_type = MadtEntryType::LocalApic,
+            0x01 => entry_type = MadtEntryType::IoApic,
+            0x02 => entry_type = MadtEntryType::IsoOverride,
+            0x03 => entry_type = MadtEntryType::NmiSource,
+            0x04 => entry_type = MadtEntryType::LocalNmi,
+            0x05 => entry_type = MadtEntryType::LocalApicAddressOverride,
+            0x09 => entry_type = MadtEntryType::LocalX2Apic,
+            0x0A => entry_type = MadtEntryType::LocalX2ApicNmi,
+            _ => entry_type = MadtEntryType::Unknown,
+        };
+
+        // Copy entry data
+        let mut data_arr: Array(u32, 8) = Array::zeroed();
+        let data_dwords: u64 = ((entry_len as u64) - 2) / 4;
+        for i in 0..data_dwords {
+            if i >= 8 { break; };
+            let data_addr: u64 = entry_addr + 2 + i * 4;
+            data_arr[i] = trusted reason "MADT entry data" {
+                let ptr: *(u32) = data_addr as *(u32);
+                return *ptr;
+            };
+        };
+
+        let entry: MadtEntry = MadtEntry {
+            entry_type: entry_type,
+            record_length: entry_len,
+            data: data_arr,
+            data_dwords: data_dwords,
+        };
+
+        state.madt.entries[entry_idx] = entry;
+        entry_idx = entry_idx + 1;
+
+        match entry_type {
+            MadtEntryType::LocalApic => state.madt.local_apic_count = state.madt.local_apic_count + 1,
+            MadtEntryType::IoApic => state.madt.io_apic_count = state.madt.io_apic_count + 1,
+            MadtEntryType::IsoOverride => state.madt.iso_override_count = state.madt.iso_override_count + 1,
+            MadtEntryType::LocalX2Apic => state.madt.local_x2apic_count = state.madt.local_x2apic_count + 1,
+            _ => {},
+        };
+
+        offset = offset + (entry_len as u64);
+    };
+
+    state.madt.entry_count = entry_idx;
+
+    residual emit {
+        op: "acpi.parse_madt",
+        table_addr: madt_address,
+        entry_count: entry_idx,
+        local_apics: state.madt.local_apic_count,
+        io_apics: state.madt.io_apic_count,
+        iso_overrides: state.madt.iso_override_count,
+        lapic_addr: header.local_apic_address as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse HPET Table
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_parse_hpet(
+    state: Handle(AcpiDriverState),
+    hpet_address: u64,
+) -> Result(void, AcpiError)
+    effect [memory:mmio, deterministic, residual]
+    court "acpi_parse_hpet:v1"
+{
+    let table: HpetTable = trusted reason "HPET table read from memory" {
+        let ptr: *(HpetTable) = hpet_address as *(HpetTable);
+        return *ptr;
+    };
+
+    if !table.header.sig_eq(acpi_make_sig(Slice(u8)::from_str("HPET"))) {
+        return Result::Err(AcpiError::AcpiHpetNotFound);
+    };
+
+    state.hpet = table;
+
+    residual emit {
+        op: "acpi.parse_hpet",
+        table_addr: hpet_address,
+        address: table.address,
+        rev_id: table.hardware_rev_id as u64,
+        comparator_count: table.comparator_count as u64,
+        vendor: table.pci_vendor_id as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Parse FADT Table
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_parse_fadt(
+    state: Handle(AcpiDriverState),
+    fadt_address: u64,
+) -> Result(void, AcpiError)
+    effect [memory:mmio, deterministic, residual]
+    court "acpi_parse_fadt:v1"
+{
+    let table: FadtTable = trusted reason "FADT table read from memory" {
+        let ptr: *(FadtTable) = fadt_address as *(FadtTable);
+        return *ptr;
+    };
+
+    if !table.header.sig_eq(acpi_make_sig(Slice(u8)::from_str("FACP"))) {
+        return Result::Err(AcpiError::AcpiFadtNotFound);
+    };
+
+    state.fadt = table;
+    state.sci_interrupt = table.sci_interrupt;
+
+    // Store PM registers for power management
+    if table.pm1a_control_block != 0 {
+        state.pm1a_cnt_blk = table.pm1a_control_block;
+    };
+    if table.pm1b_control_block != 0 {
+        state.pm1b_cnt_blk = table.pm1b_control_block;
+    };
+    state.smi_cmd_port = table.smi_command_port;
+    state.acpi_enable_value = table.acpi_enable;
+    state.acpi_disable_value = table.acpi_disable;
+
+    // Parse DSDT if present
+    let dsdt_addr: u64 = if table.x_dsdt_address != 0 {
+        table.x_dsdt_address
+    } else {
+        table.dsdt_address as u64
+    };
+
+    if dsdt_addr != 0 {
+        let dsdt_header: SdtHeader = acpi_read_sdt_header(dsdt_addr);
+        state.dsdt.header = dsdt_header;
+        state.dsdt.table_address = dsdt_addr;
+        state.dsdt.aml_data_offset = dsdt_addr + 36;
+        state.dsdt.aml_length = (dsdt_header.length as u64) - 36;
+        state.dsdt.validated = dsdt_header.validate();
+    };
+
+    residual emit {
+        op: "acpi.parse_fadt",
+        table_addr: fadt_address,
+        sci_int: table.sci_interrupt as u64,
+        pm1a_cnt: table.pm1a_control_block as u64,
+        dsdt_addr: dsdt_addr,
+        acpi_enable: table.acpi_enable as u64,
+        smi_port: table.smi_command_port as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable ACPI Mode
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_enable(
+    state: Handle(AcpiDriverState),
+    power_cap: AcpiPowerCapability,
+    timestamp: u64,
+) -> Result(void, AcpiError)
+    effect [machine:ioport, deterministic, residual]
+    court "acpi_enable:v1"
+{
+    if state.acpi_mode_enabled {
+        return Result::Ok(void);
+    };
+
+    if state.smi_cmd_port == 0 || state.acpi_enable_value == 0 {
+        return Result::Err(AcpiError::AcpiNotReady);
+    };
+
+    if !power_cap.can_sleep {
+        return Result::Err(AcpiError::AcpiCapabilityError);
+    };
+
+    trusted reason "Write SMI command port to enable ACPI, ACPI Spec §4.5.1" {
+        // outb(smi_cmd_port, acpi_enable_value)
+    };
+
+    state.acpi_mode_enabled = true;
+
+    residual emit {
+        op: "acpi.enable",
+        smi_port: state.smi_cmd_port as u64,
+        enable_val: state.acpi_enable_value as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enter Sleep State (S1-S5)
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_enter_sleep(
+    state: Handle(AcpiDriverState),
+    sleep_state: AcpiPowerState,
+    power_cap: AcpiPowerCapability,
+    timestamp: u64,
+) -> Result(void, AcpiError)
+    effect [machine:ioport, deterministic, residual]
+    court "acpi_enter_sleep:v1"
+{
+    if !state.acpi_mode_enabled {
+        return Result::Err(AcpiError::AcpiNotReady);
+    };
+
+    if !power_cap.can_sleep {
+        return Result::Err(AcpiError::AcpiCapabilityError);
+    };
+
+    let sleep_type: u16;
+    match sleep_state {
+        AcpiPowerState::G1Sleeping => sleep_type = 0x1000,  // S1
+        AcpiPowerState::G2Sleeping => sleep_type = 0x2000,  // S2
+        AcpiPowerState::G3Sleeping => sleep_type = 0x3000,  // S3
+        AcpiPowerState::G4Hibernate => sleep_type = 0x4000, // S4
+        AcpiPowerState::G5SoftOff => sleep_type = 0x5000,   // S5
+        _ => { return Result::Err(AcpiError::AcpiPowerStateError); },
+    };
+
+    // Write to PM1a_CNT and PM1b_CNT
+    let sleep_cmd: u16 = sleep_type | 0x2000;  // Set SLP_EN bit (bit 13)
+
+    trusted reason "Write ACPI PM1 control registers for sleep state transition, ACPI Spec §4.5.5" {
+        // outw(pm1a_cnt_blk, sleep_cmd)
+        if state.pm1b_cnt_blk != 0 {
+            // outw(pm1b_cnt_blk, 0x2000 | sleep_type)
+        };
+    };
+
+    residual emit {
+        op: "acpi.enter_sleep",
+        sleep_state: sleep_state as u64,
+        sleep_cmd: sleep_cmd as u64,
+        timestamp: timestamp,
+    };
+
+    // If we return, the sleep was cancelled or not deep enough
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// ACPI Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_driver_init(
+    driver_identity: Identity,
+    power_cap: AcpiPowerCapability,
+    timestamp: u64,
+) -> AcpiDriverState
+    effect [memory:mmio, deterministic, residual]
+    court "acpi_driver_init:v2"
+{
+    let state: AcpiDriverState = AcpiDriverState {
+        driver_identity: driver_identity,
+        rsdp_address: 0,
+        rsdp: trusted reason "zero-initialized RSDP" {
+            let ptr: *(Rsdp) = 0 as *(Rsdp);
+            return *ptr;  // compile-time zero
+        },
+        rsdp_valid: false,
+        xsdt_count: 0,
+        madt: MadtInfo {
+            header: MadtHeader {
+                header: SdtHeader {
+                    signature: [0;4], length: 0, revision: 0, checksum: 0,
+                    oem_id: [0;6], oem_table_id: [0;8],
+                    oem_revision: 0, creator_id: 0, creator_revision: 0,
+                },
+                local_apic_address: 0, flags: 0,
+            },
+            entries: Array::zeroed(), entry_count: 0,
+            local_apic_count: 0, io_apic_count: 0,
+            iso_override_count: 0, local_x2apic_count: 0,
+            has_8259_pic: false,
+        },
+        hpet: HpetTable {
+            header: SdtHeader {
+                signature: [0;4], length: 0, revision: 0, checksum: 0,
+                oem_id: [0;6], oem_table_id: [0;8],
+                oem_revision: 0, creator_id: 0, creator_revision: 0,
+            },
+            hardware_rev_id: 0, comparator_count: 0,
+            counter_size: 0, minimum_tick: 0,
+            page_protection: 0, legacy_replacement: false,
+            pci_vendor_id: 0, address: 0, hpet_number: 0,
+            minimum_period: 0,
+        },
+        fadt: FadtTable {
+            header: SdtHeader {
+                signature: [0;4], length: 0, revision: 0, checksum: 0,
+                oem_id: [0;6], oem_table_id: [0;8],
+                oem_revision: 0, creator_id: 0, creator_revision: 0,
+            },
+            firmware_ctrl: 0, dsdt_address: 0, model: 0, facs_address: 0,
+            boot_arch_flags: 0, reserved1: 0, flags: 0,
+            reset_register: GenericAddressStructure {
+                address_space: 0, bit_width: 0, bit_offset: 0, access_size: 0, address: 0,
+            },
+            reset_value: 0, arm_boot_arch: 0, fadt_minor_version: 0,
+            x_firmware_ctrl: 0, x_dsdt_address: 0, x_facs_address: 0,
+            sci_interrupt: 0, smi_command_port: 0, acpi_enable: 0, acpi_disable: 0,
+            s4bios_request: 0, pstate_control: 0,
+            pm1a_event_block: 0, pm1b_event_block: 0,
+            pm1a_control_block: 0, pm1b_control_block: 0,
+            pm2_control_block: 0, pm_timer_block: 0,
+            gpe0_block: 0, gpe1_block: 0,
+            pm1_event_length: 0, pm1_control_length: 0,
+            pm2_control_length: 0, pm_timer_length: 0,
+            gpe0_block_length: 0, gpe1_block_length: 0,
+            gpe1_base: 0, cst_control: 0,
+            c2_latency: 0, c3_latency: 0,
+            flush_size: 0, flush_stride: 0,
+            duty_offset: 0, duty_width: 0,
+            day_alarm: 0, month_alarm: 0, century: 0,
+            iaoopic_boot_flag: 0, flags2: 0,
+        },
+        dsdt: DsdtInfo {
+            header: SdtHeader {
+                signature: [0;4], length: 0, revision: 0, checksum: 0,
+                oem_id: [0;6], oem_table_id: [0;8],
+                oem_revision: 0, creator_id: 0, creator_revision: 0,
+            },
+            table_address: 0, aml_data_offset: 0, aml_length: 0, validated: false,
+        },
+        ssdt_tables: Array::zeroed(),
+        ssdt_count: 0,
+        power_cap: power_cap,
+        initialized: false,
+        initialization_timestamp: timestamp,
+        sci_interrupt: 0,
+        pm1a_cnt_blk: 0,
+        pm1b_cnt_blk: 0,
+        smi_cmd_port: 0,
+        acpi_enable_value: 0,
+        acpi_disable_value: 0,
+        acpi_mode_enabled: false,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "acpi_driver.init",
+        driver_identity: driver_identity.id_hash,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Full ACPI Initialization and Table Parsing
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_init_and_parse(
+    state: Handle(AcpiDriverState),
+    init_cap: AcpiPowerCapability,
+    timestamp: u64,
+) -> Result(void, AcpiError)
+    effect [memory:mmio, machine:ioport, deterministic, residual]
+    court "acpi_init_parse:v1"
+{
+    // Step 1: Find RSDP
+    let rsdp_addr_result: Result(u64, AcpiError) = acpi_find_rsdp();
+    let rsdp_addr: u64;
+    match rsdp_addr_result {
+        Result::Ok(addr) => rsdp_addr = addr,
+        Result::Err(e) => { return Result::Err(e); },
+    };
+
+    state.rsdp_address = rsdp_addr;
+
+    // Step 2: Read RSDP
+    let rsdp: Rsdp = acpi_read_rsdp(rsdp_addr);
+    if !rsdp.validate() {
+        return Result::Err(AcpiError::AcpiRsdpInvalid);
+    };
+    state.rsdp = rsdp;
+    state.rsdp_valid = true;
+
+    // Step 3: Determine XSDT or RSDT address
+    let xsdt_addr: u64 = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
+        rsdp.xsdt_address
+    } else {
+        rsdp.rsdt_address as u64
+    };
+
+    if xsdt_addr == 0 {
+        return Result::Err(AcpiError::AcpiXsdtNotFound);
+    };
+
+    // Step 4: Parse XSDT/RSDT
+    let tables_found: Result(u64, AcpiError) = acpi_parse_xsdt(state, xsdt_addr);
+    match tables_found {
+        Result::Ok(cnt) => { state.xsdt_count = cnt; },
+        Result::Err(e) => { return Result::Err(e); },
+    };
+
+    state.initialized = true;
+
+    // Step 5: Enable ACPI mode
+    let enable_result: Result(void, AcpiError) = acpi_enable(state, init_cap, timestamp);
+    match enable_result {
+        Result::Ok(_) => {},
+        Result::Err(_) => {
+            residual emit { op: "acpi.enable_failed", timestamp: timestamp };
+        },
+    };
+
+    residual emit {
+        op: "acpi_driver.init_complete",
+        rsdp_addr: rsdp_addr,
+        revision: rsdp.revision as u64,
+        xsdt_count: state.xsdt_count,
+        madt_entries: state.madt.entry_count,
+        hpet_base: state.hpet.address,
+        fadt_pm1a: state.pm1a_cnt_blk as u64,
+        acpi_enabled: if state.acpi_mode_enabled { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reboot via ACPI Reset Register
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_reboot(
+    state: Handle(AcpiDriverState),
+    power_cap: AcpiPowerCapability,
+    timestamp: u64,
+) -> Result(void, AcpiError)
+    effect [machine:ioport, memory:mmio, deterministic, residual]
+    court "acpi_reboot:v1"
+{
+    if !power_cap.can_reboot {
+        return Result::Err(AcpiError::AcpiCapabilityError);
+    };
+
+    let reset_reg: GenericAddressStructure = state.fadt.reset_register;
+
+    if reset_reg.address == 0 {
+        // Fallback: use keyboard controller reset
+        trusted reason "Keyboard controller reset port 0x64, PC-AT compat" {
+            // outb(0x64, 0xFE)
+        };
+        return Result::Ok(void);
+    };
+
+    match reset_reg.address_space as u64 {
+        0 => {  // System memory
+            trusted reason "ACPI reset register in memory space" {
+                let ptr: *(u8) = reset_reg.address as *(u8);
+                *ptr = state.fadt.reset_value;
+            };
+        },
+        1 => {  // I/O space
+            trusted reason "ACPI reset register in I/O space" {
+                // outb(reset_reg.address, fadt.reset_value)
+            };
+        },
+        _ => {},
+    };
+
+    residual emit {
+        op: "acpi.reboot",
+        reset_addr: reset_reg.address,
+        reset_val: state.fadt.reset_value as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Shutdown via ACPI
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_shutdown(
+    state: Handle(AcpiDriverState),
+    power_cap: AcpiPowerCapability,
+    timestamp: u64,
+) -> Result(void, AcpiError)
+    effect [machine:ioport, deterministic, residual]
+    court "acpi_shutdown:v1"
+{
+    return acpi_enter_sleep(state, AcpiPowerState::G5SoftOff, power_cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get Processor Count from MADT
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_get_processor_count(
+    state: Handle(AcpiDriverState),
+) -> u64
+    effect [deterministic]
+{
+    return state.madt.local_apic_count + state.madt.local_x2apic_count;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get IO APIC Count from MADT
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_get_ioapic_count(
+    state: Handle(AcpiDriverState),
+) -> u64
+    effect [deterministic]
+{
+    return state.madt.io_apic_count;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Record All ACPI Tables Residual
+// ─────────────────────────────────────────────────────────────
+
+fn acpi_record_residuals(
+    state: Handle(AcpiDriverState),
+    timestamp: u64,
+) -> void
+    effect [residual]
+    court "acpi_record_residuals:v1"
+{
+    residual emit {
+        op: "acpi_driver.state_summary",
+        initialized: if state.initialized { 1 } else { 0 },
+        rsdp_valid: if state.rsdp_valid { 1 } else { 0 },
+        rsdp_revision: state.rsdp.revision as u64,
+        xsdt_table_count: state.xsdt_count,
+        madt_entry_count: state.madt.entry_count,
+        madt_lapic_addr: state.madt.local_apic_address as u64,
+        hpet_address: state.hpet.address,
+        fadt_dsdt_addr: state.dsdt.table_address,
+        ssdt_count: state.ssdt_count,
+        acpi_mode_on: if state.acpi_mode_enabled { 1 } else { 0 },
+        timestamp: timestamp,
+    };
+}

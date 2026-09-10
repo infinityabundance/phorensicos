@@ -1,0 +1,1280 @@
+// file: rt_timer.phor
+// purpose: Real-time timer subsystem with high-resolution timers,
+//          one-shot and periodic modes, timer queues, timer slack,
+//          overrun handling, and clock synchronization.
+// evidence: RTTIMER-ARCH-001 through RTTIMER-ARCH-230
+// residual: All timer events, overruns, and synchronizations
+//           are recorded as residuals for forensic verifiability.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Timer Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_RT_TIMER_BASE : Word64 = DIAG_RTOS_BASE | 0x0200
+
+const TIMER_MAX_TIMERS       : u32 = 64
+const TIMER_QUEUE_CAP        : u32 = 128
+const TIMER_SLACK_HISTORY    : u32 = 32
+const TIMER_OVERRUN_LOG      : u32 = 64
+const TIMER_SYNC_HISTORY     : u32 = 16
+const TIMER_NAME_CAP         : u32 = 32
+const TIMER_RESIDUAL_LOG     : u32 = 64
+const TIMER_CALLBACKS_MAX    : u32 = 4
+
+// ──────────────────────────────────────────────
+// Timer Mode Enum
+// ──────────────────────────────────────────────
+pub type TimerMode : u8 = enum {
+    TimerMode_OneShot   = 0x00,
+    TimerMode_Periodic  = 0x01,
+    TimerMode_Slacked   = 0x02,
+    TimerMode_Sync      = 0x03,
+}
+
+// ──────────────────────────────────────────────
+// Timer State Enum
+// ──────────────────────────────────────────────
+pub type TimerState : u8 = enum {
+    TimerState_Stopped   = 0x00,
+    TimerState_Running   = 0x01,
+    TimerState_Expired   = 0x02,
+    TimerState_Overrun   = 0x03,
+    TimerState_Cancelled = 0x04,
+    TimerState_Syncing   = 0x05,
+}
+
+// ──────────────────────────────────────────────
+// Timer ID Type
+// ──────────────────────────────────────────────
+pub type TimerId : u32 = struct {
+    value: Word32,
+}
+
+impl TimerId {
+    pub fn new(val: Word32) -> TimerId
+        effects: [deterministic]
+    {
+        TimerId { value: val }
+    }
+
+    pub fn from_u32(val: u32) -> TimerId
+        effects: [deterministic]
+    {
+        TimerId { value: Word32::from_u32(val) }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value.to_u32()
+    }
+
+    pub fn eq(self, other: TimerId) -> bool
+        effects: [deterministic]
+    {
+        self.value.eq(other.value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Time Specification
+// ──────────────────────────────────────────────
+pub type TimeSpec : struct {
+    seconds: Word64,
+    nanoseconds: Word32,
+}
+
+impl TimeSpec {
+    pub fn new() -> TimeSpec
+        effects: [deterministic]
+    {
+        TimeSpec {
+            seconds: Word64::zero(),
+            nanoseconds: Word32::zero(),
+        }
+    }
+
+    pub fn from_ns(ns: Word64) -> TimeSpec
+        effects: [deterministic]
+    {
+        let sec: Word64 = ns.div(Word64::from_u64(1_000_000_000))
+        let rem: Word64 = ns.modulus(Word64::from_u64(1_000_000_000))
+        TimeSpec {
+            seconds: sec,
+            nanoseconds: Word32::from_u64(rem.to_u64()),
+        }
+    }
+
+    pub fn to_ns(self) -> Word64
+        effects: [deterministic]
+    {
+        let sec_ns: Word64 = self.seconds.mul(Word64::from_u64(1_000_000_000))
+        sec_ns.add(Word64::from_u64(self.nanoseconds.to_u64()))
+    }
+
+    pub fn add(self, other: TimeSpec) -> TimeSpec
+        effects: [deterministic]
+    {
+        let total_ns: Word64 = self.to_ns().add(other.to_ns())
+        TimeSpec::from_ns(total_ns)
+    }
+
+    pub fn sub(self, other: TimeSpec) -> TimeSpec
+        effects: [deterministic]
+    {
+        let total_ns: Word64 = self.to_ns().sub(other.to_ns())
+        TimeSpec::from_ns(total_ns)
+    }
+
+    pub fn lt(self, other: TimeSpec) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().lt(other.to_ns())
+    }
+
+    pub fn gt(self, other: TimeSpec) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().gt(other.to_ns())
+    }
+
+    pub fn lte(self, other: TimeSpec) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().lte(other.to_ns())
+    }
+
+    pub fn gte(self, other: TimeSpec) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().gte(other.to_ns())
+    }
+
+    pub fn eq(self, other: TimeSpec) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().eq(other.to_ns())
+    }
+
+    pub fn is_zero(self) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().is_zero()
+    }
+
+    pub fn is_positive(self) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().gt(Word64::zero())
+    }
+
+    pub fn nanoseconds(self) -> u32
+        effects: [deterministic]
+    {
+        self.nanoseconds.to_u32()
+    }
+
+    pub fn seconds_part(self) -> Word64
+        effects: [deterministic]
+    {
+        self.seconds
+    }
+}
+
+// ──────────────────────────────────────────────
+// Timer Callback Type (bounded callback list)
+// ──────────────────────────────────────────────
+pub type TimerCallback : struct {
+    callback_id: Word32,
+    fire_count: Word64,
+    last_fire: TimeSpec,
+}
+
+impl TimerCallback {
+    pub fn new(id: Word32) -> TimerCallback
+        effects: [deterministic]
+    {
+        TimerCallback {
+            callback_id: id,
+            fire_count: Word64::zero(),
+            last_fire: TimeSpec::new(),
+        }
+    }
+
+    pub fn invoke(self: ref mut, now: TimeSpec) -> Word32
+        effects: [deterministic]
+    {
+        self.fire_count = self.fire_count.increment_or_max()
+        self.last_fire = now
+        self.callback_id
+    }
+
+    pub fn fire_count(self) -> Word64
+        effects: [deterministic]
+    {
+        self.fire_count
+    }
+}
+
+// ──────────────────────────────────────────────
+// Timer Entry
+// ──────────────────────────────────────────────
+pub type TimerEntry : struct {
+    id: TimerId,
+    mode: TimerMode,
+    state: TimerState,
+    interval: TimeSpec,
+    remaining: TimeSpec,
+    expiry: TimeSpec,
+    start_time: TimeSpec,
+    slack: TimeSpec,
+    slack_adjust: TimeSpec,
+    overrun_count: Word64,
+    total_fires: Word64,
+    missed_fires: Word64,
+    last_fire: TimeSpec,
+    callbacks: FixedArray[TimerCallback, TIMER_CALLBACKS_MAX],
+    callback_count: u32,
+    name: FixedString[TIMER_NAME_CAP],
+}
+
+impl TimerEntry {
+    pub fn new(id_val: TimerId, mode_val: TimerMode, interval_val: TimeSpec) -> TimerEntry
+        effects: [deterministic]
+    {
+        TimerEntry {
+            id: id_val,
+            mode: mode_val,
+            state: TimerState::TimerState_Stopped,
+            interval: interval_val,
+            remaining: interval_val,
+            expiry: TimeSpec::new(),
+            start_time: TimeSpec::new(),
+            slack: TimeSpec::new(),
+            slack_adjust: TimeSpec::new(),
+            overrun_count: Word64::zero(),
+            total_fires: Word64::zero(),
+            missed_fires: Word64::zero(),
+            last_fire: TimeSpec::new(),
+            callbacks: FixedArray::new(),
+            callback_count: 0,
+            name: FixedString::new(),
+        }
+    }
+
+    pub fn with_name(id_val: TimerId, mode_val: TimerMode, interval_val: TimeSpec, name: FixedString[TIMER_NAME_CAP]) -> TimerEntry
+        effects: [deterministic]
+    {
+        let mut entry: TimerEntry = TimerEntry::new(id_val, mode_val, interval_val)
+        entry.name = name
+        entry
+    }
+
+    pub fn start(self: ref mut, now: TimeSpec)
+        effects: [deterministic]
+    {
+        self.state = TimerState::TimerState_Running
+        self.start_time = now
+        self.expiry = now.add(self.interval)
+        self.remaining = self.interval
+    }
+
+    pub fn stop(self: ref mut)
+        effects: [deterministic]
+    {
+        self.state = TimerState::TimerState_Stopped
+    }
+
+    pub fn tick(self: ref mut, now: TimeSpec)
+        effects: [deterministic]
+    {
+        if self.state != TimerState::TimerState_Running {
+            return
+        }
+        if now.gte(self.expiry) {
+            // Timer has expired
+            self.state = TimerState::TimerState_Expired
+            self.last_fire = now
+            self.total_fires = self.total_fires.increment_or_max()
+
+            // Check for overrun
+            let tardiness: TimeSpec = now.sub(self.expiry)
+            if tardiness.gt(self.slack) && self.slack.is_positive() {
+                self.state = TimerState::TimerState_Overrun
+                self.overrun_count = self.overrun_count.increment_or_max()
+            }
+
+            if self.mode == TimerMode::TimerMode_Periodic {
+                // Reload for periodic mode
+                self.expiry = now.add(self.interval)
+                self.state = TimerState::TimerState_Running
+            }
+        }
+    }
+
+    pub fn expired(self: ref mut, now: TimeSpec) -> bool
+        effects: [deterministic]
+    {
+        if self.state != TimerState::TimerState_Running {
+            return false
+        }
+        now.gte(self.expiry)
+    }
+
+    pub fn remaining_time(self, now: TimeSpec) -> TimeSpec
+        effects: [deterministic]
+    {
+        if self.state != TimerState::TimerState_Running {
+            return TimeSpec::new()
+        }
+        if now.gte(self.expiry) {
+            return TimeSpec::new()
+        }
+        self.expiry.sub(now)
+    }
+
+    pub fn set_slack(self: ref mut, slack_val: TimeSpec)
+        effects: [deterministic]
+    {
+        self.slack = slack_val
+    }
+
+    pub fn has_overrun(self) -> bool
+        effects: [deterministic]
+    {
+        self.state == TimerState::TimerState_Overrun
+    }
+
+    pub fn add_callback(self: ref mut, cb: TimerCallback) -> Result[(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.callback_count >= TIMER_CALLBACKS_MAX {
+            return Result::Err(bounds_capacity_exceeded(TIMER_CALLBACKS_MAX))
+        }
+        let result: Result[(), BoundsError> = self.callbacks.set(self.callback_count, cb)
+        if result.is_ok() {
+            self.callback_count = self.callback_count + 1
+        }
+        result
+    }
+
+    pub fn fire_callbacks(self: ref mut, now: TimeSpec)
+        effects: [deterministic]
+    {
+        for i in 0..self.callback_count {
+            let cb: ref mut TimerCallback = match self.callbacks.ref_at_mut(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            cb.invoke(now)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Timer Queue (sorted by expiry)
+// ──────────────────────────────────────────────
+pub type TimerQueue : struct {
+    timers: FixedArray[TimerEntry, TIMER_QUEUE_CAP],
+    count: u32,
+}
+
+impl TimerQueue {
+    pub fn new() -> TimerQueue
+        effects: [deterministic]
+    {
+        TimerQueue {
+            timers: FixedArray::new(),
+            count: 0,
+        }
+    }
+
+    pub fn insert(self: ref mut, timer: TimerEntry) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        if self.count >= TIMER_QUEUE_CAP {
+            return Result::Err(bounds_capacity_exceeded(TIMER_QUEUE_CAP))
+        }
+        // Insert sorted by expiry time
+        let mut insert_idx: u32 = self.count
+        for i in 0..self.count {
+            let existing: TimerEntry = match self.timers.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            if timer.expiry.lt(existing.expiry) {
+                insert_idx = i
+                // Shift existing timers down
+                for j in (i..self.count).rev() {
+                    let t: TimerEntry = match self.timers.get(j) {
+                        Result::Ok(v) => v,
+                        Result::Err(_) => continue,
+                    }
+                    let r: Result<(), BoundsError> = self.timers.set(j + 1, t)
+                }
+            }
+        }
+        let result: Result<(), BoundsError> = self.timers.set(insert_idx, timer)
+        if result.is_ok() {
+            self.count = self.count + 1
+        }
+        result
+    }
+
+    pub fn remove(self: ref mut, id: TimerId) -> Result<(), BoundsError>
+        effects: [deterministic]
+    {
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.count {
+            let t: TimerEntry = match self.timers.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if !found {
+            return Result::Err(bounds_index_out_of_range(0, self.count))
+        }
+        for i in found_idx..(self.count - 1) {
+            let t: TimerEntry = match self.timers.get(i + 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TimerEntry::new(TimerId::from_u32(0), TimerMode::TimerMode_OneShot, TimeSpec::new()),
+            }
+            let r: Result<(), BoundsError> = self.timers.set(i, t)
+        }
+        self.count = self.count - 1
+        Result::Ok(())
+    }
+
+    pub fn next_expiry(self) -> Result[TimeSpec, BoundsError>
+        effects: [deterministic]
+    {
+        if self.count == 0 {
+            return Result::Err(bounds_empty_collection())
+        }
+        let earliest: TimerEntry = match self.timers.get(0) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        Result::Ok(earliest.expiry)
+    }
+
+    pub fn get_expired(self: ref mut, now: TimeSpec) -> FixedArray[TimerEntry, TIMER_QUEUE_CAP]
+        effects: [deterministic]
+    {
+        let mut expired: FixedArray[TimerEntry, TIMER_QUEUE_CAP] = FixedArray::new()
+        let mut expired_count: u32 = 0
+        for i in 0..self.count {
+            let t: TimerEntry = match self.timers.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.state == TimerState::TimerState_Running && now.gte(t.expiry) {
+                let r: Result<(), BoundsError> = expired.set(expired_count, t)
+                if r.is_ok() {
+                    expired_count = expired_count + 1
+                }
+            }
+        }
+        expired
+    }
+
+    pub fn tick_all(self: ref mut, now: TimeSpec)
+        effects: [deterministic]
+    {
+        for i in 0..self.count {
+            let t: ref mut TimerEntry = match self.timers.ref_at_mut(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            t.tick(now)
+        }
+    }
+
+    pub fn count(self) -> u32
+        effects: [deterministic]
+    {
+        self.count
+    }
+
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.count == 0
+    }
+
+    pub fn clear(self: ref mut)
+        effects: [deterministic]
+    {
+        self.count = 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Timer Error Types
+// ──────────────────────────────────────────────
+pub type TimerError : struct {
+    code: Word64,
+    msg: FixedString[128],
+}
+
+impl TimerError {
+    pub fn new(c: Word64, m: FixedString[128]) -> TimerError
+        effects: [deterministic]
+    {
+        TimerError { code: c, msg: m }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn msg(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+}
+
+pub fn timer_not_found(id: u32) -> TimerError
+    effects: [deterministic]
+{
+    TimerError::new(Word64::from_u64(DIAG_RT_TIMER_BASE | 0x001),
+        FixedString[128]::from_slice("Timer ID not found"))
+}
+
+pub fn timer_queue_full() -> TimerError
+    effects: [deterministic]
+{
+    TimerError::new(Word64::from_u64(DIAG_RT_TIMER_BASE | 0x002),
+        FixedString[128]::from_slice("Timer queue capacity exceeded"))
+}
+
+pub fn timer_overrun(tid: u32) -> TimerError
+    effects: [deterministic]
+{
+    TimerError::new(Word64::from_u64(DIAG_RT_TIMER_BASE | 0x003),
+        FixedString[128]::from_slice("Timer overrun detected"))
+}
+
+pub fn timer_invalid_interval() -> TimerError
+    effects: [deterministic]
+{
+    TimerError::new(Word64::from_u64(DIAG_RT_TIMER_BASE | 0x004),
+        FixedString[128]::from_slice("Invalid timer interval (must be positive)"))
+}
+
+pub fn timer_sync_failed() -> TimerError
+    effects: [deterministic]
+{
+    TimerError::new(Word64::from_u64(DIAG_RT_TIMER_BASE | 0x005),
+        FixedString[128]::from_slice("Clock synchronization failed"))
+}
+
+// ──────────────────────────────────────────────
+// Timer Overrun Event
+// ──────────────────────────────────────────────
+pub type TimerOverrunEvent : struct {
+    timer_id: TimerId,
+    expected_fire: TimeSpec,
+    actual_fire: TimeSpec,
+    overrun_amount: TimeSpec,
+    overrun_count: Word64,
+    mode: TimerMode,
+}
+
+impl TimerOverrunEvent {
+    pub fn new(tid: TimerId, expected: TimeSpec, actual: TimeSpec, count: Word64, mode: TimerMode) -> TimerOverrunEvent
+        effects: [deterministic]
+    {
+        let overrun: TimeSpec = actual.sub(expected)
+        TimerOverrunEvent {
+            timer_id: tid,
+            expected_fire: expected,
+            actual_fire: actual,
+            overrun_amount: overrun,
+            overrun_count: count,
+            mode: mode,
+        }
+    }
+
+    pub fn severity(self) -> u8
+        effects: [deterministic]
+    {
+        let over_ns: u64 = self.overrun_amount.to_ns().to_u64()
+        if over_ns > 1_000_000_000 {
+            3
+        } else if over_ns > 100_000_000 {
+            2
+        } else if over_ns > 1_000_000 {
+            1
+        } else {
+            0
+        }
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            timer_event: "timer.overrun",
+            timer_id: self.timer_id.value() as u64,
+            overrun_ns: self.overrun_amount.to_ns().to_u64(),
+            overrun_count: self.overrun_count.to_u64(),
+            mode: self.mode as u64,
+            severity: self.severity() as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Synchronization State
+// ──────────────────────────────────────────────
+pub type ClockSyncState : struct {
+    local_time: TimeSpec,
+    reference_time: TimeSpec,
+    offset: TimeSpec,
+    drift_estimate: TimeSpec,
+    last_sync: TimeSpec,
+    sync_count: Word64,
+    drift_samples: FixedArray[TimeSpec, TIMER_SYNC_HISTORY],
+    sample_count: u32,
+    synced: bool,
+}
+
+impl ClockSyncState {
+    pub fn new() -> ClockSyncState
+        effects: [deterministic]
+    {
+        ClockSyncState {
+            local_time: TimeSpec::new(),
+            reference_time: TimeSpec::new(),
+            offset: TimeSpec::new(),
+            drift_estimate: TimeSpec::new(),
+            last_sync: TimeSpec::new(),
+            sync_count: Word64::zero(),
+            drift_samples: FixedArray::new(),
+            sample_count: 0,
+            synced: false,
+        }
+    }
+
+    pub fn synchronize(self: ref mut, local: TimeSpec, reference: TimeSpec)
+        effects: [deterministic]
+    {
+        self.local_time = local
+        self.reference_time = reference
+        self.offset = reference.sub(local)
+        let drift: TimeSpec = self.offset
+        self.last_sync = local
+        self.sync_count = self.sync_count.increment_or_max()
+        if self.sample_count < TIMER_SYNC_HISTORY {
+            let r: Result<(), BoundsError> = self.drift_samples.set(self.sample_count, drift)
+            if r.is_ok() {
+                self.sample_count = self.sample_count + 1
+            }
+        }
+        self.synced = true
+    }
+
+    pub fn corrected_time(self, local: TimeSpec) -> TimeSpec
+        effects: [deterministic]
+    {
+        if !self.synced {
+            return local
+        }
+        let elapsed: TimeSpec = local.sub(self.local_time)
+        let drift_adjust: TimeSpec = TimeSpec::from_ns(
+            elapsed.to_ns().mul(self.drift_estimate.to_ns()).div(Word64::from_u64(1_000_000_000)))
+        local.add(self.offset).add(drift_adjust)
+    }
+
+    pub fn is_synced(self) -> bool
+        effects: [deterministic]
+    {
+        self.synced
+    }
+
+    pub fn sync_age(self, now: TimeSpec) -> TimeSpec
+        effects: [deterministic]
+    {
+        now.sub(self.last_sync)
+    }
+
+    pub fn drift_rate(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.sample_count < 2 {
+            return Word64::zero()
+        }
+        let mut total_drift: Word64 = Word64::zero()
+        for i in 0..self.sample_count {
+            let d: TimeSpec = match self.drift_samples.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => TimeSpec::new(),
+            }
+            total_drift = total_drift.add(d.to_ns())
+        }
+        total_drift.div(Word64::from_u64(self.sample_count as u64))
+    }
+}
+
+// ──────────────────────────────────────────────
+// Timer Manager (main high-resolution timer subsystem)
+// ──────────────────────────────────────────────
+pub type TimerManager : struct {
+    timers: FixedArray[TimerEntry, TIMER_MAX_TIMERS],
+    timer_queue: TimerQueue,
+    timer_count: u32,
+    next_id: u32,
+    clock_sync: ClockSyncState,
+    overrun_events: FixedArray[TimerOverrunEvent, TIMER_OVERRUN_LOG],
+    overrun_count: u32,
+    current_time: TimeSpec,
+    residuals: FixedArray[TimerOverrunEvent, TIMER_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl TimerManager {
+    pub fn new() -> TimerManager
+        effects: [deterministic]
+    {
+        TimerManager {
+            timers: FixedArray::new(),
+            timer_queue: TimerQueue::new(),
+            timer_count: 0,
+            next_id: 1,
+            clock_sync: ClockSyncState::new(),
+            overrun_events: FixedArray::new(),
+            overrun_count: 0,
+            current_time: TimeSpec::new(),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+    }
+
+    pub fn create_timer(self: ref mut, mode: TimerMode, interval: TimeSpec) -> Result[TimerId, TimerError>
+        effects: [deterministic, residual]
+    {
+        if !interval.is_positive() {
+            return Result::Err(timer_invalid_interval())
+        }
+        if self.timer_count >= TIMER_MAX_TIMERS {
+            return Result::Err(timer_queue_full())
+        }
+        let id: TimerId = TimerId::from_u32(self.next_id)
+        self.next_id = self.next_id + 1
+        let entry: TimerEntry = TimerEntry::new(id, mode, interval)
+        let result: Result<(), BoundsError> = self.timers.set(self.timer_count, entry)
+        if result.is_err() {
+            return Result::Err(timer_queue_full())
+        }
+        self.timer_count = self.timer_count + 1
+
+        residual emit {
+            timer_op: "timer.created",
+            timer_id: id.value() as u64,
+            mode: mode as u64,
+            interval_ns: interval.to_ns().to_u64(),
+        }
+        Result::Ok(id)
+    }
+
+    pub fn create_timer_named(self: ref mut, mode: TimerMode, interval: TimeSpec, name: FixedString[TIMER_NAME_CAP]) -> Result[TimerId, TimerError>
+        effects: [deterministic, residual]
+    {
+        if !interval.is_positive() {
+            return Result::Err(timer_invalid_interval())
+        }
+        if self.timer_count >= TIMER_MAX_TIMERS {
+            return Result::Err(timer_queue_full())
+        }
+        let id: TimerId = TimerId::from_u32(self.next_id)
+        self.next_id = self.next_id + 1
+        let entry: TimerEntry = TimerEntry::with_name(id, mode, interval, name)
+        let result: Result<(), BoundsError> = self.timers.set(self.timer_count, entry)
+        if result.is_err() {
+            return Result::Err(timer_queue_full())
+        }
+        self.timer_count = self.timer_count + 1
+
+        residual emit {
+            timer_op: "timer.created.named",
+            timer_id: id.value() as u64,
+            mode: mode as u64,
+            interval_ns: interval.to_ns().to_u64(),
+            name: name,
+        }
+        Result::Ok(id)
+    }
+
+    pub fn start_timer(self: ref mut, id: TimerId, now: TimeSpec) -> Result<(), TimerError>
+        effects: [deterministic, residual]
+    {
+        let timer: ref mut TimerEntry = match self.find_timer_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        timer.start(now)
+        let q_result: Result<(), BoundsError> = self.timer_queue.insert(*timer)
+        if q_result.is_err() {
+            return Result::Err(timer_queue_full())
+        }
+        residual emit {
+            timer_op: "timer.started",
+            timer_id: id.value() as u64,
+            start_ns: now.to_ns().to_u64(),
+            expiry_ns: timer.expiry.to_ns().to_u64(),
+        }
+        Result::Ok(())
+    }
+
+    pub fn stop_timer(self: ref mut, id: TimerId) -> Result<(), TimerError>
+        effects: [deterministic, residual]
+    {
+        let timer: ref mut TimerEntry = match self.find_timer_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        timer.stop()
+        let q_result: Result<(), BoundsError> = self.timer_queue.remove(id)
+        residual emit {
+            timer_op: "timer.stopped",
+            timer_id: id.value() as u64,
+            fires: timer.total_fires.to_u64(),
+        }
+        Result::Ok(())
+    }
+
+    pub fn delete_timer(self: ref mut, id: TimerId) -> Result<(), TimerError>
+        effects: [deterministic, residual]
+    {
+        let _: ref mut TimerEntry = match self.find_timer_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        let q_result: Result<(), BoundsError> = self.timer_queue.remove(id)
+        // Compact timer array
+        let mut found_idx: u32 = 0
+        let mut found: bool = false
+        for i in 0..self.timer_count {
+            let t: TimerEntry = match self.timers.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                found_idx = i
+                found = true
+            }
+        }
+        if found {
+            for i in found_idx..(self.timer_count - 1) {
+                let t: TimerEntry = match self.timers.get(i + 1) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => continue,
+                }
+                let r: Result<(), BoundsError> = self.timers.set(i, t)
+            }
+            self.timer_count = self.timer_count - 1
+        }
+        residual emit {
+            timer_op: "timer.deleted",
+            timer_id: id.value() as u64,
+        }
+        Result::Ok(())
+    }
+
+    pub fn tick(self: ref mut, now: TimeSpec)
+        effects: [deterministic, residual]
+    {
+        self.current_time = now
+        self.timer_queue.tick_all(now)
+        // Process expired timers
+        let expired: FixedArray[TimerEntry, TIMER_QUEUE_CAP] = self.timer_queue.get_expired(now)
+        for i in 0..TIMER_QUEUE_CAP {
+            let entry: TimerEntry = match expired.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            if entry.state != TimerState::TimerState_Expired && entry.state != TimerState::TimerState_Overrun {
+                continue
+            }
+            // Fire callbacks
+            let timer: ref mut TimerEntry = match self.find_timer_mut(entry.id) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            timer.fire_callbacks(now)
+
+            // Check for overrun
+            let tardiness: TimeSpec = now.sub(entry.expiry)
+            if tardiness.gt(entry.slack) && entry.slack.is_positive() {
+                let overrun: TimerOverrunEvent = TimerOverrunEvent::new(
+                    entry.id, entry.expiry, now, entry.overrun_count, entry.mode)
+                self.record_overrun(overrun)
+
+                residual emit {
+                    timer_event: "timer.overrun",
+                    timer_id: entry.id.value() as u64,
+                    overrun_ns: tardiness.to_ns().to_u64(),
+                    overrun_count: entry.overrun_count.to_u64(),
+                }
+            }
+
+            if entry.mode == TimerMode::TimerMode_Periodic {
+                residual emit {
+                    timer_event: "timer.periodic.fire",
+                    timer_id: entry.id.value() as u64,
+                    fire_time_ns: now.to_ns().to_u64(),
+                }
+            } else {
+                residual emit {
+                    timer_event: "timer.oneshot.expired",
+                    timer_id: entry.id.value() as u64,
+                    expiry_ns: entry.expiry.to_ns().to_u64(),
+                    fire_time_ns: now.to_ns().to_u64(),
+                }
+            }
+        }
+    }
+
+    pub fn set_timer_slack(self: ref mut, id: TimerId, slack: TimeSpec) -> Result<(), TimerError>
+        effects: [deterministic]
+    {
+        let timer: ref mut TimerEntry = match self.find_timer_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        timer.set_slack(slack)
+        Result::Ok(())
+    }
+
+    pub fn set_timer_mode(self: ref mut, id: TimerId, mode: TimerMode) -> Result<(), TimerError>
+        effects: [deterministic]
+    {
+        let timer: ref mut TimerEntry = match self.find_timer_mut(id) {
+            Result::Ok(t) => t,
+            Result::Err(e) => return Result::Err(e),
+        }
+        timer.mode = mode
+        Result::Ok(())
+    }
+
+    pub fn synchronize_clocks(self: ref mut, local: TimeSpec, reference: TimeSpec)
+        effects: [deterministic, residual]
+    {
+        self.clock_sync.synchronize(local, reference)
+        residual emit {
+            timer_op: "clock.sync",
+            local_ns: local.to_ns().to_u64(),
+            reference_ns: reference.to_ns().to_u64(),
+            offset_ns: self.clock_sync.offset.to_ns().to_u64(),
+            sync_count: self.clock_sync.sync_count.to_u64(),
+        }
+    }
+
+    pub fn corrected_now(self) -> TimeSpec
+        effects: [deterministic]
+    {
+        self.clock_sync.corrected_time(self.current_time)
+    }
+
+    pub fn is_clock_synced(self) -> bool
+        effects: [deterministic]
+    {
+        self.clock_sync.is_synced()
+    }
+
+    pub fn clock_drift_rate(self) -> Word64
+        effects: [deterministic]
+    {
+        self.clock_sync.drift_rate()
+    }
+
+    fn find_timer_mut(self: ref mut, id: TimerId) -> Result<ref mut TimerEntry, TimerError>
+        effects: [deterministic]
+    {
+        for i in 0..self.timer_count {
+            let t: ref mut TimerEntry = match self.timers.ref_at_mut(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                return Result::Ok(t)
+            }
+        }
+        Result::Err(timer_not_found(id.value()))
+    }
+
+    fn record_overrun(self: ref mut, event: TimerOverrunEvent)
+        effects: [deterministic]
+    {
+        if self.overrun_count < TIMER_OVERRUN_LOG {
+            let r: Result<(), BoundsError> = self.overrun_events.set(self.overrun_count, event)
+            if r.is_ok() {
+                self.overrun_count = self.overrun_count + 1
+            }
+        }
+    }
+
+    pub fn timer_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.timer_count
+    }
+
+    pub fn overrun_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.overrun_count
+    }
+
+    pub fn next_expiry(self) -> Result[TimeSpec, BoundsError>
+        effects: [deterministic]
+    {
+        self.timer_queue.next_expiry()
+    }
+
+    pub fn get_timer_info(self, id: TimerId) -> Result<TimerEntry, TimerError>
+        effects: [deterministic]
+    {
+        for i in 0..self.timer_count {
+            let t: TimerEntry = match self.timers.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if t.id.eq(id) {
+                return Result::Ok(t)
+            }
+        }
+        Result::Err(timer_not_found(id.value()))
+    }
+
+    pub fn get_overrun_events(self) -> FixedArray[TimerOverrunEvent, TIMER_OVERRUN_LOG]
+        effects: [deterministic]
+    {
+        self.overrun_events
+    }
+
+    pub fn flush_residuals(self: ref mut)
+        effects: [residual]
+    {
+        for i in 0..self.residual_count {
+            let r: TimerOverrunEvent = match self.residuals.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            r.record()
+        }
+        self.residual_count = 0
+    }
+
+    pub def reset(self: ref mut)
+        effects: [deterministic, residual]
+    {
+        self.timer_queue.clear()
+        self.timer_count = 0
+        self.next_id = 1
+        self.overrun_count = 0
+        residual emit {
+            timer_op: "timer.manager.reset",
+        }
+    }
+
+    pub fn timer_report(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[512] = FixedString::new()
+        report.append(FixedString[32]::from_slice("Timer Report:\n"))
+        report.append(FixedString[32]::from_slice("  Active timers: "))
+        report.append_u64(self.timer_count as u64)
+        report.append(FixedString[32]::from_slice("\n  Overruns: "))
+        report.append_u64(self.overrun_count as u64)
+        report.append(FixedString[32]::from_slice("\n  Sync'd: "))
+        report.append(if self.clock_sync.is_synced() {
+            FixedString[4]::from_slice("yes")
+        } else {
+            FixedString[3]::from_slice("no")
+        })
+        report.append(FixedString[32]::from_slice("\n  Drift rate: "))
+        report.append_u64(self.clock_sync.drift_rate().to_u64())
+        report
+    }
+}
+
+// ──────────────────────────────────────────────
+// High-Resolution Timer Utilities
+// ──────────────────────────────────────────────
+pub fn oneshot_timer(manager: ref mut TimerManager, interval_ns: Word64, now: TimeSpec) -> Result[TimerId, TimerError>
+    effects: [deterministic, residual]
+{
+    let interval: TimeSpec = TimeSpec::from_ns(interval_ns)
+    let id: TimerId = match manager.create_timer(TimerMode::TimerMode_OneShot, interval) {
+        Result::Ok(i) => i,
+        Result::Err(e) => return Result::Err(e),
+    }
+    let start_result: Result<(), TimerError> = manager.start_timer(id, now)
+    match start_result {
+        Result::Ok(_) => Result::Ok(id),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+pub fn periodic_timer(manager: ref mut TimerManager, interval_ns: Word64, now: TimeSpec) -> Result[TimerId, TimerError>
+    effects: [deterministic, residual]
+{
+    let interval: TimeSpec = TimeSpec::from_ns(interval_ns)
+    let id: TimerId = match manager.create_timer(TimerMode::TimerMode_Periodic, interval) {
+        Result::Ok(i) => i,
+        Result::Err(e) => return Result::Err(e),
+    }
+    let start_result: Result<(), TimerError> = manager.start_timer(id, now)
+    match start_result {
+        Result::Ok(_) => Result::Ok(id),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+pub fn timer_with_slack(manager: ref mut TimerManager, mode: TimerMode, interval_ns: Word64, slack_ns: Word64, now: TimeSpec) -> Result[TimerId, TimerError>
+    effects: [deterministic, residual]
+{
+    let interval: TimeSpec = TimeSpec::from_ns(interval_ns)
+    let slack: TimeSpec = TimeSpec::from_ns(slack_ns)
+    let id: TimerId = match manager.create_timer(mode, interval) {
+        Result::Ok(i) => i,
+        Result::Err(e) => return Result::Err(e),
+    }
+    let slack_result: Result<(), TimerError> = manager.set_timer_slack(id, slack)
+    if slack_result.is_err() {
+        return Result::Err(timer_invalid_interval())
+    }
+    let start_result: Result<(), TimerError> = manager.start_timer(id, now)
+    match start_result {
+        Result::Ok(_) => Result::Ok(id),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+pub fn synchronize_with_reference(manager: ref mut TimerManager, local: TimeSpec, reference: TimeSpec)
+    effects: [deterministic, residual]
+{
+    manager.synchronize_clocks(local, reference)
+}
+
+pub fn get_resolution() -> TimeSpec
+    effects: [deterministic]
+{
+    // Return the timer resolution (typically 1 microsecond = 1000 ns)
+    TimeSpec::from_ns(Word64::from_u64(1000))
+}
+
+pub fn calibrate_timer_accuracy(manager: ref mut TimerManager, test_iterations: u32) -> Word64
+    effects: [deterministic]
+{
+    let mut total_error: Word64 = Word64::zero()
+    let test_interval: TimeSpec = TimeSpec::from_ns(Word64::from_u64(1_000_000))
+    let mut test_count: u32 = 0
+
+    for i in 0..test_iterations {
+        let before: TimeSpec = manager.current_time
+        // Simulate waiting for timer (bounded)
+        for j in 0..100 {
+            let after: TimeSpec = manager.current_time
+            if after.gte(before.add(test_interval)) {
+                break
+            }
+        }
+        let after: TimeSpec = manager.current_time
+        let elapsed: TimeSpec = after.sub(before)
+        let error: Word64 = elapsed.sub(test_interval).to_ns().abs()
+        total_error = total_error.add(error)
+        test_count = test_count + 1
+    }
+
+    if test_count == 0 {
+        return Word64::zero()
+    }
+    total_error.div(Word64::from_u64(test_count as u64))
+}
+
+// ──────────────────────────────────────────────
+// Timer Verification Functions
+// ──────────────────────────────────────────────
+pub fn verify_timer_consistency(manager: ref TimerManager) -> bool
+    effects: [deterministic]
+{
+    let timer_count: u32 = manager.timer_count
+    let queue_count: u32 = manager.timer_queue.count()
+
+    // Timer count sanity check
+    if timer_count > TIMER_MAX_TIMERS {
+        return false
+    }
+    if queue_count > timer_count {
+        return false
+    }
+
+    // Verify each timer has valid state
+    for i in 0..timer_count {
+        let timer: TimerEntry = match manager.timers.get(i) {
+            Result::Ok(t) => t,
+            Result::Err(_) => return false,
+        }
+        if timer.id.value() == 0 {
+            return false
+        }
+        if timer.mode == TimerMode::TimerMode_OneShot {
+            if timer.state == TimerState::TimerState_Running {
+                // Check expiry is in the future
+                if timer.expiry.lt(manager.current_time) {
+                    return false
+                }
+            }
+        }
+    }
+    true
+}
+
+pub fn check_overrun_status(manager: ref TimerManager, id: TimerId) -> bool
+    effects: [deterministic]
+{
+    for i in 0..manager.timer_count {
+        let timer: TimerEntry = match manager.timers.get(i) {
+            Result::Ok(t) => t,
+            Result::Err(_) => continue,
+        }
+        if timer.id.eq(id) {
+            return timer.has_overrun()
+        }
+    }
+    false
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_timer_manager() -> TimerManager
+    effects: [deterministic, residual]
+{
+    let manager: TimerManager = TimerManager::new()
+    residual emit {
+        timer_op: "timer.subsystem.init",
+        max_timers: TIMER_MAX_TIMERS as u64,
+        queue_capacity: TIMER_QUEUE_CAP as u64,
+        resolution_ns: get_resolution().to_ns().to_u64(),
+    }
+    manager
+}

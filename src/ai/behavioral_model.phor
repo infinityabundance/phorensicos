@@ -1,0 +1,823 @@
+// file: behavioral_model.phor
+// purpose: Behavioral modeling engine for execution profile construction,
+//          baseline modeling, deviation detection, behavioral signature
+//          generation, and model updates. All analysis is deterministic
+//          and produces court-verifiable behavioral evidence.
+// evidence: BEHAVIORAL-MODEL-ARCH-001 through BEHAVIORAL-MODEL-ARCH-240
+// residual: All behavioral observations, model updates, and deviations
+//           are recorded for forensic traceability.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+use core::serialization::*
+
+// ──────────────────────────────────────────────
+// Behavioral Model Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_BEHAVIORAL_MODEL : Word64 = DIAG_AI_BASE | 0x0200
+
+const MODEL_MAX_SAMPLES        : u32 = 4096
+const MODEL_FEATURE_CAP        : u32 = 64
+const MODEL_SIGNATURE_CAP      : u32 = 32
+const MODEL_DEVIATION_CAP      : u32 = 128
+const MODEL_PROFILE_CAP        : u32 = 16
+const MODEL_NAME_CAP           : u32 = 32
+const MODEL_RESIDUAL_LOG       : u32 = 64
+const MODEL_UPDATE_HISTORY     : u32 = 256
+const MODEL_WINDOW_SIZE        : u32 = 64
+const MODEL_BASELINE_MIN       : u32 = 30
+const MODEL_CLUSTER_CAP        : u32 = 8
+
+// ──────────────────────────────────────────────
+// Behavioral Feature (metric type)
+// ──────────────────────────────────────────────
+pub type BehaviorFeature : u8 = enum {
+    Feat_ExecTime       = 0x00,
+    Feat_CpuUsage       = 0x01,
+    Feat_MemAccess      = 0x02,
+    Feat_IoOps          = 0x03,
+    Feat_NetOps         = 0x04,
+    Feat_Syscalls       = 0x05,
+    Feat_ContextSwitches= 0x06,
+    Feat_PageFaults     = 0x07,
+    Feat_IPC_msgs       = 0x08,
+    Feat_LockContention = 0x09,
+}
+
+// ──────────────────────────────────────────────
+// Observation (single behavioral data point)
+// ──────────────────────────────────────────────
+pub type Observation : struct {
+    timestamp: Word64,
+    feature: BehaviorFeature,
+    value: Word64,
+    confidence: u8,
+    source: FixedString[MODEL_NAME_CAP],
+}
+
+impl Observation {
+    pub fn new(ts: Word64, feat: BehaviorFeature, val: Word64) -> Observation
+        effects: [deterministic]
+    {
+        Observation {
+            timestamp: ts,
+            feature: feat,
+            value: val,
+            confidence: 100,
+            source: FixedString::new(),
+        }
+    }
+
+    pub fn with_source(ts: Word64, feat: BehaviorFeature, val: Word64, src: FixedString[MODEL_NAME_CAP]) -> Observation
+        effects: [deterministic]
+    {
+        let mut obs: Observation = Observation::new(ts, feat, val)
+        obs.source = src
+        obs
+    }
+}
+
+// ──────────────────────────────────────────────
+// Statistical Profile for a Feature
+// ──────────────────────────────────────────────
+pub type FeatureProfile : struct {
+    feature: BehaviorFeature,
+    mean: Word64,
+    stddev: Word64,
+    min_val: Word64,
+    max_val: Word64,
+    median: Word64,
+    p95: Word64,
+    p99: Word64,
+    sample_count: u32,
+    last_updated: Word64,
+    is_stable: bool,
+}
+
+impl FeatureProfile {
+    pub fn new(feat: BehaviorFeature) -> FeatureProfile
+        effects: [deterministic]
+    {
+        FeatureProfile {
+            feature: feat,
+            mean: Word64::zero(),
+            stddev: Word64::zero(),
+            min_val: Word64::max_value(),
+            max_val: Word64::zero(),
+            median: Word64::zero(),
+            p95: Word64::zero(),
+            p99: Word64::zero(),
+            sample_count: 0,
+            last_updated: Word64::zero(),
+            is_stable: false,
+        }
+    }
+
+    pub fn update(self: ref mut, value: Word64)
+        effects: [deterministic]
+    {
+        let old_mean: Word64 = self.mean
+        let n: Word64 = Word64::from_u64(self.sample_count as u64)
+
+        // Running mean
+        self.mean = old_mean.mul(n).add(value).div(n.increment_or_max())
+
+        // Running variance (Welford's)
+        let diff: Word64 = value.sub(old_mean)
+        let sq_diff: Word64 = diff.mul(diff)
+        self.stddev = self.stddev.add(sq_diff.sub(self.stddev).div(n.increment_or_max()))
+
+        // Min/max
+        if value.lt(self.min_val) { self.min_val = value }
+        if value.gt(self.max_val) { self.max_val = value }
+
+        self.sample_count = self.sample_count + 1
+        self.is_stable = self.sample_count >= MODEL_BASELINE_MIN
+    }
+
+    pub fn z_score(self, value: Word64) -> Word64
+        effects: [deterministic]
+    {
+        if self.stddev.is_zero() {
+            if value.eq(self.mean) { return Word64::zero() }
+            return Word64::from_u64(100)
+        }
+        let diff: Word64 = if value.gt(self.mean) {
+            value.sub(self.mean)
+        } else {
+            self.mean.sub(value)
+        }
+        diff.div(self.stddev)
+    }
+
+    pub fn deviation_probability(self, value: Word64) -> u8
+        effects: [deterministic]
+    {
+        let z: Word64 = self.z_score(value)
+        let z_val: u64 = z.to_u64()
+        if z_val > 10 { 1 }
+        else if z_val > 5 { 5 }
+        else if z_val > 3 { 20 }
+        else if z_val > 2 { 50 }
+        else if z_val > 1 { 80 }
+        else { 100 }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Behavioral Profile (collection of feature profiles)
+// ──────────────────────────────────────────────
+pub type BehavioralProfile : struct {
+    name: FixedString[MODEL_NAME_CAP],
+    profiles: FixedArray[FeatureProfile, MODEL_FEATURE_CAP],
+    profile_count: u32,
+    created: Word64,
+    version: u32,
+    total_observations: Word64,
+}
+
+impl BehavioralProfile {
+    pub fn new(pname: FixedString[MODEL_NAME_CAP], ts: Word64) -> BehavioralProfile
+        effects: [deterministic]
+    {
+        BehavioralProfile {
+            name: pname,
+            profiles: FixedArray::new(),
+            profile_count: 0,
+            created: ts,
+            version: 1,
+            total_observations: Word64::zero(),
+        }
+    }
+
+    pub fn get_or_create_profile(self: ref mut, feat: BehaviorFeature) -> Result<ref mut FeatureProfile, BoundsError>
+        effects: [deterministic]
+    {
+        for i in 0..self.profile_count {
+            let p: ref mut FeatureProfile = match self.profiles.ref_at_mut(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if p.feature == feat {
+                return Result::Ok(p)
+            }
+        }
+        if self.profile_count >= MODEL_FEATURE_CAP {
+            return Result::Err(bounds_capacity_exceeded(MODEL_FEATURE_CAP))
+        }
+        let new_p: FeatureProfile = FeatureProfile::new(feat)
+        let r: Result<(), BoundsError> = self.profiles.set(self.profile_count, new_p)
+        if r.is_err() {
+            return Result::Err(r.err())
+        }
+        self.profile_count = self.profile_count + 1
+        self.profiles.ref_at_mut(self.profile_count - 1)
+    }
+
+    pub fn record_observation(self: ref mut, obs: Observation)
+        effects: [deterministic]
+    {
+        let profile: ref mut FeatureProfile = match self.get_or_create_profile(obs.feature) {
+            Result::Ok(p) => p,
+            Result::Err(_) => return,
+        }
+        profile.update(obs.value)
+        profile.last_updated = obs.timestamp
+        self.total_observations = self.total_observations.increment_or_max()
+    }
+
+    pub fn is_baseline_established(self) -> bool
+        effects: [deterministic]
+    {
+        if self.profile_count == 0 {
+            return false
+        }
+        for i in 0..self.profile_count {
+            let p: FeatureProfile = match self.profiles.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if !p.is_stable {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn stability_score(self) -> u8
+        effects: [deterministic]
+    {
+        if self.profile_count == 0 {
+            return 0
+        }
+        let mut stable_count: u32 = 0
+        for i in 0..self.profile_count {
+            let p: FeatureProfile = match self.profiles.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if p.is_stable {
+                stable_count = stable_count + 1
+            }
+        }
+        (stable_count * 100 / self.profile_count) as u8
+    }
+}
+
+// ──────────────────────────────────────────────
+// Deviation Record
+// ──────────────────────────────────────────────
+pub type Deviation : struct {
+    timestamp: Word64,
+    feature: BehaviorFeature,
+    observed_value: Word64,
+    expected_mean: Word64,
+    z_score: Word64,
+    severity: u8,
+    feature_name: FixedString[MODEL_NAME_CAP],
+}
+
+impl Deviation {
+    pub fn new(ts: Word64, feat: BehaviorFeature, observed: Word64, expected: Word64, z: Word64, sev: u8) -> Deviation
+        effects: [deterministic]
+    {
+        Deviation {
+            timestamp: ts,
+            feature: feat,
+            observed_value: observed,
+            expected_mean: expected,
+            z_score: z,
+            severity: sev,
+            feature_name: FixedString::new(),
+        }
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            ai_op: "behavioral.deviation",
+            feature: self.feature as u64,
+            observed: self.observed_value.to_u64(),
+            expected: self.expected_mean.to_u64(),
+            z_score: self.z_score.to_u64(),
+            severity: self.severity as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Behavioral Signature
+// ──────────────────────────────────────────────
+pub type BehaviorSignature : struct {
+    name: FixedString[MODEL_NAME_CAP],
+    feature_means: FixedArray[Word64, MODEL_SIGNATURE_CAP],
+    feature_stddevs: FixedArray[Word64, MODEL_SIGNATURE_CAP],
+    feature_types: FixedArray[u8, MODEL_SIGNATURE_CAP],
+    feature_count: u32,
+    version: u32,
+}
+
+impl BehaviorSignature {
+    pub fn new(sig_name: FixedString[MODEL_NAME_CAP]) -> BehaviorSignature
+        effects: [deterministic]
+    {
+        BehaviorSignature {
+            name: sig_name,
+            feature_means: FixedArray::new(),
+            feature_stddevs: FixedArray::new(),
+            feature_types: FixedArray::new(),
+            feature_count: 0,
+            version: 1,
+        }
+    }
+
+    pub fn from_profile(profile: ref BehavioralProfile) -> BehaviorSignature
+        effects: [deterministic]
+    {
+        let mut sig: BehaviorSignature = BehaviorSignature::new(profile.name)
+        for i in 0..profile.profile_count {
+            let p: FeatureProfile = match profile.profiles.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if sig.feature_count < MODEL_SIGNATURE_CAP {
+                let _ = sig.feature_means.set(sig.feature_count, p.mean)
+                let _ = sig.feature_stddevs.set(sig.feature_count, p.stddev)
+                let _ = sig.feature_types.set(sig.feature_count, p.feature as u8)
+                sig.feature_count = sig.feature_count + 1
+            }
+        }
+        sig
+    }
+
+    pub fn match_observation(self, obs: Observation) -> u8
+        effects: [deterministic]
+    {
+        for i in 0..self.feature_count {
+            let ftype: u8 = match self.feature_types.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if ftype == (obs.feature as u8) {
+                let mean: Word64 = match self.feature_means.get(i) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => Word64::zero(),
+                }
+                let stddev: Word64 = match self.feature_stddevs.get(i) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => Word64::zero(),
+                }
+                let diff: Word64 = if obs.value.gt(mean) {
+                    obs.value.sub(mean)
+                } else {
+                    mean.sub(obs.value)
+                }
+                if stddev.is_zero() {
+                    return if diff.is_zero() { 100 } else { 0 }
+                }
+                let stddevs: Word64 = diff.div(stddev)
+                let std_val: u64 = stddevs.to_u64()
+                if std_val > 5 { return 5 }
+                if std_val > 3 { return 20 }
+                if std_val > 2 { return 50 }
+                if std_val > 1 { return 80 }
+                return 100
+            }
+        }
+        0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Behavioral Model (Main)
+// ──────────────────────────────────────────────
+pub type BehavioralModel : struct {
+    baseline: BehavioralProfile,
+    current: BehavioralProfile,
+    signature: BehaviorSignature,
+    deviations: FixedArray[Deviation, MODEL_DEVIATION_CAP],
+    deviation_count: u32,
+    updates: FixedArray[Word64, MODEL_UPDATE_HISTORY],
+    update_count: u32,
+    name: FixedString[MODEL_NAME_CAP],
+    residuals: FixedArray[Observation, MODEL_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl BehavioralModel {
+    pub fn new(model_name: FixedString[MODEL_NAME_CAP], ts: Word64) -> BehavioralModel
+        effects: [deterministic, residual]
+    {
+        let model: BehavioralModel = BehavioralModel {
+            baseline: BehavioralProfile::new(model_name, ts),
+            current: BehavioralProfile::new(model_name, ts),
+            signature: BehaviorSignature::new(model_name),
+            deviations: FixedArray::new(),
+            deviation_count: 0,
+            updates: FixedArray::new(),
+            update_count: 0,
+            name: model_name,
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+        residual emit {
+            ai_op: "behavioral.model.init",
+            name: model_name,
+            max_samples: MODEL_MAX_SAMPLES as u64,
+            feature_capacity: MODEL_FEATURE_CAP as u64,
+        }
+        model
+    }
+
+    pub fn record_observation(model: ref mut BehavioralModel, obs: Observation)
+        effects: [deterministic, residual]
+    {
+        model.baseline.record_observation(obs)
+        model.current.record_observation(obs)
+
+        // Detect deviation if baseline is established
+        if model.baseline.is_baseline_established() {
+            for i in 0..model.baseline.profile_count {
+                let bp: FeatureProfile = match model.baseline.profiles.get(i) {
+                    Result::Ok(p) => p,
+                    Result::Err(_) => continue,
+                }
+                if bp.feature == obs.feature {
+                    let prob: u8 = bp.deviation_probability(obs.value)
+                    if prob < 50 {
+                        let z: Word64 = bp.z_score(obs.value)
+                        let severity: u8 = if prob < 10 {
+                            3
+                        } else if prob < 30 {
+                            2
+                        } else {
+                            1
+                        }
+                        let dev: Deviation = Deviation::new(obs.timestamp, obs.feature, obs.value, bp.mean, z, severity)
+                        if model.deviation_count < MODEL_DEVIATION_CAP {
+                            let _ = model.deviations.set(model.deviation_count, dev)
+                            model.deviation_count = model.deviation_count + 1
+                            dev.record()
+                        }
+
+                        residual emit {
+                            ai_op: "behavioral.deviation.detected",
+                            feature: obs.feature as u64,
+                            observed: obs.value.to_u64(),
+                            expected: bp.mean.to_u64(),
+                            z_score: z.to_u64(),
+                            severity: severity as u64,
+                        }
+                    }
+                }
+            }
+        }
+
+        residual emit {
+            ai_op: "behavioral.observation.recorded",
+            feature: obs.feature as u64,
+            value: obs.value.to_u64(),
+            baseline_stable: if model.baseline.is_baseline_established() { 1 } else { 0 },
+        }
+    }
+
+    pub fn update_signature(model: ref mut BehavioralModel)
+        effects: [deterministic, residual]
+    {
+        model.signature = BehaviorSignature::from_profile(&model.baseline)
+        if model.update_count < MODEL_UPDATE_HISTORY {
+            let _ = model.updates.set(model.update_count, Word64::from_u64(model.signature.feature_count as u64))
+            model.update_count = model.update_count + 1
+        }
+        residual emit {
+            ai_op: "behavioral.signature.updated",
+            version: model.signature.version as u64,
+            features: model.signature.feature_count as u64,
+            stability: model.baseline.stability_score() as u64,
+        }
+    }
+
+    pub fn match_observation_vs_signature(model: ref BehavioralModel, obs: Observation) -> u8
+        effects: [deterministic]
+    {
+        model.signature.match_observation(obs)
+    }
+
+    pub fn is_baseline_ready(model: ref BehavioralModel) -> bool
+        effects: [deterministic]
+    {
+        model.baseline.is_baseline_established()
+    }
+
+    pub fn baseline_stability(model: ref BehavioralModel) -> u8
+        effects: [deterministic]
+    {
+        model.baseline.stability_score()
+    }
+
+    pub fn get_deviations(model: ref BehavioralModel) -> FixedArray[Deviation, MODEL_DEVIATION_CAP]
+        effects: [deterministic]
+    {
+        model.deviations
+    }
+
+    pub fn deviation_count(model: ref BehavioralModel) -> u32
+        effects: [deterministic]
+    {
+        model.deviation_count
+    }
+
+    pub fn total_observations(model: ref BehavioralModel) -> Word64
+        effects: [deterministic]
+    {
+        model.baseline.total_observations
+    }
+
+    pub fn generate_report(model: ref BehavioralModel) -> FixedString[2048]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[2048] = FixedString::new()
+        report.append(FixedString[32]::from_slice("Behavioral Model Report\n"))
+        report.append(FixedString[32]::from_slice("========================\n"))
+        report.append(FixedString[16]::from_slice("Model: "))
+        report.append(model.name)
+        report.append(FixedString[16]::from_slice("\nTotal observations: "))
+        report.append_u64(model.baseline.total_observations.to_u64())
+        report.append(FixedString[16]::from_slice("\nBaseline stable: "))
+        report.append(if model.baseline.is_baseline_established() {
+            FixedString[4]::from_slice("yes")
+        } else {
+            FixedString[3]::from_slice("no")
+        })
+        report.append(FixedString[16]::from_slice("\nStability score: "))
+        report.append_u64(model.baseline.stability_score() as u64)
+        report.append(FixedString[16]::from_slice("\nProfiles: "))
+        report.append_u64(model.baseline.profile_count as u64)
+        report.append(FixedString[16]::from_slice("\nDeviations: "))
+        report.append_u64(model.deviation_count as u64)
+        report.append(FixedString[16]::from_slice("\nSignature version: "))
+        report.append_u64(model.signature.version as u64)
+
+        report.append(FixedString[16]::from_slice("\n\nFeature Profiles:\n"))
+        for i in 0..model.baseline.profile_count {
+            let p: FeatureProfile = match model.baseline.profiles.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            report.append(FixedString[8]::from_slice("  Feat["))
+            report.append_u64(p.feature as u64)
+            report.append(FixedString[8]::from_slice("]: mean="))
+            report.append_u64(p.mean.to_u64())
+            report.append(FixedString[8]::from_slice(" std="))
+            report.append_u64(p.stddev.to_u64())
+            report.append(FixedString[8]::from_slice(" n="))
+            report.append_u64(p.sample_count as u64)
+            report.append(FixedString[2]::from_slice("\n"))
+        }
+
+        report.append(FixedString[16]::from_slice("\nDeviations:\n"))
+        for i in 0..model.deviation_count {
+            let d: Deviation = match model.deviations.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            report.append(FixedString[8]::from_slice("  ["))
+            report.append_u64(d.severity as u64)
+            report.append(FixedString[8]::from_slice("] feat="))
+            report.append_u64(d.feature as u64)
+            report.append(FixedString[8]::from_slice(" obs="))
+            report.append_u64(d.observed_value.to_u64())
+            report.append(FixedString[8]::from_slice(" exp="))
+            report.append_u64(d.expected_mean.to_u64())
+            report.append(FixedString[8]::from_slice(" z="))
+            report.append_u64(d.z_score.to_u64())
+            report.append(FixedString[2]::from_slice("\n"))
+        }
+
+        report
+    }
+
+    pub fn flush_residuals(model: ref mut BehavioralModel)
+        effects: [residual]
+    {
+        residual emit {
+            ai_op: "behavioral.residuals.flushed",
+            name: model.name,
+            total_observations: model.baseline.total_observations.to_u64(),
+            deviations: model.deviation_count as u64,
+            stability: model.baseline.stability_score() as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Baseline Utilities
+// ──────────────────────────────────────────────
+pub fn establish_baseline(model: ref mut BehavioralModel, observations: FixedArray[Observation, MODEL_MAX_SAMPLES], count: u32)
+    effects: [deterministic, residual]
+{
+    for i in 0..count {
+        let obs: Observation = match observations.get(i) {
+            Result::Ok(o) => o,
+            Result::Err(_) => continue,
+        }
+        model.baseline.record_observation(obs)
+    }
+    model.update_signature()
+    residual emit {
+        ai_op: "behavioral.baseline.established",
+        name: model.name,
+        observations: count as u64,
+        profiles: model.baseline.profile_count as u64,
+        stability: model.baseline.stability_score() as u64,
+    }
+}
+
+pub fn compare_baselines(baseline: ref BehavioralProfile, current: ref BehavioralProfile) -> FixedArray[Deviation, MODEL_FEATURE_CAP]
+    effects: [deterministic]
+{
+    let mut diffs: FixedArray[Deviation, MODEL_FEATURE_CAP] = FixedArray::new()
+    let mut count: u32 = 0
+    for i in 0..baseline.profile_count {
+        let bp: FeatureProfile = match baseline.profiles.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        for j in 0..current.profile_count {
+            let cp: FeatureProfile = match current.profiles.get(j) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if bp.feature == cp.feature {
+                let mean_diff: Word64 = if bp.mean.gt(cp.mean) {
+                    bp.mean.sub(cp.mean)
+                } else {
+                    cp.mean.sub(bp.mean)
+                }
+                let z: Word64 = mean_diff.div(if bp.stddev.is_zero() { Word64::from_u64(1) } else { bp.stddev })
+                let dev: Deviation = Deviation::new(0, bp.feature, cp.mean, bp.mean, z, if z.gt(Word64::from_u64(3)) { 3 } else { 1 })
+                if count < MODEL_FEATURE_CAP {
+                    let _ = diffs.set(count, dev)
+                    count = count + 1
+                }
+            }
+        }
+    }
+    diffs
+}
+
+pub fn merge_profiles(target: ref mut BehavioralProfile, source: ref BehavioralProfile)
+    effects: [deterministic]
+{
+    for i in 0..source.profile_count {
+        let sp: FeatureProfile = match source.profiles.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        let tp: ref mut FeatureProfile = match target.get_or_create_profile(sp.feature) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        // Weighted merge
+        let total_samples: Word64 = Word64::from_u64((tp.sample_count + sp.sample_count) as u64)
+        if total_samples.is_zero() {
+            continue
+        }
+        let w1: Word64 = Word64::from_u64(tp.sample_count as u64)
+        let w2: Word64 = Word64::from_u64(sp.sample_count as u64)
+        tp.mean = tp.mean.mul(w1).add(sp.mean.mul(w2)).div(total_samples)
+        tp.stddev = tp.stddev.mul(w1).add(sp.stddev.mul(w2)).div(total_samples)
+        tp.sample_count = tp.sample_count + sp.sample_count
+        if tp.sample_count >= MODEL_BASELINE_MIN {
+            tp.is_stable = true
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Behavioral Model Verification
+// ──────────────────────────────────────────────
+pub fn verify_model_consistency(model: ref BehavioralModel) -> bool
+    effects: [deterministic]
+{
+    // Check baseline profiles are well-formed
+    for i in 0..model.baseline.profile_count {
+        let p: FeatureProfile = match model.baseline.profiles.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => return false,
+        }
+        // Mean should be between min and max
+        if p.mean.lt(p.min_val) || p.mean.gt(p.max_val) {
+            return false
+        }
+        // If stable, should have enough samples
+        if p.is_stable && p.sample_count < MODEL_BASELINE_MIN {
+            return false
+        }
+    }
+    true
+}
+
+pub fn compute_model_statistics(model: ref BehavioralModel) -> FixedString[1024]
+    effects: [deterministic]
+{
+    let mut stats: FixedString[1024] = FixedString::new()
+    stats.append(FixedString[32]::from_slice("Behavioral Model Statistics\n"))
+    stats.append(FixedString[32]::from_slice("============================\n"))
+    stats.append(FixedString[16]::from_slice("Model name: "))
+    stats.append(model.name)
+    stats.append(FixedString[16]::from_slice("\nTotal observations: "))
+    stats.append_u64(model.total_observations().to_u64())
+    stats.append(FixedString[16]::from_slice("\nBaseline profiles: "))
+    stats.append_u64(model.baseline.profile_count as u64)
+    stats.append(FixedString[16]::from_slice("\nCurrent profiles: "))
+    stats.append_u64(model.current.profile_count as u64)
+    stats.append(FixedString[16]::from_slice("\nSignature features: "))
+    stats.append_u64(model.signature.feature_count as u64)
+    stats.append(FixedString[16]::from_slice("\nTotal deviations: "))
+    stats.append_u64(model.deviation_count as u64)
+    stats.append(FixedString[16]::from_slice("\nModel updates: "))
+    stats.append_u64(model.update_count as u64)
+    stats.append(FixedString[16]::from_slice("\nBaseline stable: "))
+    stats.append(if model.baseline.is_baseline_established() {
+        FixedString[4]::from_slice("yes")
+    } else {
+        FixedString[3]::from_slice("no")
+    })
+    stats.append(FixedString[16]::from_slice("\nStability: "))
+    stats.append_u64(model.baseline_stability() as u64)
+    stats.append(FixedString[2]::from_slice("%"))
+    stats
+}
+
+pub fn reset_current_profile(model: ref mut BehavioralModel)
+    effects: [deterministic, residual]
+{
+    let ts: Word64 = model.baseline.last_updated
+    model.current = BehavioralProfile::new(model.name, ts)
+    residual emit {
+        ai_op: "behavioral.profile.reset",
+        name: model.name,
+        timestamp: ts.to_u64(),
+    }
+}
+
+pub fn compare_profiles_detailed(baseline: ref BehavioralProfile, current: ref BehavioralProfile) -> FixedString[2048]
+    effects: [deterministic]
+{
+    let mut report: FixedString[2048] = FixedString::new()
+    report.append(FixedString[32]::from_slice("Profile Comparison\n"))
+    report.append(FixedString[32]::from_slice("====================\n"))
+    for i in 0..baseline.profile_count {
+        let bp: FeatureProfile = match baseline.profiles.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        for j in 0..current.profile_count {
+            let cp: FeatureProfile = match current.profiles.get(j) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            if bp.feature == cp.feature {
+                report.append(FixedString[16]::from_slice("  Feat["))
+                report.append_u64(bp.feature as u64)
+                report.append(FixedString[16]::from_slice("]: baseline="))
+                report.append_u64(bp.mean.to_u64())
+                report.append(FixedString[16]::from_slice(" current="))
+                report.append_u64(cp.mean.to_u64())
+                let diff: Word64 = if bp.mean.gt(cp.mean) {
+                    bp.mean.sub(cp.mean)
+                } else {
+                    cp.mean.sub(bp.mean)
+                }
+                report.append(FixedString[16]::from_slice(" diff="))
+                report.append_u64(diff.to_u64())
+                report.append(FixedString[2]::from_slice("\n"))
+            }
+        }
+    }
+    report
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_behavioral_model(name: FixedString[MODEL_NAME_CAP], ts: Word64) -> BehavioralModel
+    effects: [deterministic, residual]
+{
+    let model: BehavioralModel = BehavioralModel::new(name, ts)
+    residual emit {
+        ai_op: "behavioral.subsystem.init",
+        name: name,
+        feature_capacity: MODEL_FEATURE_CAP as u64,
+        signature_capacity: MODEL_SIGNATURE_CAP as u64,
+        deviation_capacity: MODEL_DEVIATION_CAP as u64,
+    }
+    model
+}

@@ -1,0 +1,1065 @@
+//==============================================================================
+// object_format.phor — .phor-obj and .phor-spec Object File Format
+//
+// Defines the complete object file format for Phorensic: section types,
+// symbol table format, relocation types, hash table, note sections,
+// signature sections, receipt embedding, structure layouts, and
+// serialization/deserialization routines.
+//
+// All operations are residual-recorded and capability-gated.
+//==============================================================================
+
+module object_format
+  @[receipt("objfmt-v1")]
+  @[audit("OBJ-FMT")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{alloc, unsafe, io, syscall};
+use core::residual::*;
+use core::mem::*;
+use core::crypto::hash;
+
+//==============================================================================
+// File Header
+//==============================================================================
+
+/// Magic number for .phor-obj files.
+const PHOR_OBJ_MAGIC: u64 = 0x50484F524F424A00; // "PHOROBJ\0"
+
+/// Magic number for .phor-spec files.
+const PHOR_SPEC_MAGIC: u64 = 0x50484F5253504543; // "PHORSPEC"
+
+/// Current object file format version.
+const PHOR_OBJ_VERSION: u32 = 1;
+
+/// Minimum compatible version.
+const PHOR_OBJ_MIN_VERSION: u32 = 1;
+
+/// Flags for the object file header.
+pub struct ObjFlags(
+  bits: u64,
+) : effect:(pure);
+
+const OBJ_FLAG_RELOCATABLE: ObjFlags    = ObjFlags(1 << 0);
+const OBJ_FLAG_EXECUTABLE: ObjFlags     = ObjFlags(1 << 1);
+const OBJ_FLAG_SHARED: ObjFlags         = ObjFlags(1 << 2);
+const OBJ_FLAG_CORE: ObjFlags           = ObjFlags(1 << 3);
+const OBJ_FLAG_CAPABILITY_LOADED: ObjFlags = ObjFlags(1 << 4);
+const OBJ_FLAG_AFFINE_AWARE: ObjFlags   = ObjFlags(1 << 5);
+const OBJ_FLAG_RESIDUAL_INCLUDED: ObjFlags = ObjFlags(1 << 6);
+const OBJ_FLAG_DEBUG_STRIPPED: ObjFlags = ObjFlags(1 << 7);
+const OBJ_FLAG_SIGNED: ObjFlags         = ObjFlags(1 << 8);
+const OBJ_FLAG_RECEIPT_EMBEDDED: ObjFlags = ObjFlags(1 << 9);
+
+/// Primary object file header (64 bytes).
+pub struct ObjHeader(
+  /// Magic number identifying file type.
+  magic: u64,
+  /// Format version.
+  version: u32,
+  /// Minimum compatible version.
+  min_version: u32,
+  /// Flags (ObjFlags bitfield).
+  flags: u64,
+  /// Machine architecture identifier.
+  machine: MachineType,
+  /// Entry point address (0 if relocatable).
+  entry: u64,
+  /// Offset to section header table.
+  shoff: u64,
+  /// Offset to program header table (0 if not executable).
+  phoff: u64,
+  /// Offset to symbol table.
+  symoff: u64,
+  /// Offset to string table.
+  stroff: u64,
+  /// Size of this header.
+  shentsize: u16,
+  /// Number of section headers.
+  shnum: u16,
+  /// Size of program header entry.
+  phentsize: u16,
+  /// Number of program headers.
+  phnum: u16,
+  /// Index of section name string table.
+  shstrndx: u16,
+  /// Total file size.
+  filesize: u64,
+  /// Padding to 64 bytes.
+  padding: [u8; 8],
+) : effect:(pure);
+
+pub enum MachineType : u16 {
+  PhorNative   = 0x5048,  // "PH"
+  Phor64       = 0x5049,  // "PI"
+  Phor128      = 0x504A,  // "PJ"
+  Unknown      = 0x0000,
+}
+
+//==============================================================================
+// Section Types and Headers
+//==============================================================================
+
+/// Section types for .phor-obj files.
+pub enum SectionType : u32 {
+  Null          = 0,
+  ProgBits      = 1,   // Program data
+  SymTab        = 2,   // Symbol table
+  StrTab        = 3,   // String table
+  RelA          = 4,   // Relocation entries with addends
+  Hash          = 5,   // Symbol hash table
+  Note          = 6,   // Note section
+  NoBits        = 7,   // Zero-initialized data (BSS)
+  CapTab        = 8,   // Capability table
+  Residual      = 9,   // Residual recording data
+  Debug         = 10,  // Debug information
+  LineInfo      = 11,  // Line number information
+  FrameInfo     = 12,  // Frame unwind information
+  Exception     = 13,  // Exception handling tables
+  Signature     = 14,  // Digital signature
+  Receipt       = 15,  // Receipt chain
+  AffineTrack   = 16,  // Affine type tracking data
+  CapRel        = 17,  // Capability relocation
+  TLS           = 18,  // Thread-local storage
+  InitArray     = 19,  // Initialization function pointers
+  FiniArray     = 20,  // Finalization function pointers
+  PreinitArray  = 21,  // Pre-initialization function pointers
+  SpecData      = 22,  // Specification/verification data
+  Audit         = 23,  // Audit trail data
+  Comment       = 24,  // Comment section
+  GnuHash       = 25,  // GNU-style hash table
+  Processor     = 0x7000_0000,  // Processor-specific
+  User          = 0x8000_0000,  // User-defined
+}
+
+/// Section header entry (64 bytes).
+pub struct SectionHeader(
+  /// Section name (index into string table).
+  name: u32,
+  /// Section type.
+  stype: SectionType,
+  /// Section flags.
+  flags: SectionFlags,
+  /// Virtual address of section in memory.
+  addr: u64,
+  /// Offset in file.
+  offset: u64,
+  /// Size of section in file.
+  size: u64,
+  /// Link to another section (index).
+  link: u32,
+  /// Extra info (depends on section type).
+  info: u32,
+  /// Address alignment constraint.
+  addralign: u64,
+  /// Entry size for fixed-size tables.
+  entsize: u64,
+  /// Capability token for this section (0 if none required).
+  cap_token: u64,
+  /// Reserved for future use.
+  reserved: [u64; 2],
+) : effect:(pure);
+
+/// Section flags.
+pub struct SectionFlags(
+  bits: u64,
+) : effect:(pure);
+
+const SHF_WRITE: SectionFlags            = SectionFlags(1 << 0);
+const SHF_ALLOC: SectionFlags            = SectionFlags(1 << 1);
+const SHF_EXECINSTR: SectionFlags        = SectionFlags(1 << 2);
+const SHF_CAPABILITY: SectionFlags       = SectionFlags(1 << 3);
+const SHF_AFFINE: SectionFlags           = SectionFlags(1 << 4);
+const SHF_RESIDUAL: SectionFlags         = SectionFlags(1 << 5);
+const SHF_TLS: SectionFlags              = SectionFlags(1 << 6);
+const SHF_STRINGS: SectionFlags          = SectionFlags(1 << 7);
+const SHF_INFO_LINK: SectionFlags        = SectionFlags(1 << 8);
+const SHF_LINK_ORDER: SectionFlags       = SectionFlags(1 << 9);
+const SHF_OS_NONCONFORMING: SectionFlags = SectionFlags(1 << 10);
+const SHF_GROUP: SectionFlags            = SectionFlags(1 << 11);
+const SHF_EXCLUDE: SectionFlags          = SectionFlags(1 << 12);
+const SHF_COMPRESSED: SectionFlags       = SectionFlags(1 << 13);
+const SHF_SIGNED: SectionFlags           = SectionFlags(1 << 14);
+const SHF_ENCRYPTED: SectionFlags        = SectionFlags(1 << 15);
+
+//==============================================================================
+// Program Headers (for executables/shared objects)
+//==============================================================================
+
+/// Program header types.
+pub enum ProgramType : u32 {
+  Null       = 0,
+  Load       = 1,   // Loadable segment
+  Dynamic    = 2,   // Dynamic linking info
+  Interp     = 3,   // Interpreter path
+  Note       = 4,   // Note segment
+  Phdr       = 6,   // Program header table itself
+  TLS        = 7,   // TLS template
+  GnuStack   = 0x6474E551,  // Stack executability
+  GnuRelRo   = 0x6474E552,  // Read-only after relocation
+  Capability = 0x50484341,  // "PHCA" — Phorensic capability segment
+  Residual   = 0x50485245,  // "PHRE" — Residual segment
+  Signature  = 0x50485349,  // "PHSI" — Signature segment
+}
+
+/// Program header entry (56 bytes).
+pub struct ProgramHeader(
+  /// Segment type.
+  ptype: ProgramType,
+  /// Segment flags.
+  flags: SegmentFlags,
+  /// Offset in file.
+  offset: u64,
+  /// Virtual address in memory.
+  vaddr: u64,
+  /// Physical address (if relevant).
+  paddr: u64,
+  /// Size in file.
+  filesz: u64,
+  /// Size in memory.
+  memsz: u64,
+  /// Alignment.
+  align: u64,
+  /// Capability token for this segment.
+  cap_token: u64,
+) : effect:(pure);
+
+pub struct SegmentFlags(
+  bits: u32,
+) : effect:(pure);
+
+const PF_X: SegmentFlags = SegmentFlags(1 << 0);  // Executable
+const PF_W: SegmentFlags = SegmentFlags(1 << 1);  // Writable
+const PF_R: SegmentFlags = SegmentFlags(1 << 2);  // Readable
+const PF_CAP: SegmentFlags = SegmentFlags(1 << 3); // Capability-gated
+const PF_RES: SegmentFlags = SegmentFlags(1 << 4); // Residual-tracked
+
+//==============================================================================
+// Symbol Table
+//==============================================================================
+
+/// Symbol binding types.
+pub enum SymbolBinding : u8 {
+  Local   = 0,
+  Global  = 1,
+  Weak    = 2,
+  Unique  = 3,
+  CapLocal = 4,   // Capability-scoped local
+}
+
+/// Symbol types.
+pub enum SymbolType : u8 {
+  NoType   = 0,
+  Object   = 1,
+  Func     = 2,
+  Section  = 3,
+  File     = 4,
+  Common   = 5,
+  TLS      = 6,
+  CapSlot  = 7,    // Capability slot
+  CapClass = 8,    // Capability class descriptor
+  Affine   = 9,    // Affine type marker
+  Residual = 10,   // Residual anchor
+  InitFunc = 11,   // Initialization function
+  FiniFunc = 12,   // Finalization function
+}
+
+/// Symbol visibility.
+pub enum SymbolVisibility : u8 {
+  Default   = 0,
+  Internal  = 1,
+  Hidden    = 2,
+  Protected = 3,
+  Sealed    = 4,   // Only accessible via capability
+}
+
+/// Symbol table entry (48 bytes).
+pub struct SymbolEntry(
+  /// Name (index into string table).
+  name: u32,
+  /// Symbol info (binding + type).
+  info: u8,
+  /// Symbol visibility.
+  other: u8,
+  /// Section header index.
+  shndx: u16,
+  /// Symbol value/address.
+  value: u64,
+  /// Symbol size.
+  size: u64,
+  /// Capability type tag (0 if not a capability).
+  cap_type: u64,
+  /// Affine type ID (0 if not affine).
+  affine_type: u64,
+  /// Calling convention (for function symbols).
+  call_conv: u8,
+  /// Reserved.
+  reserved: [u8; 7],
+) : effect:(pure);
+
+/// Encode symbol binding and type into a single byte.
+pub fn encode_symbol_info[
+  binding: SymbolBinding,
+  stype: SymbolType,
+] -> u8 : effect:(pure) {
+  return (binding as u8) << 4 | (stype as u8);
+}
+
+/// Decode symbol binding from info byte.
+pub fn decode_symbol_binding[info: u8] -> SymbolBinding : effect:(pure) {
+  return @int_to_enum((info >> 4) & 0x0F);
+}
+
+/// Decode symbol type from info byte.
+pub fn decode_symbol_type[info: u8] -> SymbolType : effect:(pure) {
+  return @int_to_enum(info & 0x0F);
+}
+
+/// Maximum number of symbols in a single object.
+const MAX_SYMBOLS: u32 = 1_000_000;
+
+//==============================================================================
+// Relocation Types
+//==============================================================================
+
+/// Relocation types for Phorensic object files.
+pub enum RelocationType : u32 {
+  // --- Absolute Relocations ---
+  Abs64          = 0,    // S + A (64-bit absolute)
+  Abs32          = 1,    // S + A (32-bit absolute, zero-extended)
+  Abs16          = 2,    // S + A (16-bit absolute)
+  Abs8           = 3,    // S + A (8-bit absolute)
+
+  // --- PC-relative Relocations ---
+  PC32           = 10,   // S + A - P (32-bit PC-relative)
+  PC64           = 11,   // S + A - P (64-bit PC-relative)
+  PCRel          = 12,   // S + A - P (arbitrary width, target-defined)
+
+  // --- Page-relative Relocations ---
+  Page64         = 20,   // Page-aligned S + A
+  PageOff        = 21,   // Page offset of S + A
+  Hi20           = 22,   // High 20 bits (for lui-like)
+  Lo12           = 23,   // Low 12 bits (for addi-like)
+  Lo12Signed    = 24,   // Signed low 12 bits
+
+  // --- Call Relocations ---
+  Call           = 30,   // Function call (PLT-aware)
+  CallPLT        = 31,   // PLT entry call
+  JmpRel         = 32,   // Jump (PC-relative)
+
+  // --- TLS Relocations ---
+  TLS_TPOFF64    = 40,   // Offset from thread pointer (64-bit)
+  TLS_TPOFF32    = 41,   // Offset from thread pointer (32-bit)
+  TLS_DTPMOD64   = 42,   // Module ID for dynamic TLS
+  TLS_DTPOFF64   = 43,   // Offset for dynamic TLS
+  TLS_GD         = 44,   // General dynamic TLS
+  TLS_LD         = 45,   // Local dynamic TLS
+  TLS_IE         = 46,   // Initial exec TLS
+  TLS_LE         = 47,   // Local exec TLS
+
+  // --- Capability Relocations ---
+  CapBase        = 50,   // Capability base address
+  CapOffset      = 51,   // Capability offset from base
+  CapToken       = 52,   // Capability token/generation
+  CapDerive      = 53,   // Derive capability from base
+  CapSeal        = 54,   // Seal capability at load time
+  CapBounds      = 55,   // Set capability bounds
+
+  // --- Affine Type Relocations ---
+  AffineInit     = 60,   // Initialize affine tracking
+  AffineMove     = 61,   // Record affine move
+  AffineDrop     = 62,   // Record affine drop
+
+  // --- Residual Relocations ---
+  ResidualAnchor = 70,   // Residual anchoring point
+  ResidualGen    = 71,   // Generate residual at this point
+  ResidualLink   = 72,   // Link to previous residual
+
+  // --- Special ---
+  NONE           = 255,  // No relocation
+}
+
+/// Relocation entry with explicit addend (24 bytes).
+pub struct RelocationA(
+  /// Offset within the section to apply relocation to.
+  offset: u64,
+  /// Relocation type.
+  rtype: RelocationType,
+  /// Symbol table index.
+  sym: u32,
+  /// Explicit addend.
+  addend: i64,
+  /// Capability token for this relocation (0 = none).
+  cap_token: u64,
+) : effect:(pure);
+
+/// Relocation entry without addend (16 bytes).
+pub struct Relocation(
+  offset: u64,
+  rtype: RelocationType,
+  sym: u32,
+  cap_token: u64,
+) : effect:(pure);
+
+//==============================================================================
+// Hash Table
+//==============================================================================
+
+/// Standard hash table for symbol lookup (Elf-style).
+pub struct HashTable(
+  nbucket: u32,
+  nchain: u32,
+  buckets: [u32],
+  chains: [u32],
+) : effect:(alloc);
+
+/// Compute standard ELF hash for a symbol name.
+pub fn elf_hash[name: *u8, len: u32] -> u32 : effect:(pure)
+  loop: bounded(1024)
+{
+  var h: u32 = 0;
+  for var i: u32 = 0; i < len; i += 1 {
+    h = (h << 4) + name[i] as u32;
+    let g: u32 = h & 0xF000_0000;
+    if g != 0 {
+      h ^= g >> 24;
+    }
+    h &= !g;
+  }
+  return h;
+}
+
+/// GNU-style hash function (better distribution).
+pub fn gnu_hash[name: *u8, len: u32] -> u32 : effect:(pure)
+  loop: bounded(1024)
+{
+  var h: u32 = 5381;
+  for var i: u32 = 0; i < len; i += 1 {
+    h = (h << 5) + h + name[i] as u32;
+  }
+  return h;
+}
+
+/// Lookup a symbol in the hash table.
+pub fn hash_lookup[
+  table: *HashTable,
+  name: *u8,
+  name_len: u32,
+  symbols: *[SymbolEntry],
+  strtab: *u8,
+] -> Option[u32] : effect:(pure)
+  loop: bounded(1024)
+{
+  let hash_val: u32 = elf_hash(name, name_len);
+  let bucket_idx: u32 = hash_val % table.nbucket;
+
+  if bucket_idx >= table.nbucket {
+    return None;
+  }
+
+  let chain_idx: u32 = table.buckets[bucket_idx];
+
+  while chain_idx != 0xFFFFFFFF && chain_idx < table.nchain {
+    let sym: SymbolEntry = symbols[chain_idx];
+    let sym_name: *u8 = strtab + sym.name;
+    let matched: bool = compare_strings(name, name_len, sym_name);
+    if matched {
+      return Some(chain_idx);
+    }
+    chain_idx = table.chains[chain_idx];
+  }
+
+  return None;
+}
+
+/// Create a hash table from a symbol table.
+pub fn build_hash_table[
+  symbols: *[SymbolEntry],
+  num_symbols: u32,
+  strtab: *u8,
+] -> HashTable : effect:(alloc)
+  loop: bounded(MAX_SYMBOLS as u64)
+{
+  // Determine bucket count (next power of 2 >= num_symbols/2)
+  var nbucket: u32 = 1;
+  while nbucket < num_symbols / 2 && nbucket < 0x8000_0000 {
+    nbucket <<= 1;
+  }
+  if nbucket < 4 {
+    nbucket = 4;
+  }
+
+  let table: HashTable = HashTable(
+    nbucket: nbucket,
+    nchain: num_symbols,
+    buckets: @alloc_array(u32, nbucket),
+    chains: @alloc_array(u32, num_symbols),
+  );
+
+  // Initialize buckets to 0xFFFFFFFF (empty)
+  for var i: u32 = 0; i < nbucket; i += 1 {
+    table.buckets[i] = 0xFFFFFFFF;
+  }
+
+  // Build chains
+  for var i: u32 = 0; i < num_symbols; i += 1 {
+    let sym: SymbolEntry = symbols[i];
+    let sym_name: *u8 = strtab + sym.name;
+    let name_len: u32 = string_length(sym_name);
+    let hash_val: u32 = elf_hash(sym_name, name_len);
+    let bucket_idx: u32 = hash_val % nbucket;
+
+    table.chains[i] = table.buckets[bucket_idx];
+    table.buckets[bucket_idx] = i;
+  }
+
+  return table;
+}
+
+//==============================================================================
+// Note Section
+//==============================================================================
+
+/// Note descriptor (8-byte aligned).
+pub struct NoteDescriptor(
+  /// Length of note name (including null terminator).
+  namesz: u32,
+  /// Length of note descriptor data.
+  descsz: u32,
+  /// Note type (vendor-specific).
+  ntype: u32,
+  /// Note name follows (variable-length, padded).
+  /// Descriptor data follows name.
+) : effect:(pure);
+
+/// Well-known note types for Phorensic.
+pub enum NoteType : u32 {
+  // --- Phorensic-specific notes ---
+  PHOR_ABI_TAG     = 0x50484101,  // "PHA1"  — ABI version info
+  PHOR_BUILD_ID    = 0x50484202,  // "PHB2"  — Build ID
+  PHOR_CAP_POLICY  = 0x50484303,  // "PHC3"  — Capability policy
+  PHOR_SOURCE_HASH = 0x50484404,  // "PHD4"  — Source tree hash
+  PHOR_RECEIPT     = 0x50484505,  // "PHE5"  — Receipt chain anchor
+  PHOR_AUDIT       = 0x50484606,  // "PHF6"  — Audit configuration
+  PHOR_RESIDUAL    = 0x50484707,  // "PHG7"  — Residual configuration
+  PHOR_SIGNATURE   = 0x50484808,  // "PHH8"  — Digital signature
+  PHOR_ORIGIN      = 0x50484909,  // "PHI9"  — Origin metadata
+
+  // --- Standard notes ---
+  GNU_BUILD_ID     = 0x03,        // GNU build ID
+  GNU_ABI_TAG      = 0x01,        // GNU ABI tag
+  GNU_GOLD_VERSION = 0x04,        // Gold linker version
+}
+
+//==============================================================================
+// Signature Section
+//==============================================================================
+
+/// Signature algorithm identifiers.
+pub enum SignatureAlgorithm : u8 {
+  None       = 0,
+  Ed25519    = 1,
+  Ed448      = 2,
+  ECDSA_P256 = 3,
+  ECDSA_P384 = 4,
+  RSA_2048   = 5,
+  RSA_4096   = 6,
+  Dilithium3 = 7,
+  Falcon512  = 8,
+  SPHINCS    = 9,
+}
+
+/// Hash algorithm identifiers.
+pub enum HashAlgorithm : u8 {
+  None     = 0,
+  SHA256   = 1,
+  SHA384   = 2,
+  SHA512   = 3,
+  BLAKE2b  = 4,
+  BLAKE2s  = 5,
+  SHA3_256 = 6,
+  SHA3_512 = 7,
+}
+
+/// Signature section header (embedded in section data).
+pub struct SignatureSection(
+  /// Signature algorithm used.
+  sig_algorithm: SignatureAlgorithm,
+  /// Hash algorithm used for the message digest.
+  hash_algorithm: HashAlgorithm,
+  /// Size of the signature value.
+  sig_size: u16,
+  /// Size of the public key.
+  key_size: u16,
+  /// Flags.
+  flags: SignatureFlags,
+  /// Reserved.
+  reserved: [u8; 5],
+  /// Hash of the signed content follows (variable).
+  /// Signature value follows hash.
+  /// Public key follows signature.
+) : effect:(pure);
+
+pub struct SignatureFlags(
+  bits: u16,
+) : effect:(pure);
+
+const SIG_FLAG_COUNTERSIGN: SignatureFlags = SignatureFlags(1 << 0);
+const SIG_FLAG_CHAINED: SignatureFlags     = SignatureFlags(1 << 1);
+const SIG_FLAG_TIMESTAMPED: SignatureFlags = SignatureFlags(1 << 2);
+const SIG_FLAG_REVOCABLE: SignatureFlags   = SignatureFlags(1 << 3);
+
+//==============================================================================
+// Receipt Embedding
+//==============================================================================
+
+/// A receipt is a cryptographic commitment to the provenance of an object.
+pub struct Receipt(
+  /// Receipt format version.
+  version: u8,
+  /// Receipt type.
+  rtype: ReceiptType,
+  /// Hash algorithm used.
+  hash_algorithm: HashAlgorithm,
+  /// Signature algorithm (if signed).
+  sig_algorithm: SignatureAlgorithm,
+  /// Hash of the content being receipted.
+  content_hash: [u8; 64],
+  /// Hash of the build environment (compiler, flags, etc.).
+  build_hash: [u8; 64],
+  /// Hash of the source tree at build time.
+  source_hash: [u8; 64],
+  /// Timestamp of receipt creation.
+  timestamp: u64,
+  /// Unique receipt identifier.
+  receipt_id: u128,
+  /// Signer identity (capability hash).
+  signer_identity: [u8; 32],
+  /// Signature value (variable length, stored separately).
+  signature_size: u16,
+  /// Chain to previous receipt (0 = root).
+  previous_receipt: u128,
+  /// Reserved.
+  reserved: [u8; 14],
+) : effect:(pure);
+
+pub enum ReceiptType : u8 {
+  /// Receipt for a source file.
+  SourceFile     = 0,
+  /// Receipt for a compiled object.
+  CompiledObject = 1,
+  /// Receipt for a linked executable.
+  Executable     = 2,
+  /// Receipt for a specification.
+  Specification  = 3,
+  /// Receipt for an audit trail.
+  AuditTrail     = 4,
+  /// Receipt for a residual record.
+  ResidualRecord = 5,
+  /// Receipt for a capability delegation chain.
+  CapDelegation  = 6,
+}
+
+/// Embed a receipt in a section.
+pub fn embed_receipt[
+  section_data: *u8,
+  section_capacity: u32,
+  receipt: *Receipt,
+  signature_data: *u8,
+  sig_size: u16,
+] -> Result[u32, ReceiptError] : effect:(alloc, unsafe)
+  loop: bounded(1)
+{
+  let receipt_size: u32 = 256;  // sizeof(Receipt) + overhead
+  let total_size: u32 = receipt_size + sig_size as u32;
+
+  if total_size > section_capacity {
+    return Err(ReceiptError::SectionTooSmall);
+  }
+
+  // Write receipt header
+  @memcpy(section_data, receipt, 256);
+  // Write signature data after receipt
+  @memcpy(section_data + 256, signature_data, sig_size as u64);
+
+  return Ok(total_size);
+}
+
+pub enum ReceiptError : u64 {
+  SectionTooSmall    = 1,
+  InvalidHash        = 2,
+  SignatureMismatch  = 3,
+  ReceiptChainBroken = 4,
+}
+
+/// Verify a receipt against content.
+pub fn verify_receipt[
+  receipt: *Receipt,
+  content: *u8,
+  content_len: u64,
+] -> Result[(), ReceiptError] : effect:(unsafe)
+  loop: bounded(1)
+{
+  // Compute hash of content
+  let computed_hash: [u8; 64] = hash_content(content, content_len, receipt.hash_algorithm);
+
+  // Compare with stored hash
+  for var i: u32 = 0; i < 64; i += 1 {
+    if computed_hash[i] != receipt.content_hash[i] {
+      return Err(ReceiptError::InvalidHash);
+    }
+  }
+
+  return Ok(());
+}
+
+//==============================================================================
+// .phor-spec Format (Specification/Dependent Types)
+//==============================================================================
+
+/// Specification file header format.
+pub struct SpecHeader(
+  magic: u64,
+  version: u32,
+  spec_type: SpecType,
+  num_declarations: u32,
+  num_theorems: u32,
+  num_axioms: u32,
+  declaration_offset: u64,
+  theorem_offset: u64,
+  axiom_offset: u64,
+  string_table_offset: u64,
+  cap_requirements_offset: u64,
+  filesize: u64,
+  reserved: [u64; 4],
+) : effect:(pure);
+
+pub enum SpecType : u32 {
+  ContractSpec     = 0,  // Capability contract specification
+  TypeSpec         = 1,  // Type-level specification
+  AffineSpec       = 2,  // Affine type specification
+  ResidualSpec     = 3,  // Residual behavior specification
+  EffectSpec       = 4,  // Effect system specification
+  VerificationSpec = 5,  // Verification conditions
+  AuditSpec        = 6,  // Audit policy specification
+}
+
+/// Specification declaration.
+pub struct SpecDeclaration(
+  name: u32,
+  decl_type: SpecDeclType,
+  params: u32,
+  return_type: u32,
+  effect_mask: u64,
+  cap_requirement: u64,
+  body_offset: u64,
+  body_size: u32,
+) : effect:(pure);
+
+pub enum SpecDeclType : u16 {
+  Function   = 0,
+  Predicate  = 1,
+  Lemma      = 2,
+  Theorem    = 3,
+  Axiom      = 4,
+  Invariant  = 5,
+  Contract   = 6,
+  CapRule    = 7,
+  EffectRule = 8,
+}
+
+/// Theorem entry in a spec file.
+pub struct SpecTheorem(
+  name: u32,
+  theorem_kind: TheoremKind,
+  num_preconditions: u32,
+  num_postconditions: u32,
+  proof_offset: u64,
+  proof_size: u32,
+  verified: bool,
+) : effect:(pure);
+
+pub enum TheoremKind : u8 {
+  TypeSafety     = 0,
+  CapabilitySafety = 1,
+  EffectCorrectness = 2,
+  MemorySafety   = 3,
+  AffineCorrectness = 4,
+  ResidualCompleteness = 5,
+  Termination    = 6,
+  Custom         = 7,
+}
+
+//==============================================================================
+// Serialization / Deserialization
+//==============================================================================
+
+/// Write an object header to a buffer.
+pub fn serialize_header[
+  header: *ObjHeader,
+  buffer: *u8,
+  buffer_size: u32,
+] -> Result[u32, SerializeError] : effect:(unsafe)
+  loop: bounded(1)
+{
+  if buffer_size < 64 {
+    return Err(SerializeError::BufferTooSmall);
+  }
+
+  @memcpy(buffer, header, 64);
+  return Ok(64);
+}
+
+/// Parse an object header from a buffer with validation.
+pub fn deserialize_header[
+  buffer: *u8,
+  buffer_size: u32,
+] -> Result[ObjHeader, DeserializeError] : effect:(unsafe)
+  loop: bounded(1)
+{
+  if buffer_size < 64 {
+    return Err(DeserializeError::TruncatedHeader);
+  }
+
+  let header: *ObjHeader = @int_to_ptr(buffer);
+
+  // Validate magic
+  if header.magic != PHOR_OBJ_MAGIC && header.magic != PHOR_SPEC_MAGIC {
+    return Err(DeserializeError::BadMagic);
+  }
+
+  // Validate version compatibility
+  if header.min_version > PHOR_OBJ_VERSION {
+    return Err(DeserializeError::IncompatibleVersion);
+  }
+
+  // Validate file size
+  if header.filesize > buffer_size as u64 {
+    return Err(DeserializeError::TruncatedFile);
+  }
+
+  return Ok(*header);
+}
+
+/// Validate the integrity of an entire object file.
+pub fn validate_object[
+  buffer: *u8,
+  buffer_size: u32,
+  expected_cap_token: u64,
+] -> Result[(), ObjectValidationError] : effect:(unsafe)
+  loop: bounded(MAX_SYMBOLS as u64)
+{
+  let header: ObjHeader = deserialize_header(buffer, buffer_size)?;
+
+  // Validate section headers
+  if header.shnum > 0 {
+    if header.shoff == 0 || header.shoff + (header.shnum as u64 * header.shentsize as u64) > buffer_size as u64 {
+      return Err(ObjectValidationError::InvalidSectionHeaders);
+    }
+
+    for var i: u16 = 0; i < header.shnum; i += 1 {
+      let shdr: *SectionHeader = @int_to_ptr(buffer + header.shoff + (i as u64 * header.shentsize as u64));
+      if shdr.offset + shdr.size > buffer_size as u64 {
+        return Err(ObjectValidationError::SectionOutOfBounds);
+      }
+    }
+  }
+
+  // Validate program headers if present
+  if header.phnum > 0 {
+    if header.phoff == 0 || header.phoff + (header.phnum as u64 * header.phentsize as u64) > buffer_size as u64 {
+      return Err(ObjectValidationError::InvalidProgramHeaders);
+    }
+  }
+
+  // Validate symbol table
+  if header.symoff > 0 {
+    if header.symoff > buffer_size as u64 {
+      return Err(ObjectValidationError::InvalidSymbolTable);
+    }
+  }
+
+  return Ok(());
+}
+
+pub enum SerializeError : u64 {
+  BufferTooSmall = 1,
+  InvalidData    = 2,
+}
+
+pub enum DeserializeError : u64 {
+  TruncatedHeader     = 1,
+  BadMagic            = 2,
+  IncompatibleVersion = 3,
+  TruncatedFile       = 4,
+  CorruptSection      = 5,
+}
+
+pub enum ObjectValidationError : u64 {
+  InvalidSectionHeaders  = 1,
+  InvalidProgramHeaders  = 2,
+  InvalidSymbolTable     = 3,
+  SectionOutOfBounds     = 4,
+  CapabilityTokenMissing = 5,
+  InvalidCapabilityToken = 6,
+  SignatureVerificationFailed = 7,
+}
+
+//==============================================================================
+// Section Iteration
+//==============================================================================
+
+/// Iterator over section headers in an object file.
+pub struct SectionIterator(
+  object_base: *u8,
+  header: *ObjHeader,
+  current_index: u16,
+) : effect:(unsafe);
+
+/// Get the next section header from the iterator.
+pub fn next_section[
+  iter: *SectionIterator,
+] -> Option[SectionHeader] : effect:(unsafe)
+  loop: bounded(1)
+{
+  if iter.current_index >= iter.header.shnum {
+    return None;
+  }
+
+  let offset: u64 = iter.header.shoff + (iter.current_index as u64 * iter.header.shentsize as u64);
+  let shdr: *SectionHeader = @int_to_ptr(iter.object_base + offset);
+  iter.current_index += 1;
+
+  return Some(*shdr);
+}
+
+/// Find a section by type.
+pub fn find_section_by_type[
+  object_base: *u8,
+  header: *ObjHeader,
+  stype: SectionType,
+] -> Option[(SectionHeader, u32)] : effect:(unsafe)
+  loop: bounded(65535)
+{
+  for var i: u16 = 0; i < header.shnum; i += 1 {
+    let offset: u64 = header.shoff + (i as u64 * header.shentsize as u64);
+    let shdr: *SectionHeader = @int_to_ptr(object_base + offset);
+    if shdr.stype == stype {
+      return Some((*shdr, i));
+    }
+  }
+  return None;
+}
+
+/// Get section name from string table.
+pub fn get_section_name[
+  object_base: *u8,
+  header: *ObjHeader,
+  shdr: *SectionHeader,
+] -> [u8; 256] : effect:(unsafe)
+  loop: bounded(1)
+{
+  let strtab_offset: u64 = header.shoff + (header.shstrndx as u64 * header.shentsize as u64);
+  let strtab_shdr: *SectionHeader = @int_to_ptr(object_base + strtab_offset);
+  let strtab: *u8 = object_base + strtab_shdr.offset;
+
+  let name: [u8; 256] = Default;
+  let name_offset: u32 = shdr.name;
+  for var i: u32 = 0; i < 255; i += 1 {
+    let c: u8 = strtab[name_offset + i];
+    name[i] = c;
+    if c == 0 {
+      break;
+    }
+  }
+  return name;
+}
+
+//==============================================================================
+// Utility Functions
+//==============================================================================
+
+fn hash_content[data: *u8, len: u64, algo: HashAlgorithm] -> [u8; 64] : effect:(pure) {
+  return Default;
+}
+
+fn compare_strings[a: *u8, a_len: u32, b: *u8] -> bool : effect:(pure) {
+  for var i: u32 = 0; i < a_len; i += 1 {
+    if a[i] != b[i] { return false; }
+    if a[i] == 0 { return true; }
+  }
+  return b[a_len] == 0;
+}
+
+fn string_length[s: *u8] -> u32 : effect:(pure) {
+  var len: u32 = 0;
+  for var i: u32 = 0; i < 65536; i += 1 {
+    if s[i] == 0 { return len; }
+    len += 1;
+  }
+  return len;
+}
+
+fn @alloc_array[T, N](count: u32) -> *[T] : effect:(alloc) { return null; }
+
+pub type u128 = u64;  // simplified
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_header_roundtrip[] : effect:(unsafe) {
+  var header: ObjHeader = ObjHeader(
+    magic: PHOR_OBJ_MAGIC,
+    version: 1,
+    min_version: 1,
+    flags: (OBJ_FLAG_RELOCATABLE | OBJ_FLAG_CAPABILITY_LOADED).bits,
+    machine: MachineType::PhorNative,
+    entry: 0,
+    shoff: 64,
+    phoff: 0,
+    symoff: 0,
+    stroff: 0,
+    shentsize: 64,
+    shnum: 3,
+    phentsize: 56,
+    phnum: 0,
+    shstrndx: 1,
+    filesize: 4096,
+    padding: Default,
+  );
+
+  var buffer: [u8; 128] = Default;
+  let written: u32 = serialize_header(&header, buffer, 128);
+  assert(written == 64);
+
+  let parsed: ObjHeader = deserialize_header(buffer, 128);
+  assert(parsed.magic == PHOR_OBJ_MAGIC);
+  assert(parsed.version == 1);
+  assert(parsed.shnum == 3);
+}
+
+@Test
+pub fn test_symbol_info_encoding[] : effect:(pure) {
+  let info: u8 = encode_symbol_info(SymbolBinding::Global, SymbolType::Func);
+  assert(decode_symbol_binding(info) == SymbolBinding::Global);
+  assert(decode_symbol_type(info) == SymbolType::Func);
+}
+
+@Test
+pub fn test_elf_hash[] : effect:(pure) {
+  let name: [u8; 5] = [0x6D, 0x61, 0x69, 0x6E, 0x00];  // "main\0"
+  let hash_val: u32 = elf_hash(name, 5);
+  assert(hash_val != 0);
+}
+
+@Test
+pub fn test_object_validation[] : effect:(unsafe) {
+  var buffer: [u8; 64] = Default;
+  // Zeroed buffer should fail validation
+  let result: Result[ObjHeader, DeserializeError] = deserialize_header(buffer, 64);
+  assert(result.is_err());
+}

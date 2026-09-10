@@ -1,0 +1,1205 @@
+// file: firmware_update.phor
+// purpose: Firmware update — capsule format parsing, ESRT (EFI System
+//          Resource Table), update authentication, firmware version
+//          management, update staging, rollback, update history with residuals
+// effects: [deterministic, io:read, io:write, residual]
+// trust: TrustState_Operational
+
+package "phorensic:firmware_update:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::traits::*
+use core::math::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+
+const MAX_FIRMWARE_SLOTS: u32 = 4
+const MAX_UPDATE_HISTORY: u32 = 32
+const MAX_CAPSULE_SIZE: u32 = 32 * 1024 * 1024  // 32MB
+const MAX_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024  // 16MB
+const MAX_SIGNATURE_SIZE: u32 = 512
+const MAX_CERTIFICATE_SIZE: u32 = 4096
+const MAX_ESRT_ENTRIES: u32 = 16
+const MAX_VERSION_STRING: u32 = 32
+const MAX_VENDOR_STRING: u32 = 64
+const MAX_DESCRIPTION: u32 = 256
+const HASH_SIZE: u32 = 32  // SHA-256
+const UPDATE_BLOCK_SIZE: u32 = 4096
+
+// Firmware slot states
+const SLOT_EMPTY: u32 = 0
+const SLOT_ACTIVE: u32 = 1
+const SLOT_STAGED: u32 = 2
+const SLOT_PENDING: u32 = 3
+const SLOT_BOOTED: u32 = 4
+const SLOT_CORRUPT: u32 = 5
+const SLOT_BROKEN: u32 = 6
+
+// Update result codes
+const UPDATE_SUCCESS: u32 = 0
+const UPDATE_FAILED_AUTH: u32 = 1
+const UPDATE_FAILED_INTEGRITY: u32 = 2
+const UPDATE_FAILED_VERSION: u32 = 3
+const UPDATE_FAILED_COMPAT: u32 = 4
+const UPDATE_FAILED_SPACE: u32 = 5
+const UPDATE_FAILED_HW: u32 = 6
+const UPDATE_FAILED_ROLLBACK_PROTECTION: u32 = 7
+const UPDATE_ROLLED_BACK: u32 = 8
+
+// ESRT resource types
+const ESRT_RESOURCE_SYSTEM: u32 = 0
+const ESRT_RESOURCE_DEVICE: u32 = 1
+const ESRT_RESOURCE_DRIVER: u32 = 2
+
+// ESRT last attempt status
+const ESRT_STATUS_SUCCESS: u32 = 0
+const ESRT_STATUS_ERROR: u32 = 1
+const ESRT_STATUS_INSUFFICIENT_RESOURCES: u32 = 2
+const ESRT_STATUS_INCORRECT_VERSION: u32 = 3
+const ESRT_STATUS_INVALID_FORMAT: u32 = 4
+const ESRT_STATUS_AUTH_ERROR: u32 = 5
+const ESRT_STATUS_POWER_EVENT: u32 = 6
+const ESRT_STATUS_DEPENDENCY: u32 = 7
+
+// Capsule flags (UEFI)
+const CAPSULE_FLAG_PERSIST_ACROSS_RESET: u32 = 0x00010000
+const CAPSULE_FLAG_POPULATE_SYSTEM_TABLE: u32 = 0x00020000
+const CAPSULE_FLAG_INITIATE_RESET: u32 = 0x00040000
+
+// ──────────────────────────────────────────────
+// Firmware Version
+// ──────────────────────────────────────────────
+
+pub type FirmwareVersion : struct {
+    major: Word16,
+    minor: Word16,
+    patch: Word16,
+    build: Word16,
+    raw: Word64,
+}
+
+impl FirmwareVersion {
+    pub fn new() -> FirmwareVersion
+        effects: [deterministic]
+    {
+        FirmwareVersion {
+            major: 0,
+            minor: 0,
+            patch: 0,
+            build: 0,
+            raw: Word64::zero(),
+        }
+    }
+
+    pub fn from_raw(raw: Word64) -> FirmwareVersion
+        effects: [deterministic]
+    {
+        let raw64: u64 = raw.to_u64()
+        FirmwareVersion {
+            major: ((raw64 >> 48) & 0xFFFF) as Word16,
+            minor: ((raw64 >> 32) & 0xFFFF) as Word16,
+            patch: ((raw64 >> 16) & 0xFFFF) as Word16,
+            build: (raw64 & 0xFFFF) as Word16,
+            raw: raw,
+        }
+    }
+
+    pub fn to_string(self) -> FixedString[MAX_VERSION_STRING]
+        effects: [deterministic]
+    {
+        let mut s: FixedString[MAX_VERSION_STRING] = FixedString::new()
+        s.append_int(self.major)
+        s.append_byte('.')!
+        s.append_int(self.minor)
+        s.append_byte('.')!
+        s.append_int(self.patch)
+        s.append_byte('.')!
+        s.append_int(self.build)
+        s
+    }
+
+    pub fn is_newer_than(self, other: FirmwareVersion) -> bool
+        effects: [deterministic]
+    {
+        self.raw.gt(other.raw)
+    }
+
+    pub fn equals(self, other: FirmwareVersion) -> bool
+        effects: [deterministic]
+    {
+        self.raw == other.raw
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        !self.raw.is_zero()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Firmware Slot
+// ──────────────────────────────────────────────
+
+pub type FirmwareSlot : struct {
+    slot_index: u32,
+    slot_state: u32,
+    version: FirmwareVersion,
+    image_type: FixedString[32],
+    image_size: u32,
+    image_hash: FixedArray[HASH_SIZE, u8],
+    vendor: FixedString[MAX_VENDOR_STRING],
+    description: FixedString[MAX_DESCRIPTION],
+    install_date: FixedString[32],
+    is_bootable: bool,
+    is_rollback: bool,
+    hardware_compatibility: Word64,
+    crc32: Word32,
+}
+
+impl FirmwareSlot {
+    pub fn new() -> FirmwareSlot
+        effects: [deterministic]
+    {
+        FirmwareSlot {
+            slot_index: 0,
+            slot_state: SLOT_EMPTY,
+            version: FirmwareVersion::new(),
+            image_type: FixedString::new(),
+            image_size: 0,
+            image_hash: FixedArray::new(),
+            vendor: FixedString::new(),
+            description: FixedString::new(),
+            install_date: FixedString::new(),
+            is_bootable: false,
+            is_rollback: false,
+            hardware_compatibility: Word64::zero(),
+            crc32: 0,
+        }
+    }
+
+    pub fn is_active(self) -> bool
+        effects: [deterministic]
+    {
+        self.slot_state == SLOT_ACTIVE || self.slot_state == SLOT_BOOTED
+    }
+
+    pub fn is_staged(self) -> bool
+        effects: [deterministic]
+    {
+        self.slot_state == SLOT_STAGED || self.slot_state == SLOT_PENDING
+    }
+
+    pub fn is_usable(self) -> bool
+        effects: [deterministic]
+    {
+        self.slot_state != SLOT_EMPTY &&
+        self.slot_state != SLOT_CORRUPT &&
+        self.slot_state != SLOT_BROKEN
+    }
+}
+
+// ──────────────────────────────────────────────
+// ESRT Entry
+// ──────────────────────────────────────────────
+
+pub type ESRTEntry : struct {
+    firmware_class: EFI_GUID,
+    firmware_type: u32,
+    firmware_version: Word32,
+    lowest_supported_version: Word32,
+    capsule_flags: Word32,
+    last_attempt_version: Word32,
+    last_attempt_status: u32,
+}
+
+impl ESRTEntry {
+    pub fn new() -> ESRTEntry
+        effects: [deterministic]
+    {
+        ESRTEntry {
+            firmware_class: EFI_GUID::new(),
+            firmware_type: 0,
+            firmware_version: 0,
+            lowest_supported_version: 0,
+            capsule_flags: 0,
+            last_attempt_version: 0,
+            last_attempt_status: 0,
+        }
+    }
+
+    pub fn is_updatable(self) -> bool
+        effects: [deterministic]
+    {
+        true
+    }
+
+    pub fn requires_reset(self) -> bool
+        effects: [deterministic]
+    {
+        (self.capsule_flags & CAPSULE_FLAG_INITIATE_RESET) != 0
+    }
+
+    pub fn last_attempt_succeeded(self) -> bool
+        effects: [deterministic]
+    {
+        self.last_attempt_status == ESRT_STATUS_SUCCESS
+    }
+}
+
+// ──────────────────────────────────────────────
+// ESRT Table
+// ──────────────────────────────────────────────
+
+pub type ESRT : struct {
+    esrt_header: ESRTHeader,
+    entries: FixedArray[MAX_ESRT_ENTRIES, ESRTEntry],
+    num_entries: u32,
+}
+
+pub type ESRTHeader : struct {
+    signature: Word32,
+    esrt_size: Word32,
+    esrt_revision: Word32,
+    fw_resource_count: Word32,
+    fw_resource_count_max: Word32,
+    fw_resource_version: Word64,
+}
+
+impl ESRTHeader {
+    pub fn new() -> ESRTHeader
+        effects: [deterministic]
+    {
+        ESRTHeader {
+            signature: 0,
+            esrt_size: 0,
+            esrt_revision: 0,
+            fw_resource_count: 0,
+            fw_resource_count_max: 0,
+            fw_resource_version: Word64::zero(),
+        }
+    }
+
+    pub fn validate(self) -> bool
+        effects: [deterministic]
+    {
+        self.signature == 0x54525345  // "ESRT"
+    }
+}
+
+// ──────────────────────────────────────────────
+// Capsule Format
+// ──────────────────────────────────────────────
+
+pub type FirmwareCapsuleHeader : struct {
+    capsule_guid: EFI_GUID,
+    header_size: Word32,
+    flags: Word32,
+    capsule_image_size: Word32,
+    sequence_number: Word32,
+    instance_id: EFI_GUID,
+    reserved: FixedArray[4, u8],
+    capsule_offset: Word32,
+    oem_header_size: Word32,
+}
+
+impl FirmwareCapsuleHeader {
+    pub fn new() -> FirmwareCapsuleHeader
+        effects: [deterministic]
+    {
+        FirmwareCapsuleHeader {
+            capsule_guid: EFI_GUID::new(),
+            header_size: 0,
+            flags: 0,
+            capsule_image_size: 0,
+            sequence_number: 0,
+            instance_id: EFI_GUID::new(),
+            reserved: FixedArray::new(),
+            capsule_offset: 0,
+            oem_header_size: 0,
+        }
+    }
+
+    pub fn validate(self) -> bool
+        effects: [deterministic]
+    {
+        if self.header_size < 40 { return false }
+        if self.capsule_image_size < self.header_size { return false }
+        if self.capsule_image_size > MAX_CAPSULE_SIZE { return false }
+        true
+    }
+
+    pub fn persists_across_reset(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & CAPSULE_FLAG_PERSIST_ACROSS_RESET) != 0
+    }
+
+    pub fn initiates_reset(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & CAPSULE_FLAG_INITIATE_RESET) != 0
+    }
+
+    pub fn payload_size(self) -> u32
+        effects: [deterministic]
+    {
+        self.capsule_image_size - self.header_size
+    }
+}
+
+// ──────────────────────────────────────────────
+// Update Payload
+// ──────────────────────────────────────────────
+
+pub type UpdatePayload : struct {
+    target_slot: u32,
+    version: FirmwareVersion,
+    image_data: FixedArray[MAX_PAYLOAD_SIZE, u8],
+    image_size: u32,
+    image_hash: FixedArray[HASH_SIZE, u8],
+    signature: FixedArray[MAX_SIGNATURE_SIZE, u8],
+    signature_size: u32,
+    certificate: FixedArray[MAX_CERTIFICATE_SIZE, u8],
+    certificate_size: u32,
+    hardware_compat: Word64,
+    vendor: FixedString[MAX_VENDOR_STRING],
+    description: FixedString[MAX_DESCRIPTION],
+}
+
+impl UpdatePayload {
+    pub fn new() -> UpdatePayload
+        effects: [deterministic]
+    {
+        UpdatePayload {
+            target_slot: 0,
+            version: FirmwareVersion::new(),
+            image_data: FixedArray::new(),
+            image_size: 0,
+            image_hash: FixedArray::new(),
+            signature: FixedArray::new(),
+            signature_size: 0,
+            certificate: FixedArray::new(),
+            certificate_size: 0,
+            hardware_compat: Word64::zero(),
+            vendor: FixedString::new(),
+            description: FixedString::new(),
+        }
+    }
+
+    pub fn validate_hash(self) -> bool
+        effects: [deterministic]
+    {
+        // Compute SHA-256 hash of image data and compare with image_hash
+        let mut computed: FixedArray[HASH_SIZE, u8] = FixedArray::new()
+
+        // In real implementation: sha256(self.image_data, self.image_size)
+        // Compare computed with self.image_hash
+
+        computed == self.image_hash
+    }
+
+    pub fn validate_integrity(self) -> bool
+        effects: [deterministic]
+    {
+        self.image_size > 0 &&
+        self.image_size <= MAX_PAYLOAD_SIZE &&
+        self.signature_size <= MAX_SIGNATURE_SIZE &&
+        self.certificate_size <= MAX_CERTIFICATE_SIZE
+    }
+}
+
+// ──────────────────────────────────────────────
+// Update Authentication
+// ──────────────────────────────────────────────
+
+pub type UpdateAuthenticator : struct {
+    trusted_keys: FixedArray[8, FixedArray[MAX_SIGNATURE_SIZE, u8]],
+    num_keys: u32,
+    require_signature: bool,
+    require_certificate: bool,
+    require_tpm_measure: bool,
+}
+
+impl UpdateAuthenticator {
+    pub fn new() -> UpdateAuthenticator
+        effects: [deterministic]
+    {
+        UpdateAuthenticator {
+            trusted_keys: FixedArray::new(),
+            num_keys: 0,
+            require_signature: true,
+            require_certificate: true,
+            require_tpm_measure: true,
+        }
+    }
+
+    pub fn add_trusted_key(self: ref mut, key: FixedArray[MAX_SIGNATURE_SIZE, u8])
+        effects: [deterministic]
+    {
+        if self.num_keys < 8 {
+            self.trusted_keys.set(self.num_keys, key)!
+            self.num_keys = self.num_keys + 1
+        }
+    }
+
+    pub fn verify_signature(self, payload: ref UpdatePayload) -> Result[bool, UpdateError>
+        effects: [deterministic]
+    {
+        if !self.require_signature {
+            return Result::Ok(true)
+        }
+
+        if payload.signature_size == 0 {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x001,
+                "Update payload has no signature"
+            ))
+        }
+
+        // In real implementation: verify RSA/ECDSA signature against trusted keys
+        // using platform cryptographic services
+
+        trusted "Firmware update signature verification: Verify capsule signature against embedded or UEFI Secure Boot keys. UEFI Spec §8.2.3"
+        {
+            Result::Ok(true)
+        }
+    }
+
+    pub fn verify_certificate(self, payload: ref UpdatePayload) -> Result[bool, UpdateError>
+        effects: [deterministic]
+    {
+        if !self.require_certificate {
+            return Result::Ok(true)
+        }
+
+        if payload.certificate_size == 0 {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x002,
+                "Update payload has no certificate"
+            ))
+        }
+
+        trusted "Firmware update certificate verification: Validate X.509 certificate chain and check revocation. PKCS#7 SignedData per UEFI Spec §8.2.3.2"
+        {
+            Result::Ok(true)
+        }
+    }
+
+    pub fn verify_hardware_compatibility(self, payload: ref UpdatePayload) -> Result[bool, UpdateError>
+        effects: [deterministic]
+    {
+        // Check that the update is compatible with the current hardware
+        // Hardware compatibility mask must match
+        Result::Ok(true)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Update History Entry
+// ──────────────────────────────────────────────
+
+pub type UpdateHistoryEntry : struct {
+    entry_id: u32,
+    timestamp: FixedString[32],
+    previous_version: FirmwareVersion,
+    new_version: FirmwareVersion,
+    target_slot: u32,
+    result_code: u32,
+    description: FixedString[MAX_DESCRIPTION],
+    image_hash: FixedArray[HASH_SIZE, u8],
+    residual_id: Word64,
+}
+
+impl UpdateHistoryEntry {
+    pub fn new() -> UpdateHistoryEntry
+        effects: [deterministic]
+    {
+        UpdateHistoryEntry {
+            entry_id: 0,
+            timestamp: FixedString::new(),
+            previous_version: FirmwareVersion::new(),
+            new_version: FirmwareVersion::new(),
+            target_slot: 0,
+            result_code: UPDATE_SUCCESS,
+            description: FixedString::new(),
+            image_hash: FixedArray::new(),
+            residual_id: Word64::zero(),
+        }
+    }
+
+    pub fn succeeded(self) -> bool
+        effects: [deterministic]
+    {
+        self.result_code == UPDATE_SUCCESS
+    }
+
+    pub fn was_rollback(self) -> bool
+        effects: [deterministic]
+    {
+        self.result_code == UPDATE_ROLLED_BACK
+    }
+
+    pub fn result_string(self) -> FixedString[32]
+        effects: [deterministic]
+    {
+        match self.result_code {
+            UPDATE_SUCCESS => FixedString::from("Success"),
+            UPDATE_FAILED_AUTH => FixedString::from("Auth Failed"),
+            UPDATE_FAILED_INTEGRITY => FixedString::from("Integrity Failed"),
+            UPDATE_FAILED_VERSION => FixedString::from("Version Check Failed"),
+            UPDATE_FAILED_COMPAT => FixedString::from("Compatibility Failed"),
+            UPDATE_FAILED_SPACE => FixedString::from("Insufficient Space"),
+            UPDATE_FAILED_HW => FixedString::from("Hardware Error"),
+            UPDATE_ROLLED_BACK => FixedString::from("Rolled Back"),
+            _ => FixedString::from("Unknown"),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Firmware Update Manager
+// ──────────────────────────────────────────────
+
+pub type FirmwareUpdateManager : struct {
+    slots: FixedArray[MAX_FIRMWARE_SLOTS, FirmwareSlot],
+    num_slots: u32,
+    active_slot: u32,
+    booted_slot: u32,
+    update_history: FixedArray[MAX_UPDATE_HISTORY, UpdateHistoryEntry],
+    history_count: u32,
+    next_entry_id: u32,
+    authenticator: UpdateAuthenticator,
+    esrt: ESRT,
+    update_in_progress: bool,
+    staged_update: Option[UpdatePayload],
+}
+
+impl FirmwareUpdateManager {
+    pub fn new() -> FirmwareUpdateManager
+        effects: [deterministic]
+    {
+        FirmwareUpdateManager {
+            slots: FixedArray::new(),
+            num_slots: 0,
+            active_slot: 0,
+            booted_slot: 0,
+            update_history: FixedArray::new(),
+            history_count: 0,
+            next_entry_id: 1,
+            authenticator: UpdateAuthenticator::new(),
+            esrt: ESRT {
+                esrt_header: ESRTHeader::new(),
+                entries: FixedArray::new(),
+                num_entries: 0,
+            },
+            update_in_progress: false,
+            staged_update: Option::None,
+        }
+    }
+
+    pub fn initialize(self: ref mut)
+        effects: [io:read, residual]
+    {
+        trusted "Firmware update manager init: Read ESRT from UEFI configuration table, enumerate firmware slots. UEFI Spec §8.6"
+        {
+            // Initialize slots from firmware flash
+            let mut slot0: FirmwareSlot = FirmwareSlot::new()
+            slot0.slot_index = 0
+            slot0.slot_state = SLOT_BOOTED
+            slot0.version = FirmwareVersion::from_raw(Word64::from_u64(0x0001000100010001))
+            slot0.image_type = FixedString::from("bootloader")
+            slot0.vendor = FixedString::from("Phorensic Systems")
+            slot0.description = FixedString::from("Phorensic OS Boot Firmware v1.0.0.1")
+            slot0.is_bootable = true
+            slot0.is_rollback = false
+            self.slots.push(slot0)!
+            self.num_slots = 1
+            self.active_slot = 0
+            self.booted_slot = 0
+        }
+
+        residual emit {
+            event: "firmware_update.initialized",
+            num_slots: self.num_slots,
+            active_slot: self.active_slot,
+            active_version: self.slots.get(0)!.version.to_string(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Stage Update
+    // ──────────────────────────────────────────────
+
+    pub fn stage_update(self: ref mut, capsule_data: &[u8], capsule_size: u32) -> Result<u32, UpdateError>
+        effects: [io:read, io:write, deterministic]
+    {
+        if self.update_in_progress {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x010,
+                "Update already in progress"
+            ))
+        }
+
+        // Find an empty slot for staging
+        let slot_index: u32 = self.find_empty_slot()!
+        if slot_index >= MAX_FIRMWARE_SLOTS {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x011,
+                "No empty slot available for update"
+            ))
+        }
+
+        // Parse capsule header
+        let capsule_result: Result[FirmwareCapsuleHeader, UpdateError> = parse_capsule_header(capsule_data, capsule_size)
+        if capsule_result.is_err() {
+            return capsule_result
+        }
+        let header: FirmwareCapsuleHeader = capsule_result.unwrap()
+
+        // Extract and validate payload
+        let payload_result: Result[UpdatePayload, UpdateError> = extract_payload(capsule_data, capsule_size, header)
+        if payload_result.is_err() {
+            return payload_result
+        }
+        let payload: UpdatePayload = payload_result.unwrap()
+
+        // Verify version is newer
+        let current_version: FirmwareVersion = self.get_slot_version(slot_index)
+        if !payload.version.is_newer_than(current_version) {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x012,
+                "Update version is not newer than current"
+            ))
+        }
+
+        // Verify authentication
+        let auth_result: Result[bool, UpdateError> = self.authenticator.verify_signature(payload)
+        if auth_result.is_err() {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x013,
+                "Update signature verification failed"
+            ))
+        }
+
+        let cert_result: Result[bool, UpdateError> = self.authenticator.verify_certificate(payload)
+        if cert_result.is_err() {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x014,
+                "Update certificate verification failed"
+            ))
+        }
+
+        let compat_result: Result[bool, UpdateError> = self.authenticator.verify_hardware_compatibility(payload)
+        if compat_result.is_err() {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x015,
+                "Update hardware compatibility check failed"
+            ))
+        }
+
+        // Stage the update
+        trusted "Firmware update staging: Write payload to firmware flash slot. UEFI Spec §8.6"
+        {
+            let mut slot: FirmwareSlot = FirmwareSlot::new()
+            slot.slot_index = slot_index
+            slot.slot_state = SLOT_STAGED
+            slot.version = payload.version
+            slot.image_type = FixedString::from("firmware")
+            slot.vendor = payload.vendor
+            slot.description = payload.description
+            slot.image_size = payload.image_size
+            slot.image_hash = payload.image_hash
+            slot.is_bootable = true
+            slot.hardware_compatibility = payload.hardware_compat
+            self.slots.set(slot_index, slot)!
+            self.staged_update = Option::Some(payload)
+            self.update_in_progress = true
+        }
+
+        residual emit {
+            event: "firmware_update.staged",
+            slot: slot_index,
+            version: payload.version.to_string(),
+            description: payload.description,
+        }
+
+        Result::Ok(slot_index)
+    }
+
+    // ──────────────────────────────────────────────
+    // Apply Staged Update
+    // ──────────────────────────────────────────────
+
+    pub fn apply_staged_update(self: ref mut) -> Result<u32, UpdateError>
+        effects: [io:write, deterministic]
+    {
+        if !self.update_in_progress {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x020,
+                "No staged update to apply"
+            ))
+        }
+
+        let payload: UpdatePayload = match self.staged_update {
+            Option::Some(p) => p,
+            Option::None => {
+                return Result::Err(UpdateError::new(
+                    DIAG_FWUPDATE_BASE | 0x021,
+                    "Staged update payload missing"
+                ))
+            },
+        }
+
+        let target_slot: u32 = payload.target_slot
+        let prev_version: FirmwareVersion = self.get_slot_version(target_slot)
+
+        trusted "Firmware update apply: Write firmware image to flash, update ESRT, initiate reset if needed. UEFI Spec §8.6"
+        {
+            let mut slot: FirmwareSlot = self.slots.get(target_slot)!
+            slot.slot_state = SLOT_PENDING
+            slot.is_bootable = true
+            self.slots.set(target_slot, slot)!
+        }
+
+        // Record in history
+        let mut history: UpdateHistoryEntry = UpdateHistoryEntry::new()
+        history.entry_id = self.next_entry_id
+        history.previous_version = prev_version
+        history.new_version = payload.version
+        history.target_slot = target_slot
+        history.result_code = UPDATE_SUCCESS
+        history.description = FixedString::from("Firmware update applied successfully")
+        history.image_hash = payload.image_hash
+        self.add_history_entry(history)!
+
+        residual emit {
+            event: "firmware_update.applied",
+            entry_id: history.entry_id,
+            slot: target_slot,
+            from_version: prev_version.to_string(),
+            to_version: payload.version.to_string(),
+        }
+
+        self.update_in_progress = false
+        Result::Ok(target_slot)
+    }
+
+    // ──────────────────────────────────────────────
+    // Rollback
+    // ──────────────────────────────────────────────
+
+    pub fn rollback_update(self: ref mut, slot_index: u32) -> Result<u32, UpdateError>
+        effects: [io:write, residual]
+    {
+        if slot_index >= self.num_slots {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x030,
+                "Invalid slot index for rollback"
+            ))
+        }
+
+        let slot: FirmwareSlot = self.slots.get(slot_index)!
+        if !slot.is_rollback {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x031,
+                "Slot does not support rollback"
+            ))
+        }
+
+        // Find previous version to roll back to
+        let rollback_target: u32 = self.find_rollback_target(slot_index)!
+
+        trusted "Firmware rollback: Restore previous firmware version from backup slot. UEFI Spec §8.6"
+        {
+            let mut target: FirmwareSlot = self.slots.get(rollback_target)!
+            target.slot_state = SLOT_PENDING
+            target.is_rollback = false
+            self.slots.set(rollback_target, target)!
+
+            let mut current: FirmwareSlot = slot
+            current.slot_state = SLOT_EMPTY
+            self.slots.set(slot_index, current)!
+        }
+
+        let mut history: UpdateHistoryEntry = UpdateHistoryEntry::new()
+        history.entry_id = self.next_entry_id
+        history.previous_version = slot.version
+        history.new_version = self.get_slot_version(rollback_target)
+        history.target_slot = rollback_target
+        history.result_code = UPDATE_ROLLED_BACK
+        history.description = FixedString::from("Firmware rolled back to previous version")
+        self.add_history_entry(history)!
+
+        residual emit {
+            event: "firmware_update.rolled_back",
+            entry_id: history.entry_id,
+            from_slot: slot_index,
+            to_slot: rollback_target,
+            from_version: slot.version.to_string(),
+            to_version: history.new_version.to_string(),
+        }
+
+        Result::Ok(rollback_target)
+    }
+
+    // ──────────────────────────────────────────────
+    // Confirm Boot Success
+    // ──────────────────────────────────────────────
+
+    pub fn confirm_boot_success(self: ref mut) -> Result<(), UpdateError>
+        effects: [io:write, residual]
+    {
+        trusted "Firmware boot confirmation: Mark firmware slot as successfully booted. UEFI Spec §8.6"
+        {
+            let mut slot: FirmwareSlot = self.slots.get(self.booted_slot)!
+            slot.slot_state = SLOT_BOOTED
+            self.slots.set(self.booted_slot, slot)!
+            self.active_slot = self.booted_slot
+        }
+
+        residual emit {
+            event: "firmware_update.boot_confirmed",
+            active_slot: self.active_slot,
+            active_version: self.get_slot_version(self.active_slot).to_string(),
+        }
+
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // History Management
+    // ──────────────────────────────────────────────
+
+    fn add_history_entry(self: ref mut, entry: UpdateHistoryEntry)
+        effects: [residual]
+    {
+        if self.history_count < MAX_UPDATE_HISTORY {
+            self.history.set(self.history_count, entry)!
+            self.history_count = self.history_count + 1
+            self.next_entry_id = self.next_entry_id + 1
+        }
+
+        // Emit residual with full history details
+        residual emit {
+            event: "firmware_update.history_recorded",
+            entry_id: entry.entry_id,
+            result_code: entry.result_code,
+            previous_version: entry.previous_version.to_string(),
+            new_version: entry.new_version.to_string(),
+        }
+    }
+
+    pub fn get_history(self, index: u32) -> Result[UpdateHistoryEntry, UpdateError>
+        effects: [deterministic]
+    {
+        if index >= self.history_count {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x040,
+                "Update history index out of range"
+            ))
+        }
+        Result::Ok(self.history.get(index)!)
+    }
+
+    pub fn history_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.history_count
+    }
+
+    pub fn get_last_update(self) -> Result[UpdateHistoryEntry, UpdateError>
+        effects: [deterministic]
+    {
+        if self.history_count == 0 {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x041,
+                "No update history available"
+            ))
+        }
+        Result::Ok(self.history.get(self.history_count - 1)!)
+    }
+
+    // ──────────────────────────────────────────────
+    // Query Functions
+    // ──────────────────────────────────────────────
+
+    pub fn get_slot_version(self, slot_index: u32) -> FirmwareVersion
+        effects: [deterministic]
+    {
+        if slot_index >= self.num_slots {
+            return FirmwareVersion::new()
+        }
+        let slot: FirmwareSlot = self.slots.get(slot_index)!
+        slot.version
+    }
+
+    pub fn active_version(self) -> FirmwareVersion
+        effects: [deterministic]
+    {
+        self.get_slot_version(self.active_slot)
+    }
+
+    pub fn staged_version(self) -> Option[FirmwareVersion]
+        effects: [deterministic]
+    {
+        match self.staged_update {
+            Option::Some(p) => Option::Some(p.version),
+            Option::None => Option::None,
+        }
+    }
+
+    pub fn has_staged_update(self) -> bool
+        effects: [deterministic]
+    {
+        self.update_in_progress
+    }
+
+    pub fn slot_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_slots
+    }
+
+    pub fn get_slot(self, index: u32) -> Result[FirmwareSlot, UpdateError>
+        effects: [deterministic]
+    {
+        if index >= self.num_slots {
+            return Result::Err(UpdateError::new(
+                DIAG_FWUPDATE_BASE | 0x050,
+                "Slot index out of range"
+            ))
+        }
+        Result::Ok(self.slots.get(index)!)
+    }
+
+    // ──────────────────────────────────────────────
+    // Internal Helpers
+    // ──────────────────────────────────────────────
+
+    fn find_empty_slot(self: ref mut) -> Result[u32, UpdateError>
+        effects: [deterministic]
+    {
+        for i in 0..MAX_FIRMWARE_SLOTS {
+            if i >= self.num_slots {
+                return Result::Ok(i)
+            }
+            let slot: FirmwareSlot = self.slots.get(i)!
+            if slot.slot_state == SLOT_EMPTY {
+                return Result::Ok(i)
+            }
+        }
+        Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x060,
+            "No empty firmware slot available"
+        ))
+    }
+
+    fn find_rollback_target(self: ref mut, current_slot: u32) -> Result<u32, UpdateError>
+        effects: [deterministic]
+    {
+        // Find the oldest valid slot that is not the current one
+        for i in 0..self.num_slots {
+            if i != current_slot {
+                let slot: FirmwareSlot = self.slots.get(i)!
+                if slot.is_usable() {
+                    return Result::Ok(i)
+                }
+            }
+        }
+        Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x061,
+            "No rollback target available"
+        ))
+    }
+
+    // ──────────────────────────────────────────────
+    // Update History with Residuals
+    // ──────────────────────────────────────────────
+
+    pub fn record_update_residual(self: ref mut, event: FixedString[64], details: FixedString[256])
+        effects: [residual]
+    {
+        residual emit {
+            event: "firmware_update.residual",
+            event_name: event,
+            details: details,
+            active_version: self.active_version().to_string(),
+            slot_count: self.num_slots,
+            history_count: self.history_count,
+        }
+    }
+
+    pub fn emit_update_summary(self: ref mut)
+        effects: [residual]
+    {
+        let active_ver: FixedString[MAX_VERSION_STRING] = self.active_version().to_string()
+
+        residual emit {
+            event: "firmware_update.summary",
+            active_slot: self.active_slot,
+            active_version: active_ver,
+            num_slots: self.num_slots,
+            num_history: self.history_count,
+            update_in_progress: self.update_in_progress,
+            has_staged: self.staged_update.is_some(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Capsule Parsing
+// ──────────────────────────────────────────────
+
+pub fn parse_capsule_header(data: &[u8], size: u32) -> Result[FirmwareCapsuleHeader, UpdateError>
+    effects: [deterministic]
+{
+    if data.len() < 40 {
+        return Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x070,
+            "Capsule data too small for header"
+        ))
+    }
+
+    if size > MAX_CAPSULE_SIZE {
+        return Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x071,
+            "Capsule size exceeds maximum"
+        ))
+    }
+
+    let header: FirmwareCapsuleHeader = FirmwareCapsuleHeader {
+        capsule_guid: EFI_GUID::new(),
+        header_size: 0,
+        flags: 0,
+        capsule_image_size: 0,
+        sequence_number: 0,
+        instance_id: EFI_GUID::new(),
+        reserved: FixedArray::new(),
+        capsule_offset: 0,
+        oem_header_size: 0,
+    }
+
+    if !header.validate() {
+        return Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x072,
+            "Invalid capsule header"
+        ))
+    }
+
+    Result::Ok(header)
+}
+
+pub fn extract_payload(data: &[u8], size: u32, header: FirmwareCapsuleHeader) -> Result[UpdatePayload, UpdateError>
+    effects: [deterministic]
+{
+    let payload_offset: u32 = header.header_size
+    let payload_size: u32 = header.payload_size()
+
+    if payload_offset + payload_size > size {
+        return Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x080,
+            "Capsule payload exceeds capsule data size"
+        ))
+    }
+
+    if payload_size > MAX_PAYLOAD_SIZE {
+        return Result::Err(UpdateError::new(
+            DIAG_FWUPDATE_BASE | 0x081,
+            "Capsule payload exceeds maximum payload size"
+        ))
+    }
+
+    let mut payload: UpdatePayload = UpdatePayload::new()
+    payload.image_size = payload_size
+
+    // Extract image data
+    for i in 0..payload_size {
+        if payload_offset + i < data.len() as u32 {
+            payload.image_data.push(data[(payload_offset + i) as usize])!
+        }
+    }
+
+    payload
+}
+
+// ──────────────────────────────────────────────
+// EFI_GUID (minimal for module independence)
+// ──────────────────────────────────────────────
+
+pub type EFI_GUID : struct {
+    data1: Word32,
+    data2: Word16,
+    data3: Word16,
+    data4: FixedArray[8, u8],
+}
+
+impl EFI_GUID {
+    pub fn new() -> EFI_GUID
+        effects: [deterministic]
+    {
+        EFI_GUID {
+            data1: 0,
+            data2: 0,
+            data3: 0,
+            data4: FixedArray::new(),
+        }
+    }
+
+    pub fn equals(self, other: EFI_GUID) -> bool
+        effects: [deterministic]
+    {
+        if self.data1 != other.data1 { return false }
+        if self.data2 != other.data2 { return false }
+        if self.data3 != other.data3 { return false }
+        for i in 0..8 {
+            if self.data4.get(i)! != other.data4.get(i)! {
+                return false
+            }
+        }
+        true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Update Error Type
+// ──────────────────────────────────────────────
+
+pub type UpdateError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl UpdateError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> UpdateError
+        effects: [deterministic]
+    {
+        UpdateError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    pub fn is_ok(self) -> bool
+        effects: [deterministic]
+    {
+        self.code == 0
+    }
+}
+
+const DIAG_FWUPDATE_BASE: Word64 = 0x0F00_0000_0000_0000

@@ -1,0 +1,1316 @@
+// tracer.phor — System Call Tracer: Syscall Entry/Exit Capture, Argument Logging,
+//                Return Value Logging, Timestamp, Filter Expressions, Trace Buffer
+//                (Fixed-Capacity Ring), Trace Export (CTF Format), Trace Comparison
+// Phorensic OS — Debug Subsystem
+//
+// This module implements a system call tracer for the Phorensic OS kernel.
+// It captures syscall entry and exit events with full argument and return
+// value logging. The tracer uses a fixed-capacity ring buffer and supports
+// filtering, CTF-format export, and trace comparison.
+//
+// Operations:
+// 1. Syscall entry/exit capture — hooks at syscall boundary points
+// 2. Argument logging — captures syscall arguments (up to 6 per call)
+// 3. Return value logging — captures return values and error codes
+// 4. Timestamp — high-resolution timestamp for each event
+// 5. Filter expressions — select which syscalls to trace
+// 6. Trace buffer — fixed-capacity ring buffer for events
+// 7. Trace export — CTF (Common Trace Format) compatible output
+// 8. Trace comparison — diff two trace buffers
+//
+// Boundedness: Trace ring buffer 1024 events. Arguments 6 per syscall.
+// Filter expressions 32. All loops bounded.
+//
+// Effect declarations:
+//   [pure]    — data formatting, filtering, comparison
+//   [io]      — trace export, serial output
+//   [syscall] — syscall hook installation and interception
+//   [memory]  — argument value reads
+//   [diag]    — residual recording
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes for Tracer
+// ──────────────────────────────────────────────
+
+const TRACE_SYSCALL_ENTRY : u64 = 0x13000u64;
+const TRACE_SYSCALL_EXIT  : u64 = 0x13001u64;
+const TRACE_BUFFER_OVERFLOW: u64 = 0x13002u64;
+const TRACE_EXPORT        : u64 = 0x13003u64;
+const TRACE_FILTER        : u64 = 0x13004u64;
+const TRACE_COMPARISON    : u64 = 0x13005u64;
+const TRACE_ERROR         : u64 = 0x1300Fu64;
+
+// ──────────────────────────────────────────────
+// Syscall Definitions
+// ──────────────────────────────────────────────
+
+/// Syscall direction (entry or exit).
+pub sealdatatype TraceDirection : u8 {
+    /// Syscall entry (before execution).
+    Entry = 0u8,
+    /// Syscall exit (after execution).
+    Exit = 1u8,
+}
+
+/// Syscall argument descriptor.
+pub struct SyscallArgument {
+    /// Argument index (0-5).
+    pub index : u32,
+    /// Argument value.
+    pub value : u64,
+    /// Argument name (if known).
+    pub name : FixedString64,
+    /// Whether this argument was read from memory.
+    pub is_pointer : bool,
+    /// Size of pointed-to data (if pointer).
+    pub pointer_size : u32,
+}
+
+/// A single trace event.
+pub struct TraceEvent {
+    /// Sequence number in trace.
+    pub sequence : u32,
+    /// Direction (entry or exit).
+    pub direction : TraceDirection,
+    /// Syscall number.
+    pub syscall_number : u32,
+    /// Syscall name.
+    pub syscall_name : FixedString64,
+    /// Timestamp (nanoseconds).
+    pub timestamp_ns : u64,
+    /// Thread/process ID.
+    pub thread_id : u32,
+    /// CPU ID.
+    pub cpu_id : u32,
+    /// Syscall arguments (max 6).
+    pub arguments : Array64<SyscallArgument>,
+    /// Return value (for exit events).
+    pub return_value : u64,
+    /// Error code (0 = success).
+    pub error_code : u32,
+    /// Duration of syscall in ns (for exit events).
+    pub duration_ns : u64,
+}
+
+/// Filter expression for selecting syscalls.
+pub struct FilterExpression {
+    /// Filter expression string.
+    pub expression : FixedString256,
+    /// Whether the filter is active.
+    pub active : bool,
+    /// Match count.
+    pub match_count : u32,
+}
+
+/// Trace comparison result.
+pub struct TraceDiff {
+    /// Events only in trace A.
+    pub only_in_a : Array128<u32>,
+    /// Events only in trace B.
+    pub only_in_b : Array128<u32>,
+    /// Events present in both but with differences.
+    pub different : Array128<(u32, u32)>,
+    /// Number of matching events.
+    pub matching_count : u32,
+    /// Total differences found.
+    pub total_diffs : u32,
+}
+
+/// Tracer residual.
+pub struct TracerResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub event_count : u32,
+    pub filter_count : u32,
+    pub timestamp : u64,
+}
+
+/// Main tracer state.
+pub struct SyscallTracer {
+    /// Trace event ring buffer (max 1024).
+    pub events : Array512<TraceEvent>,
+    /// Current write position.
+    pub write_pos : u32,
+    /// Total events recorded.
+    pub total_events : u32,
+    /// Events dropped due to overflow.
+    pub dropped_events : u32,
+    /// Whether the tracer is active.
+    pub active : bool,
+    /// Sequence counter.
+    pub sequence_counter : u32,
+    /// Active filter expressions.
+    pub filters : Array32<FilterExpression>,
+    /// Whether filtering is enabled.
+    pub filtering_enabled : bool,
+    /// Syscall name table (mapping number -> name).
+    pub syscall_names : Array256<FixedString64>,
+    /// Currently traced thread ID (0 = all threads).
+    pub trace_thread_id : u32,
+    /// Whether to record timestamps.
+    pub record_timestamps : bool,
+    /// Whether to log entry events.
+    pub log_entries : bool,
+    /// Whether to log exit events.
+    pub log_exits : bool,
+    /// Maximum argument count to log.
+    pub max_arguments : u32,
+    /// Residual log.
+    pub residual_log : Array128<TracerResidual>,
+    /// Start timestamp of current trace session.
+    pub session_start_ns : u64,
+}
+
+impl SyscallTracer {
+    /// Create a new syscall tracer.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> SyscallTracer [pure] {
+        SyscallTracer {
+            events: Array512::new(),
+            write_pos: 0u32,
+            total_events: 0u32,
+            dropped_events: 0u32,
+            active: false,
+            sequence_counter: 0u32,
+            filters: Array32::new(),
+            filtering_enabled: false,
+            syscall_names: Array256::new(),
+            trace_thread_id: 0u32,
+            record_timestamps: true,
+            log_entries: true,
+            log_exits: true,
+            max_arguments: 6u32,
+            residual_log: Array128::new(),
+            session_start_ns: 0u64,
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a tracer residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, event_count : u32) -> SyscallTracer [diag] {
+        let residual : TracerResidual = TracerResidual {
+            code: code,
+            message: message,
+            action: action,
+            event_count: event_count,
+            filter_count: self.filters.len() as u32,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Syscall Name Registration
+    // ──────────────────────────────────────────
+
+    /// Register a syscall name mapping.
+    /// Effect: pure — populates name table.
+    pub fn register_syscall_name(mut self, number : u32,
+                                 name : FixedString64) -> Result<SyscallTracer, FixedString256> [pure] {
+        if (number as u32) >= 256u32 {
+            return Result::Err(FixedString256::from("syscall number out of range"));
+        }
+        // Ensure capacity.
+        while (self.syscall_names.len() as u32) <= number {
+            let _ = self.syscall_names.push(FixedString64::new());
+        }
+        let _ = self.syscall_names.set(number, name);
+        Result::Ok(self)
+    }
+
+    /// Get the name of a syscall by number.
+    /// Effect: pure — name lookup.
+    pub fn get_syscall_name(&self, number : u32) -> FixedString64 [pure] {
+        if (number as u32) < self.syscall_names.len() {
+            self.syscall_names.get(number)
+        } else {
+            FixedString64::new()
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Tracer Lifecycle
+    // ──────────────────────────────────────────
+
+    /// Start tracing.
+    /// Effect: syscall — installs syscall hooks.
+    pub fn start(mut self) -> Result<SyscallTracer, FixedString256> [syscall, diag] {
+        if self.active {
+            return Result::Err(FixedString256::from("tracer already active"));
+        }
+
+        self.active = true;
+        self.events.clear();
+        self.write_pos = 0u32;
+        self.total_events = 0u32;
+        self.dropped_events = 0u32;
+        self.sequence_counter = 0u32;
+        self.session_start_ns = __builtin_timestamp();
+
+        // Install syscall hooks.
+        __builtin_install_syscall_entry_hook();
+        if self.log_exits {
+            __builtin_install_syscall_exit_hook();
+        }
+
+        self = self.record_residual(TRACE_SYSCALL_ENTRY,
+                                    FixedString256::from("tracer started"),
+                                    FixedString64::from("start"),
+                                    0u32);
+        Result::Ok(self)
+    }
+
+    /// Stop tracing.
+    /// Effect: syscall — removes syscall hooks.
+    pub fn stop(mut self) -> Result<SyscallTracer, FixedString256> [syscall, diag] {
+        if !self.active {
+            return Result::Err(FixedString256::from("tracer not active"));
+        }
+
+        self.active = false;
+
+        // Remove syscall hooks.
+        __builtin_remove_syscall_entry_hook();
+        __builtin_remove_syscall_exit_hook();
+
+        self = self.record_residual(TRACE_SYSCALL_ENTRY,
+                                    FixedString256::from("tracer stopped"),
+                                    FixedString64::from("stop"),
+                                    self.total_events);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Event Capture
+    // ──────────────────────────────────────────
+
+    /// Record a syscall entry event.
+    /// Effect: syscall, memory — captures arguments.
+    pub fn record_entry(mut self, syscall_number : u32, arg0 : u64, arg1 : u64,
+                        arg2 : u64, arg3 : u64, arg4 : u64,
+                        arg5 : u64) -> SyscallTracer [syscall, memory, diag] {
+        if !self.active {
+            return self;
+        }
+
+        // Check filter.
+        if self.filtering_enabled {
+            if !self.evaluate_filters(syscall_number) {
+                return self;
+            }
+        }
+
+        // Check thread filter.
+        if self.trace_thread_id != 0u32 {
+            let current_tid : u32 = __builtin_current_thread_id();
+            if current_tid != self.trace_thread_id {
+                return self;
+            }
+        }
+
+        let seq : u32 = self.sequence_counter;
+        self.sequence_counter += 1u32;
+
+        let mut args : Array64<SyscallArgument> = Array64::new();
+        let arg_values : Array64<u64> = Array64::from_fixed([arg0, arg1, arg2, arg3, arg4, arg5]);
+        let arg_names : Array64<FixedString64> = Array64::from_fixed([
+            FixedString64::from("arg0"), FixedString64::from("arg1"),
+            FixedString64::from("arg2"), FixedString64::from("arg3"),
+            FixedString64::from("arg4"), FixedString64::from("arg5"),
+        ]);
+
+        // loop: bounds[BOUND_SMALL] — bounded by 6 arguments.
+        for var i : u32 = 0u32; i < self.max_arguments && i < 6u32; i += 1u32 [6u32] {
+            let arg : SyscallArgument = SyscallArgument {
+                index: i,
+                value: arg_values.get(i),
+                name: arg_names.get(i),
+                is_pointer: false,
+                pointer_size: 0u32,
+            };
+            let _ = args.push(arg);
+        }
+
+        let name : FixedString64 = self.get_syscall_name(syscall_number);
+
+        let event : TraceEvent = TraceEvent {
+            sequence: seq,
+            direction: TraceDirection::Entry,
+            syscall_number: syscall_number,
+            syscall_name: name,
+            timestamp_ns: if self.record_timestamps { __builtin_timestamp() } else { 0u64 },
+            thread_id: __builtin_current_thread_id(),
+            cpu_id: __builtin_current_cpu_id(),
+            arguments: args,
+            return_value: 0u64,
+            error_code: 0u32,
+            duration_ns: 0u64,
+        };
+
+        if self.events.is_full() {
+            // Ring buffer: overwrite oldest.
+            self.dropped_events += 1u32;
+            self.write_pos = 0u32;
+        }
+
+        let _ = self.events.push(event);
+        self.total_events += 1u32;
+
+        self.record_residual(TRACE_SYSCALL_ENTRY,
+                             FixedString256::from("entry captured"),
+                             FixedString64::from("entry"),
+                             self.total_events)
+    }
+
+    /// Record a syscall exit event.
+    /// Effect: syscall — captures return value.
+    pub fn record_exit(mut self, syscall_number : u32, return_value : u64,
+                       error_code : u32) -> SyscallTracer [syscall, diag] {
+        if !self.active {
+            return self;
+        }
+
+        if !self.log_exits {
+            return self;
+        }
+
+        // Check filter.
+        if self.filtering_enabled {
+            if !self.evaluate_filters(syscall_number) {
+                return self;
+            }
+        }
+
+        // Check thread filter.
+        if self.trace_thread_id != 0u32 {
+            let current_tid : u32 = __builtin_current_thread_id();
+            if current_tid != self.trace_thread_id {
+                return self;
+            }
+        }
+
+        let seq : u32 = self.sequence_counter;
+        self.sequence_counter += 1u32;
+
+        let name : FixedString64 = self.get_syscall_name(syscall_number);
+
+        let timestamp_exit : u64 = if self.record_timestamps { __builtin_timestamp() } else { 0u64 };
+
+        let event : TraceEvent = TraceEvent {
+            sequence: seq,
+            direction: TraceDirection::Exit,
+            syscall_number: syscall_number,
+            syscall_name: name,
+            timestamp_ns: timestamp_exit,
+            thread_id: __builtin_current_thread_id(),
+            cpu_id: __builtin_current_cpu_id(),
+            arguments: Array64::new(),
+            return_value: return_value,
+            error_code: error_code,
+            duration_ns: 0u64,
+        };
+
+        if self.events.is_full() {
+            self.dropped_events += 1u32;
+            self.write_pos = 0u32;
+        }
+
+        let _ = self.events.push(event);
+        self.total_events += 1u32;
+
+        self.record_residual(TRACE_SYSCALL_EXIT,
+                             FixedString256::from("exit captured"),
+                             FixedString64::from("exit"),
+                             self.total_events)
+    }
+
+    // ──────────────────────────────────────────
+    // Filter Expressions
+    // ──────────────────────────────────────────
+
+    /// Add a filter expression.
+    /// Effect: pure — adds to filter list.
+    pub fn add_filter(mut self, expression : FixedString256) -> Result<SyscallTracer, FixedString256> [pure] {
+        if self.filters.is_full() {
+            return Result::Err(FixedString256::from("filter list full"));
+        }
+
+        let filter : FilterExpression = FilterExpression {
+            expression: expression,
+            active: true,
+            match_count: 0u32,
+        };
+        let _ = self.filters.push(filter);
+
+        self = self.record_residual(TRACE_FILTER,
+                                    FixedString256::from("filter added"),
+                                    FixedString64::from("add_filter"),
+                                    0u32);
+        Result::Ok(self)
+    }
+
+    /// Evaluate all active filters against a syscall number.
+    /// Effect: pure — filter matching.
+    fn evaluate_filters(&self, syscall_number : u32) -> bool [pure] {
+        if !self.filtering_enabled || self.filters.is_empty() {
+            return true;
+        }
+
+        // loop: bounds[BOUND_SMALL] — bounded by 32 filters.
+        for var i : u32 = 0u32; i < self.filters.len(); i += 1u32 [self.filters.len()] {
+            let filter : FilterExpression = self.filters.get(i);
+            if !filter.active {
+                continue;
+            }
+
+            // Simple filter matching: check if expression contains syscall number.
+            let expr : FixedString256 = filter.expression;
+            let num_str : FixedString256 = FixedString256::new();
+            num_str.push_u32(syscall_number);
+
+            // Check if expression contains the syscall number string.
+            if expr.contains(num_str) {
+                return true;
+            }
+
+            // Check for wildcard "*".
+            if expr == FixedString256::from("*") {
+                return true;
+            }
+
+            // Check for negative filter "!" (exclude).
+            if expr.len() > 0u32 && expr.get_byte(0u32) == '!' as u8 {
+                let neg_expr : FixedString256 = expr.substring(1u32, expr.len());
+                if neg_expr.contains(num_str) {
+                    return false;
+                }
+            }
+        }
+
+        // If filters exist but none matched, don't record.
+        false
+    }
+
+    /// Enable or disable filtering.
+    /// Effect: pure — toggles filtering.
+    pub fn set_filtering(mut self, enabled : bool) -> SyscallTracer [pure] {
+        self.filtering_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable a specific filter.
+    /// Effect: pure — toggles filter.
+    pub fn set_filter_active(mut self, index : u32,
+                             active : bool) -> Result<SyscallTracer, FixedString256> [pure] {
+        if index >= self.filters.len() {
+            return Result::Err(FixedString256::from("filter index out of range"));
+        }
+        let mut filter : FilterExpression = self.filters.get(index);
+        filter.active = active;
+        let _ = self.filters.set(index, filter);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Buffer Management
+    // ──────────────────────────────────────────
+
+    /// Get current number of events in the buffer.
+    /// Effect: pure — data query.
+    pub fn event_count(&self) -> u32 [pure] {
+        self.events.len()
+    }
+
+    /// Get total events recorded (including dropped).
+    /// Effect: pure — data query.
+    pub fn total_events_recorded(&self) -> u32 [pure] {
+        self.total_events
+    }
+
+    /// Get dropped event count.
+    /// Effect: pure — data query.
+    pub fn dropped_event_count(&self) -> u32 [pure] {
+        self.dropped_events
+    }
+
+    /// Clear the trace buffer.
+    /// Effect: pure — buffer reset.
+    pub fn clear_buffer(mut self) -> SyscallTracer [diag] {
+        let count : u32 = self.events.len();
+        self.events.clear();
+        self.write_pos = 0u32;
+        self = self.record_residual(TRACE_SYSCALL_ENTRY,
+                                    FixedString256::from("buffer cleared"),
+                                    FixedString64::from("clear"),
+                                    count);
+        self
+    }
+
+    /// Get an event by index.
+    /// Effect: pure — data access.
+    pub fn get_event(&self, index : u32) -> Result<TraceEvent, FixedString256> [pure] {
+        if index >= self.events.len() {
+            return Result::Err(FixedString256::from("event index out of range"));
+        }
+        Result::Ok(self.events.get(index))
+    }
+
+    /// Set the thread ID to trace (0 = all threads).
+    /// Effect: pure — configuration.
+    pub fn set_trace_thread(mut self, thread_id : u32) -> SyscallTracer [pure] {
+        self.trace_thread_id = thread_id;
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Export (CTF Format)
+    // ──────────────────────────────────────────
+
+    /// Export trace events in CTF-inspired text format.
+    /// Effect: io — generates CTF-compatible output.
+    pub fn export_ctf(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        // CTF header.
+        output.push_str(FixedString256::from("# CTF 1.8\n"));
+        output.push_str(FixedString256::from("# PhorensicOS Syscall Trace\n"));
+        output.push_str(FixedString256::from("# Trace UUID: "));
+        output.push_u64_hex(__builtin_timestamp());
+        output.push_str(FixedString256::from("\n\n"));
+
+        // Metadata section.
+        output.push_str(FixedString256::from("env {\n"));
+        output.push_str(FixedString256::from("    domain = \"kernel\";\n"));
+        output.push_str(FixedString256::from("    tracer_name = \"phor_syscall_tracer\";\n"));
+        output.push_str(FixedString256::from("    tracer_major = 1;\n"));
+        output.push_str(FixedString256::from("    tracer_minor = 0;\n"));
+        output.push_str(FixedString256::from("}\n\n"));
+
+        // Event types.
+        output.push_str(FixedString256::from("typeentry struct {\n"));
+        output.push_str(FixedString256::from("    uint32_t seq;\n"));
+        output.push_str(FixedString256::from("    uint32_t syscall_nr;\n"));
+        output.push_str(FixedString256::from("    uint64_t ts;\n"));
+        output.push_str(FixedString256::from("    uint32_t tid;\n"));
+        output.push_str(FixedString256::from("    uint32_t cpu;\n"));
+        output.push_str(FixedString256::from("    uint64_t arg0;\n"));
+        output.push_str(FixedString256::from("    uint64_t arg1;\n"));
+        output.push_str(FixedString256::from("    uint64_t arg2;\n"));
+        output.push_str(FixedString256::from("    uint64_t arg3;\n"));
+        output.push_str(FixedString256::from("    uint64_t arg4;\n"));
+        output.push_str(FixedString256::from("    uint64_t arg5;\n");
+        output.push_str(FixedString256::from("};\n\n"));
+
+        output.push_str(FixedString256::from("typexit struct {\n"));
+        output.push_str(FixedString256::from("    uint32_t seq;\n"));
+        output.push_str(FixedString256::from("    uint32_t syscall_nr;\n");
+        output.push_str(FixedString256::from("    uint64_t ts;\n"));
+        output.push_str(FixedString256::from("    uint32_t tid;\n"));
+        output.push_str(FixedString256::from("    uint32_t cpu;\n"));
+        output.push_str(FixedString256::from("    uint64_t ret;\n"));
+        output.push_str(FixedString256::from("    uint32_t err;\n"));
+        output.push_str(FixedString256::from("    uint64_t dur;\n");
+        output.push_str(FixedString256::from("};\n\n"));
+
+        // Trace events.
+        output.push_str(FixedString256::from("trace {\n"));
+
+        // loop: bounds[BOUND_LARGE] — bounded by event count.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event : TraceEvent = self.events.get(i);
+
+            if event.direction == TraceDirection::Entry {
+                output.push_str(FixedString256::from("    entry { seq = "));
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from(", nr = "));
+                output.push_u32(event.syscall_number);
+                output.push_str(FixedString256::from(", ts = "));
+                output.push_u64(event.timestamp_ns);
+                output.push_str(FixedString256::from(", tid = "));
+                output.push_u32(event.thread_id);
+                output.push_str(FixedString256::from(", cpu = "));
+                output.push_u32(event.cpu_id);
+
+                // Arguments.
+                // loop: bounds[BOUND_SMALL] — bounded by 6 args.
+                for var j : u32 = 0u32; j < event.arguments.len() && j < 6u32; j += 1u32 [6u32] {
+                    let arg : SyscallArgument = event.arguments.get(j);
+                    output.push_str(FixedString256::from(", arg"));
+                    output.push_u32(j);
+                    output.push_str(FixedString256::from(" = 0x"));
+                    output.push_u64_hex(arg.value);
+                }
+                output.push_str(FixedString256::from(" };\n"));
+            } else {
+                output.push_str(FixedString256::from("    exit { seq = "));
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from(", nr = "));
+                output.push_u32(event.syscall_number);
+                output.push_str(FixedString256::from(", ts = "));
+                output.push_u64(event.timestamp_ns);
+                output.push_str(FixedString256::from(", tid = "));
+                output.push_u32(event.thread_id);
+                output.push_str(FixedString256::from(", cpu = "));
+                output.push_u32(event.cpu_id);
+                output.push_str(FixedString256::from(", ret = 0x"));
+                output.push_u64_hex(event.return_value);
+                output.push_str(FixedString256::from(", err = "));
+                output.push_u32(event.error_code);
+                output.push_str(FixedString256::from(", dur = "));
+                output.push_u64(event.duration_ns);
+                output.push_str(FixedString256::from(" };\n"));
+            }
+        }
+
+        output.push_str(FixedString256::from("}\n"));
+        output
+    }
+
+    /// Export trace as a human-readable log.
+    /// Effect: io — human-readable output.
+    pub fn export_human_readable(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("=== Syscall Trace ===\n"));
+        output.push_str(FixedString256::from("Total events: "));
+        output.push_u32(self.total_events);
+        output.push_str(FixedString256::from(", Buffer: "));
+        output.push_u32(self.events.len());
+        output.push_str(FixedString256::from(", Dropped: "));
+        output.push_u32(self.dropped_events);
+        output.push_str(FixedString256::from("\n\n"));
+
+        // loop: bounds[BOUND_LARGE] — bounded by event count.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event : TraceEvent = self.events.get(i);
+
+            if event.direction == TraceDirection::Entry {
+                output.push_str(FixedString256::from("["));
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from("] ENTRY "));
+                if event.syscall_name.len() > 0u32 {
+                    output.push_str(FixedString256::from_buffer(event.syscall_name));
+                } else {
+                    output.push_str(FixedString256::from("syscall_"));
+                    output.push_u32(event.syscall_number);
+                }
+                output.push_str(FixedString256::from(" (tid="));
+                output.push_u32(event.thread_id);
+                output.push_str(FixedString256::from(", cpu="));
+                output.push_u32(event.cpu_id);
+                if self.record_timestamps {
+                    output.push_str(FixedString256::from(", ts="));
+                    output.push_u64(event.timestamp_ns);
+                }
+                output.push_str(FixedString256::from(")\n"));
+
+                // loop: bounds[BOUND_SMALL] — bounded by args.
+                for var j : u32 = 0u32; j < event.arguments.len(); j += 1u32 [event.arguments.len()] {
+                    let arg : SyscallArgument = event.arguments.get(j);
+                    output.push_str(FixedString256::from("    "));
+                    output.push_str(FixedString256::from_buffer(arg.name));
+                    output.push_str(FixedString256::from(" = 0x"));
+                    output.push_u64_hex(arg.value);
+                    if arg.is_pointer {
+                        output.push_str(FixedString256::from(" (ptr, size="));
+                        output.push_u32(arg.pointer_size);
+                        output.push_str(FixedString256::from(")"));
+                    }
+                    output.push_str(FixedString256::from("\n"));
+                }
+            } else {
+                output.push_str(FixedString256::from("["));
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from("] EXIT  "));
+                if event.syscall_name.len() > 0u32 {
+                    output.push_str(FixedString256::from_buffer(event.syscall_name));
+                } else {
+                    output.push_str(FixedString256::from("syscall_"));
+                    output.push_u32(event.syscall_number);
+                }
+                output.push_str(FixedString256::from(" -> 0x"));
+                output.push_u64_hex(event.return_value);
+                if event.error_code != 0u32 {
+                    output.push_str(FixedString256::from(" (err="));
+                    output.push_u32(event.error_code);
+                    output.push_str(FixedString256::from(")"));
+                }
+                output.push_str(FixedString256::from(" ["));
+                output.push_u64(event.duration_ns);
+                output.push_str(FixedString256::from(" ns]\n"));
+            }
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Comparison
+    // ──────────────────────────────────────────
+
+    /// Compare this trace with another trace.
+    /// Effect: pure — data comparison.
+    pub fn compare(&self, other : SyscallTracer) -> TraceDiff [pure] {
+        var diff : TraceDiff = TraceDiff {
+            only_in_a: Array128::new(),
+            only_in_b: Array128::new(),
+            different: Array128::new(),
+            matching_count: 0u32,
+            total_diffs: 0u32,
+        };
+
+        // Build a map of sequences for B.
+        var b_map : Array128<(u32, u32)> = Array128::new(); // (seq, index)
+        // loop: bounds[BOUND_LARGE] — bounded by other events.
+        for var i : u32 = 0u32; i < other.events.len(); i += 1u32 [other.events.len()] {
+            let event : TraceEvent = other.events.get(i);
+            if b_map.len() < 128u32 {
+                let _ = b_map.push((event.sequence, i));
+            }
+        }
+
+        // Compare A events against B.
+        // loop: bounds[BOUND_LARGE] — bounded by self events.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event_a : TraceEvent = self.events.get(i);
+            var found : bool = false;
+
+            // loop: bounds[BOUND_MEDIUM] — bounded by B map.
+            for var j : u32 = 0u32; j < b_map.len(); j += 1u32 [b_map.len()] {
+                let (seq_b, idx_b) : (u32, u32) = b_map.get(j);
+                if seq_b == event_a.sequence {
+                    found = true;
+                    let event_b : TraceEvent = other.events.get(idx_b);
+
+                    // Check for differences.
+                    var is_diff : bool = false;
+                    if event_a.syscall_number != event_b.syscall_number { is_diff = true; }
+                    if event_a.return_value != event_b.return_value { is_diff = true; }
+                    if event_a.error_code != event_b.error_code { is_diff = true; }
+
+                    if is_diff {
+                        let _ = diff.different.push((i, idx_b));
+                        diff.total_diffs += 1u32;
+                    } else {
+                        diff.matching_count += 1u32;
+                    }
+                    break;
+                }
+            }
+
+            if !found {
+                let _ = diff.only_in_a.push(i);
+                diff.total_diffs += 1u32;
+            }
+        }
+
+        // Find events only in B.
+        // loop: bounds[BOUND_LARGE] — bounded by other events.
+        for var i : u32 = 0u32; i < other.events.len(); i += 1u32 [other.events.len()] {
+            let event_b : TraceEvent = other.events.get(i);
+            var found : bool = false;
+
+            // loop: bounds[BOUND_LARGE] — bounded by self events.
+            for var j : u32 = 0u32; j < self.events.len(); j += 1u32 [self.events.len()] {
+                let event_a : TraceEvent = self.events.get(j);
+                if event_a.sequence == event_b.sequence {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                let _ = diff.only_in_b.push(i);
+                diff.total_diffs += 1u32;
+            }
+        }
+
+        diff
+    }
+
+    /// Format a trace comparison result.
+    /// Effect: io — formatted output.
+    pub fn format_comparison(&self, diff : TraceDiff) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("=== Trace Comparison ===\n"));
+        output.push_str(FixedString256::from("Matching events: "));
+        output.push_u32(diff.matching_count);
+        output.push_str(FixedString256::from("\n"));
+        output.push_str(FixedString256::from("Total differences: "));
+        output.push_u32(diff.total_diffs);
+        output.push_str(FixedString256::from("\n\n"));
+
+        output.push_str(FixedString256::from("Events only in trace A:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by 128.
+        for var i : u32 = 0u32; i < diff.only_in_a.len(); i += 1u32 [diff.only_in_a.len()] {
+            let idx : u32 = diff.only_in_a.get(i);
+            if idx < self.events.len() {
+                let event : TraceEvent = self.events.get(idx);
+                output.push_str(FixedString256::from("  ["));
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from("] "));
+                if event.direction == TraceDirection::Entry {
+                    output.push_str(FixedString256::from("ENTRY "));
+                } else {
+                    output.push_str(FixedString256::from("EXIT "));
+                }
+                if event.syscall_name.len() > 0u32 {
+                    output.push_str(FixedString256::from_buffer(event.syscall_name));
+                } else {
+                    output.push_str(FixedString256::from("syscall_"));
+                    output.push_u32(event.syscall_number);
+                }
+                output.push_str(FixedString256::from("\n"));
+            }
+        }
+
+        output.push_str(FixedString256::from("\nEvents only in trace B:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by 128.
+        for var i : u32 = 0u32; i < diff.only_in_b.len(); i += 1u32 [diff.only_in_b.len()] {
+            output.push_str(FixedString256::from("  ["));
+            output.push_u32(diff.only_in_b.get(i));
+            output.push_str(FixedString256::from("]\n"));
+        }
+
+        output.push_str(FixedString256::from("\nDifferent events:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by 128.
+        for var i : u32 = 0u32; i < diff.different.len(); i += 1u32 [diff.different.len()] {
+            let (idx_a, idx_b) : (u32, u32) = diff.different.get(i);
+            output.push_str(FixedString256::from("  A["));
+            output.push_u32(idx_a);
+            output.push_str(FixedString256::from("] vs B["));
+            output.push_u32(idx_b);
+            output.push_str(FixedString256::from("]\n"));
+        }
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────
+
+    // ──────────────────────────────────────────
+    // Argument Decoding Helpers
+    // ──────────────────────────────────────────
+
+    /// Decode a syscall argument value as a string (if pointer to string).
+    /// Effect: memory — reads string from target memory.
+    pub fn decode_string_arg(&self, address : u64, max_len : u32) -> FixedString256 [memory] {
+        var result : FixedString256 = FixedString256::new();
+        if address == 0u64 {
+            result.push_str(FixedString256::from("null"));
+            return result;
+        }
+
+        // loop: bounds[BOUND_SMALL] — bounded by max_len.
+        for var i : u32 = 0u32; i < max_len; i += 1u32 [max_len] {
+            let byte : u8 = __builtin_read_byte(address + i as u64);
+            if byte == 0u8 {
+                break;
+            }
+            if byte >= 0x20u8 && byte <= 0x7Eu8 {
+                result.push_byte(byte);
+            } else {
+                result.push_str(FixedString256::from("."));
+            }
+        }
+        result
+    }
+
+    /// Format a syscall argument value for display.
+    /// Effect: pure — formatting.
+    pub fn format_argument(value : u64, is_pointer : bool) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        if is_pointer && value == 0u64 {
+            result.push_str(FixedString256::from("NULL"));
+        } else if is_pointer {
+            result.push_str(FixedString256::from("0x"));
+            result.push_u64_hex(value);
+        } else if value > 0xFFFFFFFFu64 {
+            result.push_str(FixedString256::from("0x"));
+            result.push_u64_hex(value);
+        } else {
+            result.push_u64(value);
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Search
+    // ──────────────────────────────────────────
+
+    /// Find events matching a syscall number.
+    /// Effect: pure — search.
+    pub fn find_events_by_syscall(&self, syscall_number : u32) -> Array128<TraceEvent> [pure] {
+        var matching : Array128<TraceEvent> = Array128::new();
+        // loop: bounds[BOUND_LARGE] — bounded by events.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event : TraceEvent = self.events.get(i);
+            if event.syscall_number == syscall_number {
+                let _ = matching.push(event);
+            }
+        }
+        matching
+    }
+
+    /// Find events matching a thread ID.
+    /// Effect: pure — search.
+    pub fn find_events_by_thread(&self, thread_id : u32) -> Array128<TraceEvent> [pure] {
+        var matching : Array128<TraceEvent> = Array128::new();
+        // loop: bounds[BOUND_LARGE] — bounded by events.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event : TraceEvent = self.events.get(i);
+            if event.thread_id == thread_id {
+                let _ = matching.push(event);
+            }
+        }
+        matching
+    }
+
+    /// Find events within a time range.
+    /// Effect: pure — search.
+    pub fn find_events_by_time_range(&self, start_ns : u64, end_ns : u64) -> Array128<TraceEvent> [pure] {
+        var matching : Array128<TraceEvent> = Array128::new();
+        // loop: bounds[BOUND_LARGE] — bounded by events.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event : TraceEvent = self.events.get(i);
+            if event.timestamp_ns >= start_ns && event.timestamp_ns <= end_ns {
+                let _ = matching.push(event);
+            }
+        }
+        matching
+    }
+
+    // ──────────────────────────────────────────
+    // Trace Statistics
+    // ──────────────────────────────────────────
+
+    /// Compute trace statistics.
+    /// Effect: pure — statistical analysis.
+    pub fn compute_statistics(&self) -> FixedString1024 [pure] {
+        var output : FixedString1024 = FixedString1024::new();
+        var entry_count : u32 = 0u32;
+        var exit_count : u32 = 0u32;
+        var error_count : u32 = 0u32;
+        var total_duration : u64 = 0u64;
+        var syscall_frequencies : Array64<(u32, u32)> = Array64::new();
+
+        // loop: bounds[BOUND_LARGE] — bounded by event count.
+        for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+            let event : TraceEvent = self.events.get(i);
+
+            if event.direction == TraceDirection::Entry {
+                entry_count += 1u32;
+            } else {
+                exit_count += 1u32;
+                total_duration += event.duration_ns;
+                if event.error_code != 0u32 {
+                    error_count += 1u32;
+                }
+            }
+
+            // Update frequency.
+            var found_freq : bool = false;
+            // loop: bounds[BOUND_SMALL] — bounded by frequency list.
+            for var j : u32 = 0u32; j < syscall_frequencies.len(); j += 1u32 [syscall_frequencies.len()] {
+                let (nr, count) : (u32, u32) = syscall_frequencies.get(j);
+                if nr == event.syscall_number {
+                    let _ = syscall_frequencies.set(j, (nr, count + 1u32));
+                    found_freq = true;
+                    break;
+                }
+            }
+
+            if !found_freq {
+                let _ = syscall_frequencies.push((event.syscall_number, 1u32));
+            }
+        }
+
+        output.push_str(FixedString256::from("=== Trace Statistics ===\n"));
+        output.push_str(FixedString256::from("Total events: "));
+        output.push_u32(self.total_events);
+        output.push_str(FixedString256::from("\n"));
+        output.push_str(FixedString256::from("Entries: "));
+        output.push_u32(entry_count);
+        output.push_str(FixedString256::from("\n"));
+        output.push_str(FixedString256::from("Exits: "));
+        output.push_u32(exit_count);
+        output.push_str(FixedString256::from("\n"));
+        output.push_str(FixedString256::from("Errors: "));
+        output.push_u32(error_count);
+        output.push_str(FixedString256::from("\n"));
+        if exit_count > 0u32 {
+            output.push_str(FixedString256::from("Avg duration: "));
+            output.push_u64(total_duration / exit_count as u64);
+            output.push_str(FixedString256::from(" ns\n"));
+        }
+        output.push_str(FixedString256::from("Dropped events: "));
+        output.push_u32(self.dropped_events);
+        output.push_str(FixedString256::from("\n\n"));
+
+        output.push_str(FixedString256::from("Top syscalls by frequency:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by frequencies.
+        for var i : u32 = 0u32; i < syscall_frequencies.len(); i += 1u32 [syscall_frequencies.len()] {
+            let (nr, count) : (u32, u32) = syscall_frequencies.get(i);
+            let name : FixedString64 = self.get_syscall_name(nr);
+            output.push_str(FixedString256::from("  "));
+            if name.len() > 0u32 {
+                output.push_str(FixedString256::from_buffer(name));
+            } else {
+                output.push_str(FixedString256::from("syscall_"));
+                output.push_u32(nr);
+            }
+            output.push_str(FixedString256::from(": "));
+                output.push_u32(count);
+                output.push_str(FixedString256::from("\n"));
+            }
+
+            output
+        }
+
+        // ──────────────────────────────────────────
+        // Trace JSON Export
+        // ──────────────────────────────────────────
+
+        /// Export trace events as JSON-like text.
+        /// Effect: io — JSON output.
+        pub fn export_json(&self) -> FixedString1024 [io] {
+            var output : FixedString1024 = FixedString1024::new();
+            output.push_str(FixedString256::from("[\n"));
+
+            // loop: bounds[BOUND_LARGE] — bounded by event count.
+            for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+                let event : TraceEvent = self.events.get(i);
+                output.push_str(FixedString256::from("  {\"seq\": "));
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from(", \"nr\": "));
+                output.push_u32(event.syscall_number);
+                output.push_str(FixedString256::from(", \"dir\": \""));
+                if event.direction == TraceDirection::Entry {
+                    output.push_str(FixedString256::from("entry"));
+                } else {
+                    output.push_str(FixedString256::from("exit"));
+                }
+                output.push_str(FixedString256::from("\", \"ts\": "));
+                output.push_u64(event.timestamp_ns);
+                output.push_str(FixedString256::from(", \"tid\": "));
+                output.push_u32(event.thread_id);
+                if event.direction == TraceDirection::Exit {
+                    output.push_str(FixedString256::from(", \"ret\": "));
+                    output.push_u64(event.return_value);
+                }
+                output.push_str(FixedString256::from("}"));
+                if i + 1u32 < self.events.len() {
+                    output.push_str(FixedString256::from(","));
+                }
+                output.push_str(FixedString256::from("\n"));
+            }
+
+            output.push_str(FixedString256::from("]\n"));
+            output
+        }
+
+        /// Export trace to a simple CSV format.
+        /// Effect: io — CSV output.
+        pub fn export_csv(&self) -> FixedString1024 [io] {
+            var output : FixedString1024 = FixedString1024::new();
+            output.push_str(FixedString256::from("seq,dir,nr,name,ts,tid,cpu,ret,err\n"));
+
+            // loop: bounds[BOUND_LARGE] — bounded by event count.
+            for var i : u32 = 0u32; i < self.events.len(); i += 1u32 [self.events.len()] {
+                let event : TraceEvent = self.events.get(i);
+                output.push_u32(event.sequence);
+                output.push_str(FixedString256::from(","));
+                if event.direction == TraceDirection::Entry {
+                    output.push_str(FixedString256::from("entry"));
+                } else {
+                    output.push_str(FixedString256::from("exit"));
+                }
+                output.push_str(FixedString256::from(","));
+                output.push_u32(event.syscall_number);
+                output.push_str(FixedString256::from(","));
+                if event.syscall_name.len() > 0u32 {
+                    output.push_str(FixedString256::from_buffer(event.syscall_name));
+                }
+                output.push_str(FixedString256::from(","));
+                output.push_u64(event.timestamp_ns);
+                output.push_str(FixedString256::from(","));
+                output.push_u32(event.thread_id);
+                output.push_str(FixedString256::from(","));
+                output.push_u32(event.cpu_id);
+                output.push_str(FixedString256::from(",0x"));
+                output.push_u64_hex(event.return_value);
+                output.push_str(FixedString256::from(","));
+                output.push_u32(event.error_code);
+                output.push_str(FixedString256::from("\n"));
+            }
+
+            output
+        }
+    }
+
+// ──────────────────────────────────────────────
+// Trace Export Format Selection
+// ──────────────────────────────────────────────
+
+/// Export trace in the specified format.
+pub fn export_trace(tracer : SyscallTracer, format : FixedString64) -> FixedString1024 [io] {
+    if format == FixedString64::from("ctf") {
+        tracer.export_ctf()
+    } else if format == FixedString64::from("csv") {
+        tracer.export_csv()
+    } else if format == FixedString64::from("json") {
+        tracer.export_json()
+    } else {
+        tracer.export_human_readable()
+    }
+}
+
+/// Compare two traces and return a diff summary.
+pub fn compare_traces(a : SyscallTracer, b : SyscallTracer) -> FixedString1024 [pure] {
+    let diff : TraceDiff = a.compare(b);
+    a.format_comparison(diff)
+}
+
+/// Summarize trace statistics as a short string.
+pub fn trace_quick_stats(tracer : SyscallTracer) -> FixedString256 [pure] {
+    var result : FixedString256 = FixedString256::new();
+    result.push_str(FixedString256::from("events="));
+    result.push_u32(tracer.event_count());
+    result.push_str(FixedString256::from(" total="));
+    result.push_u32(tracer.total_events_recorded());
+    result.push_str(FixedString256::from(" dropped="));
+    result.push_u32(tracer.dropped_event_count());
+    result
+}
+
+/// Get the syscall name or number as a formatted string.
+pub fn format_syscall_name(tracer : SyscallTracer, nr : u32) -> FixedString256 [pure] {
+    let name : FixedString64 = tracer.get_syscall_name(nr);
+    if name.len() > 0u32 {
+        FixedString256::from_buffer(name)
+    } else {
+        var result : FixedString256 = FixedString256::from("syscall_");
+        result.push_u32(nr);
+        result
+    }
+}
+
+/// Print trace stats to serial.
+pub fn print_trace_stats(tracer : SyscallTracer) [io] {
+    let stats : FixedString1024 = tracer.compute_statistics();
+    __builtin_serial_write_string(stats);
+}
+
+/// Check if the trace contains a specific syscall.
+pub fn trace_has_syscall(tracer : SyscallTracer, syscall_nr : u32) -> bool [pure] {
+    let matching : Array128<TraceEvent> = tracer.find_events_by_syscall(syscall_nr);
+    matching.len() > 0u32
+}
+
+/// Get the number of unique syscalls in the trace.
+pub fn unique_syscall_count(tracer : SyscallTracer) -> u32 [pure] {
+    var syscalls : Array256<u32> = Array256::new();
+    for var i : u32 = 0u32; i < tracer.events.len(); i += 1u32 [tracer.events.len()] {
+        let event : TraceEvent = tracer.events.get(i);
+        var found : bool = false;
+        for var j : u32 = 0u32; j < syscalls.len(); j += 1u32 [syscalls.len()] {
+            if syscalls.get(j) == event.syscall_number {
+                found = true;
+                break;
+            }
+        }
+        if !found { let _ = syscalls.push(event.syscall_number); }
+    }
+    syscalls.len()
+}
+
+/// Compute average syscall duration.
+pub fn average_syscall_duration(tracer : SyscallTracer) -> u64 [pure] {
+    var total_dur : u64 = 0u64;
+    var count : u32 = 0u32;
+    for var i : u32 = 0u32; i < tracer.events.len(); i += 1u32 [tracer.events.len()] {
+        let event : TraceEvent = tracer.events.get(i);
+        if event.direction == TraceDirection::Exit {
+            total_dur += event.duration_ns;
+            count += 1u32;
+        }
+    }
+    if count == 0u32 { return 0u64; }
+    total_dur / count as u64
+}
+
+/// Get the syscall name or number as a formatted string.
+pub fn format_syscall_name_short(tracer : SyscallTracer, nr : u32) -> FixedString256 [pure] {
+    let name : FixedString64 = tracer.get_syscall_name(nr);
+    if name.len() > 0u32 {
+        FixedString256::from_buffer(name)
+    } else {
+        var result : FixedString256 = FixedString256::from("sc_");
+        result.push_u32(nr);
+        result
+    }
+}
+
+/// Compute the error rate (fraction of syscalls that returned errors).
+pub fn syscall_error_rate(tracer : SyscallTracer) -> f64 [pure] {
+    var errors : u32 = 0u32;
+    var total : u32 = 0u32;
+    for var i : u32 = 0u32; i < tracer.events.len(); i += 1u32 [tracer.events.len()] {
+        let event : TraceEvent = tracer.events.get(i);
+        if event.direction == TraceDirection::Exit {
+            total += 1u32;
+            if event.error_code != 0u32 { errors += 1u32; }
+        }
+    }
+    if total == 0u32 { return 0.0f64; }
+    errors as f64 / total as f64 * 100.0f64
+}
+
+/// Find the slowest syscall in the trace.
+pub fn slowest_syscall(tracer : SyscallTracer) -> (u32, u64) [pure] {
+    var max_dur : u64 = 0u64;
+    var nr : u32 = 0u32;
+    for var i : u32 = 0u32; i < tracer.events.len(); i += 1u32 [tracer.events.len()] {
+        let event : TraceEvent = tracer.events.get(i);
+        if event.direction == TraceDirection::Exit && event.duration_ns > max_dur {
+            max_dur = event.duration_ns;
+            nr = event.syscall_number;
+        }
+    }
+    (nr, max_dur)
+}
+
+/// Print the active trace configuration.
+pub fn print_trace_config(tracer : SyscallTracer) [io] {
+    __builtin_serial_write_string(FixedString256::from("Tracer config: active="));
+    __builtin_serial_write_string(if tracer.active { FixedString256::from("yes") } else { FixedString256::from("no") });
+    __builtin_serial_write_string(FixedString256::from(" entries="));
+    __builtin_serial_write_hex_u32(tracer.log_entries as u32);
+    __builtin_serial_write_string(FixedString256::from(" exits="));
+    __builtin_serial_write_hex_u32(tracer.log_exits as u32);
+    __builtin_serial_write_string(FixedString256::from(" filter="));
+    __builtin_serial_write_hex_u32(if tracer.filtering_enabled { 1u32 } else { 0u32 });
+    __builtin_serial_write_string(FixedString256::from("\n"));
+}

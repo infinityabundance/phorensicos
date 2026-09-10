@@ -1,0 +1,1130 @@
+// coverage.phor — Code Coverage: Basic Block Coverage, Edge Coverage, Coverage Data
+//                  Collection, Coverage Bitmap, Coverage Export (GCNO, LCOV), Coverage
+//                  Merging, Coverage-Guided Fuzzing Interface
+// Phorensic OS — Debug Subsystem
+//
+// This module implements code coverage collection and analysis for runtime in the
+// Phorensic OS kernel. It supports both basic block coverage and edge coverage
+// using a fixed-capacity coverage bitmap. Coverage data can be exported in GCNO
+// and LCOV formats, merged across multiple runs, and used to guide fuzzing.
+//
+// Operations:
+// 1. Basic block coverage — track which basic blocks have been executed
+// 2. Edge coverage — track control flow edges (source->target pairs)
+// 3. Coverage data collection — runtime coverage bitmap updates
+// 4. Coverage bitmap — compact bit-per-block representation
+// 5. Coverage export — GCNO (gcov-compatible) and LCOV formats
+// 6. Coverage merging — merge multiple coverage bitmaps
+// 7. Coverage-guided fuzzing — interface for fuzzing tools
+//
+// Boundedness: Coverage bitmap 4096 blocks. Edge table 8192 edges. All bounded.
+//
+// Effect declarations:
+//   [pure]    — data analysis, formatting
+//   [io]      — export output
+//   [coverage] — coverage bitmap updates
+//   [diag]    — residual recording
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const COV_BLOCK_HIT       : u64 = 0x18000u64;
+const COV_EDGE_HIT        : u64 = 0x18001u64;
+const COV_EXPORT          : u64 = 0x18002u64;
+const COV_MERGE           : u64 = 0x18003u64;
+const COV_ERROR           : u64 = 0x1800Fu64;
+
+// ──────────────────────────────────────────────
+// Coverage Types
+// ──────────────────────────────────────────────
+
+/// Coverage data format.
+pub sealdatatype CoverageFormat : u8 {
+    GCNO = 0u8,
+    LCOV = 1u8,
+    Raw = 2u8,
+}
+
+/// A single basic block descriptor.
+pub struct BasicBlock {
+    /// Block ID.
+    pub block_id : u32,
+    /// Start address.
+    pub start_address : u64,
+    /// Size in bytes.
+    pub size : u64,
+    /// Function this block belongs to.
+    pub function_name : FixedString64,
+    /// Source file.
+    pub source_file : FixedString64,
+    /// Source line number.
+    pub source_line : u32,
+    /// Execution count.
+    pub hit_count : u32,
+    /// Whether this block was hit.
+    pub hit : bool,
+}
+
+/// A control flow edge.
+pub struct CoverageEdge {
+    /// Edge ID.
+    pub edge_id : u32,
+    /// Source block ID.
+    pub source_block : u32,
+    /// Target block ID.
+    pub target_block : u32,
+    /// Execution count.
+    pub hit_count : u32,
+    /// Whether this edge was traversed.
+    pub hit : bool,
+}
+
+/// Coverage data for a single function.
+pub struct FunctionCoverage {
+    /// Function name.
+    pub name : FixedString64,
+    /// Source file.
+    pub source_file : FixedString64,
+    /// Starting line.
+    pub start_line : u32,
+    /// Number of basic blocks.
+    pub block_count : u32,
+    /// Number of hit blocks.
+    pub hit_blocks : u32,
+    /// Coverage percentage (0-100).
+    pub coverage_pct : u8,
+}
+
+/// Coverage residual.
+pub struct CoverageResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub blocks_hit : u32,
+    pub edges_hit : u32,
+    pub timestamp : u64,
+}
+
+/// Main coverage manager.
+pub struct CoverageManager {
+    /// Basic block bitmap (4096 bits = 512 bytes).
+    pub block_bitmap : Array512<u8>,
+    /// Edge bitmap (8192 bits = 1024 bits, using 128 bytes).
+    pub edge_bitmap : Array128<u8>,
+    /// Basic block descriptors.
+    pub blocks : Array512<BasicBlock>,
+    /// Edge descriptors.
+    pub edges : Array512<CoverageEdge>,
+    /// Per-function coverage data.
+    pub functions : Array256<FunctionCoverage>,
+    /// Whether coverage collection is active.
+    pub active : bool,
+    /// Total basic blocks (registered).
+    pub total_blocks : u32,
+    /// Total edges (registered).
+    pub total_edges : u32,
+    /// Blocks hit.
+    pub blocks_hit : u32,
+    /// Edges hit.
+    pub edges_hit : u32,
+    /// Module name.
+    pub module_name : FixedString64,
+    /// Residual log.
+    pub residual_log : Array128<CoverageResidual>,
+}
+
+impl CoverageManager {
+    /// Create a new coverage manager.
+    /// Effect: pure — deterministic construction.
+    pub fn new(module_name : FixedString64) -> CoverageManager [pure] {
+        CoverageManager {
+            block_bitmap: Array512::new(),
+            edge_bitmap: Array128::new(),
+            blocks: Array512::new(),
+            edges: Array512::new(),
+            functions: Array256::new(),
+            active: false,
+            total_blocks: 0u32,
+            total_edges: 0u32,
+            blocks_hit: 0u32,
+            edges_hit: 0u32,
+            module_name: module_name,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a coverage residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64) -> CoverageManager [diag] {
+        let residual : CoverageResidual = CoverageResidual {
+            code: code,
+            message: message,
+            action: action,
+            blocks_hit: self.blocks_hit,
+            edges_hit: self.edges_hit,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Block/Edge Registration
+    // ──────────────────────────────────────────
+
+    /// Register a basic block for coverage tracking.
+    /// Effect: pure — block registration.
+    pub fn register_block(mut self, block_id : u32, start_address : u64, size : u64,
+                          function_name : FixedString64, source_file : FixedString64,
+                          source_line : u32) -> Result<CoverageManager, FixedString256> [pure] {
+        if self.blocks.is_full() {
+            return Result::Err(FixedString256::from("block table full"));
+        }
+
+        let block : BasicBlock = BasicBlock {
+            block_id: block_id,
+            start_address: start_address,
+            size: size,
+            function_name: function_name,
+            source_file: source_file,
+            source_line: source_line,
+            hit_count: 0u32,
+            hit: false,
+        };
+        let _ = self.blocks.push(block);
+        self.total_blocks += 1u32;
+        Result::Ok(self)
+    }
+
+    /// Register a control flow edge for coverage tracking.
+    /// Effect: pure — edge registration.
+    pub fn register_edge(mut self, edge_id : u32, source_block : u32,
+                         target_block : u32) -> Result<CoverageManager, FixedString256> [pure] {
+        if self.edges.is_full() {
+            return Result::Err(FixedString256::from("edge table full"));
+        }
+
+        let edge : CoverageEdge = CoverageEdge {
+            edge_id: edge_id,
+            source_block: source_block,
+            target_block: target_block,
+            hit_count: 0u32,
+            hit: false,
+        };
+        let _ = self.edges.push(edge);
+        self.total_edges += 1u32;
+        Result::Ok(self)
+    }
+
+    /// Register a function coverage entry.
+    /// Effect: pure — function registration.
+    pub fn register_function(mut self, name : FixedString64, source_file : FixedString64,
+                             start_line : u32) -> Result<CoverageManager, FixedString256> [pure] {
+        if self.functions.is_full() {
+            return Result::Err(FixedString256::from("function table full"));
+        }
+
+        let func : FunctionCoverage = FunctionCoverage {
+            name: name,
+            source_file: source_file,
+            start_line: start_line,
+            block_count: 0u32,
+            hit_blocks: 0u32,
+            coverage_pct: 0u8,
+        };
+        let _ = self.functions.push(func);
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Coverage Collection
+    // ──────────────────────────────────────────
+
+    /// Start coverage collection.
+    /// Effect: pure — starts collection.
+    pub fn start(mut self) -> CoverageManager [diag] {
+        self.active = true;
+        self.record_residual(COV_BLOCK_HIT,
+                             FixedString256::from("coverage collection started"),
+                             FixedString64::from("start"))
+    }
+
+    /// Stop coverage collection.
+    /// Effect: pure — stops collection.
+    pub fn stop(mut self) -> CoverageManager [diag] {
+        self.active = false;
+        self = self.compute_statistics();
+        self.record_residual(COV_BLOCK_HIT,
+                             FixedString256::from("coverage collection stopped"),
+                             FixedString64::from("stop"))
+    }
+
+    /// Mark a basic block as hit (called from instrumented code).
+    /// Effect: coverage — updates block bitmap.
+    pub fn mark_block_hit(mut self, block_id : u32) -> CoverageManager [coverage, diag] {
+        if !self.active {
+            return self;
+        }
+
+        if block_id >= 4096u32 {
+            return self;
+        }
+
+        let byte_index : u32 = block_id / 8u32;
+        let bit_index : u8 = (block_id % 8u32) as u8;
+
+        if byte_index < 512u32 {
+            let mut byte_val : u8 = self.block_bitmap.get(byte_index);
+            let mask : u8 = 1u8 << bit_index;
+            if byte_val & mask == 0u8 {
+                byte_val |= mask;
+                let _ = self.block_bitmap.set(byte_index, byte_val);
+                self.blocks_hit += 1u32;
+
+                // Update block descriptor if available.
+                if block_id < self.blocks.len() {
+                    let mut block : BasicBlock = self.blocks.get(block_id);
+                    block.hit = true;
+                    block.hit_count += 1u32;
+                    let _ = self.blocks.set(block_id, block);
+                }
+            }
+        }
+
+        self.record_residual(COV_BLOCK_HIT,
+                             FixedString256::from("block marked hit"),
+                             FixedString64::from("mark_block"))
+    }
+
+    /// Mark a control flow edge as hit (called from instrumented code).
+    /// Effect: coverage — updates edge bitmap.
+    pub fn mark_edge_hit(mut self, edge_id : u32) -> CoverageManager [coverage, diag] {
+        if !self.active {
+            return self;
+        }
+
+        if edge_id >= 8192u32 {
+            return self;
+        }
+
+        let byte_index : u32 = edge_id / 8u32;
+        let bit_index : u8 = (edge_id % 8u32) as u8;
+
+        if byte_index < 128u32 {
+            let mut byte_val : u8 = self.edge_bitmap.get(byte_index);
+            let mask : u8 = 1u8 << bit_index;
+            if byte_val & mask == 0u8 {
+                byte_val |= mask;
+                let _ = self.edge_bitmap.set(byte_index, byte_val);
+                self.edges_hit += 1u32;
+
+                // Update edge descriptor if available.
+                if edge_id < self.edges.len() {
+                    let mut edge : CoverageEdge = self.edges.get(edge_id);
+                    edge.hit = true;
+                    edge.hit_count += 1u32;
+                    let _ = self.edges.set(edge_id, edge);
+                }
+            }
+        }
+
+        self.record_residual(COV_EDGE_HIT,
+                             FixedString256::from("edge marked hit"),
+                             FixedString64::from("mark_edge"))
+    }
+
+    /// Mark multiple blocks as hit in a single call (batched for performance).
+    /// Effect: coverage — batch bitmap updates.
+    pub fn mark_blocks_hit_batch(mut self, block_ids : Array64<u32>,
+                                 count : u32) -> CoverageManager [coverage, diag] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by count.
+        for var i : u32 = 0u32; i < count && i < block_ids.len(); i += 1u32 [count] {
+            let block_id : u32 = block_ids.get(i);
+            self = self.mark_block_hit(block_id);
+        }
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Statistics
+    // ──────────────────────────────────────────
+
+    /// Compute coverage statistics.
+    /// Effect: pure — statistics computation.
+    pub fn compute_statistics(mut self) -> CoverageManager [pure] {
+        // Compute per-function coverage.
+        // loop: bounds[BOUND_LARGE] — bounded by functions.
+        for var i : u32 = 0u32; i < self.functions.len(); i += 1u32 [self.functions.len()] {
+            let mut func : FunctionCoverage = self.functions.get(i);
+            var blocks_in_func : u32 = 0u32;
+            var hit_in_func : u32 = 0u32;
+
+            // Count blocks belonging to this function.
+            // loop: bounds[BOUND_LARGE] — bounded by blocks.
+            for var j : u32 = 0u32; j < self.blocks.len(); j += 1u32 [self.blocks.len()] {
+                let block : BasicBlock = self.blocks.get(j);
+                if block.function_name == func.name {
+                    blocks_in_func += 1u32;
+                    if block.hit {
+                        hit_in_func += 1u32;
+                    }
+                }
+            }
+
+            func.block_count = blocks_in_func;
+            func.hit_blocks = hit_in_func;
+            if blocks_in_func > 0u32 {
+                func.coverage_pct = (hit_in_func * 100u32 / blocks_in_func) as u8;
+            }
+            let _ = self.functions.set(i, func);
+        }
+        self
+    }
+
+    /// Get overall coverage percentage.
+    /// Effect: pure — coverage percentage.
+    pub fn overall_coverage_pct(&self) -> u8 [pure] {
+        if self.total_blocks == 0u32 {
+            return 0u8;
+        }
+        ((self.blocks_hit * 100u32) / self.total_blocks) as u8
+    }
+
+    /// Get edge coverage percentage.
+    /// Effect: pure — edge coverage.
+    pub fn edge_coverage_pct(&self) -> u8 [pure] {
+        if self.total_edges == 0u32 {
+            return 0u8;
+        }
+        ((self.edges_hit * 100u32) / self.total_edges) as u8
+    }
+
+    // ──────────────────────────────────────────
+    // GCNO Export (gcov-compatible)
+    // ──────────────────────────────────────────
+
+    /// Export coverage data in GCNO format.
+    /// Effect: io — GCNO output.
+    pub fn export_gcno(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+        output.push_str(FixedString256::from("# GCNO coverage data for "));
+        output.push_str(FixedString256::from_buffer(self.module_name));
+        output.push_str(FixedString256::from("\n"));
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by functions.
+        for var i : u32 = 0u32; i < self.functions.len(); i += 1u32 [self.functions.len()] {
+            let func : FunctionCoverage = self.functions.get(i);
+
+            output.push_str(FixedString256::from("function:"));
+            output.push_str(FixedString256::from_buffer(func.name));
+            output.push_str(FixedString256::from(","));
+            output.push_str(FixedString256::from_buffer(func.source_file));
+            output.push_str(FixedString256::from(","));
+            output.push_u32(func.start_line);
+            output.push_str(FixedString256::from("\n"));
+
+            // Basic blocks for this function.
+            // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+            for var j : u32 = 0u32; j < self.blocks.len(); j += 1u32 [self.blocks.len()] {
+                let block : BasicBlock = self.blocks.get(j);
+                if block.function_name == func.name {
+                    output.push_str(FixedString256::from("block:"));
+                    output.push_u32(block.block_id);
+                    output.push_str(FixedString256::from(","));
+                    output.push_str(FixedString256::from_buffer(block.source_file));
+                    output.push_str(FixedString256::from(","));
+                    output.push_u32(block.source_line);
+                    output.push_str(FixedString256::from(","));
+                    output.push_u32(block.hit_count);
+                    output.push_str(FixedString256::from("\n"));
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Export coverage data in LCOV format.
+    /// Effect: io — LCOV output.
+    pub fn export_lcov(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("SF:"));
+        output.push_str(FixedString256::from_buffer(self.module_name));
+        output.push_str(FixedString256::from("\n"));
+
+        // Group blocks by source file.
+        var current_file : FixedString64 = FixedString64::new();
+        var line_hits : Array512<(u32, u32)> = Array512::new();
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+        for var i : u32 = 0u32; i < self.blocks.len(); i += 1u32 [self.blocks.len()] {
+            let block : BasicBlock = self.blocks.get(i);
+
+            if block.source_file != current_file {
+                // Emit previous file data.
+                if current_file.len() > 0u32 {
+                    // loop: bounds[BOUND_MEDIUM] — bounded by line hits.
+                    for var j : u32 = 0u32; j < line_hits.len(); j += 1u32 [line_hits.len()] {
+                        let (line, count) : (u32, u32) = line_hits.get(j);
+                        output.push_str(FixedString256::from("DA:"));
+                        output.push_u32(line);
+                        output.push_str(FixedString256::from(","));
+                        output.push_u32(count);
+                        output.push_str(FixedString256::from("\n"));
+                    }
+                    output.push_str(FixedString256::from("end_of_record\n"));
+                    line_hits.clear();
+                }
+                current_file = block.source_file;
+                output.push_str(FixedString256::from("SF:"));
+                output.push_str(FixedString256::from_buffer(current_file));
+                output.push_str(FixedString256::from("\n"));
+            }
+
+            // Check if this line already has a hit count.
+            var line_found : bool = false;
+            // loop: bounds[BOUND_SMALL] — bounded by line hits.
+            for var j : u32 = 0u32; j < line_hits.len(); j += 1u32 [line_hits.len()] {
+                let (line, count) : (u32, u32) = line_hits.get(j);
+                if line == block.source_line {
+                    let _ = line_hits.set(j, (line, count + block.hit_count));
+                    line_found = true;
+                    break;
+                }
+            }
+            if !line_found {
+                let _ = line_hits.push((block.source_line, block.hit_count));
+            }
+        }
+
+        // Emit last file.
+        if current_file.len() > 0u32 {
+            // loop: bounds[BOUND_MEDIUM] — bounded by line hits.
+            for var j : u32 = 0u32; j < line_hits.len(); j += 1u32 [line_hits.len()] {
+                let (line, count) : (u32, u32) = line_hits.get(j);
+                output.push_str(FixedString256::from("DA:"));
+                output.push_u32(line);
+                output.push_str(FixedString256::from(","));
+                output.push_u32(count);
+                output.push_str(FixedString256::from("\n"));
+            }
+            output.push_str(FixedString256::from("end_of_record\n"));
+        }
+
+        // Summary.
+        output.push_str(FixedString256::from("summary:blocks="));
+        output.push_u32(self.total_blocks);
+        output.push_str(FixedString256::from(",hit="));
+        output.push_u32(self.blocks_hit);
+        output.push_str(FixedString256::from(",coverage="));
+        output.push_u32(self.overall_coverage_pct() as u32);
+        output.push_str(FixedString256::from("%\n"));
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Coverage Merging
+    // ──────────────────────────────────────────
+
+    /// Merge another coverage manager's data into this one.
+    /// Effect: pure — data merging.
+    pub fn merge(mut self, other : CoverageManager) -> Result<CoverageManager, FixedString256> [pure] {
+        // Merge block bitmaps (OR operation).
+        // loop: bounds[BOUND_LARGE] — bounded by bitmap size.
+        for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+            let a : u8 = self.block_bitmap.get(i);
+            let b : u8 = other.block_bitmap.get(i);
+            let _ = self.block_bitmap.set(i, a | b);
+        }
+
+        // Merge edge bitmaps (OR operation).
+        // loop: bounds[BOUND_MEDIUM] — bounded by edge bitmap size.
+        for var i : u32 = 0u32; i < 128u32; i += 1u32 [128u32] {
+            let a : u8 = self.edge_bitmap.get(i);
+            let b : u8 = other.edge_bitmap.get(i);
+            let _ = self.edge_bitmap.set(i, a | b);
+        }
+
+        // Merge block hit counts.
+        // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+        for var i : u32 = 0u32; i < self.blocks.len() && i < other.blocks.len(); i += 1u32 [self.blocks.len()] {
+            let mut block_self : BasicBlock = self.blocks.get(i);
+            let block_other : BasicBlock = other.blocks.get(i);
+            block_self.hit_count += block_other.hit_count;
+            block_self.hit = block_self.hit || block_other.hit;
+            let _ = self.blocks.set(i, block_self);
+        }
+
+        // Merge edge hit counts.
+        // loop: bounds[BOUND_MEDIUM] — bounded by edges.
+        for var i : u32 = 0u32; i < self.edges.len() && i < other.edges.len(); i += 1u32 [self.edges.len()] {
+            let mut edge_self : CoverageEdge = self.edges.get(i);
+            let edge_other : CoverageEdge = other.edges.get(i);
+            edge_self.hit_count += edge_other.hit_count;
+            edge_self.hit = edge_self.hit || edge_other.hit;
+            let _ = self.edges.set(i, edge_self);
+        }
+
+        // Recompute blocks_hit and edges_hit counts.
+        self.blocks_hit = 0u32;
+        // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+        for var i : u32 = 0u32; i < self.blocks.len(); i += 1u32 [self.blocks.len()] {
+            let block : BasicBlock = self.blocks.get(i);
+            if block.hit {
+                self.blocks_hit += 1u32;
+            }
+        }
+
+        self.edges_hit = 0u32;
+        // loop: bounds[BOUND_MEDIUM] — bounded by edges.
+        for var i : u32 = 0u32; i < self.edges.len(); i += 1u32 [self.edges.len()] {
+            let edge : CoverageEdge = self.edges.get(i);
+            if edge.hit {
+                self.edges_hit += 1u32;
+            }
+        }
+
+        self = self.compute_statistics();
+        self = self.record_residual(COV_MERGE,
+                                    FixedString256::from("coverage data merged"),
+                                    FixedString64::from("merge"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Fuzzing Interface
+    // ──────────────────────────────────────────
+
+    /// Get the block coverage bitmap for fuzzing tools.
+    /// Effect: pure — data access.
+    pub fn get_block_bitmap(&self) -> Array512<u8> [pure] {
+        self.block_bitmap
+    }
+
+    /// Get the edge coverage bitmap for fuzzing tools.
+    /// Effect: pure — data access.
+    pub fn get_edge_bitmap(&self) -> Array128<u8> [pure] {
+        self.edge_bitmap
+    }
+
+    /// Compute a coverage hash for fuzzing feedback.
+    /// Effect: pure — hash computation.
+    pub fn coverage_hash(&self) -> u64 [pure] {
+        var hash : u64 = 14695981039346656037u64;
+
+        // Hash block bitmap.
+        // loop: bounds[BOUND_LARGE] — bounded by bitmap.
+        for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+            hash ^= self.block_bitmap.get(i) as u64;
+            hash *= 1099511628211u64;
+        }
+
+        // Hash edge bitmap.
+        // loop: bounds[BOUND_MEDIUM] — bounded by edge bitmap.
+        for var i : u32 = 0u32; i < 128u32; i += 1u32 [128u32] {
+            hash ^= self.edge_bitmap.get(i) as u64;
+            hash *= 1099511628211u64;
+        }
+
+        hash
+    }
+
+    /// Check if the coverage has changed since a previous hash.
+    /// Effect: pure — hash comparison.
+    pub fn has_coverage_changed(&self, previous_hash : u64) -> bool [pure] {
+        self.coverage_hash() != previous_hash
+    }
+
+    /// Reset coverage data for a new fuzzing iteration.
+    /// Effect: pure — bitmap reset.
+    pub fn reset_for_fuzzing(mut self) -> CoverageManager [diag] {
+        // Clear bitmaps.
+        // loop: bounds[BOUND_LARGE] — bounded by block bitmap.
+        for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+            let _ = self.block_bitmap.set(i, 0u8);
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by edge bitmap.
+        for var i : u32 = 0u32; i < 128u32; i += 1u32 [128u32] {
+            let _ = self.edge_bitmap.set(i, 0u8);
+        }
+
+        self.blocks_hit = 0u32;
+        self.edges_hit = 0u32;
+
+        // Reset block hit states.
+        // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+        for var i : u32 = 0u32; i < self.blocks.len(); i += 1u32 [self.blocks.len()] {
+            let mut block : BasicBlock = self.blocks.get(i);
+            block.hit = false;
+            block.hit_count = 0u32;
+            let _ = self.blocks.set(i, block);
+        }
+
+        // Reset edge hit states.
+        // loop: bounds[BOUND_MEDIUM] — bounded by edges.
+        for var i : u32 = 0u32; i < self.edges.len(); i += 1u32 [self.edges.len()] {
+            let mut edge : CoverageEdge = self.edges.get(i);
+            edge.hit = false;
+            edge.hit_count = 0u32;
+            let _ = self.edges.set(i, edge);
+        }
+
+        self.record_residual(COV_MERGE,
+                             FixedString256::from("coverage reset for fuzzing"),
+                             FixedString64::from("fuzz_reset"))
+    }
+
+    // ──────────────────────────────────────────
+    // Fuzzing Coverage Feedback
+    // ──────────────────────────────────────────
+
+    /// Get a new coverage bitmap for fuzzing (returns only new coverage since last call).
+    /// Effect: pure — differential coverage.
+    pub fn get_new_coverage(mut self, previous_bitmap : Array512<u8>) -> (CoverageManager, Array512<u8>) [pure] {
+        var new_bits : Array512<u8> = Array512::new();
+
+        // loop: bounds[BOUND_LARGE] — bounded by bitmap.
+        for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+            let current : u8 = self.block_bitmap.get(i);
+            let previous : u8 = previous_bitmap.get(i);
+            let delta : u8 = current & !previous;
+            let _ = new_bits.push(delta);
+        }
+
+        (self, new_bits)
+    }
+
+    /// Count the number of covered edges for the fuzzer's feedback score.
+    /// Effect: pure — coverage count.
+    pub fn count_covered_edges(&self) -> u32 [pure] {
+        var count : u32 = 0u32;
+        // loop: bounds[BOUND_MEDIUM] — bounded by edge bitmap.
+        for var i : u32 = 0u32; i < 128u32; i += 1u32 [128u32] {
+            let byte : u8 = self.edge_bitmap.get(i);
+            // Count bits set in this byte.
+            var bit : u8 = 0u8;
+            // loop: bounds[BOUND_SMALL] — 8 bits per byte.
+            loop: bounds[BOUND_SMALL] while bit < 8u8 {
+                if byte & (1u8 << bit) != 0u8 {
+                    count += 1u32;
+                }
+                bit += 1u8;
+            }
+        }
+        count
+    }
+
+    /// Compute a feature vector for fuzzing feedback (bucketed edge hits).
+    /// Effect: pure — feature computation.
+    pub fn compute_fuzzing_features(&self) -> Array64<u64> [pure] {
+        var features : Array64<u64> = Array64::new();
+
+        // Feature 1: total blocks hit.
+        let _ = features.push(self.blocks_hit as u64);
+
+        // Feature 2: total edges hit.
+        let _ = features.push(self.edges_hit as u64);
+
+        // Feature 3: coverage hash.
+        let _ = features.push(self.coverage_hash());
+
+        // Feature 4: function coverage count.
+        var funcs_with_coverage : u32 = 0u32;
+        // loop: bounds[BOUND_MEDIUM] — bounded by functions.
+        for var i : u32 = 0u32; i < self.functions.len(); i += 1u32 [self.functions.len()] {
+            let func : FunctionCoverage = self.functions.get(i);
+            if func.hit_blocks > 0u32 {
+                funcs_with_coverage += 1u32;
+            }
+        }
+        let _ = features.push(funcs_with_coverage as u64);
+
+        features
+    }
+
+    /// Get the coverage as a bitmap suitable for AFL-style fuzzing.
+    /// Effect: pure — bitmap export.
+    pub fn export_afl_bitmap(&self) -> Array512<u8> [pure] {
+        var afl_map : Array512<u8> = Array512::new();
+
+        // AFL uses a 64KB bitmap; we map our coverage into it via hashing.
+        // loop: bounds[BOUND_LARGE] — bounded by block bitmap.
+        for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+            let byte : u8 = self.block_bitmap.get(i);
+            if byte != 0u8 {
+                // Hash the position to get an AFL bitmap index.
+                var hash : u32 = i;
+                hash ^= hash << 13u32;
+                hash ^= hash >> 17u32;
+                hash ^= hash << 5u32;
+                let afl_index : u32 = hash % 512u32;
+                let existing : u8 = afl_map.get(afl_index);
+                let new_val : u8 = if existing < 0xFFu8 { existing + 1u8 } else { 0xFFu8 };
+                let _ = afl_map.set(afl_index, new_val);
+            }
+        }
+
+        afl_map
+    }
+
+    /// Get the total hit count for all blocks (for fuzzing corpus scheduling).
+    /// Effect: pure — hit count sum.
+    pub fn total_hit_count(&self) -> u64 [pure] {
+        var total : u64 = 0u64;
+        // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+        for var i : u32 = 0u32; i < self.blocks.len(); i += 1u32 [self.blocks.len()] {
+            let block : BasicBlock = self.blocks.get(i);
+            total += block.hit_count as u64;
+        }
+        total
+    }
+
+    // ──────────────────────────────────────────
+    // Coverage Export (Human-Readable Format)
+    // ──────────────────────────────────────────
+
+    /// Export coverage in a simple text format.
+    /// Effect: io — text export.
+    pub fn export_text(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+        output.push_str(FixedString256::from("Coverage: "));
+        output.push_u32(self.blocks_hit);
+        output.push_str(FixedString256::from("/"));
+        output.push_u32(self.total_blocks);
+        output.push_str(FixedString256::from(" blocks, "));
+        output.push_u32(self.edges_hit);
+        output.push_str(FixedString256::from("/"));
+        output.push_u32(self.total_edges);
+        output.push_str(FixedString256::from(" edges\n"));
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by blocks.
+        for var i : u32 = 0u32; i < self.blocks.len(); i += 1u32 [self.blocks.len()] {
+            let block : BasicBlock = self.blocks.get(i);
+            output.push_str(if block.hit { FixedString256::from("  HIT ") } else { FixedString256::from("  MISS ") });
+            output.push_str(FixedString256::from_buffer(block.function_name));
+            output.push_str(FixedString256::from(" +0x"));
+            output.push_u64_hex(block.start_address);
+            output.push_str(FixedString256::from(" x"));
+            output.push_u32(block.hit_count);
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output
+    }
+
+    /// Generate a human-readable coverage report.
+    /// Effect: io — report generation.
+    pub fn generate_report(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("=== Coverage Report ===\n"));
+        output.push_str(FixedString256::from("Module: "));
+        output.push_str(FixedString256::from_buffer(self.module_name));
+        output.push_str(FixedString256::from("\n\n"));
+
+        output.push_str(FixedString256::from("Block Coverage: "));
+        output.push_u32(self.blocks_hit);
+        output.push_str(FixedString256::from(" / "));
+        output.push_u32(self.total_blocks);
+        output.push_str(FixedString256::from(" ("));
+        output.push_u32(self.overall_coverage_pct() as u32);
+        output.push_str(FixedString256::from("%)\n"));
+
+        output.push_str(FixedString256::from("Edge Coverage: "));
+        output.push_u32(self.edges_hit);
+        output.push_str(FixedString256::from(" / "));
+        output.push_u32(self.total_edges);
+        output.push_str(FixedString256::from(" ("));
+        output.push_u32(self.edge_coverage_pct() as u32);
+        output.push_str(FixedString256::from("%)\n\n"));
+
+        output.push_str(FixedString256::from("Function Coverage:\n"));
+        // loop: bounds[BOUND_MEDIUM] — bounded by functions.
+        for var i : u32 = 0u32; i < self.functions.len(); i += 1u32 [self.functions.len()] {
+            let func : FunctionCoverage = self.functions.get(i);
+            output.push_str(FixedString256::from("  "));
+            output.push_str(FixedString256::from_buffer(func.name));
+            output.push_str(FixedString256::from(": "));
+            output.push_u32(func.hit_blocks);
+            output.push_str(FixedString256::from("/"));
+            output.push_u32(func.block_count);
+            output.push_str(FixedString256::from("("));
+            output.push_u32(func.coverage_pct as u32);
+            output.push_str(FixedString256::from("%)\n"));
+            }
+
+            // Edge coverage section.
+            output.push_str(FixedString256::from("\nEdge Coverage Details:\n"));
+            // loop: bounds[BOUND_MEDIUM] — bounded by edges.
+            for var i : u32 = 0u32; i < self.edges.len(); i += 1u32 [self.edges.len()] {
+                let edge : CoverageEdge = self.edges.get(i);
+                output.push_str(FixedString256::from("  Edge "));
+                output.push_u32(edge.edge_id);
+                output.push_str(FixedString256::from(": B"));
+                output.push_u32(edge.source_block);
+                output.push_str(FixedString256::from(" -> B"));
+                output.push_u32(edge.target_block);
+                output.push_str(FixedString256::from(" ["));
+                output.push_str(if edge.hit { FixedString256::from("hit") } else { FixedString256::from("miss") });
+                output.push_str(FixedString256::from("] x"));
+                output.push_u32(edge.hit_count);
+                output.push_str(FixedString256::from("\n"));
+            }
+
+            // Summary.
+            output.push_str(FixedString256::from("\nCoverage Hash: 0x"));
+            output.push_u64_hex(self.coverage_hash());
+            output.push_str(FixedString256::from("\n"));
+
+            output
+        }
+    }
+
+// ──────────────────────────────────────────────
+// Coverage Manager Utility Functions
+// ──────────────────────────────────────────────
+
+/// Get the bit at a position in the coverage bitmap.
+/// Effect: pure — bitmap access.
+pub fn get_bitmap_bit(bitmap : Array512<u8>, bit_index : u32) -> bool [pure] {
+    let byte_index : u32 = bit_index / 8u32;
+    let bit_offset : u8 = (bit_index % 8u32) as u8;
+    if byte_index >= 512u32 {
+        return false;
+    }
+    (bitmap.get(byte_index) & (1u8 << bit_offset)) != 0u8
+}
+
+/// Set a bit in the coverage bitmap.
+/// Effect: pure — bitmap mutation.
+pub fn set_bitmap_bit(mut bitmap : Array512<u8>, bit_index : u32, value : bool) -> Array512<u8> [pure] {
+    let byte_index : u32 = bit_index / 8u32;
+    let bit_offset : u8 = (bit_index % 8u32) as u8;
+    if byte_index >= 512u32 {
+        return bitmap;
+    }
+    let mut byte : u8 = bitmap.get(byte_index);
+    if value {
+        byte |= 1u8 << bit_offset;
+    } else {
+        byte &= !(1u8 << bit_offset);
+    }
+    let _ = bitmap.set(byte_index, byte);
+    bitmap
+}
+
+/// Compute the Hamming weight of a bitmap (number of set bits).
+/// Effect: pure — population count.
+pub fn bitmap_popcount(bitmap : Array512<u8>, num_bytes : u32) -> u32 [pure] {
+    var count : u32 = 0u32;
+    // loop: bounds[BOUND_LARGE] — bounded by num_bytes.
+    for var i : u32 = 0u32; i < num_bytes && i < 512u32; i += 1u32 [num_bytes] {
+        let byte : u8 = bitmap.get(i);
+        // Count bits in byte.
+        var b : u8 = byte;
+        // loop: bounds[BOUND_SMALL] — 8 bits max.
+        loop: bounds[BOUND_SMALL] while b != 0u8 {
+            count += 1u32;
+            b &= b - 1u8;
+        }
+    }
+    count
+}
+
+/// XOR two coverage bitmaps (for detecting new coverage).
+/// Effect: pure — bitmap XOR.
+pub fn bitmap_xor(a : Array512<u8>, b : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    // loop: bounds[BOUND_LARGE] — bounded by bitmap size.
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let _ = result.push(a.get(i) ^ b.get(i));
+    }
+    result
+}
+
+/// AND two coverage bitmaps (intersection).
+/// Effect: pure — bitmap AND.
+pub fn bitmap_and(a : Array512<u8>, b : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    // loop: bounds[BOUND_LARGE] — bounded by bitmap size.
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let _ = result.push(a.get(i) & b.get(i));
+    }
+    result
+}
+
+/// Compute coverage similarity (Jaccard index) between two managers.
+/// Effect: pure — similarity computation.
+pub fn coverage_similarity(a : CoverageManager, b : CoverageManager) -> f64 [pure] {
+    let a_bits : u32 = bitmap_popcount(a.block_bitmap, 512u32);
+    let b_bits : u32 = bitmap_popcount(b.block_bitmap, 512u32);
+    let and_bits : u32 = bitmap_popcount(bitmap_and(a.block_bitmap, b.block_bitmap), 512u32);
+
+    let union_bits : u32 = a_bits + b_bits - and_bits;
+    if union_bits == 0u32 {
+        return 1.0f64;
+    }
+    and_bits as f64 / union_bits as f64
+}
+
+// ──────────────────────────────────────────────
+// Coverage Bitmap Serialization
+// ──────────────────────────────────────────────
+
+/// Serialize the coverage bitmap to a byte buffer for storage or transmission.
+/// Effect: pure — serialization.
+pub fn serialize_coverage_bitmap(bitmap : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    // Copy the entire bitmap.
+    // loop: bounds[BOUND_LARGE] — bounded by 512 bytes.
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let _ = result.push(bitmap.get(i));
+    }
+    result
+}
+
+/// Deserialize a coverage bitmap from a byte buffer.
+/// Effect: pure — deserialization.
+pub fn deserialize_coverage_bitmap(data : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    // loop: bounds[BOUND_LARGE] — bounded by 512 bytes.
+    for var i : u32 = 0u32; i < 512u32 && i < data.len(); i += 1u32 [512u32] {
+        let _ = result.push(data.get(i));
+    }
+    result
+}
+
+/// Compute a compressed representation of the bitmap (run-length encoded).
+/// Effect: pure — compression.
+pub fn compress_coverage_bitmap(bitmap : Array512<u8>) -> Array256<(u8, u8)> [pure] {
+    var result : Array256<(u8, u8)> = Array256::new();
+    var pos : u32 = 0u32;
+
+    // loop: bounds[BOUND_LARGE] — bounded by 512 bytes.
+    loop: bounds[BOUND_LARGE] while pos < 512u32 {
+        let byte : u8 = bitmap.get(pos);
+        var run : u8 = 1u8;
+        // Count consecutive identical bytes.
+        // loop: bounds[BOUND_MEDIUM] — bounded by remaining length.
+        loop: bounds[BOUND_MEDIUM] while (pos + run as u32) < 512u32 && run < 255u8 {
+            if bitmap.get(pos + run as u32) == byte {
+                run += 1u8;
+            } else {
+                break;
+            }
+        }
+        let _ = result.push((run, byte));
+        pos += run as u32;
+    }
+
+    result
+}
+
+/// Check if two coverage bitmaps are identical.
+/// Effect: pure — comparison.
+pub fn bitmaps_equal(a : Array512<u8>, b : Array512<u8>) -> bool [pure] {
+    // loop: bounds[BOUND_LARGE] — bounded by 512 bytes.
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        if a.get(i) != b.get(i) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Find the first differing byte between two bitmaps.
+/// Effect: pure — diff.
+pub fn bitmap_first_diff(a : Array512<u8>, b : Array512<u8>) -> u32 [pure] {
+    // loop: bounds[BOUND_LARGE] — bounded by 512 bytes.
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        if a.get(i) != b.get(i) {
+            return i;
+        }
+    }
+    512u32
+}
+
+/// Normalize a coverage bitmap (threshold-based filtering).
+pub fn normalize_bitmap(bitmap : Array512<u8>, threshold : u8) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let byte : u8 = bitmap.get(i);
+        if byte >= threshold {
+            let _ = result.push(0xFFu8);
+        } else {
+            let _ = result.push(0u8);
+        }
+    }
+    result
+}
+
+/// Union two bitmaps elementwise (max).
+pub fn bitmap_union_max(a : Array512<u8>, b : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let va : u8 = a.get(i);
+        let vb : u8 = b.get(i);
+        let _ = result.push(if va > vb { va } else { vb });
+    }
+    result
+}
+
+/// Subtract one bitmap from another.
+pub fn bitmap_subtract(a : Array512<u8>, b : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let va : u8 = a.get(i);
+        let vb : u8 = b.get(i);
+        let _ = result.push(if va > vb { va - vb } else { 0u8 });
+    }
+    result
+}
+
+/// Check if bitmap A covers everything bitmap B covers.
+pub fn bitmap_contains(a : Array512<u8>, b : Array512<u8>) -> bool [pure] {
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let va : u8 = a.get(i);
+        let vb : u8 = b.get(i);
+        if vb > va { return false; }
+        if vb > 0u8 && va == 0u8 { return false; }
+    }
+    true
+}
+
+/// Convert a hit count bitmap to a boolean bitmap.
+pub fn bitmap_to_boolean(bitmap : Array512<u8>) -> Array512<u8> [pure] {
+    var result : Array512<u8> = Array512::new();
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        let _ = result.push(if bitmap.get(i) > 0u8 { 1u8 } else { 0u8 });
+    }
+    result
+}
+
+/// Compute the coverage density (fraction of non-zero bytes).
+pub fn bitmap_density(bitmap : Array512<u8>) -> f64 [pure] {
+    var non_zero : u32 = 0u32;
+    for var i : u32 = 0u32; i < 512u32; i += 1u32 [512u32] {
+        if bitmap.get(i) != 0u8 { non_zero += 1u32; }
+    }
+    non_zero as f64 / 512.0f64
+}

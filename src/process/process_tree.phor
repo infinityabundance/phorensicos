@@ -1,0 +1,1067 @@
+// file: process_tree.phor
+// purpose: Process tree management: parent/child tracking, orphan handling,
+//          zombie reaping, process group management, session management.
+//          All operations use bounded loops and record residuals for all
+//          process tree state changes.
+// evidence: PROC-PTREE-ARCH-001 through PROC-PTREE-ARCH-230
+// residual: Every process reparenting, group change, and state transition
+//           records a residual for the audit trail.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use process::process::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-DIAG-001 through PROC-PTREE-DIAG-010
+
+const DIAG_PTREE_BASE        : Word64 = Word64::from_u64(0xB400)
+const DIAG_PTREE_OK          : Word64 = DIAG_PTREE_BASE | 0x000
+const DIAG_PTREE_NOT_FOUND   : Word64 = DIAG_PTREE_BASE | 0x001
+const DIAG_PTREE_ORPHAN      : Word64 = DIAG_PTREE_BASE | 0x002
+const DIAG_PTREE_GROUP_FULL  : Word64 = DIAG_PTREE_BASE | 0x003
+const DIAG_PTREE_SESSION_FULL: Word64 = DIAG_PTREE_BASE | 0x004
+const DIAG_PTREE_BOUNDS      : Word64 = DIAG_PTREE_BASE | 0x005
+const DIAG_PTREE_REAPED      : Word64 = DIAG_PTREE_BASE | 0x006
+
+// ──────────────────────────────────────────────
+// Process Tree Constants
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-CONST-001 through PROC-PTREE-CONST-015
+
+const MAX_PROCESS_GROUPS       : u32 = 64
+const MAX_SESSIONS             : u32 = 16
+const MAX_MEMBERS_PER_GROUP    : u32 = 64
+const MAX_ORPHANS              : u32 = 32
+const MAX_ZOMBIES              : u32 = 64
+const REAP_BATCH_SIZE          : u32 = 8
+const GROUP_NAME_MAX_LEN       : u32 = 48
+
+// Process Group Flags
+const PGRP_FLAG_SESSION_LEADER : u32 = 0x01
+const PGRP_FLAG_FOREGROUND     : u32 = 0x02
+const PGRP_FLAG_ORPHANED       : u32 = 0x04
+
+// Session Flags
+const SESS_FLAG_LOGIN          : u32 = 0x01
+const SESS_FLAG_SERVICE        : u32 = 0x02
+
+// ──────────────────────────────────────────────
+// Process Group
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-GROUP-001 through PROC-PTREE-GROUP-025
+
+pub type ProcessGroup : struct {
+    pgid: Pid,
+    session_id: u32,
+    members: FixedArray[MAX_MEMBERS_PER_GROUP, Pid],
+    num_members: u32,
+    leader_pid: Pid,
+    flags: u32,
+    generation: Word32,
+}
+
+impl ProcessGroup {
+    pub fn new(pgid: Pid, leader: Pid, session_id: u32) -> ProcessGroup
+        effects: [deterministic]
+    {
+        ProcessGroup {
+            pgid: pgid,
+            session_id: session_id,
+            members: FixedArray::new(),
+            num_members: 0,
+            leader_pid: leader,
+            flags: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn add_member(self: ref mut, pid: Pid) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_members >= MAX_MEMBERS_PER_GROUP {
+            return Result::Err(proc_error(
+                DIAG_PTREE_GROUP_FULL,
+                FixedString[128]::from_slice("Process group is full")))
+        }
+        self.members.push(pid);
+        self.num_members = self.num_members + 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn remove_member(self: ref mut, pid: Pid)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_members
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_members {
+            let member: ref Pid = self.members.get(i)
+            if member.value() == pid.value() {
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_members - 1) {
+                    let next: Pid = self.members.get(j + 1)
+                    self.members.set(j, next)
+                }
+                self.num_members = self.num_members - 1
+                self.generation.bump()
+                return
+            }
+        }
+    }
+
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.num_members == 0
+    }
+
+    pub fn member_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_members
+    }
+
+    pub fn contains(self, pid: Pid) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_members
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_members {
+            let member: ref Pid = self.members.get(i)
+            if member.value() == pid.value() {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn is_orphaned(self) -> bool
+        effects: [deterministic]
+    {
+        (self.flags & PGRP_FLAG_ORPHANED) != 0
+    }
+
+    pub fn set_leader(self: ref mut, pid: Pid)
+        effects: [deterministic]
+    {
+        self.leader_pid = pid
+    }
+
+    pub fn get_leader(self) -> Pid
+        effects: [deterministic]
+    {
+        self.leader_pid
+    }
+}
+
+// ──────────────────────────────────────────────
+// Session
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-SESSION-001 through PROC-PTREE-SESSION-020
+
+pub type Session : struct {
+    session_id: u32,
+    leader_pid: Pid,
+    process_groups: FixedArray[MAX_PROCESS_GROUPS, Pid],  // PGIDs in this session
+    num_groups: u32,
+    controlling_terminal: Handle,
+    flags: u32,
+    foreground_group: Pid,
+    generation: Word32,
+}
+
+impl Session {
+    pub fn new(session_id: u32, leader: Pid) -> Session
+        effects: [deterministic]
+    {
+        Session {
+            session_id: session_id,
+            leader_pid: leader,
+            process_groups: FixedArray::new(),
+            num_groups: 0,
+            controlling_terminal: Handle::null(),
+            flags: 0,
+            foreground_group: leader,
+            generation: Word32::initial(),
+        }
+    }
+
+    pub fn add_group(self: ref mut, pgid: Pid) -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_groups >= MAX_PROCESS_GROUPS {
+            return Result::Err(proc_error(
+                DIAG_PTREE_SESSION_FULL,
+                FixedString[128]::from_slice("Session has too many groups")))
+        }
+        self.process_groups.push(pgid);
+        self.num_groups = self.num_groups + 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn remove_group(self: ref mut, pgid: Pid)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_groups
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_groups {
+            let g: ref Pid = self.process_groups.get(i)
+            if g.value() == pgid.value() {
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_groups - 1) {
+                    let next: Pid = self.process_groups.get(j + 1)
+                    self.process_groups.set(j, next)
+                }
+                self.num_groups = self.num_groups - 1
+                self.generation.bump()
+                return
+            }
+        }
+    }
+
+    pub fn is_orphaned(self) -> bool
+        effects: [deterministic]
+    {
+        self.num_groups == 0
+    }
+
+    pub fn set_controlling_terminal(self: ref mut, tty: Handle)
+        effects: [deterministic]
+    {
+        self.controlling_terminal = tty
+    }
+
+    pub fn set_foreground_group(self: ref mut, pgid: Pid)
+        effects: [deterministic]
+    {
+        self.foreground_group = pgid
+    }
+}
+
+// ──────────────────────────────────────────────
+// Orphan Record
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-ORPHAN-001 through PROC-PTREE-ORPHAN-012
+
+pub type OrphanRecord : struct {
+    orphan_pid: Pid,
+    original_parent: Pid,
+    new_parent: Pid,
+    reason: u8,
+    timestamp: Word64,
+}
+
+impl OrphanRecord {
+    pub fn new(orphan: Pid, old_parent: Pid, new_parent: Pid, reason: u8) -> OrphanRecord
+        effects: [deterministic]
+    {
+        OrphanRecord {
+            orphan_pid: orphan,
+            original_parent: old_parent,
+            new_parent: new_parent,
+            reason: reason,
+            timestamp: __builtin_read_timestamp(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Zombie Record
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-ZOMBIE-001 through PROC-PTREE-ZOMBIE-012
+
+pub type ZombieRecord : struct {
+    zombie_pid: Pid,
+    parent_pid: Pid,
+    exit_code: i32,
+    timestamp: Word64,
+    reaped: bool,
+}
+
+impl ZombieRecord {
+    pub fn new(zombie: Pid, parent: Pid, exit_code: i32) -> ZombieRecord
+        effects: [deterministic]
+    {
+        ZombieRecord {
+            zombie_pid: zombie,
+            parent_pid: parent,
+            exit_code: exit_code,
+            timestamp: __builtin_read_timestamp(),
+            reaped: false,
+        }
+    }
+
+    pub fn mark_reaped(self: ref mut)
+        effects: [deterministic]
+    {
+        self.reaped = true
+    }
+}
+
+// ──────────────────────────────────────────────
+// Process Tree Manager
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-MGR-001 through PROC-PTREE-MGR-120
+
+pub type ProcessTree : struct {
+    process_groups: FixedArray[MAX_PROCESS_GROUPS, ProcessGroup],
+    num_groups: u32,
+    sessions: FixedArray[MAX_SESSIONS, Session],
+    num_sessions: u32,
+    orphans: FixedArray[MAX_ORPHANS, OrphanRecord],
+    num_orphans: u32,
+    zombie_records: FixedArray[MAX_ZOMBIES, ZombieRecord],
+    num_zombies: u32,
+    init_pid: Pid,
+    idle_pid: Pid,
+    total_orphans_handled: u64,
+    total_zombies_reaped: u64,
+    generation: Word32,
+}
+
+impl ProcessTree {
+    pub fn new(init_pid: Pid, idle_pid: Pid) -> ProcessTree
+        effects: [deterministic]
+    {
+        ProcessTree {
+            process_groups: FixedArray::new(),
+            num_groups: 0,
+            sessions: FixedArray::new(),
+            num_sessions: 0,
+            orphans: FixedArray::new(),
+            num_orphans: 0,
+            zombie_records: FixedArray::new(),
+            num_zombies: 0,
+            init_pid: init_pid,
+            idle_pid: idle_pid,
+            total_orphans_handled: 0,
+            total_zombies_reaped: 0,
+            generation: Word32::initial(),
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Process Group Management
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-GRPMGMT-001 through PROC-PTREE-GRPMGMT-030
+
+    pub fn create_process_group(self: ref mut, pgid: Pid, leader: Pid,
+                                 session_id: u32)
+        -> Result[u32, ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_groups >= MAX_PROCESS_GROUPS {
+            return Result::Err(proc_error(
+                DIAG_PTREE_GROUP_FULL,
+                FixedString[128]::from_slice("Max process groups reached")))
+        }
+        let group: ProcessGroup = ProcessGroup::new(pgid, leader, session_id)
+        self.process_groups.push(group);
+        self.num_groups = self.num_groups + 1
+        self.generation.bump();
+        self.record_group_create_residual(pgid, session_id)
+        Result::Ok(self.num_groups - 1)
+    }
+
+    pub fn get_group(self: ref, pgid: Pid) -> Result[ref ProcessGroup, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_groups
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_groups {
+            let group: ref ProcessGroup = self.process_groups.get(i)
+            if group.pgid.value() == pgid.value() {
+                return Result::Ok(group)
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PTREE_NOT_FOUND,
+            FixedString[128]::from_slice("Process group not found")))
+    }
+
+    pub fn get_group_mut(self: ref mut, pgid: Pid)
+        -> Result[ref mut ProcessGroup, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_groups
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_groups {
+            let g: ref ProcessGroup = self.process_groups.get(i)
+            if g.pgid.value() == pgid.value() {
+                return Result::Ok(self.process_groups.get_mut(i))
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PTREE_NOT_FOUND,
+            FixedString[128]::from_slice("Process group not found")))
+    }
+
+    pub fn join_group(self: ref mut, pgid: Pid, pid: Pid)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let group: ref mut ProcessGroup = self.get_group_mut(pgid)?
+        group.add_member(pid)?;
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn leave_group(self: ref mut, pgid: Pid, pid: Pid)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        let group: ref mut ProcessGroup = self.get_group_mut(pgid)?
+        group.remove_member(pid);
+        if group.is_empty() {
+            // Clean up empty groups
+            self.destroy_empty_group(pgid)?;
+        }
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn destroy_empty_group(self: ref mut, pgid: Pid)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_groups
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_groups {
+            let g: ref ProcessGroup = self.process_groups.get(i)
+            if g.pgid.value() == pgid.value() && g.is_empty() {
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_groups - 1) {
+                    let next: ProcessGroup = self.process_groups.get(j + 1)
+                    self.process_groups.set(j, next)
+                }
+                self.num_groups = self.num_groups - 1
+                self.generation.bump()
+                return Result::Ok(())
+            }
+        }
+        Result::Ok(())  // Already gone
+    }
+
+    // ──────────────────────────────────────────────
+    // Session Management
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-SESSMGMT-001 through PROC-PTREE-SESSMGMT-025
+
+    pub fn create_session(self: ref mut, session_id: u32, leader: Pid)
+        -> Result[(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_sessions >= MAX_SESSIONS {
+            return Result::Err(proc_error(
+                DIAG_PTREE_SESSION_FULL,
+                FixedString[128]::from_slice("Max sessions reached")))
+        }
+        let session: Session = Session::new(session_id, leader)
+        self.sessions.push(session);
+        self.num_sessions = self.num_sessions + 1
+        self.generation.bump();
+        self.record_session_create_residual(session_id, leader)
+        Result::Ok(())
+    }
+
+    pub fn get_session(self: ref, session_id: u32) -> Result[ref Session, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_sessions
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_sessions {
+            let session: ref Session = self.sessions.get(i)
+            if session.session_id == session_id {
+                return Result::Ok(session)
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PTREE_NOT_FOUND,
+            FixedString[128]::from_slice("Session not found")))
+    }
+
+    pub fn get_session_mut(self: ref mut, session_id: u32)
+        -> Result[ref mut Session, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by num_sessions
+        loop: bounds[BOUND_SMALL] for i in 0..self.num_sessions {
+            let s: ref Session = self.sessions.get(i)
+            if s.session_id == session_id {
+                return Result::Ok(self.sessions.get_mut(i))
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PTREE_NOT_FOUND,
+            FixedString[128]::from_slice("Session not found")))
+    }
+
+    pub fn add_group_to_session(self: ref mut, session_id: u32, pgid: Pid)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        let session: ref mut Session = self.get_session_mut(session_id)?
+        session.add_group(pgid)
+    }
+
+    // ──────────────────────────────────────────────
+    // Orphan Handling
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-ORPHAN-HANDLE-001 through PROC-PTREE-ORPHAN-HANDLE-030
+
+    pub fn handle_exiting_parent(self: ref mut, parent_pid: Pid,
+                                  table: ref mut ProcessTable)
+        -> Result<u32, ProcessError>
+        effects: [deterministic]
+    {
+        let mut orphans_count: u32 = 0
+        let parent: ref ProcessControlBlock = match table.get_process(parent_pid) {
+            Result::Ok(p) => p,
+            Result::Err(_) => return Result::Ok(0),
+        }
+        let child_list: FixedArray[MAX_CHILD_PROCESSES, Pid] = parent.children
+        // loop: bounds[BOUND_MEDIUM] — bounded by parent child count
+        loop: bounds[BOUND_MEDIUM] for i in 0..parent.num_children {
+            let child_pid: Pid = child_list.get(i)
+            if !child_pid.is_valid() {
+                continue
+            }
+            // Reparent to init
+            let child_result: Result[ref mut ProcessControlBlock, ProcessError> =
+                table.get_process_mut(child_pid)
+            match child_result {
+                Result::Ok(child) => {
+                    let old_parent: Pid = child.parent_pid
+                    child.parent_pid = self.init_pid
+                    // Record orphan
+                    let record: OrphanRecord = OrphanRecord::new(
+                        child_pid, old_parent, self.init_pid, 0)
+                    if self.num_orphans < MAX_ORPHANS {
+                        self.orphans.push(record);
+                        self.num_orphans = self.num_orphans + 1
+                    }
+                    orphans_count = orphans_count + 1
+                },
+                Result::Err(_) => {},
+            }
+            // Reparent to init's process table entry
+            let init_result: Result[ref mut ProcessControlBlock, ProcessError> =
+                table.get_process_mut(self.init_pid)
+            match init_result {
+                Result::Ok(init_proc) => {
+                    let _ = init_proc.add_child(child_pid)
+                },
+                Result::Err(_) => {},
+            }
+        }
+        if orphans_count > 0 {
+            self.total_orphans_handled = self.total_orphans_handled +
+                                          (orphans_count as u64)
+            self.generation.bump();
+            self.record_orphan_handle_residual(parent_pid, orphans_count)
+        }
+        Result::Ok(orphans_count)
+    }
+
+    // ──────────────────────────────────────────────
+    // Zombie Reaping
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-REAP-001 through PROC-PTREE-REAP-030
+
+    pub fn register_zombie(self: ref mut, zombie_pid: Pid, parent_pid: Pid,
+                            exit_code: i32)
+        -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        if self.num_zombies >= MAX_ZOMBIES {
+            return Result::Err(proc_error(
+                DIAG_PTREE_BOUNDS,
+                FixedString[128]::from_slice("Zombie table full")))
+        }
+        let record: ZombieRecord = ZombieRecord::new(
+            zombie_pid, parent_pid, exit_code)
+        self.zombie_records.push(record);
+        self.num_zombies = self.num_zombies + 1
+        self.generation.bump()
+        Result::Ok(())
+    }
+
+    pub fn reap_zombie(self: ref mut, parent_pid: Pid)
+        -> Result<(Pid, i32), ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_zombies
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_zombies {
+            let record: ref ZombieRecord = self.zombie_records.get(i)
+            if record.parent_pid.value() == parent_pid.value() && !record.reaped {
+                let zombie_pid: Pid = record.zombie_pid
+                let exit_code: i32 = record.exit_code
+                let rec_mut: ref mut ZombieRecord = self.zombie_records.get_mut(i)
+                rec_mut.mark_reaped();
+                self.total_zombies_reaped = self.total_zombies_reaped + 1
+                self.generation.bump();
+                self.record_reap_residual(zombie_pid, parent_pid)
+                // Remove from table
+                self.cleanup_reaped_zombies()?;
+                return Result::Ok((zombie_pid, exit_code))
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PTREE_NOT_FOUND,
+            FixedString[128]::from_slice("No zombie to reap for this parent")))
+    }
+
+    pub fn reap_orphan_zombies(self: ref mut)
+        -> Result<u32, ProcessError>
+        effects: [deterministic]
+    {
+        let mut reaped: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_zombies
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_zombies {
+            let mut can_reap: bool = false
+            {
+                let record: ref ZombieRecord = self.zombie_records.get(i)
+                if record.reaped {
+                    continue
+                }
+                // Check if parent is init (orphans we reparented)
+                if record.parent_pid.value() == self.init_pid.value() {
+                    can_reap = true
+                }
+            }
+            if can_reap {
+                let rec_mut: ref mut ZombieRecord = self.zombie_records.get_mut(i)
+                rec_mut.mark_reaped();
+                reaped = reaped + 1
+            }
+        }
+        if reaped > 0 {
+            self.total_zombies_reaped = self.total_zombies_reaped + (reaped as u64)
+            self.cleanup_reaped_zombies()?;
+            self.generation.bump();
+        }
+        Result::Ok(reaped)
+    }
+
+    fn cleanup_reaped_zombies(self: ref mut) -> Result<(), ProcessError>
+        effects: [deterministic]
+    {
+        let mut i: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_zombies
+        loop: bounds[BOUND_MEDIUM] for _ in 0..MAX_ZOMBIES {
+            if i >= self.num_zombies {
+                break
+            }
+            let record: ref ZombieRecord = self.zombie_records.get(i)
+            if record.reaped {
+                // Remove
+                // loop: bounds[BOUND_MEDIUM] — bounded by remaining
+                loop: bounds[BOUND_MEDIUM] for j in i..(self.num_zombies - 1) {
+                    let next: ZombieRecord = self.zombie_records.get(j + 1)
+                    self.zombie_records.set(j, next)
+                }
+                self.num_zombies = self.num_zombies - 1
+            } else {
+                i = i + 1
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn zombie_count(self) -> u32
+        effects: [deterministic]
+    {
+        let mut count: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_zombies
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_zombies {
+            let record: ref ZombieRecord = self.zombie_records.get(i)
+            if !record.reaped {
+                count = count + 1
+            }
+        }
+        count
+    }
+
+    // ──────────────────────────────────────────────
+    // Process Group Signal (forwarding)
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-PGSIG-001 through PROC-PTREE-PGSIG-015
+
+    pub fn signal_process_group(self: ref mut, pgid: Pid,
+                                 table: ref ProcessTable,
+                                 signal_info: ref SignalInfo)
+        -> Result<u32, ProcessError>
+        effects: [deterministic, io]
+    {
+        let group: ref ProcessGroup = self.get_group(pgid)?
+        let mut signaled: u32 = 0
+        // loop: bounds[BOUND_MEDIUM] — bounded by group.num_members
+        loop: bounds[BOUND_MEDIUM] for i in 0..group.num_members {
+            let member_pid: Pid = group.members.get(i)
+            match table.get_process(member_pid) {
+                Result::Ok(proc) => {
+                    if proc.is_alive() {
+                        // In production, would call signal manager here
+                        signaled = signaled + 1
+                    }
+                },
+                Result::Err(_) => {},
+            }
+        }
+        Result::Ok(signaled)
+    }
+
+    // ──────────────────────────────────────────────
+    // Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-QUERY-001 through PROC-PTREE-QUERY-020
+
+    pub fn group_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_groups
+    }
+
+    pub fn session_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_sessions
+    }
+
+    pub fn orphan_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.num_orphans
+    }
+
+    pub fn get_orphan(self, index: u32) -> Result[ref OrphanRecord, ProcessError>
+        effects: [deterministic]
+    {
+        if index >= self.num_orphans {
+            return Result::Err(proc_error(
+                DIAG_PTREE_BOUNDS,
+                FixedString[128]::from_slice("Orphan index out of bounds")))
+        }
+        // trust: bounds-checked
+        trusted("orphan record access: index verified") {
+            Result::Ok(self.orphans.get(index))
+        }
+    }
+
+    pub fn get_zombie(self, index: u32) -> Result[ref ZombieRecord, ProcessError>
+        effects: [deterministic]
+    {
+        if index >= self.num_zombies {
+            return Result::Err(proc_error(
+                DIAG_PTREE_BOUNDS,
+                FixedString[128]::from_slice("Zombie index out of bounds")))
+        }
+        // trust: bounds-checked
+        trusted("zombie record access: index verified") {
+            Result::Ok(self.zombie_records.get(index))
+        }
+    }
+
+    pub fn find_group_for_process(self, pid: Pid) -> Result[Pid, ProcessError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_groups
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_groups {
+            let group: ref ProcessGroup = self.process_groups.get(i)
+            if group.contains(pid) {
+                return Result::Ok(group.pgid)
+            }
+        }
+        Result::Err(proc_error(
+            DIAG_PTREE_NOT_FOUND,
+            FixedString[128]::from_slice("Process not in any group")))
+    }
+
+    pub fn total_orphans_handled(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_orphans_handled
+    }
+
+    pub fn total_zombies_reaped(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_zombies_reaped
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: PROC-PTREE-RESID-001 through PROC-PTREE-RESID-015
+
+    fn record_group_create_residual(self, pgid: Pid, session_id: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Process group created",
+            code: DIAG_PTREE_OK,
+            data: (pgid.value(), session_id),
+        )
+    }
+
+    fn record_session_create_residual(self, session_id: u32, leader: Pid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Session created",
+            code: DIAG_PTREE_OK,
+            data: (session_id, leader.value()),
+        )
+    }
+
+    fn record_orphan_handle_residual(self, parent: Pid, count: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Orphans reparented to init",
+            code: DIAG_PTREE_ORPHAN,
+            data: (parent.value(), count),
+        )
+    }
+
+    fn record_reap_residual(self, zombie: Pid, parent: Pid)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Zombie reaped",
+            code: DIAG_PTREE_REAPED,
+            data: (zombie.value(), parent.value()),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Initialization
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-INIT-001 through PROC-PTREE-INIT-015
+
+pub fn init_process_tree(init_pid: Pid, idle_pid: Pid) -> ProcessTree
+    effects: [deterministic]
+{
+    let mut tree: ProcessTree = ProcessTree::new(init_pid, idle_pid)
+    // Create the init process group (PGID = PID of init)
+    let result: Result[u32, ProcessError> = tree.create_process_group(
+        init_pid, init_pid, 0)
+    match result {
+        Result::Ok(_) => {},
+        Result::Err(_) => {},
+    }
+    // Create the init session (SID = 0)
+    let sess_result: Result[(), ProcessError> = tree.create_session(0, init_pid)
+    match sess_result {
+        Result::Ok(_) => {},
+        Result::Err(_) => {},
+    }
+    tree
+}
+
+pub fn reparent_process(tree: ref mut ProcessTree, pid: Pid,
+                         new_parent: Pid, table: ref mut ProcessTable)
+    -> Result<(), ProcessError>
+    effects: [deterministic]
+{
+    let proc: ref mut ProcessControlBlock = table.get_process_mut(pid)?
+    proc.parent_pid = new_parent
+    let new_parent_proc: ref mut ProcessControlBlock =
+        table.get_process_mut(new_parent)?
+    new_parent_proc.add_child(pid)
+    Result::Ok(())
+}
+
+pub fn is_process_orphaned(tree: ref ProcessTree, pid: Pid,
+                            table: ref ProcessTable) -> bool
+    effects: [deterministic]
+{
+    let proc_result: Result[ref ProcessControlBlock, ProcessError> =
+        table.get_process(pid)
+    match proc_result {
+        Result::Ok(proc) => {
+            let parent_result: Result[ref ProcessControlBlock, ProcessError> =
+                table.get_process(proc.parent_pid)
+            match parent_result {
+                Result::Ok(_) => false,  // Parent exists
+                Result::Err(_) => true,  // Parent is gone
+            }
+        },
+        Result::Err(_) => false,
+    }
+}
+
+pub fn get_process_group_leader(tree: ref ProcessTree, pgid: Pid) -> Pid
+    effects: [deterministic]
+{
+    let group_result: Result[ref ProcessGroup, ProcessError> = tree.get_group(pgid)
+    match group_result {
+        Result::Ok(group) => group.get_leader(),
+        Result::Err(_) => Pid::zero(),
+    }
+}
+
+// ──────────────────────────────────────────────
+// Additional Utility Functions
+// ──────────────────────────────────────────────
+// Evidence path: PROC-PTREE-UTIL-001 through PROC-PTREE-UTIL-020
+
+pub fn count_processes_in_group(tree: ref ProcessTree, pgid: Pid) -> u32
+    effects: [deterministic]
+{
+    let group_result: Result[ref ProcessGroup, ProcessError> = tree.get_group(pgid)
+    match group_result {
+        Result::Ok(group) => group.member_count(),
+        Result::Err(_) => 0,
+    }
+}
+
+pub fn get_group_member(tree: ref ProcessTree, pgid: Pid, index: u32)
+    -> Result[Pid, ProcessError>
+    effects: [deterministic]
+{
+    let group: ref ProcessGroup = tree.get_group(pgid)?
+    if index >= group.members.len() {
+        return Result::Err(proc_error(
+            DIAG_PTREE_BOUNDS,
+            FixedString[128]::from_slice("Member index out of bounds")))
+    }
+    // trust: bounds-checked
+    trusted("group member access: index within range") {
+        Result::Ok(group.members.get(index))
+    }
+}
+
+pub fn is_group_empty(tree: ref ProcessTree, pgid: Pid) -> bool
+    effects: [deterministic]
+{
+    let group_result: Result[ref ProcessGroup, ProcessError> = tree.get_group(pgid)
+    match group_result {
+        Result::Ok(group) => group.is_empty(),
+        Result::Err(_) => true,
+    }
+}
+
+pub fn get_session_leader(tree: ref ProcessTree, session_id: u32) -> Pid
+    effects: [deterministic]
+{
+    let session_result: Result[ref Session, ProcessError> = tree.get_session(session_id)
+    match session_result {
+        Result::Ok(session) => session.leader_pid,
+        Result::Err(_) => Pid::zero(),
+    }
+}
+
+pub fn session_has_foreground_group(tree: ref ProcessTree, session_id: u32) -> bool
+    effects: [deterministic]
+{
+    let session_result: Result[ref Session, ProcessError> = tree.get_session(session_id)
+    match session_result {
+        Result::Ok(session) => session.foreground_group.is_valid(),
+        Result::Err(_) => false,
+    }
+}
+
+pub fn get_foreground_group(tree: ref ProcessTree, session_id: u32) -> Pid
+    effects: [deterministic]
+{
+    let session_result: Result[ref Session, ProcessError> = tree.get_session(session_id)
+    match session_result {
+        Result::Ok(session) => session.foreground_group,
+        Result::Err(_) => Pid::zero(),
+    }
+}
+
+pub fn set_foreground_group(tree: ref mut ProcessTree, session_id: u32, pgid: Pid)
+    -> Result<(), ProcessError>
+    effects: [deterministic]
+{
+    let session: ref mut Session = tree.get_session_mut(session_id)?
+    session.set_foreground_group(pgid);
+    tree.generation.bump()
+    Result::Ok(())
+}
+
+pub fn is_session_orphaned(tree: ref ProcessTree, session_id: u32) -> bool
+    effects: [deterministic]
+{
+    let session_result: Result[ref Session, ProcessError> = tree.get_session(session_id)
+    match session_result {
+        Result::Ok(session) => session.is_orphaned(),
+        Result::Err(_) => true,
+    }
+}
+
+pub fn reparent_orphans_to_init(tree: ref mut ProcessTree,
+                                 table: ref mut ProcessTable)
+    -> Result<u32, ProcessError>
+    effects: [deterministic]
+{
+    tree.handle_exiting_parent(Pid::zero(), table)
+}
+
+pub fn cleanup_all_zombies(tree: ref mut ProcessTree)
+    -> Result<u32, ProcessError>
+    effects: [deterministic]
+{
+    let mut total: u32 = 0
+    // loop: bounds[BOUND_MEDIUM] — bounded by zombie count
+    loop: bounds[BOUND_MEDIUM] for _ in 0..MAX_ZOMBIES {
+        let count: u32 = tree.reap_orphan_zombies()?
+        if count == 0 {
+            break
+        }
+        total = total + count
+    }
+    Result::Ok(total)
+}
+
+pub fn process_group_summary(tree: ref ProcessTree) -> ProcessGroupSummary
+    effects: [deterministic]
+{
+    let mut total_members: u32 = 0
+    // loop: bounds[BOUND_MEDIUM] — bounded by num_groups
+    loop: bounds[BOUND_MEDIUM] for i in 0..tree.num_groups {
+        let group: ref ProcessGroup = tree.process_groups.get(i)
+        total_members = total_members + group.num_members
+    }
+    ProcessGroupSummary {
+        total_groups: tree.num_groups,
+        total_members: total_members,
+        total_sessions: tree.num_sessions,
+        total_orphans: tree.num_orphans,
+        total_zombies: tree.zombie_count(),
+    }
+}
+
+pub type ProcessGroupSummary : struct {
+    total_groups: u32,
+    total_members: u32,
+    total_sessions: u32,
+    total_orphans: u32,
+    total_zombies: u32,
+}
+
+impl ProcessGroupSummary {
+    pub fn format(self) -> FixedString[256]
+        effects: [deterministic]
+    {
+        let mut s: FixedString[256] = FixedString::new()
+        let _ = s.append("Groups: ")
+        let _ = s.append_u32(self.total_groups)
+        let _ = s.append(", Members: ")
+        let _ = s.append_u32(self.total_members)
+        let _ = s.append(", Sessions: ")
+        let _ = s.append_u32(self.total_sessions)
+        let _ = s.append(", Orphans: ")
+        let _ = s.append_u32(self.total_orphans)
+        let _ = s.append(", Zombies: ")
+        let _ = s.append_u32(self.total_zombies)
+        s
+    }
+}

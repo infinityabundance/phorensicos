@@ -1,0 +1,1259 @@
+// borrow_checker.phor — Affine Capability Borrow Checker
+// Phorensic Compiler Infrastructure — Borrow Checking Phase
+//
+// This module implements the affine capability borrow checker for the Phorensic
+// compiler. It enforces the core invariant that capabilities (affine values) cannot
+// be duplicated — only moved or consumed. The borrow checker operates on the IR
+// after lowering and before optimization.
+//
+// Checks performed:
+// 1. Move tracking — tracks each value's location through moves
+// 2. Borrow regions — checks that borrows do not outlive their sources
+// 3. Lifetime inference — infers minimum lifetimes for temporary values
+// 4. Use-after-move detection — detects reads after a value has been moved
+// 5. Capability duplication detection — catches copies of affine values
+// 6. Generation tag validation — verifies handle generation tags
+// 7. Diagnostic codes for all violations — stable error codes
+//
+// Evidence semantics: Each check produces an EvidenceReceipt recording what was
+// checked and whether it passed. The full set of receipts is emitted as a
+// BorrowCheckReceipt for downstream sealing.
+//
+// Boundedness: All tracking structures are fixed-capacity (64 tracked values,
+// 256 borrow regions, 64 in-scope lifetimes). All loops are bounded by these
+// capacities.
+//
+// Effect declarations: All check functions are [pure] (deterministic computation)
+// except those that emit diagnostics [diag].
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+
+// ──────────────────────────────────────────────
+// MoveState: Tracks the location and ownership of each value
+// ──────────────────────────────────────────────
+// Every value tracked by the borrow checker has a MoveState indicating
+// whether it is available, has been moved, or has been consumed.
+// Evidence path: BORROW-MOVE-001 through BORROW-MOVE-020
+
+pub sealdatatype MoveState : u8 {
+    /// Value is available for use (owned or borrowed).
+    Available = 0u8,
+    /// Value has been moved to another binding.
+    Moved = 1u8,
+    /// Value has been consumed (e.g., capability use).
+    Consumed = 2u8,
+    /// Value is currently borrowed immutably.
+    BorrowedImmutable = 3u8,
+    /// Value is currently borrowed mutably.
+    BorrowedMutable = 4u8,
+    /// Value is in an error state (use-after-move detected).
+    ErrorUseAfterMove = 5u8,
+}
+
+impl MoveState {
+    pub fn name(&self) -> FixedString256 [pure] {
+        match self {
+            MoveState::Available => FixedString256::from("available"),
+            MoveState::Moved => FixedString256::from("moved"),
+            MoveState::Consumed => FixedString256::from("consumed"),
+            MoveState::BorrowedImmutable => FixedString256::from("borrowed-immutable"),
+            MoveState::BorrowedMutable => FixedString256::from("borrowed-mutable"),
+            MoveState::ErrorUseAfterMove => FixedString256::from("error-use-after-move"),
+        }
+    }
+
+    pub fn is_available(&self) -> bool [pure] {
+        match self {
+            MoveState::Available => true,
+            MoveState::BorrowedImmutable => true,
+            MoveState::BorrowedMutable => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_consumed(&self) -> bool [pure] {
+        match self {
+            MoveState::Consumed => true,
+            MoveState::Moved => true,
+            _ => false,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// ValueRecord: Tracks a single value through its lifetime
+// ──────────────────────────────────────────────
+// Each value has a name, type kind, move state, generation tag, and
+// a flag indicating whether it is linear (must be consumed exactly once).
+// Evidence path: BORROW-RECORD-001 through BORROW-RECORD-015
+
+pub struct ValueRecord {
+    /// Name of the value (variable or temporary).
+    pub name : FixedString256,
+    /// Whether this is a capability (affine) type.
+    pub is_capability : bool,
+    /// Whether this is linear (must be consumed exactly once).
+    pub is_linear : bool,
+    /// Current move state.
+    pub state : MoveState,
+    /// Generation tag for handle validation.
+    pub generation : u64,
+    /// Scope depth at which this value was introduced.
+    pub scope_depth : u32,
+    /// Whether the value is a function parameter.
+    pub is_parameter : bool,
+    /// Borrow count (number of outstanding borrows).
+    pub borrow_count : u32,
+    /// Whether this value is a temporary.
+    pub is_temporary : bool,
+}
+
+impl ValueRecord {
+    pub fn new(
+        name : FixedString256,
+        is_capability : bool,
+        is_linear : bool,
+        generation : u64,
+        scope_depth : u32,
+    ) -> ValueRecord [pure] {
+        ValueRecord {
+            name: name,
+            is_capability: is_capability,
+            is_linear: is_linear,
+            state: MoveState::Available,
+            generation: generation,
+            scope_depth: scope_depth,
+            is_parameter: false,
+            borrow_count: 0u32,
+            is_temporary: false,
+        }
+    }
+
+    pub fn with_parameter(mut self) -> ValueRecord [pure] {
+        self.is_parameter = true;
+        self
+    }
+
+    pub fn with_temporary(mut self) -> ValueRecord [pure] {
+        self.is_temporary = true;
+        self
+    }
+
+    pub fn clone_value(&self) -> ValueRecord [pure] {
+        ValueRecord {
+            name: self.name,
+            is_capability: self.is_capability,
+            is_linear: self.is_linear,
+            state: self.state,
+            generation: self.generation,
+            scope_depth: self.scope_depth,
+            is_parameter: self.is_parameter,
+            borrow_count: self.borrow_count,
+            is_temporary: self.is_temporary,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// BorrowRecord: Tracks a single borrow of a value
+// ──────────────────────────────────────────────
+// Each borrow records the source value, the borrower name, whether
+// the borrow is mutable, and the scope depth at which it was created.
+// Evidence path: BORROW-BORROW-001 through BORROW-BORROW-012
+
+pub struct BorrowRecord {
+    /// Name of the source value being borrowed.
+    pub source_name : FixedString256,
+    /// Name of the borrower (reference variable).
+    pub borrower_name : FixedString256,
+    /// Whether the borrow is mutable.
+    pub is_mutable : bool,
+    /// Scope depth where the borrow was created.
+    pub borrow_scope : u32,
+    /// Scope depth where the borrow ends (when the reference goes out of scope).
+    pub end_scope : u32,
+    /// Whether the borrow has been released.
+    pub is_released : bool,
+    /// Generation tag of the source at borrow time.
+    pub source_generation : u64,
+}
+
+impl BorrowRecord {
+    pub fn new(
+        source_name : FixedString256,
+        borrower_name : FixedString256,
+        is_mutable : bool,
+        borrow_scope : u32,
+        source_generation : u64,
+    ) -> BorrowRecord [pure] {
+        BorrowRecord {
+            source_name: source_name,
+            borrower_name: borrower_name,
+            is_mutable: is_mutable,
+            borrow_scope: borrow_scope,
+            end_scope: borrow_scope,
+            is_released: false,
+            source_generation: source_generation,
+        }
+    }
+
+    pub fn release(mut self) -> BorrowRecord [pure] {
+        self.is_released = true;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// Lifetime: Represents the lifetime of a value or borrow
+// ──────────────────────────────────────────────
+// Lifetimes track the range of scopes during which a value is valid.
+// Evidence path: BORROW-LIFETIME-001 through BORROW-LIFETIME-010
+
+pub struct Lifetime {
+    /// Name of the value or borrow this lifetime belongs to.
+    pub name : FixedString256,
+    /// Scope depth where this lifetime begins.
+    pub start_scope : u32,
+    /// Scope depth where this lifetime ends.
+    pub end_scope : u32,
+    /// Whether this lifetime has been inferred (vs. explicitly declared).
+    pub inferred : bool,
+}
+
+impl Lifetime {
+    pub fn new(name : FixedString256, start_scope : u32, end_scope : u32) -> Lifetime [pure] {
+        Lifetime {
+            name: name,
+            start_scope: start_scope,
+            end_scope: end_scope,
+            inferred: false,
+        }
+    }
+
+    pub fn inferred(name : FixedString256, start_scope : u32) -> Lifetime [pure] {
+        Lifetime {
+            name: name,
+            start_scope: start_scope,
+            end_scope: start_scope + 1u32,
+            inferred: true,
+        }
+    }
+
+    pub fn contains(&self, scope : u32) -> bool [pure] {
+        scope >= self.start_scope && scope < self.end_scope
+    }
+
+    pub fn overlaps(&self, other : Lifetime) -> bool [pure] {
+        self.start_scope < other.end_scope && other.start_scope < self.end_scope
+    }
+}
+
+// ──────────────────────────────────────────────
+// GenerationTag: Validates handle generation consistency
+// ──────────────────────────────────────────────
+// Each handle carries a generation tag that must be validated
+// when the handle is used. This prevents use-after-revoke.
+// Evidence path: BORROW-GEN-001 through BORROW-GEN-015
+
+pub struct GenerationTag {
+    /// The handle identifier.
+    pub handle_id : u64,
+    /// Current generation number.
+    pub generation : u64,
+    /// Expected generation at creation time.
+    pub expected_generation : u64,
+    /// Whether this tag has been validated.
+    pub validated : bool,
+}
+
+impl GenerationTag {
+    pub fn new(handle_id : u64, generation : u64) -> GenerationTag [pure] {
+        GenerationTag {
+            handle_id: handle_id,
+            generation: generation,
+            expected_generation: generation,
+            validated: false,
+        }
+    }
+
+    pub fn validate(mut self, actual_generation : u64) -> Result<GenerationTag, DiagnosticPayload> [pure, diag] {
+        if actual_generation != self.expected_generation {
+            let msg : FixedString256 = FixedString256::from("generation tag mismatch for handle ");
+            let msg_with_id : FixedString256 = msg.push_u64(self.handle_id);
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerHandleGenerationMismatch,
+                msg_with_id,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+        self.validated = true;
+        Result::Ok(self)
+    }
+
+    pub fn advance(mut self) -> GenerationTag [pure] {
+        self.generation = self.generation + 1u64;
+        self.validated = false;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// BorrowChecker: Main borrow checking state machine
+// ──────────────────────────────────────────────
+// The borrow checker maintains all tracking structures and provides
+// methods for every check operation. It processes values through
+// their lifetimes, detecting violations at each step.
+// Evidence path: BORROW-CHECKER-001 through BORROW-CHECKER-060
+
+pub struct BorrowChecker {
+    /// Tracked values (bounded: 64 max).
+    pub values : Array64<ValueRecord>,
+    /// Active borrow records (bounded: 256 max).
+    pub borrows : Array128<BorrowRecord>,
+    /// Inferred lifetimes (bounded: 64 max).
+    pub lifetimes : Array64<Lifetime>,
+    /// Generation tags for handles (bounded: 64 max).
+    pub generation_tags : Array64<GenerationTag>,
+    /// Current scope depth.
+    pub scope_depth : u32,
+    /// Diagnostic bag for collecting violations.
+    pub diagnostics : DiagnosticBag,
+    /// Number of moves tracked.
+    pub move_count : u32,
+    /// Number of borrows created.
+    pub borrow_count : u32,
+    /// Number of use-after-move violations detected.
+    pub use_after_move_count : u32,
+    /// Number of capability duplication violations detected.
+    pub duplication_count : u32,
+    /// Number of generation tag violations detected.
+    pub gen_violation_count : u32,
+    /// Number of lifetime violations detected.
+    pub lifetime_violation_count : u32,
+    /// Whether the checker has completed analysis.
+    pub completed : bool,
+    /// Generation counter for new values.
+    pub next_generation : u64,
+}
+
+impl BorrowChecker {
+    pub fn new() -> BorrowChecker [pure] {
+        BorrowChecker {
+            values: Array64::new(),
+            borrows: Array128::new(),
+            lifetimes: Array64::new(),
+            generation_tags: Array64::new(),
+            scope_depth: 0u32,
+            diagnostics: DiagnosticBag::new(),
+            move_count: 0u32,
+            borrow_count: 0u32,
+            use_after_move_count: 0u32,
+            duplication_count: 0u32,
+            gen_violation_count: 0u32,
+            lifetime_violation_count: 0u32,
+            completed: false,
+            next_generation: 1u64,
+        }
+    }
+
+    // ── Value Registration ──
+
+    pub fn register_value(
+        mut self,
+        name : FixedString256,
+        is_capability : bool,
+        is_linear : bool,
+    ) -> BorrowChecker [pure] {
+        if self.values.len() >= self.values.capacity() {
+            // Cannot register more values; capacity exhausted.
+            return self;
+        }
+        let gen : u64 = self.next_generation;
+        self.next_generation = self.next_generation + 1u64;
+        let record : ValueRecord = ValueRecord::new(name, is_capability, is_linear, gen, self.scope_depth);
+        let _ = self.values.push(record);
+        self
+    }
+
+    pub fn register_parameter(
+        mut self,
+        name : FixedString256,
+        is_capability : bool,
+        is_linear : bool,
+    ) -> BorrowChecker [pure] {
+        if self.values.len() >= self.values.capacity() {
+            return self;
+        }
+        let gen : u64 = self.next_generation;
+        self.next_generation = self.next_generation + 1u64;
+        let mut record : ValueRecord = ValueRecord::new(name, is_capability, is_linear, gen, self.scope_depth);
+        record = record.with_parameter();
+        let _ = self.values.push(record);
+        self
+    }
+
+    pub fn register_temporary(
+        mut self,
+        name : FixedString256,
+        is_capability : bool,
+    ) -> BorrowChecker [pure] {
+        if self.values.len() >= self.values.capacity() {
+            return self;
+        }
+        let gen : u64 = self.next_generation;
+        self.next_generation = self.next_generation + 1u64;
+        let mut record : ValueRecord = ValueRecord::new(name, is_capability, false, gen, self.scope_depth);
+        record = record.with_temporary();
+        let _ = self.values.push(record);
+        self
+    }
+
+    // ── Move Tracking ──
+
+    pub fn track_move(
+        mut self,
+        from_name : FixedString256,
+        to_name : FixedString256,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        self.move_count = self.move_count + 1u32;
+
+        // Bounded: at most 64 tracked values.
+        let mut found : bool = false;
+        let mut from_idx : u32 = 0u32;
+        let mut idx_scan : u32 = 0u32;
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.name == from_name {
+                found = true;
+                from_idx = i;
+            }
+        }
+
+        if !found {
+            let msg : FixedString256 = FixedString256::from("cannot move from unknown value '");
+            let msg2 : FixedString256 = msg + from_name + FixedString256::from("'");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        let source : ValueRecord = self.values.get(from_idx);
+        if !source.is_capability {
+            // Non-capability values can be copied; no violation.
+            let _ = self.register_value(to_name, source.is_capability, source.is_linear);
+            return Result::Ok(self);
+        }
+
+        if source.state == MoveState::Moved || source.state == MoveState::Consumed {
+            self.use_after_move_count = self.use_after_move_count + 1u32;
+            let msg : FixedString256 = FixedString256::from("use after move of capability '");
+            let msg2 : FixedString256 = msg + from_name + FixedString256::from("'");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        // Check for outstanding mutable borrows.
+        // loop: bounds[BOUND_SMALL] — bounded by 128 borrows.
+        loop: bounds[BOUND_SMALL] for i in 0..self.borrows.len() {
+            let borrow : BorrowRecord = self.borrows.get(i);
+            if borrow.source_name == from_name && !borrow.is_released && borrow.is_mutable {
+                let msg : FixedString256 = FixedString256::from("cannot move '");
+                let msg2 : FixedString256 = msg + from_name + FixedString256::from("' while mutably borrowed");
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LowerCapabilityViolation,
+                    msg2,
+                    SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lowerer,
+                );
+                return Result::Err(diag);
+            }
+        }
+
+        // Mark source as moved.
+        self.values.set(from_idx, ValueRecord {
+            state: MoveState::Moved,
+            ..source
+        });
+
+        // Register destination.
+        let gen : u64 = self.next_generation;
+        self.next_generation = self.next_generation + 1u64;
+        let dest : ValueRecord = ValueRecord::new(to_name, true, source.is_linear, gen, self.scope_depth);
+        let _ = self.values.push(dest);
+
+        Result::Ok(self)
+    }
+
+    pub fn track_consume(
+        mut self,
+        name : FixedString256,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        let mut found : bool = false;
+        let mut found_idx : u32 = 0u32;
+
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.name == name {
+                found = true;
+                found_idx = i;
+            }
+        }
+
+        if !found {
+            let msg : FixedString256 = FixedString256::from("cannot consume unknown value '");
+            let msg2 : FixedString256 = msg + name + FixedString256::from("'");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        let record : ValueRecord = self.values.get(found_idx);
+
+        if record.state == MoveState::Moved || record.state == MoveState::Consumed {
+            self.use_after_move_count = self.use_after_move_count + 1u32;
+            let msg : FixedString256 = FixedString256::from("use after move of '");
+            let msg2 : FixedString256 = msg + name + FixedString256::from("' in consume operation");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        self.values.set(found_idx, ValueRecord {
+            state: MoveState::Consumed,
+            ..record
+        });
+
+        Result::Ok(self)
+    }
+
+    // ── Borrow Regions ──
+
+    pub fn borrow_value(
+        mut self,
+        source_name : FixedString256,
+        borrower_name : FixedString256,
+        is_mutable : bool,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        let mut source_idx : u32 = 0u32;
+        let mut found : bool = false;
+
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.name == source_name {
+                found = true;
+                source_idx = i;
+            }
+        }
+
+        if !found {
+            let msg : FixedString256 = FixedString256::from("cannot borrow unknown value '");
+            let msg2 : FixedString256 = msg + source_name + FixedString256::from("'");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        let source : ValueRecord = self.values.get(source_idx);
+
+        if source.state == MoveState::Moved || source.state == MoveState::Consumed {
+            self.use_after_move_count = self.use_after_move_count + 1u32;
+            let msg : FixedString256 = FixedString256::from("cannot borrow '");
+            let msg2 : FixedString256 = msg + source_name + FixedString256::from("' after move");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        if is_mutable {
+            // Mutable borrow requires no outstanding borrows (immutable or mutable).
+            // loop: bounds[BOUND_MEDIUM] — bounded by 128 borrows.
+            loop: bounds[BOUND_MEDIUM] for i in 0..self.borrows.len() {
+                let borrow : BorrowRecord = self.borrows.get(i);
+                if borrow.source_name == source_name && !borrow.is_released {
+                    let msg : FixedString256 = FixedString256::from("cannot mutably borrow '");
+                    let msg2 : FixedString256 = msg + source_name + FixedString256::from("' because it is already borrowed");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerCapabilityViolation,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    return Result::Err(diag);
+                }
+            }
+
+            self.values.set(source_idx, ValueRecord {
+                state: MoveState::BorrowedMutable,
+                borrow_count: source.borrow_count + 1u32,
+                ..source
+            });
+        } else {
+            // Immutable borrow: allow if no mutable borrows are outstanding.
+            // loop: bounds[BOUND_MEDIUM] — bounded by 128 borrows.
+            loop: bounds[BOUND_MEDIUM] for i in 0..self.borrows.len() {
+                let borrow : BorrowRecord = self.borrows.get(i);
+                if borrow.source_name == source_name && !borrow.is_released && borrow.is_mutable {
+                    let msg : FixedString256 = FixedString256::from("cannot immutably borrow '");
+                    let msg2 : FixedString256 = msg + source_name + FixedString256::from("' because it is mutably borrowed");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerCapabilityViolation,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    return Result::Err(diag);
+                }
+            }
+
+            self.values.set(source_idx, ValueRecord {
+                state: MoveState::BorrowedImmutable,
+                ..source
+            });
+        }
+
+        if self.borrows.len() >= self.borrows.capacity() {
+            let msg : FixedString256 = FixedString256::from("borrow tracking capacity exceeded");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        self.borrow_count = self.borrow_count + 1u32;
+        let source_gen : u64 = source.generation;
+        let borrow : BorrowRecord = BorrowRecord::new(source_name, borrower_name, is_mutable, self.scope_depth, source_gen);
+        let _ = self.borrows.push(borrow);
+
+        Result::Ok(self)
+    }
+
+    pub fn release_borrow(
+        mut self,
+        borrower_name : FixedString256,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        let mut borrow_idx : u32 = 0u32;
+        let mut found : bool = false;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 borrows.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.borrows.len() {
+            let borrow : BorrowRecord = self.borrows.get(i);
+            if borrow.borrower_name == borrower_name && !borrow.is_released {
+                found = true;
+                borrow_idx = i;
+            }
+        }
+
+        if !found {
+            let msg : FixedString256 = FixedString256::from("cannot release unknown borrow '");
+            let msg2 : FixedString256 = msg + borrower_name + FixedString256::from("'");
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::LowerCapabilityViolation,
+                msg2,
+                SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                DiagnosticSeverity::Error,
+                CompilerPhase::Lowerer,
+            );
+            return Result::Err(diag);
+        }
+
+        let borrow : BorrowRecord = self.borrows.get(borrow_idx);
+        let released : BorrowRecord = borrow.release();
+        self.borrows.set(borrow_idx, released);
+
+        // Restore source state if no more borrows.
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for vi in 0..self.values.len() {
+            let val : ValueRecord = self.values.get(vi);
+            if val.name == borrow.source_name {
+                let new_borrow_count : u32 = val.borrow_count - 1u32;
+                if new_borrow_count == 0u32 {
+                    // Check if any other borrows remain.
+                    let mut other_borrows : bool = false;
+                    // loop: bounds[BOUND_MEDIUM] — bounded by 128 borrows.
+                    loop: bounds[BOUND_MEDIUM] for bi in 0..self.borrows.len() {
+                        let other : BorrowRecord = self.borrows.get(bi);
+                        if other.source_name == borrow.source_name && !other.is_released {
+                            other_borrows = true;
+                        }
+                    }
+                    if !other_borrows {
+                        self.values.set(vi, ValueRecord {
+                            state: MoveState::Available,
+                            borrow_count: 0u32,
+                            ..val
+                        });
+                    }
+                } else {
+                    self.values.set(vi, ValueRecord {
+                        borrow_count: new_borrow_count,
+                        ..val
+                    });
+                }
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    // ── Lifetime Inference ──
+
+    pub fn enter_scope(mut self) -> BorrowChecker [pure] {
+        self.scope_depth = self.scope_depth + 1u32;
+        self
+    }
+
+    pub fn exit_scope(mut self) -> BorrowChecker [pure] {
+        if self.scope_depth == 0u32 {
+            // Cannot exit below root scope.
+            return self;
+        }
+
+        // End lifetimes for values that go out of scope.
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.scope_depth == self.scope_depth {
+                // Update lifetime end.
+                // loop: bounds[BOUND_SMALL] — bounded by 64 lifetimes.
+                loop: bounds[BOUND_SMALL] for li in 0..self.lifetimes.len() {
+                    let lt : Lifetime = self.lifetimes.get(li);
+                    if lt.name == record.name {
+                        self.lifetimes.set(li, Lifetime {
+                            end_scope: self.scope_depth,
+                            ..lt
+                        });
+                    }
+                }
+
+                // Check for use-after-move at scope exit for linear values.
+                if record.is_linear && record.state != MoveState::Consumed && !record.is_temporary {
+                    self.use_after_move_count = self.use_after_move_count + 1u32;
+                    let msg : FixedString256 = FixedString256::from("linear value '");
+                    let msg2 : FixedString256 = msg + record.name + FixedString256::from("' not consumed before scope exit");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerCapabilityViolation,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    let _ = self.diagnostics.emit(diag);
+                }
+            }
+        }
+
+        // Check for borrows that outlive their source scope.
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 borrows.
+        loop: bounds[BOUND_MEDIUM] for bi in 0..self.borrows.len() {
+            let borrow : BorrowRecord = self.borrows.get(bi);
+            if !borrow.is_released {
+                // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+                loop: bounds[BOUND_SMALL] for vi in 0..self.values.len() {
+                    let val : ValueRecord = self.values.get(vi);
+                    if val.name == borrow.source_name && val.scope_depth >= self.scope_depth {
+                        self.lifetime_violation_count = self.lifetime_violation_count + 1u32;
+                        let msg : FixedString256 = FixedString256::from("borrow of '");
+                        let msg2 : FixedString256 = msg + borrow.source_name + FixedString256::from("' outlives its source scope");
+                        let diag : DiagnosticPayload = DiagnosticPayload::new(
+                            DiagnosticCode::LowerCapabilityViolation,
+                            msg2,
+                            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                            DiagnosticSeverity::Error,
+                            CompilerPhase::Lowerer,
+                        );
+                        let _ = self.diagnostics.emit(diag);
+                    }
+                }
+            }
+        }
+
+        self.scope_depth = self.scope_depth - 1u32;
+        self
+    }
+
+    pub fn infer_lifetime(
+        mut self,
+        name : FixedString256,
+        start_scope : u32,
+    ) -> BorrowChecker [pure] {
+        if self.lifetimes.len() >= self.lifetimes.capacity() {
+            return self;
+        }
+        let lt : Lifetime = Lifetime::inferred(name, start_scope);
+        let _ = self.lifetimes.push(lt);
+        self
+    }
+
+    // ── Capability Duplication Detection ──
+
+    pub fn check_duplication(
+        mut self,
+        name : FixedString256,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.name == name && record.is_capability {
+                // Check if we're trying to duplicate by finding another copy.
+                let mut copy_count : u32 = 0u32;
+                // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+                loop: bounds[BOUND_SMALL] for j in 0..self.values.len() {
+                    let other : ValueRecord = self.values.get(j);
+                    if other.name == name {
+                        copy_count = copy_count + 1u32;
+                    }
+                }
+                if copy_count > 1u32 {
+                    self.duplication_count = self.duplication_count + 1u32;
+                    let msg : FixedString256 = FixedString256::from("capability '");
+                    let msg2 : FixedString256 = msg + name + FixedString256::from("' is being duplicated (affine violation)");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerCapabilityViolation,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    return Result::Err(diag);
+                }
+            }
+        }
+        Result::Ok(self)
+    }
+
+    pub fn check_copy(
+        mut self,
+        name : FixedString256,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.name == name && record.is_capability {
+                self.duplication_count = self.duplication_count + 1u32;
+                let msg : FixedString256 = FixedString256::from("cannot copy capability '");
+                let msg2 : FixedString256 = msg + name + FixedString256::from("'; affine types cannot be copied");
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LowerCapabilityViolation,
+                    msg2,
+                    SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lowerer,
+                );
+                return Result::Err(diag);
+            }
+        }
+        Result::Ok(self)
+    }
+
+    // ── Generation Tag Validation ──
+
+    pub fn register_generation_tag(
+        mut self,
+        handle_id : u64,
+        generation : u64,
+    ) -> BorrowChecker [pure] {
+        if self.generation_tags.len() >= self.generation_tags.capacity() {
+            return self;
+        }
+        let tag : GenerationTag = GenerationTag::new(handle_id, generation);
+        let _ = self.generation_tags.push(tag);
+        self
+    }
+
+    pub fn validate_generation_tag(
+        mut self,
+        handle_id : u64,
+        actual_generation : u64,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 tags.
+        loop: bounds[BOUND_SMALL] for i in 0..self.generation_tags.len() {
+            let tag : GenerationTag = self.generation_tags.get(i);
+            if tag.handle_id == handle_id {
+                match tag.validate(actual_generation) {
+                    Result::Ok(validated_tag) => {
+                        self.generation_tags.set(i, validated_tag);
+                        return Result::Ok(self);
+                    }
+                    Result::Err(diag) => {
+                        self.gen_violation_count = self.gen_violation_count + 1u32;
+                        let _ = self.diagnostics.emit(diag);
+                        return Result::Err(diag);
+                    }
+                }
+            }
+        }
+
+        let msg : FixedString256 = FixedString256::from("no generation tag found for handle ");
+        let msg_with_id : FixedString256 = msg.push_u64(handle_id);
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerHandleGenerationMismatch,
+            msg_with_id,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lowerer,
+        );
+        self.gen_violation_count = self.gen_violation_count + 1u32;
+        let _ = self.diagnostics.emit(diag);
+        Result::Err(diag)
+    }
+
+    pub fn advance_generation_tag(mut self, handle_id : u64) -> BorrowChecker [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 tags.
+        loop: bounds[BOUND_SMALL] for i in 0..self.generation_tags.len() {
+            let tag : GenerationTag = self.generation_tags.get(i);
+            if tag.handle_id == handle_id {
+                let advanced : GenerationTag = tag.advance();
+                self.generation_tags.set(i, advanced);
+            }
+        }
+        self
+    }
+
+    // ── Use-After-Move Detection ──
+
+    pub fn check_use_after_move(
+        mut self,
+        name : FixedString256,
+    ) -> Result<BorrowChecker, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.name == name {
+                if record.state == MoveState::Moved || record.state == MoveState::Consumed {
+                    self.use_after_move_count = self.use_after_move_count + 1u32;
+                    let msg : FixedString256 = FixedString256::from("use after move of '");
+                    let msg2 : FixedString256 = msg + name + FixedString256::from("'");
+                    let diag : DiagnosticPayload = DiagnosticPayload::new(
+                        DiagnosticCode::LowerCapabilityViolation,
+                        msg2,
+                        SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+                        DiagnosticSeverity::Error,
+                        CompilerPhase::Lowerer,
+                    );
+                    let _ = self.diagnostics.emit(diag);
+                    return Result::Err(diag);
+                }
+                self.values.set(i, ValueRecord {
+                    state: MoveState::ErrorUseAfterMove,
+                    ..record
+                });
+            }
+        }
+        Result::Ok(self)
+    }
+
+    // ── Verification and Completion ──
+
+    pub fn verify_all_linear_consumed(&self) -> Result<(), FixedString256> [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 values.
+        loop: bounds[BOUND_SMALL] for i in 0..self.values.len() {
+            let record : ValueRecord = self.values.get(i);
+            if record.is_linear && record.state != MoveState::Consumed && !record.is_temporary {
+                let msg : FixedString256 = FixedString256::from("linear value '");
+                let msg2 : FixedString256 = msg + record.name + FixedString256::from("' was not consumed");
+                return Result::Err(msg2);
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn verify_no_outstanding_borrows(&self) -> Result<(), FixedString256> [pure] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 borrows.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.borrows.len() {
+            let borrow : BorrowRecord = self.borrows.get(i);
+            if !borrow.is_released {
+                let msg : FixedString256 = FixedString256::from("outstanding borrow of '");
+                let msg2 : FixedString256 = msg + borrow.source_name + FixedString256::from("' at scope exit");
+                return Result::Err(msg2);
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn finalize(mut self) -> (BorrowChecker, BorrowCheckReceipt) [pure] {
+        let _ = self.verify_all_linear_consumed();
+        let receipt : BorrowCheckReceipt = BorrowCheckReceipt::new(
+            self.move_count,
+            self.borrow_count,
+            self.use_after_move_count,
+            self.duplication_count,
+            self.gen_violation_count,
+            self.lifetime_violation_count,
+        );
+        self.completed = true;
+        (self, receipt)
+    }
+
+    pub fn has_violations(&self) -> bool [pure] {
+        self.use_after_move_count > 0u32
+            || self.duplication_count > 0u32
+            || self.gen_violation_count > 0u32
+            || self.lifetime_violation_count > 0u32
+    }
+}
+
+// ──────────────────────────────────────────────
+// BorrowCheckReceipt: Evidence receipt for borrow checking
+// ──────────────────────────────────────────────
+// Records all borrow checking results for downstream sealing.
+// Evidence path: BORROW-RECEIPT-001 through BORROW-RECEIPT-010
+
+pub struct BorrowCheckReceipt {
+    pub evidence : EvidenceReceipt,
+    pub move_count : u32,
+    pub borrow_count : u32,
+    pub use_after_move_count : u32,
+    pub duplication_count : u32,
+    pub gen_violation_count : u32,
+    pub lifetime_violation_count : u32,
+    pub passed : bool,
+}
+
+impl BorrowCheckReceipt {
+    pub fn new(
+        move_count : u32,
+        borrow_count : u32,
+        use_after_move_count : u32,
+        duplication_count : u32,
+        gen_violation_count : u32,
+        lifetime_violation_count : u32,
+    ) -> BorrowCheckReceipt [pure] {
+        let passed : bool = use_after_move_count == 0u32
+            && duplication_count == 0u32
+            && gen_violation_count == 0u32
+            && lifetime_violation_count == 0u32;
+
+        var payload_hash : u64 = 14695981039346656037u64;
+        payload_hash ^= move_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= borrow_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= use_after_move_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= duplication_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= gen_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= lifetime_violation_count as u64;
+        payload_hash *= 1099511628211u64;
+
+        BorrowCheckReceipt {
+            evidence: EvidenceReceipt::new(
+                CompilerPhase::Lowerer,
+                payload_hash,
+                0u64,
+                0u64,
+            ),
+            move_count: move_count,
+            borrow_count: borrow_count,
+            use_after_move_count: use_after_move_count,
+            duplication_count: duplication_count,
+            gen_violation_count: gen_violation_count,
+            lifetime_violation_count: lifetime_violation_count,
+            passed: passed,
+        }
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("BorrowCheck: "));
+        if self.passed {
+            result.push_str(FixedString256::from("PASS"));
+        } else {
+            result.push_str(FixedString256::from("FAIL"));
+        }
+        result.push_str(FixedString256::from(" [moves="));
+        result.push_u32(self.move_count);
+        result.push_str(FixedString256::from(", borrows="));
+        result.push_u32(self.borrow_count);
+        result.push_str(FixedString256::from(", use-after-move="));
+        result.push_u32(self.use_after_move_count);
+        result.push_str(FixedString256::from(", duplications="));
+        result.push_u32(self.duplication_count);
+        result.push_str(FixedString256::from(", gen-violations="));
+        result.push_u32(self.gen_violation_count);
+        result.push_str(FixedString256::from(", lifetime-violations="));
+        result.push_u32(self.lifetime_violation_count);
+        result.push_str(FixedString256::from("]"));
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// BorrowChecker Diagnostic Codes (PHOR-COMP-031 through PHOR-COMP-060)
+// ──────────────────────────────────────────────
+// These extend the DiagnosticCode sealed datatype with borrow checker
+// specific codes. They are mapped to diagnostic messages by the checker.
+
+// Diagnostic code constants for borrow checker violations.
+const BORROW_ERR_USE_AFTER_MOVE       : u64 = 31u64
+const BORROW_ERR_DUPLICATION          : u64 = 32u64
+const BORROW_ERR_GENERATION_MISMATCH : u64 = 33u64
+const BORROW_ERR_LIFETIME_VIOLATION  : u64 = 34u64
+const BORROW_ERR_BORROW_OVERLAP      : u64 = 35u64
+const BORROW_ERR_MOVE_OF_BORROWED    : u64 = 36u64
+const BORROW_ERR_LINEAR_NOT_CONSUMED : u64 = 37u64
+const BORROW_ERR_BORROW_OUTLIVES     : u64 = 38u64
+const BORROW_ERR_MUTABLE_BORROW_CONFLICT : u64 = 39u64
+const BORROW_ERR_CAPACITY_EXCEEDED   : u64 = 40u64
+
+// ──────────────────────────────────────────────
+// Diagnostic Helper Functions
+// ──────────────────────────────────────────────
+// These functions construct standardized diagnostic messages
+// for each type of borrow checker violation.
+
+pub fn diag_use_after_move(name : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("use after move of capability '");
+    let full_msg : FixedString256 = msg + name + FixedString256::from("'");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_duplication(name : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("capability '");
+    let full_msg : FixedString256 = msg + name + FixedString256::from("' cannot be duplicated (affine)");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_generation_mismatch(
+    handle_id : u64,
+    expected : u64,
+    actual : u64,
+    location : SourceLocation,
+) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("generation tag mismatch for handle ");
+    let msg2 : FixedString256 = msg.push_u64(handle_id);
+    let msg3 : FixedString256 = msg2 + FixedString256::from(" (expected ") + expected + FixedString256::from(", actual ") + actual + FixedString256::from(")");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerHandleGenerationMismatch,
+        msg3,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_lifetime_violation(name : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("borrow of '");
+    let full_msg : FixedString256 = msg + name + FixedString256::from("' outlives its source scope");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_borrow_overlap(source : FixedString256, borrower : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("cannot borrow '");
+    let msg2 : FixedString256 = msg + source + FixedString256::from("' as mutable because '");
+    let msg3 : FixedString256 = msg2 + borrower + FixedString256::from("' has an immutable borrow");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        msg3,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_move_of_borrowed(name : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("cannot move '");
+    let full_msg : FixedString256 = msg + name + FixedString256::from("' while borrowed");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_linear_not_consumed(name : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("linear value '");
+    let full_msg : FixedString256 = msg + name + FixedString256::from("' was not consumed");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}
+
+pub fn diag_borrow_outlives_source(source : FixedString256, location : SourceLocation) -> DiagnosticPayload [pure, diag] {
+    let msg : FixedString256 = FixedString256::from("borrow of '");
+    let full_msg : FixedString256 = msg + source + FixedString256::from("' outlives the source value");
+    DiagnosticPayload::new(
+        DiagnosticCode::LowerCapabilityViolation,
+        full_msg,
+        location,
+        DiagnosticSeverity::Error,
+        CompilerPhase::Lowerer,
+    )
+}

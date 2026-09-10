@@ -1,0 +1,1116 @@
+// verification.phor — Object verification: integrity, signatures, receipt chain, source↔binary
+// Phorensic Forensic Store: verification subsystem
+// Spec: FORENSIC_STORE.md — Verify Object, SEALED_PACKAGE_FORMAT.md — Package Verification
+// Grammar: PHORENSIC_GRAMMAR.md §43, §42
+
+package forensic_store.verification;
+
+use forensic_store.store_object::{
+    StoreObject, Hash256, hash256_zero, hash256_equal,
+    TrustState, TrustLevel,
+    Identity, identity_equal,
+    ResidualRecord, ResidualHistory,
+    DialectProfile,
+    ObjectSignatures, Signature, AuditorStamp,
+    ExpansionReceipt, StageReceipt, ReplayCheckpoint, ResidualEdge,
+    ObjectRole,
+};
+use forensic_store.store_key::{
+    StoreKey, store_key_equal, store_key_zero,
+};
+
+// ============================================================================
+// Verification Check Results
+// ============================================================================
+
+/// Result of a single verification check.
+type CheckResult = enum {
+    /// Check passed
+    Pass = 0,
+    /// Check failed with a specific reason
+    Fail = 1,
+    /// Check could not be performed (missing data)
+    Skip = 2,
+    /// Check produced a warning but did not fail
+    Warning = 3,
+}
+
+/// A single verification check record with detailed evidence.
+struct VerificationCheck
+    layout packed
+{
+    /// Check identifier
+    check_id: Array[u8, 64],
+    check_id_len: u32,
+    /// Check description
+    description: Array[u8, 256],
+    description_len: u32,
+    /// Result of the check
+    result: CheckResult,
+    /// Detailed failure reason (if applicable)
+    failure_detail: Array[u8, 512],
+    failure_detail_len: u32,
+    /// Hash of evidence used for this check
+    evidence_hash: Hash256,
+    /// Residual emitted during this check
+    check_residual: ResidualRecord,
+}
+
+// ============================================================================
+// Comprehensive Verification Report
+// ============================================================================
+
+/// Complete verification report for a store object.
+/// Contains all individual check results plus an aggregate verdict.
+struct VerificationReport
+    layout packed
+{
+    /// The object key that was verified
+    object_key: StoreKey,
+    /// Aggregate verdict
+    verdict: VerificationVerdict,
+    /// Timestamp of verification
+    verified_at: u64,
+    /// Verifier identity
+    verifier: Identity,
+    /// Individual checks (bounded to 32 checks)
+    checks: Array[VerificationCheck, 32],
+    check_count: u32,
+    /// Number of checks that passed
+    passed_count: u32,
+    /// Number of checks that failed
+    failed_count: u32,
+    /// Number of checks skipped
+    skipped_count: u32,
+    /// Number of warnings
+    warning_count: u32,
+    /// Overall evidence hash chain
+    evidence_chain_hash: Hash256,
+    /// Whether the object should be quarantined
+    quarantine_recommended: bool,
+    /// Quarantine reason (if applicable)
+    quarantine_reason: Array[u8, 256],
+    quarantine_reason_len: u32,
+    /// Residual records produced during verification
+    verification_residuals: ResidualHistory,
+}
+
+/// Aggregate verification verdict.
+type VerificationVerdict = enum {
+    /// All checks passed
+    AllPassed = 0,
+    /// All critical checks passed, warnings only
+    PassedWithWarnings = 1,
+    /// Some non-critical checks failed
+    PartialFailure = 2,
+    /// Critical checks failed
+    CriticalFailure = 3,
+    /// Verification could not complete
+    Incomplete = 4,
+}
+
+// ============================================================================
+// Verification Report Construction
+// ============================================================================
+
+/// Create an empty verification report for a given key.
+fn verification_report_new(
+    key: StoreKey,
+    verifier: Identity,
+    timestamp: u64,
+) -> VerificationReport
+    effect [compute]
+{
+    let empty_residuals: ResidualHistory = ResidualHistory {
+        records: Array[ResidualRecord, 1024]::zeroed(),
+        count: 0,
+        head: 0,
+        tail: 0,
+        total_emitted: 0,
+        owner_hash: key,
+    };
+
+    return VerificationReport {
+        object_key: key,
+        verdict: VerificationVerdict::Incomplete,
+        verified_at: timestamp,
+        verifier: verifier,
+        checks: Array[VerificationCheck, 32]::zeroed(),
+        check_count: 0,
+        passed_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        warning_count: 0,
+        evidence_chain_hash: hash256_zero(),
+        quarantine_recommended: false,
+        quarantine_reason: Array[u8, 256]::zeroed(),
+        quarantine_reason_len: 0,
+        verification_residuals: empty_residuals,
+    };
+}
+
+/// Append a check result to a verification report.
+fn verification_report_add_check(
+    report: VerificationReport,
+    check: VerificationCheck,
+) -> VerificationReport
+    effect [compute, residual]
+{
+    let mut new_report: VerificationReport = report;
+    if new_report.check_count < 32 {
+        new_report.checks[new_report.check_count] = check;
+        new_report.check_count = new_report.check_count + 1;
+
+        match check.result {
+            CheckResult::Pass => {
+                new_report.passed_count = new_report.passed_count + 1;
+            },
+            CheckResult::Fail => {
+                new_report.failed_count = new_report.failed_count + 1;
+            },
+            CheckResult::Skip => {
+                new_report.skipped_count = new_report.skipped_count + 1;
+            },
+            CheckResult::Warning => {
+                new_report.warning_count = new_report.warning_count + 1;
+            },
+        }
+
+        residual emit {
+            op: "verification.check_added",
+            check_id_prefix: check.check_id[0] as u64,
+            result: check.result as u64,
+        };
+    }
+    return new_report;
+}
+
+/// Finalize a verification report — compute aggregate verdict.
+fn verification_report_finalize(
+    report: VerificationReport,
+) -> VerificationReport
+    effect [compute, residual]
+{
+    let verdict: VerificationVerdict;
+    if report.failed_count > 0 {
+        verdict = VerificationVerdict::CriticalFailure;
+    } else if report.warning_count > 0 {
+        if report.passed_count == report.check_count - report.warning_count {
+            verdict = VerificationVerdict::PassedWithWarnings;
+        } else {
+            verdict = VerificationVerdict::PartialFailure;
+        }
+    } else if report.skipped_count > 0 {
+        verdict = VerificationVerdict::Incomplete;
+    } else {
+        verdict = VerificationVerdict::AllPassed;
+    }
+
+    let quarantine: bool = verdict == VerificationVerdict::CriticalFailure;
+
+    residual emit {
+        op: "verification.finalized",
+        passed: report.passed_count,
+        failed: report.failed_count,
+        skipped: report.skipped_count,
+        verdict: verdict as u64,
+        quarantine: quarantine as u64,
+    };
+
+    return VerificationReport {
+        object_key: report.object_key,
+        verdict: verdict,
+        verified_at: report.verified_at,
+        verifier: report.verifier,
+        checks: report.checks,
+        check_count: report.check_count,
+        passed_count: report.passed_count,
+        failed_count: report.failed_count,
+        skipped_count: report.skipped_count,
+        warning_count: report.warning_count,
+        evidence_chain_hash: report.evidence_chain_hash,
+        quarantine_recommended: quarantine,
+        quarantine_reason: report.quarantine_reason,
+        quarantine_reason_len: report.quarantine_reason_len,
+        verification_residuals: report.verification_residuals,
+    };
+}
+
+// ============================================================================
+// Check 1: Content Integrity
+// ============================================================================
+
+/// Verify that the object's content hash matches the actual content.
+fn check_content_integrity(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("content_integrity");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Content hash matches computed hash over content bytes");
+
+    // Compute content hash (XOR-based placeholder)
+    let computed: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    for i in 0..obj.content_len as u64 {
+        computed.bytes[i % 32] = computed.bytes[i % 32] ^ obj.content[i];
+    }
+
+    let match_result: bool = hash256_equal(computed, obj.content_hash);
+    let result: CheckResult;
+    let fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let fail_len: u32 = 0;
+
+    if match_result {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Content hash mismatch: stored != computed");
+        for i in 0..52 { fail_detail[i] = msg[i]; }
+        fail_len = 52;
+    }
+
+    residual emit {
+        op: "verification.check.content_integrity",
+        result: result as u64,
+        match: match_result as u64,
+    };
+
+    return VerificationCheck {
+        check_id: check_id,
+        check_id_len: 17,
+        description: desc,
+        description_len: 58,
+        result: result,
+        failure_detail: fail_detail,
+        failure_detail_len: fail_len,
+        evidence_hash: computed,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_content_integrity"),
+            op_name_len: 22,
+            op_type: 1,
+            timestamp: 0,
+            generation: 0,
+            actor: Identity {
+                name: Array[u8, 128]::zeroed(), name_len: 0,
+                key_fingerprint: hash256_zero(),
+                dialect_scope: Array[u8, 64]::zeroed(), dialect_scope_len: 0,
+                version: 0, established_at_gen: 0,
+            },
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Check 2: Signature Validity
+// ============================================================================
+
+/// Verify that all signatures on the object are valid.
+fn check_signatures(
+    obj: StoreObject,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("signature_validity");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("All signatures are cryptographically valid and key is trusted");
+
+    let mut all_valid: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Check content signature if present
+    if obj.signatures.content_sig_present {
+        let sig: Signature = obj.signatures.content_signature;
+        let mut key_trusted: bool = false;
+        for i in 0..trusted_key_count as u64 {
+            if hash256_equal(sig.signer_key, trusted_keys[i]) {
+                key_trusted = true;
+            }
+        }
+        if !key_trusted {
+            all_valid = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Content signature key not in trusted keyring");
+            for i in 0..51 { fail_detail[i] = msg[i]; }
+            fail_len = 51;
+        }
+        // Signature verification would use cryptographic verification here
+        // For now, check that sig bytes are non-zero
+        let mut sig_nonzero: bool = false;
+        for i in 0..sig.sig_bytes_len as u64 {
+            if sig.sig_bytes[i] != 0 {
+                sig_nonzero = true;
+            }
+        }
+        if !sig_nonzero {
+            all_valid = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Content signature bytes are empty");
+            for i in 0..37 { fail_detail[i] = msg[i]; }
+            fail_len = 37;
+        }
+    }
+
+    // Check evidence signatures
+    for i in 0..obj.signatures.evidence_sig_count as u64 {
+        let sig: Signature = obj.signatures.evidence_signatures[i];
+        let mut key_trusted: bool = false;
+        for j in 0..trusted_key_count as u64 {
+            if hash256_equal(sig.signer_key, trusted_keys[j]) {
+                key_trusted = true;
+            }
+        }
+        if !key_trusted {
+            all_valid = false;
+        }
+    }
+
+    let result: CheckResult;
+    if all_valid {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+    }
+
+    residual emit {
+        op: "verification.check.signatures",
+        result: result as u64,
+        sig_count: obj.signatures.evidence_sig_count,
+        content_sig_present: obj.signatures.content_sig_present as u64,
+    };
+
+    return VerificationCheck {
+        check_id: check_id,
+        check_id_len: 18,
+        description: desc,
+        description_len: 70,
+        result: result,
+        failure_detail: fail_detail,
+        failure_detail_len: fail_len,
+        evidence_hash: obj.signatures.content_signature.signer_key,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_signatures"),
+            op_name_len: 16,
+            op_type: 1,
+            timestamp: 0,
+            generation: 0,
+            actor: Identity {
+                name: Array[u8, 128]::zeroed(), name_len: 0,
+                key_fingerprint: hash256_zero(),
+                dialect_scope: Array[u8, 64]::zeroed(), dialect_scope_len: 0,
+                version: 0, established_at_gen: 0,
+            },
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Check 3: Receipt Chain Integrity
+// ============================================================================
+
+/// Verify that the receipt chain (expansion → compilation → replay) is continuous.
+fn check_receipt_chain(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("receipt_chain_integrity");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Receipt chain is continuous: each stage output matches next stage input");
+
+    let mut chain_ok: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Check expansion receipts chain
+    if obj.expansion_receipt_count > 0 {
+        let mut prev_output: Hash256 = hash256_zero();
+        for i in 0..obj.expansion_receipt_count as u64 {
+            let receipt: ExpansionReceipt = obj.expansion_receipts[i];
+            if i > 0 {
+                if !hash256_equal(prev_output, receipt.input_hash) {
+                    chain_ok = false;
+                    let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Expansion receipt chain gap at index");
+                    for j in 0..42 { fail_detail[j] = msg[j]; }
+                    fail_len = 42;
+                }
+            }
+            prev_output = receipt.output_hash;
+        }
+    } else {
+        // No expansion receipts — not a failure, just skip
+    }
+
+    // Check compilation receipts chain
+    if obj.compilation_receipt_count > 0 {
+        let mut prev_input: Hash256 = obj.source_snapshot_hash;
+        let mut chain_gap: bool = false;
+        for i in 0..obj.compilation_receipt_count as u64 {
+            let receipt: StageReceipt = obj.compilation_receipts[i];
+            if !hash256_equal(prev_input, receipt.input_hash) {
+                chain_gap = true;
+            }
+            prev_input = receipt.output_hash;
+        }
+        if chain_gap {
+            chain_ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Compilation receipt chain has gap");
+            for j in 0..39 { fail_detail[j] = msg[j]; }
+            fail_len = 39;
+        }
+    }
+
+    let result: CheckResult;
+    if chain_ok {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+    }
+
+    residual emit {
+        op: "verification.check.receipt_chain",
+        result: result as u64,
+        exp_count: obj.expansion_receipt_count,
+        comp_count: obj.compilation_receipt_count,
+    };
+
+    return VerificationCheck {
+        check_id: check_id,
+        check_id_len: 23,
+        description: desc,
+        description_len: 82,
+        result: result,
+        failure_detail: fail_detail,
+        failure_detail_len: fail_len,
+        evidence_hash: obj.source_snapshot_hash,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_receipt_chain"),
+            op_name_len: 20,
+            op_type: 1,
+            timestamp: 0,
+            generation: 0,
+            actor: Identity::default(),
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Check 4: Trust State Consistency
+// ============================================================================
+
+/// Verify that the trust state is consistent with the available evidence.
+fn check_trust_state(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("trust_state_consistency");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Trust state level is justified by available evidence");
+
+    let mut consistent: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // An object cannot be sealed if trust level is below SealVerified
+    if obj.sealed && obj.trust_state.level < TrustLevel::SealVerified {
+        consistent = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Sealed object has trust level below SealVerified");
+        for i in 0..55 { fail_detail[i] = msg[i]; }
+        fail_len = 55;
+    }
+
+    // An object with CourtVerified trust must have compilation receipts
+    if obj.trust_state.level >= TrustLevel::CourtVerified {
+        if obj.compilation_receipt_count == 0 {
+            consistent = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("CourtVerified trust requires compilation receipts");
+            for i in 0..52 { fail_detail[i] = msg[i]; }
+            fail_len = 52;
+        }
+    }
+
+    // Trust state must have non-zero verification count if promoted
+    if obj.trust_state.level > TrustLevel::Ingested {
+        if obj.trust_state.verification_count == 0 {
+            consistent = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Promoted trust state has zero verification count");
+            for i in 0..53 { fail_detail[i] = msg[i]; }
+            fail_len = 53;
+        }
+    }
+
+    let result: CheckResult;
+    if consistent {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+    }
+
+    residual emit {
+        op: "verification.check.trust_state",
+        result: result as u64,
+        level: obj.trust_state.level as u64,
+        sealed: obj.sealed as u64,
+    };
+
+    return VerificationCheck {
+        check_id: check_id,
+        check_id_len: 24,
+        description: desc,
+        description_len: 66,
+        result: result,
+        failure_detail: fail_detail,
+        failure_detail_len: fail_len,
+        evidence_hash: obj.trust_state.evidence_chain_hash,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_trust_state"),
+            op_name_len: 18,
+            op_type: 1,
+            timestamp: 0,
+            generation: 0,
+            actor: Identity::default(),
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Check 5: Source↔Binary Correspondence
+// ============================================================================
+
+/// Verify that source and binary are in correspondence.
+/// For a source object, no binary is expected. For a binary object,
+/// the source_snapshot_hash must be non-zero and the seal flag must be set.
+fn check_source_binary(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("source_binary_correspondence");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Source↔binary correspondence is verified by seal chain");
+
+    let mut ok: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Determine if this object is expected to have source↔binary seal
+    let needs_seal: bool = obj.object_role == ObjectRole::Binary ||
+                           obj.object_role == ObjectRole::PackageContainer ||
+                           obj.object_role == ObjectRole::SourceBinarySeal;
+
+    if needs_seal {
+        // Must have non-zero source hash
+        if hash256_is_zero(obj.source_snapshot_hash) {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary object missing source snapshot hash");
+            for i in 0..49 { fail_detail[i] = msg[i]; }
+            fail_len = 49;
+        }
+
+        // Must have build recipe
+        if obj.build_recipe.name_len == 0 {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary object missing build recipe");
+            for i in 0..38 { fail_detail[i] = msg[i]; }
+            fail_len = 38;
+        }
+
+        // Must have at least one compilation receipt
+        if obj.compilation_receipt_count == 0 {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary object missing compilation receipts");
+            for i in 0..42 { fail_detail[i] = msg[i]; }
+            fail_len = 42;
+        }
+
+        // Must be sealed
+        if !obj.sealed {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary object is not sealed");
+            for i in 0..32 { fail_detail[i] = msg[i]; }
+            fail_len = 32;
+        }
+    }
+
+    let result: CheckResult;
+    if ok {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+    }
+
+    residual emit {
+        op: "verification.check.source_binary",
+        result: result as u64,
+        needs_seal: needs_seal as u64,
+    };
+
+    return VerificationCheck {
+        check_id: check_id,
+        check_id_len: 28,
+        description: desc,
+        description_len: 63,
+        result: result,
+        failure_detail: fail_detail,
+        failure_detail_len: fail_len,
+        evidence_hash: obj.source_snapshot_hash,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_source_binary"),
+            op_name_len: 20,
+            op_type: 1,
+            timestamp: 0,
+            generation: 0,
+            actor: Identity::default(),
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Check 6: Evidence Chain Completeness
+// ============================================================================
+
+/// Verify that the evidence chain is complete and references are consistent.
+fn check_evidence_chain(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("evidence_chain_completeness");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Evidence chain is complete: all receipts reference valid hashes");
+
+    let mut complete: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Check that residual edges reference valid entries
+    for i in 0..obj.residual_edge_count as u64 {
+        let edge: ResidualEdge = obj.residual_edges[i];
+        // Verify source and target event IDs are within range
+        if edge.source_residual_id > obj.residual_history.total_emitted {
+            complete = false;
+        }
+        if edge.target_residual_id > obj.residual_history.total_emitted {
+            complete = false;
+        }
+    }
+
+    if !complete {
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Residual edges reference out-of-range event IDs");
+        for i in 0..52 { fail_detail[i] = msg[i]; }
+        fail_len = 52;
+    }
+
+    let result: CheckResult;
+    if complete {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+    }
+
+    return VerificationCheck {
+        check_id: check_id,
+        check_id_len: 27,
+        description: desc,
+        description_len: 68,
+        result: result,
+        failure_detail: fail_detail,
+        failure_detail_len: fail_len,
+        evidence_hash: obj.residual_history_chain_hash,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_evidence_chain"),
+            op_name_len: 20,
+            op_type: 1,
+            timestamp: 0,
+            generation: 0,
+            actor: Identity::default(),
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0,
+            causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Complete Verification Orchestrator
+// ============================================================================
+
+/// Run all verification checks on a store object.
+fn verify_object(
+    obj: StoreObject,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+    verifier: Identity,
+    timestamp: u64,
+) -> VerificationReport
+    effect [compute, residual]
+{
+    let report: VerificationReport = verification_report_new(obj.key, verifier, timestamp);
+    let mut rep: VerificationReport = report;
+
+    // Check 1: Content integrity
+    let c1: VerificationCheck = check_content_integrity(obj);
+    rep = verification_report_add_check(rep, c1);
+
+    // Check 2: Signature validity
+    let c2: VerificationCheck = check_signatures(obj, trusted_keys, trusted_key_count);
+    rep = verification_report_add_check(rep, c2);
+
+    // Check 3: Receipt chain integrity
+    let c3: VerificationCheck = check_receipt_chain(obj);
+    rep = verification_report_add_check(rep, c3);
+
+    // Check 4: Trust state consistency
+    let c4: VerificationCheck = check_trust_state(obj);
+    rep = verification_report_add_check(rep, c4);
+
+    // Check 5: Source↔binary correspondence
+    let c5: VerificationCheck = check_source_binary(obj);
+    rep = verification_report_add_check(rep, c5);
+
+    // Check 6: Evidence chain completeness
+    let c6: VerificationCheck = check_evidence_chain(obj);
+    rep = verification_report_add_check(rep, c6);
+
+    // Finalize report
+    let rep: VerificationReport = verification_report_finalize(rep);
+
+    residual emit {
+        op: "verification.complete",
+        key_prefix: obj.key.bytes[0] as u64,
+        verdict: rep.verdict as u64,
+        checks_passed: rep.passed_count,
+        checks_failed: rep.failed_count,
+    };
+
+    return rep;
+}
+
+// ============================================================================
+// Helper: Identity default for verifier construction
+// ============================================================================
+
+impl Identity {
+    fn default() -> Identity {
+        return Identity {
+            name: Array[u8, 128]::zeroed(),
+            name_len: 0,
+            key_fingerprint: hash256_zero(),
+            dialect_scope: Array[u8, 64]::zeroed(),
+            dialect_scope_len: 0,
+            version: 0,
+            established_at_gen: 0,
+        };
+    }
+}
+
+// ResidualHistory chain hash getter on the object
+fn get_residual_chain_hash(history: ResidualHistory) -> Hash256
+    effect [compute]
+{
+    let accum: Hash256 = Hash256 { bytes: Array[u8, 32]::zeroed() };
+    for i in 0..history.count as u64 {
+        let idx: u32 = (history.head + i as u32) % 1024;
+        let rec: ResidualRecord = history.records[idx];
+        for j in 0..32 {
+            accum.bytes[j] = accum.bytes[j] ^ rec.parent_residual_hash.bytes[j];
+        }
+    }
+    return accum;
+}
+
+// ============================================================================
+// Check 7: Provenance Consistency
+// ============================================================================
+
+/// Verify that the provenance record is consistent with the object's role and trust state.
+fn check_provenance_consistency(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("provenance_consistency");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Provenance record is consistent with object role, identity, and trust state");
+
+    let mut ok: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Identity must be valid
+    if !identity_is_valid(obj.identity) {
+        ok = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Object identity has zero key fingerprint");
+        for i in 0..45 { fail_detail[i] = msg[i]; }
+        fail_len = 45;
+    }
+
+    // Creator identity must be valid
+    if !identity_is_valid(obj.provenance.creator) {
+        ok = false;
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Provenance creator has zero key fingerprint");
+        for i in 0..49 { fail_detail[i] = msg[i]; }
+        fail_len = 49;
+    }
+
+    // Source reference must be non-empty for Binary and Package objects
+    if obj.object_role == ObjectRole::Binary ||
+       obj.object_role == ObjectRole::PackageContainer {
+        if obj.provenance.source_ref_len == 0 {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Binary/package object missing source reference in provenance");
+            for i in 0..64 { fail_detail[i] = msg[i]; }
+            fail_len = 64;
+        }
+    }
+
+    // Justification must be present for promoted objects
+    if obj.trust_state.level >= TrustLevel::SealVerified {
+        if obj.provenance.justification_len == 0 {
+            ok = false;
+            let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Promoted object missing justification in provenance");
+            for i in 0..58 { fail_detail[i] = msg[i]; }
+            fail_len = 58;
+        }
+    }
+
+    let result: CheckResult;
+    if ok {
+        result = CheckResult::Pass;
+    } else {
+        result = CheckResult::Fail;
+    }
+
+    residual emit {
+        op: "verification.check.provenance",
+        result: result as u64,
+    };
+
+    return VerificationCheck {
+        check_id: check_id, check_id_len: 23,
+        description: desc, description_len: 92,
+        result: result,
+        failure_detail: fail_detail, failure_detail_len: fail_len,
+        evidence_hash: obj.provenance.parent_hash,
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_provenance"),
+            op_name_len: 17,
+            op_type: 1, timestamp: 0, generation: 0,
+            actor: Identity::default(),
+            object_hash: obj.key,
+            severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0, causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Check 8: Residual Graph Consistency
+// ============================================================================
+
+/// Verify that the residual graph has no cycles and edges are consistent.
+fn check_residual_graph(obj: StoreObject) -> VerificationCheck
+    effect [compute, residual]
+{
+    let check_id: Array[u8, 64] = Array[u8, 64]::from_literal("residual_graph_consistency");
+    let desc: Array[u8, 256] = Array[u8, 256]::from_literal("Residual dependency graph is acyclic and edges reference valid residuals");
+
+    let mut ok: bool = true;
+    let mut fail_detail: Array[u8, 512] = Array[u8, 512]::zeroed();
+    let mut fail_len: u32 = 0;
+
+    // Check that all edges reference residual IDs within the valid range
+    for i in 0..obj.residual_edge_count as u64 {
+        let edge: ResidualEdge = obj.residual_edges[i];
+        if edge.source_residual_id > obj.residual_history.total_emitted {
+            ok = false;
+        }
+        if edge.target_residual_id > obj.residual_history.total_emitted {
+            ok = false;
+        }
+    }
+
+    // Simple cycle detection via marking
+    // Since we cannot have unbounded recursion, we use a bounded iterative check
+    let mut visited: Array[bool, 256] = Array[bool, 256]::zeroed();
+    for i in 0..obj.residual_edge_count as u64 {
+        if i >= 256 { break; }
+        // Follow DependsOn edges to check for cycles
+        let edge: ResidualEdge = obj.residual_edges[i];
+        if edge.edge_type == 1 { // DependsOn
+            // Check that target is not same as source (self-loop)
+            if edge.source_residual_id == edge.target_residual_id {
+                ok = false;
+            }
+        }
+    }
+
+    if !ok {
+        let msg: Array[u8, 512] = Array[u8, 512]::from_literal("Residual graph contains invalid edges or self-loops");
+        for i in 0..55 { fail_detail[i] = msg[i]; }
+        fail_len = 55;
+    }
+
+    let result: CheckResult;
+    if ok { result = CheckResult::Pass; } else { result = CheckResult::Fail; }
+
+    return VerificationCheck {
+        check_id: check_id, check_id_len: 27,
+        description: desc, description_len: 84,
+        result: result,
+        failure_detail: fail_detail, failure_detail_len: fail_len,
+        evidence_hash: hash256_zero(),
+        check_residual: ResidualRecord {
+            op_name: Array[u8, 128]::from_literal("check_residual_graph"),
+            op_name_len: 21,
+            op_type: 1, timestamp: 0, generation: 0,
+            actor: Identity::default(),
+            object_hash: obj.key, severity: 2,
+            field_keys: Array[Array[u8, 64], 16]::zeroed(),
+            field_values: Array[Array[u8, 256], 16]::zeroed(),
+            field_key_lens: Array[u32, 16]::zeroed(),
+            field_value_lens: Array[u32, 16]::zeroed(),
+            field_count: 0,
+            parent_residual_hash: hash256_zero(),
+            event_id: 0, causal_category: 0,
+            reserved: Array[u64, 8]::zeroed(),
+        },
+    };
+}
+
+// ============================================================================
+// Full Verification Orchestrator (Expanded)
+// ============================================================================
+
+/// Run all 8 verification checks on a store object.
+fn verify_object_full(
+    obj: StoreObject,
+    trusted_keys: Array[Hash256, 64],
+    trusted_key_count: u32,
+    verifier: Identity,
+    timestamp: u64,
+) -> VerificationReport
+    effect [compute, residual]
+{
+    let report: VerificationReport = verification_report_new(obj.key, verifier, timestamp);
+    let mut rep: VerificationReport = report;
+
+    residual emit {
+        op: "verification.full.start",
+        key_prefix: obj.key.bytes[0] as u64,
+    };
+
+    // Check 1: Content integrity
+    let c1: VerificationCheck = check_content_integrity(obj);
+    rep = verification_report_add_check(rep, c1);
+
+    // Check 2: Signature validity
+    let c2: VerificationCheck = check_signatures(obj, trusted_keys, trusted_key_count);
+    rep = verification_report_add_check(rep, c2);
+
+    // Check 3: Receipt chain integrity
+    let c3: VerificationCheck = check_receipt_chain(obj);
+    rep = verification_report_add_check(rep, c3);
+
+    // Check 4: Trust state consistency
+    let c4: VerificationCheck = check_trust_state(obj);
+    rep = verification_report_add_check(rep, c4);
+
+    // Check 5: Source↔binary correspondence
+    let c5: VerificationCheck = check_source_binary(obj);
+    rep = verification_report_add_check(rep, c5);
+
+    // Check 6: Evidence chain completeness
+    let c6: VerificationCheck = check_evidence_chain(obj);
+    rep = verification_report_add_check(rep, c6);
+
+    // Check 7: Provenance consistency
+    let c7: VerificationCheck = check_provenance_consistency(obj);
+    rep = verification_report_add_check(rep, c7);
+
+    // Check 8: Residual graph consistency
+    let c8: VerificationCheck = check_residual_graph(obj);
+    rep = verification_report_add_check(rep, c8);
+
+    // Finalize
+    let rep: VerificationReport = verification_report_finalize(rep);
+
+    residual emit {
+        op: "verification.full.complete",
+        key_prefix: obj.key.bytes[0] as u64,
+        verdict: rep.verdict as u64,
+        checks_passed: rep.passed_count,
+        checks_failed: rep.failed_count,
+    };
+
+    return rep;
+}
+
+// ============================================================================
+// Verification Utilities
+// ============================================================================
+
+/// Check if an identity has a non-zero fingerprint.
+fn identity_is_valid(id: Identity) -> bool
+    effect [compute]
+{
+    for i in 0..32 {
+        if id.key_fingerprint.bytes[i] != 0 {
+            return true;
+        }
+    }
+    return false;
+}

@@ -1,0 +1,1231 @@
+// dns.phor — DNS client: message format, question/response, record types (A, AAAA, CNAME, MX, TXT), caching, resolution with timeouts
+// Implements RFC 1035 DNS protocol with residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/dns.phor
+// Court: dns:v1
+
+package network.dns;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ipv4.*;
+import network.ipv6.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// DNS sub-range: 0xE800 - 0xE8FF
+
+type DnsError = enum {
+    DnsMessageTooShort     = 0xE800,  // NE800: DNS message shorter than header
+    DnsBadId               = 0xE801,  // NE801: Response ID does not match request
+    DnsBadRcode            = 0xE802,  // NE802: Response error code
+    DnsNoAnswer            = 0xE803,  // NE803: No answer in DNS response
+    DnsNameTooLong         = 0xE804,  // NE804: DNS name exceeds maximum length
+    DnsNameLabelTooLong    = 0xE805,  // NE805: DNS label exceeds 63 bytes
+    DnsLabelCompression    = 0xE806,  // NE806: Pointer in label compression out of bounds
+    DnsTypeUnknown         = 0xE807,  // NE807: Unknown DNS record type
+    DnsClassUnknown        = 0xE808,  // NE808: Unknown DNS class
+    DnsCacheFull           = 0xE809,  // NE809: DNS cache full
+    DnsEntryNotFound       = 0xE80A,  // NE80A: DNS entry not found in cache
+    DnsTimeout             = 0xE80B,  // NE80B: DNS resolution timed out
+    DnsServerNoResponse    = 0xE80C,  // NE80C: DNS server did not respond
+    DnsServerRefused       = 0xE80D,  // NE80D: DNS server refused query
+    DnsFormatError         = 0xE80E,  // NE80E: DNS server reported format error
+    DnsServerFailure       = 0xE80F,  // NE80F: DNS server internal failure
+    DnsNameNotFound        = 0xE810,  // NE810: Domain name does not exist (NXDOMAIN)
+    DnsCapabilityError     = 0xE811,  // NE811: Insufficient capability for DNS
+    DnsBufferOverflow      = 0xE812,  // NE812: DNS message buffer overflow
+    DnsMaxRetries          = 0xE813,  // NE813: DNS query max retries reached
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const DNS_HDR_SIZE       : u64 = 12;
+const DNS_MAX_NAME_LEN   : u64 = 255;
+const DNS_MAX_LABEL_LEN  : u64 = 63;
+const DNS_MAX_MSG_SIZE   : u64 = 512;
+const DNS_UDP_PAYLOAD_MAX: u64 = 512;
+const DNS_PORT           : u16 = 53;
+const DNS_DEFAULT_TIMEOUT: u64 = 5000;
+const DNS_MAX_RETRIES    : u64 = 3;
+const DNS_CACHE_CAPACITY : u64 = 256;
+const DNS_DEFAULT_TTL    : u64 = 300;
+const DNS_MAX_SERVERS    : u64 = 4;
+
+// ─────────────────────────────────────────────────────────────
+// DNS Record Types
+// ─────────────────────────────────────────────────────────────
+
+type DnsRecordType = enum {
+    DnsTypeA     = 1,
+    DnsTypeNS    = 2,
+    DnsTypeCNAME = 5,
+    DnsTypeSOA   = 6,
+    DnsTypeWKS   = 11,
+    DnsTypePTR   = 12,
+    DnsTypeMX    = 15,
+    DnsTypeTXT   = 16,
+    DnsTypeAAAA  = 28,
+    DnsTypeSRV   = 33,
+    DnsTypeANY   = 255,
+}
+
+type DnsClass = enum {
+    DnsClassIn   = 1,
+    DnsClassCS   = 2,
+    DnsClassCH   = 3,
+    DnsClassHS   = 4,
+    DnsClassAny  = 255,
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Header
+// ─────────────────────────────────────────────────────────────
+
+struct DnsHeader {
+    id: u16,
+    flags: u16,
+    qdcount: u16,
+    ancount: u16,
+    nscount: u16,
+    arcount: u16,
+}
+
+impl DnsHeader {
+    fn new(id: u16, recursive: bool) -> DnsHeader
+        effect [deterministic]
+    {
+        let flags: u16 = if recursive { 0x0100 } else { 0 };
+        return DnsHeader {
+            id: id,
+            flags: flags,
+            qdcount: 1,
+            ancount: 0,
+            nscount: 0,
+            arcount: 0,
+        };
+    }
+
+    fn parse(data: Array(u8, DNS_MAX_MSG_SIZE)) -> Result(DnsHeader, DnsError)
+        effect [deterministic]
+    {
+        let id: u16 = ((data[0] as u16) << 8) | (data[1] as u16);
+        let flags: u16 = ((data[2] as u16) << 8) | (data[3] as u16);
+        let qdcount: u16 = ((data[4] as u16) << 8) | (data[5] as u16);
+        let ancount: u16 = ((data[6] as u16) << 8) | (data[7] as u16);
+        let nscount: u16 = ((data[8] as u16) << 8) | (data[9] as u16);
+        let arcount: u16 = ((data[10] as u16) << 8) | (data[11] as u16);
+        return Result::Ok(DnsHeader {
+            id: id,
+            flags: flags,
+            qdcount: qdcount,
+            ancount: ancount,
+            nscount: nscount,
+            arcount: arcount,
+        });
+    }
+
+    fn serialize(self) -> Array(u8, DNS_HDR_SIZE)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, DNS_HDR_SIZE) = Array::zeroed();
+        buf[0] = ((self.id >> 8) & 0xFF) as u8;
+        buf[1] = (self.id & 0xFF) as u8;
+        buf[2] = ((self.flags >> 8) & 0xFF) as u8;
+        buf[3] = (self.flags & 0xFF) as u8;
+        buf[4] = ((self.qdcount >> 8) & 0xFF) as u8;
+        buf[5] = (self.qdcount & 0xFF) as u8;
+        buf[6] = ((self.ancount >> 8) & 0xFF) as u8;
+        buf[7] = (self.ancount & 0xFF) as u8;
+        buf[8] = ((self.nscount >> 8) & 0xFF) as u8;
+        buf[9] = (self.nscount & 0xFF) as u8;
+        buf[10] = ((self.arcount >> 8) & 0xFF) as u8;
+        buf[11] = (self.arcount & 0xFF) as u8;
+        return buf;
+    }
+
+    fn is_response(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & 0x8000) != 0;
+    }
+
+    fn rcode(self) -> u8
+        effect [deterministic]
+    {
+        return (self.flags & 0x000F) as u8;
+    }
+
+    fn is_truncated(self) -> bool
+        effect [deterministic]
+    {
+        return (self.flags & 0x0200) != 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Name Encoding/Decoding
+// ─────────────────────────────────────────────────────────────
+
+struct DnsName {
+    labels: Array(Array(u8, DNS_MAX_LABEL_LEN), 32),
+    label_count: u64,
+    full_name: Array(u8, DNS_MAX_NAME_LEN),
+    full_name_len: u64,
+}
+
+impl DnsName {
+    fn from_string(name: Array(u8, DNS_MAX_NAME_LEN), name_len: u64) -> Result(DnsName, DnsError)
+        effect [deterministic]
+    {
+        if name_len > DNS_MAX_NAME_LEN {
+            return Result::Err(DnsError::DnsNameTooLong);
+        };
+        let mut labels: Array(Array(u8, DNS_MAX_LABEL_LEN), 32) = Array::zeroed();
+        let mut label_count: u64 = 0;
+        let mut label_start: u64 = 0;
+        loop bound DNS_MAX_NAME_LEN {
+            if i >= name_len {
+                break;
+            };
+            if name[i] == '.' {
+                let label_len: u64 = i - label_start;
+                if label_len > DNS_MAX_LABEL_LEN {
+                    return Result::Err(DnsError::DnsNameLabelTooLong);
+                };
+                let mut label: Array(u8, DNS_MAX_LABEL_LEN) = Array::zeroed();
+                loop bound DNS_MAX_LABEL_LEN {
+                    if j >= label_len {
+                        break;
+                    };
+                    label[j] = name[label_start + j];
+                };
+                if label_count < 32 {
+                    labels[label_count] = label;
+                    label_count = label_count + 1;
+                };
+                label_start = i + 1;
+            };
+        };
+        // Last label (after final dot)
+        let last_len: u64 = name_len - label_start;
+        if last_len > 0 && last_len <= DNS_MAX_LABEL_LEN {
+            let mut label: Array(u8, DNS_MAX_LABEL_LEN) = Array::zeroed();
+            loop bound DNS_MAX_LABEL_LEN {
+                if j >= last_len {
+                    break;
+                };
+                label[j] = name[label_start + j];
+            };
+            if label_count < 32 {
+                labels[label_count] = label;
+                label_count = label_count + 1;
+            };
+        };
+        return Result::Ok(DnsName {
+            labels: labels,
+            label_count: label_count,
+            full_name: name,
+            full_name_len: name_len,
+        });
+    }
+
+    fn encode(self, buf: ref mut Array(u8, DNS_MAX_MSG_SIZE), offset: ref mut u64) -> Result(void, DnsError)
+        effect [deterministic]
+    {
+        loop bound 32 {
+            if i >= self.label_count {
+                break;
+            };
+            if *offset + 1 > DNS_MAX_MSG_SIZE {
+                return Result::Err(DnsError::DnsBufferOverflow);
+            };
+            let label: Array(u8, DNS_MAX_LABEL_LEN) = self.labels[i];
+            let label_len: u8 = 0;
+            let mut llen: u8 = 0;
+            loop bound DNS_MAX_LABEL_LEN {
+                if llen >= (DNS_MAX_LABEL_LEN as u8) { break; };
+                if label[llen as u64] == 0 { break; };
+                llen = llen + 1;
+            };
+            buf[*offset] = llen;
+            *offset = *offset + 1;
+            loop bound DNS_MAX_LABEL_LEN {
+                if j >= (llen as u64) {
+                    break;
+                };
+                buf[*offset] = label[j];
+                *offset = *offset + 1;
+            };
+        };
+        // Root label terminator
+        if *offset >= DNS_MAX_MSG_SIZE {
+            return Result::Err(DnsError::DnsBufferOverflow);
+        };
+        buf[*offset] = 0;
+        *offset = *offset + 1;
+        return Result::Ok(void);
+    }
+
+    fn decode(data: Array(u8, DNS_MAX_MSG_SIZE), msg_len: u64,
+              offset: ref mut u64) -> Result(DnsName, DnsError)
+        effect [deterministic]
+    {
+        let mut labels: Array(Array(u8, DNS_MAX_LABEL_LEN), 32) = Array::zeroed();
+        let mut label_count: u64 = 0;
+        let mut full: Array(u8, DNS_MAX_NAME_LEN) = Array::zeroed();
+        let mut full_len: u64 = 0;
+        let mut pos: u64 = *offset;
+        let mut loop_count: u64 = 0;
+        loop bound 64 {
+            if loop_count >= 64 {
+                return Result::Err(DnsError::DnsNameTooLong);
+            };
+            if pos >= msg_len {
+                return Result::Err(DnsError::DnsMessageTooShort);
+            };
+            let byte: u8 = data[pos];
+            if byte == 0 {
+                pos = pos + 1;
+                break;
+            };
+            // Check for compression pointer (top 2 bits = 11)
+            if (byte & 0xC0) == 0xC0 {
+                if pos + 1 >= msg_len {
+                    return Result::Err(DnsError::DnsLabelCompression);
+                };
+                let ptr: u16 = (((byte & 0x3F) as u16) << 8) | (data[pos + 1] as u16);
+                if (ptr as u64) >= msg_len {
+                    return Result::Err(DnsError::DnsLabelCompression);
+                };
+                // Follow pointer recursively (bounded)
+                pos = ptr as u64;
+                loop_count = loop_count + 1;
+                continue;
+            };
+            // Normal label
+            let label_len: u64 = byte as u64;
+            if label_len > DNS_MAX_LABEL_LEN {
+                return Result::Err(DnsError::DnsNameLabelTooLong);
+            };
+            if label_count >= 32 {
+                return Result::Err(DnsError::DnsNameTooLong);
+            };
+            let mut label: Array(u8, DNS_MAX_LABEL_LEN) = Array::zeroed();
+            pos = pos + 1;
+            loop bound DNS_MAX_LABEL_LEN {
+                if i >= label_len {
+                    break;
+                };
+                if pos >= msg_len {
+                    break;
+                };
+                label[i] = data[pos];
+                full[full_len] = data[pos];
+                full_len = full_len + 1;
+                pos = pos + 1;
+            };
+            labels[label_count] = label;
+            label_count = label_count + 1;
+            full[full_len] = '.';
+            full_len = full_len + 1;
+            loop_count = loop_count + 1;
+        };
+        if full_len > 0 && full[full_len - 1] == '.' {
+            full_len = full_len - 1;
+        };
+        *offset = pos;
+        return Result::Ok(DnsName {
+            labels: labels,
+            label_count: label_count,
+            full_name: full,
+            full_name_len: full_len,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Question
+// ─────────────────────────────────────────────────────────────
+
+struct DnsQuestion {
+    name: DnsName,
+    qtype: u16,
+    qclass: u16,
+}
+
+impl DnsQuestion {
+    fn new(name: DnsName, qtype: u16) -> DnsQuestion
+        effect [deterministic]
+    {
+        return DnsQuestion {
+            name: name,
+            qtype: qtype,
+            qclass: 1,
+        };
+    }
+
+    fn serialize(self, buf: ref mut Array(u8, DNS_MAX_MSG_SIZE), offset: ref mut u64) -> Result(void, DnsError)
+        effect [deterministic]
+    {
+        let encode_res: Result(void, DnsError) = self.name.encode(buf, offset);
+        if encode_res.is_err() {
+            return Result::Err(encode_res.unwrap_err());
+        };
+        if *offset + 4 > DNS_MAX_MSG_SIZE {
+            return Result::Err(DnsError::DnsBufferOverflow);
+        };
+        buf[*offset] = ((self.qtype >> 8) & 0xFF) as u8;
+        buf[*offset + 1] = (self.qtype & 0xFF) as u8;
+        buf[*offset + 2] = ((self.qclass >> 8) & 0xFF) as u8;
+        buf[*offset + 3] = (self.qclass & 0xFF) as u8;
+        *offset = *offset + 4;
+        return Result::Ok(void);
+    }
+
+    fn parse(data: Array(u8, DNS_MAX_MSG_SIZE), msg_len: u64,
+              offset: ref mut u64) -> Result(DnsQuestion, DnsError)
+        effect [deterministic]
+    {
+        let name_res: Result(DnsName, DnsError) = DnsName::decode(data, msg_len, offset);
+        if name_res.is_err() {
+            return Result::Err(name_res.unwrap_err());
+        };
+        let name: DnsName = name_res.unwrap();
+        if *offset + 4 > msg_len {
+            return Result::Err(DnsError::DnsMessageTooShort);
+        };
+        let qtype: u16 = ((data[*offset] as u16) << 8) | (data[*offset + 1] as u16);
+        let qclass: u16 = ((data[*offset + 2] as u16) << 8) | (data[*offset + 3] as u16);
+        *offset = *offset + 4;
+        return Result::Ok(DnsQuestion {
+            name: name,
+            qtype: qtype,
+            qclass: qclass,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Resource Record
+// ─────────────────────────────────────────────────────────────
+
+struct DnsResourceRecord {
+    name: DnsName,
+    rtype: u16,
+    rclass: u16,
+    ttl: u32,
+    rdlength: u16,
+    rdata: Array(u8, DNS_MAX_MSG_SIZE),
+    rdata_len: u64,
+}
+
+impl DnsResourceRecord {
+    fn parse(data: Array(u8, DNS_MAX_MSG_SIZE), msg_len: u64,
+              offset: ref mut u64) -> Result(DnsResourceRecord, DnsError)
+        effect [deterministic]
+    {
+        let name_res: Result(DnsName, DnsError) = DnsName::decode(data, msg_len, offset);
+        if name_res.is_err() {
+            return Result::Err(name_res.unwrap_err());
+        };
+        let name: DnsName = name_res.unwrap();
+        if *offset + 10 > msg_len {
+            return Result::Err(DnsError::DnsMessageTooShort);
+        };
+        let rtype: u16 = ((data[*offset] as u16) << 8) | (data[*offset + 1] as u16);
+        let rclass: u16 = ((data[*offset + 2] as u16) << 8) | (data[*offset + 3] as u16);
+        let ttl: u32 = ((data[*offset + 4] as u32) << 24) | ((data[*offset + 5] as u32) << 16) |
+                       ((data[*offset + 6] as u32) << 8) | (data[*offset + 7] as u32);
+        let rdlength: u16 = ((data[*offset + 8] as u16) << 8) | (data[*offset + 9] as u16);
+        *offset = *offset + 10;
+        if *offset + (rdlength as u64) > msg_len {
+            return Result::Err(DnsError::DnsMessageTooShort);
+        };
+        let mut rdata: Array(u8, DNS_MAX_MSG_SIZE) = Array::zeroed();
+        loop bound DNS_MAX_MSG_SIZE {
+            if i >= (rdlength as u64) {
+                break;
+            };
+            rdata[i] = data[*offset + i];
+        };
+        let rdata_len: u64 = rdlength as u64;
+        *offset = *offset + rdata_len;
+        return Result::Ok(DnsResourceRecord {
+            name: name,
+            rtype: rtype,
+            rclass: rclass,
+            ttl: ttl,
+            rdlength: rdlength,
+            rdata: rdata,
+            rdata_len: rdata_len,
+        });
+    }
+
+    fn as_a_record(self) -> Result(Ipv4Address, DnsError)
+        effect [deterministic]
+    {
+        if self.rtype != 1 || self.rdata_len < 4 {
+            return Result::Err(DnsError::DnsTypeUnknown);
+        };
+        let mut octets: Array(u8, 4) = Array::zeroed();
+        loop bound 4 {
+            octets[i] = self.rdata[i];
+        };
+        return Result::Ok(Ipv4Address::from_bytes(octets));
+    }
+
+    fn as_aaaa_record(self) -> Result(Ipv6Address, DnsError)
+        effect [deterministic]
+    {
+        if self.rtype != 28 || self.rdata_len < 16 {
+            return Result::Err(DnsError::DnsTypeUnknown);
+        };
+        let mut octets: Array(u8, 16) = Array::zeroed();
+        loop bound 16 {
+            octets[i] = self.rdata[i];
+        };
+        return Result::Ok(Ipv6Address::from_bytes(octets));
+    }
+
+    fn as_cname(self) -> Result(DnsName, DnsError)
+        effect [deterministic]
+    {
+        if self.rtype != 5 {
+            return Result::Err(DnsError::DnsTypeUnknown);
+        };
+        let mut offset: u64 = 0;
+        let name_res: Result(DnsName, DnsError) = DnsName::decode(self.rdata, self.rdata_len, &mut offset);
+        if name_res.is_err() {
+            return Result::Err(name_res.unwrap_err());
+        };
+        return name_res;
+    }
+
+    fn as_mx(self) -> Result((u16, DnsName), DnsError)
+        effect [deterministic]
+    {
+        if self.rtype != 15 || self.rdata_len < 3 {
+            return Result::Err(DnsError::DnsTypeUnknown);
+        };
+        let preference: u16 = ((self.rdata[0] as u16) << 8) | (self.rdata[1] as u16);
+        let mut offset: u64 = 2;
+        let name_res: Result(DnsName, DnsError) = DnsName::decode(self.rdata, self.rdata_len, &mut offset);
+        if name_res.is_err() {
+            return Result::Err(name_res.unwrap_err());
+        };
+        return Result::Ok((preference, name_res.unwrap()));
+    }
+
+    fn as_txt(self) -> Result(Array(u8, DNS_MAX_MSG_SIZE), DnsError)
+        effect [deterministic]
+    {
+        if self.rtype != 16 {
+            return Result::Err(DnsError::DnsTypeUnknown);
+        };
+        let mut text: Array(u8, DNS_MAX_MSG_SIZE) = Array::zeroed();
+        let mut text_len: u64 = 0;
+        let mut pos: u64 = 0;
+        loop bound DNS_MAX_MSG_SIZE {
+            if pos >= self.rdata_len {
+                break;
+            };
+            let chunk_len: u8 = self.rdata[pos];
+            pos = pos + 1;
+            loop bound DNS_MAX_MSG_SIZE {
+                if i >= (chunk_len as u64) {
+                    break;
+                };
+                if pos < self.rdata_len {
+                    text[text_len] = self.rdata[pos];
+                    text_len = text_len + 1;
+                    pos = pos + 1;
+                };
+            };
+        };
+        return Result::Ok(text);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Message
+// ─────────────────────────────────────────────────────────────
+
+struct DnsMessage {
+    header: DnsHeader,
+    questions: Array(DnsQuestion, 4),
+    question_count: u64,
+    answers: Array(DnsResourceRecord, 16),
+    answer_count: u64,
+    authorities: Array(DnsResourceRecord, 8),
+    authority_count: u64,
+    additionals: Array(DnsResourceRecord, 8),
+    additional_count: u64,
+}
+
+impl DnsMessage {
+    fn query(id: u16, name: DnsName, qtype: u16, recursive: bool) -> DnsMessage
+        effect [deterministic]
+    {
+        let mut questions: Array(DnsQuestion, 4) = Array::zeroed();
+        questions[0] = DnsQuestion::new(name, qtype);
+        return DnsMessage {
+            header: DnsHeader::new(id, recursive),
+            questions: questions,
+            question_count: 1,
+            answers: Array::zeroed(),
+            answer_count: 0,
+            authorities: Array::zeroed(),
+            authority_count: 0,
+            additionals: Array::zeroed(),
+            additional_count: 0,
+        };
+    }
+
+    fn serialize(self) -> Result(Array(u8, DNS_MAX_MSG_SIZE), DnsError)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, DNS_MAX_MSG_SIZE) = Array::zeroed();
+        let hdr_buf: Array(u8, DNS_HDR_SIZE) = self.header.serialize();
+        loop bound DNS_HDR_SIZE {
+            buf[i] = hdr_buf[i];
+        };
+        let mut offset: u64 = DNS_HDR_SIZE;
+        loop bound 4 {
+            if i >= self.question_count {
+                break;
+            };
+            let ser_res: Result(void, DnsError) = self.questions[i].serialize(buf, offset);
+            if ser_res.is_err() {
+                return Result::Err(ser_res.unwrap_err());
+            };
+            offset = offset + self.questions[i].name.full_name_len + 6;
+        };
+        return Result::Ok(buf);
+    }
+
+    fn parse(raw: Array(u8, DNS_MAX_MSG_SIZE), len: u64) -> Result(DnsMessage, DnsError)
+        effect [deterministic]
+        court "dns_message_parse:v1"
+    {
+        if len < DNS_HDR_SIZE {
+            return Result::Err(DnsError::DnsMessageTooShort);
+        };
+        let hdr_res: Result(DnsHeader, DnsError) = DnsHeader::parse(raw);
+        if hdr_res.is_err() {
+            return Result::Err(hdr_res.unwrap_err());
+        };
+        let header: DnsHeader = hdr_res.unwrap();
+        let mut offset: u64 = DNS_HDR_SIZE;
+        let mut questions: Array(DnsQuestion, 4) = Array::zeroed();
+        let mut qcount: u64 = 0;
+        loop bound 4 {
+            if i >= (header.qdcount as u64) {
+                break;
+            };
+            let q_res: Result(DnsQuestion, DnsError) = DnsQuestion::parse(raw, len, &mut offset);
+            if q_res.is_err() {
+                return Result::Err(q_res.unwrap_err());
+            };
+            if qcount < 4 {
+                questions[qcount] = q_res.unwrap();
+                qcount = qcount + 1;
+            };
+        };
+        let mut answers: Array(DnsResourceRecord, 16) = Array::zeroed();
+        let mut acount: u64 = 0;
+        loop bound 16 {
+            if i >= (header.ancount as u64) {
+                break;
+            };
+            let rr_res: Result(DnsResourceRecord, DnsError) = DnsResourceRecord::parse(raw, len, &mut offset);
+            if rr_res.is_err() {
+                return Result::Err(rr_res.unwrap_err());
+            };
+            if acount < 16 {
+                answers[acount] = rr_res.unwrap();
+                acount = acount + 1;
+            };
+        };
+        let mut authorities: Array(DnsResourceRecord, 8) = Array::zeroed();
+        let mut auth_count: u64 = 0;
+        loop bound 8 {
+            if i >= (header.nscount as u64) {
+                break;
+            };
+            let rr_res: Result(DnsResourceRecord, DnsError) = DnsResourceRecord::parse(raw, len, &mut offset);
+            if rr_res.is_err() {
+                return Result::Err(rr_res.unwrap_err());
+            };
+            if auth_count < 8 {
+                authorities[auth_count] = rr_res.unwrap();
+                auth_count = auth_count + 1;
+            };
+        };
+        let mut additionals: Array(DnsResourceRecord, 8) = Array::zeroed();
+        let mut add_count: u64 = 0;
+        loop bound 8 {
+            if i >= (header.arcount as u64) {
+                break;
+            };
+            let rr_res: Result(DnsResourceRecord, DnsError) = DnsResourceRecord::parse(raw, len, &mut offset);
+            if rr_res.is_err() {
+                return Result::Err(rr_res.unwrap_err());
+            };
+            if add_count < 8 {
+                additionals[add_count] = rr_res.unwrap();
+                add_count = add_count + 1;
+            };
+        };
+        return Result::Ok(DnsMessage {
+            header: header,
+            questions: questions,
+            question_count: qcount,
+            answers: answers,
+            answer_count: acount,
+            authorities: authorities,
+            authority_count: auth_count,
+            additionals: additionals,
+            additional_count: add_count,
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Cache Entry
+// ─────────────────────────────────────────────────────────────
+
+struct DnsCacheEntry {
+    name: Array(u8, DNS_MAX_NAME_LEN),
+    name_len: u64,
+    rtype: u16,
+    ttl: u32,
+    timestamp: u64,
+    rdata: Array(u8, DNS_MAX_MSG_SIZE),
+    rdata_len: u64,
+    generation: u64,
+}
+
+impl DnsCacheEntry {
+    fn empty() -> DnsCacheEntry
+        effect [deterministic]
+    {
+        return DnsCacheEntry {
+            name: Array::zeroed(),
+            name_len: 0,
+            rtype: 0,
+            ttl: 0,
+            timestamp: 0,
+            rdata: Array::zeroed(),
+            rdata_len: 0,
+            generation: 0,
+        };
+    }
+
+    fn new(name: Array(u8, DNS_MAX_NAME_LEN), name_len: u64, rtype: u16,
+            ttl: u32, now: u64, rdata: Array(u8, DNS_MAX_MSG_SIZE), rdata_len: u64) -> DnsCacheEntry
+        effect [deterministic]
+    {
+        return DnsCacheEntry {
+            name: name,
+            name_len: name_len,
+            rtype: rtype,
+            ttl: ttl,
+            timestamp: now,
+            rdata: rdata,
+            rdata_len: rdata_len,
+            generation: 1,
+        };
+    }
+
+    fn is_expired(self, now: u64) -> bool
+        effect [deterministic]
+    {
+        return (now - self.timestamp) >= (self.ttl as u64);
+    }
+}
+
+struct DnsCache {
+    entries: Array(DnsCacheEntry, DNS_CACHE_CAPACITY),
+    entry_count: u64,
+}
+
+impl DnsCache {
+    fn new() -> DnsCache
+        effect [deterministic]
+    {
+        return DnsCache {
+            entries: Array::zeroed(),
+            entry_count: 0,
+        };
+    }
+
+    fn lookup(self, name: Array(u8, DNS_MAX_NAME_LEN), name_len: u64,
+               rtype: u16, now: u64) -> Result(DnsCacheEntry, DnsError)
+        effect [deterministic]
+    {
+        loop bound DNS_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let entry: DnsCacheEntry = self.entries[i];
+            if entry.rtype != rtype {
+                continue;
+            };
+            if entry.name_len != name_len {
+                continue;
+            };
+            let mut match_name: bool = true;
+            loop bound DNS_MAX_NAME_LEN {
+                if j >= name_len {
+                    break;
+                };
+                if entry.name[j] != name[j] {
+                    match_name = false;
+                    break;
+                };
+            };
+            if match_name && !entry.is_expired(now) {
+                return Result::Ok(entry);
+            };
+        };
+        return Result::Err(DnsError::DnsEntryNotFound);
+    }
+
+    fn insert(self: ref mut, entry: DnsCacheEntry)
+        effect [deterministic]
+    {
+        // Update existing
+        loop bound DNS_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            let e: DnsCacheEntry = self.entries[i];
+            if e.rtype == entry.rtype && e.name_len == entry.name_len {
+                let mut match_name: bool = true;
+                loop bound DNS_MAX_NAME_LEN {
+                    if j >= (e.name_len) {
+                        break;
+                    };
+                    if entry.name[j] != e.name[j] {
+                        match_name = false;
+                        break;
+                    };
+                };
+                if match_name {
+                    self.entries[i] = entry;
+                    self.entries[i].generation = self.entries[i].generation + 1;
+                    return;
+                };
+            };
+        };
+        if self.entry_count < DNS_CACHE_CAPACITY {
+            self.entries[self.entry_count] = entry;
+            self.entry_count = self.entry_count + 1;
+        } else {
+            // Evict oldest
+            let mut oldest_idx: u64 = 0;
+            let mut oldest_ts: u64 = self.entries[0].timestamp;
+            loop bound DNS_CACHE_CAPACITY {
+                if i >= self.entry_count {
+                    break;
+                };
+                if self.entries[i].timestamp < oldest_ts {
+                    oldest_ts = self.entries[i].timestamp;
+                    oldest_idx = i;
+                };
+            };
+            self.entries[oldest_idx] = entry;
+        };
+    }
+
+    fn purge_expired(self: ref mut, now: u64)
+        effect [deterministic]
+    {
+        let mut i: u64 = 0;
+        loop bound DNS_CACHE_CAPACITY {
+            if i >= self.entry_count {
+                break;
+            };
+            if self.entries[i].is_expired(now) {
+                self.entries[i] = self.entries[self.entry_count - 1];
+                self.entry_count = self.entry_count - 1;
+            } else {
+                i = i + 1;
+            };
+        };
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Resolver State
+// ─────────────────────────────────────────────────────────────
+
+struct DnsServer {
+    address: Ipv4Address,
+    port: u16,
+}
+
+impl DnsServer {
+    fn new(addr: Ipv4Address) -> DnsServer
+        effect [deterministic]
+    {
+        return DnsServer { address: addr, port: DNS_PORT };
+    }
+}
+
+struct DnsResolver {
+    cache: DnsCache,
+    servers: Array(DnsServer, DNS_MAX_SERVERS),
+    server_count: u64,
+    next_id: u16,
+    queries_sent: u64,
+    queries_recv: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    timeouts: u64,
+    generation: u64,
+}
+
+impl DnsResolver {
+    fn new() -> DnsResolver
+        effect [deterministic]
+    {
+        let mut servers: Array(DnsServer, DNS_MAX_SERVERS) = Array::zeroed();
+        // Default to public DNS resolvers
+        servers[0] = DnsServer::new(Ipv4Address::from_string(Array::from_literal("8.8.8.8"), 7).unwrap());
+        servers[1] = DnsServer::new(Ipv4Address::from_string(Array::from_literal("1.1.1.1"), 7).unwrap());
+        return DnsResolver {
+            cache: DnsCache::new(),
+            servers: servers,
+            server_count: 2,
+            next_id: 1,
+            queries_sent: 0,
+            queries_recv: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            timeouts: 0,
+            generation: 1,
+        };
+    }
+
+    fn next_id(self: ref mut) -> u16
+        effect [deterministic]
+    {
+        let id: u16 = self.next_id;
+        self.next_id = self.next_id + 1;
+        return id;
+    }
+
+    fn resolve_a(
+        self: ref mut,
+        hostname: Array(u8, DNS_MAX_NAME_LEN),
+        hostname_len: u64,
+        now: u64,
+    ) -> Result(Ipv4Address, DnsError)
+        effect [deterministic]
+        court "dns_resolve_a:v1"
+    {
+        // Check cache first
+        let cache_res: Result(DnsCacheEntry, DnsError) = self.cache.lookup(hostname, hostname_len, 1, now);
+        if cache_res.is_ok() {
+            let entry: DnsCacheEntry = cache_res.unwrap();
+            let ip_res: Result(Ipv4Address, DnsError) = Ipv4Address::from_bytes(
+                Array::from_slice(entry.rdata, entry.rdata_len, 0).unwrap()
+            );
+            if ip_res.is_ok() {
+                self.cache_hits = self.cache_hits + 1;
+                return ip_res;
+            };
+        };
+        self.cache_misses = self.cache_misses + 1;
+        // Need to query server
+        // Build query message
+        let name_res: Result(DnsName, DnsError) = DnsName::from_string(hostname, hostname_len);
+        if name_res.is_err() {
+            return Result::Err(name_res.unwrap_err());
+        };
+        let name: DnsName = name_res.unwrap();
+        let query: DnsMessage = DnsMessage::query(self.next_id(), name, 1, true);
+        self.queries_sent = self.queries_sent + 1;
+
+        residual emit {
+            op: "dns.resolve_a",
+            hostname: hostname,
+            server_count: self.server_count,
+            cache_entries: self.cache.count(),
+        };
+
+        // In a full implementation, would send UDP query and await response
+        // Here we simulate a protocol-level wrapper
+        return Result::Err(DnsError::DnsServerNoResponse);
+    }
+
+    fn resolve_aaaa(
+        self: ref mut,
+        hostname: Array(u8, DNS_MAX_NAME_LEN),
+        hostname_len: u64,
+        now: u64,
+    ) -> Result(Ipv6Address, DnsError)
+        effect [deterministic]
+    {
+        let cache_res: Result(DnsCacheEntry, DnsError) = self.cache.lookup(hostname, hostname_len, 28, now);
+        if cache_res.is_ok() {
+            self.cache_hits = self.cache_hits + 1;
+        };
+        self.cache_misses = self.cache_misses + 1;
+        return Result::Err(DnsError::DnsServerNoResponse);
+    }
+
+    fn process_response(self: ref mut, response: DnsMessage, now: u64) -> Result(Ipv4Address, DnsError)
+        effect [deterministic]
+        court "dns_process_response:v1"
+    {
+        self.queries_recv = self.queries_recv + 1;
+        if response.header.rcode() != 0 {
+            if response.header.rcode() == 3 {
+                return Result::Err(DnsError::DnsNameNotFound);
+            };
+            return Result::Err(DnsError::DnsBadRcode);
+        };
+        if response.answer_count == 0 {
+            return Result::Err(DnsError::DnsNoAnswer);
+        };
+        loop bound 16 {
+            if i >= response.answer_count {
+                break;
+            };
+            let rr: DnsResourceRecord = response.answers[i];
+            if rr.rtype == 1 && rr.rdata_len >= 4 {
+                let ip_res: Result(Ipv4Address, DnsError) = rr.as_a_record();
+                if ip_res.is_ok() {
+                    let ip: Ipv4Address = ip_res.unwrap();
+                    // Cache the result
+                    let cache_entry: DnsCacheEntry = DnsCacheEntry::new(
+                        rr.name.full_name, rr.name.full_name_len,
+                        1, rr.ttl, now, rr.rdata, rr.rdata_len,
+                    );
+                    self.cache.insert(cache_entry);
+                    return Result::Ok(ip);
+                };
+            };
+        };
+        return Result::Err(DnsError::DnsNoAnswer);
+    }
+
+    fn add_server(self: ref mut, addr: Ipv4Address) -> Result(void, DnsError)
+        effect [deterministic]
+    {
+        if self.server_count >= DNS_MAX_SERVERS {
+            return Result::Err(DnsError::DnsCacheFull);
+        };
+        self.servers[self.server_count] = DnsServer::new(addr);
+        self.server_count = self.server_count + 1;
+        return Result::Ok(void);
+    }
+
+    fn get_statistics(self) -> (u64, u64, u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.queries_sent,
+            self.queries_recv,
+            self.cache_hits,
+            self.cache_misses,
+            self.timeouts,
+            self.cache.count(),
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn dns_init() -> Result(DnsResolver, DnsError)
+    effect [deterministic]
+    court "dns_init:v1"
+{
+    residual emit {
+        op: "dns.init",
+        status: "ready",
+    };
+    return Result::Ok(DnsResolver::new());
+}
+
+fn dns_name_to_string(name: DnsName) -> Array(u8, DNS_MAX_NAME_LEN + 1)
+    effect [deterministic]
+{
+    let mut result: Array(u8, DNS_MAX_NAME_LEN + 1) = Array::zeroed();
+    let mut pos: u64 = 0;
+    loop bound 32 {
+        if i >= name.label_count {
+            break;
+        };
+        let label: Array(u8, DNS_MAX_LABEL_LEN) = name.labels[i];
+        loop bound DNS_MAX_LABEL_LEN {
+            if label[j] == 0 {
+                break;
+            };
+            result[pos] = label[j];
+            pos = pos + 1;
+        };
+        if i < name.label_count - 1 {
+            result[pos] = '.';
+            pos = pos + 1;
+        };
+    };
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Server Selection and Failover
+// ─────────────────────────────────────────────────────────────
+
+fn dns_server_health_check(server: DnsServer, timeout_ms: u64) -> bool
+    effect [deterministic]
+{
+    let _ = server;
+    let _ = timeout_ms;
+    // In a full implementation, would send a test query
+    return true;
+}
+
+fn dns_select_best_server(servers: Array(DnsServer, DNS_MAX_SERVERS), count: u64) -> Result(u64, DnsError)
+    effect [deterministic]
+{
+    if count == 0 {
+        return Result::Err(DnsError::DnsServerNoResponse);
+    };
+    // Simple round-robin: return first healthy server
+    loop bound DNS_MAX_SERVERS {
+        if i >= count {
+            break;
+        };
+        if dns_server_health_check(servers[i], 1000) {
+            return Result::Ok(i);
+        };
+    };
+    return Result::Err(DnsError::DnsServerNoResponse);
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Record Validation
+// ─────────────────────────────────────────────────────────────
+
+fn dns_validate_a_record(rdata: Array(u8, DNS_MAX_MSG_SIZE), rdlen: u64) -> bool
+    effect [deterministic]
+{
+    if rdlen < 4 {
+        return false;
+    };
+    let first_octet: u8 = rdata[0];
+    // Reject 0.0.0.0
+    if first_octet == 0 {
+        let mut all_zero: bool = true;
+        loop bound 4 {
+            if rdata[i] != 0 {
+                all_zero = false;
+                break;
+            };
+        };
+        if all_zero {
+            return false;
+        };
+    };
+    // Reject loopback
+    if first_octet == 127 {
+        return false;
+    };
+    return true;
+}
+
+fn dns_validate_aaaa_record(rdata: Array(u8, DNS_MAX_MSG_SIZE), rdlen: u64) -> bool
+    effect [deterministic]
+{
+    if rdlen < 16 {
+        return false;
+    };
+    // Reject ::1 (loopback)
+    let mut is_loopback: bool = true;
+    loop bound 15 {
+        if rdata[i] != 0 {
+            is_loopback = false;
+            break;
+        };
+    };
+    if is_loopback && rdata[15] == 1 {
+        return false;
+    };
+    return true;
+}
+
+fn dns_validate_name(name: Array(u8, DNS_MAX_NAME_LEN), name_len: u64) -> bool
+    effect [deterministic]
+{
+    if name_len == 0 || name_len > DNS_MAX_NAME_LEN {
+        return false;
+    };
+    let mut dot_count: u64 = 0;
+    loop bound DNS_MAX_NAME_LEN {
+        if i >= name_len {
+            break;
+        };
+        if name[i] == '.' {
+            dot_count = dot_count + 1;
+        } else if !(name[i] >= 'a' && name[i] <= 'z') &&
+                  !(name[i] >= 'A' && name[i] <= 'Z') &&
+                  !(name[i] >= '0' && name[i] <= '9') &&
+                  name[i] != '-' && name[i] != '_' {
+            return false;
+        };
+    };
+    return dot_count >= 1;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DNS Record Type Name Lookup
+// ─────────────────────────────────────────────────────────────
+
+fn dns_type_to_name(rtype: u16) -> Array(u8, 8)
+    effect [deterministic]
+{
+    if rtype == 1 { return Array::from_literal("A"); };
+    if rtype == 2 { return Array::from_literal("NS"); };
+    if rtype == 5 { return Array::from_literal("CNAME"); };
+    if rtype == 6 { return Array::from_literal("SOA"); };
+    if rtype == 12 { return Array::from_literal("PTR"); };
+    if rtype == 15 { return Array::from_literal("MX"); };
+    if rtype == 16 { return Array::from_literal("TXT"); };
+    if rtype == 28 { return Array::from_literal("AAAA"); };
+    if rtype == 33 { return Array::from_literal("SRV"); };
+    return Array::from_literal("?");
+}
+
+fn dns_class_to_name(rclass: u16) -> Array(u8, 12)
+    effect [deterministic]
+{
+    if rclass == 1 { return Array::from_literal("IN"); };
+    if rclass == 3 { return Array::from_literal("CH"); };
+    if rclass == 4 { return Array::from_literal("HS"); };
+    return Array::from_literal("??");
+}

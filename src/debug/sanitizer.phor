@@ -1,0 +1,1204 @@
+// sanitizer.phor — Sanitizer Runtime: Address Sanitizer (Redzones, Quarantine),
+//                   Undefined Behavior Sanitizer (Integer Overflow, Shift, Bounds),
+//                   Memory Sanitizer (Uninitialized Read Detection), Leak Detection
+//                   (Stack Trace Recording), Crash Report Generation
+// Phorensic OS — Debug Subsystem
+//
+// This module implements runtime sanitizer support for the Phorensic OS kernel.
+// It provides address sanitization (heap/stack redzones, use-after-free quarantine),
+// undefined behavior detection (integer overflow, invalid shifts, out-of-bounds),
+// memory sanitization (uninitialized memory read detection), and leak detection
+// with stack trace recording. All detections produce detailed crash reports.
+//
+// Operations:
+// 1. Address sanitizer — redzone padding, quarantine, use-after-free detection
+// 2. UB sanitizer — integer overflow, shift, bounds, enum, null checks
+// 3. Memory sanitizer — uninitialized read tracking and detection
+// 4. Leak detection — allocation tracking, stack trace recording, leak reporting
+// 5. Crash report generation — formatted reports for all sanitizer detections
+//
+// Boundedness: Redzone regions 256. Quarantine 64 entries. Allocation map 512.
+// Stack trace depth 32. All loops bounded.
+//
+// Effect declarations:
+//   [pure]    — analysis, formatting
+//   [io]      — report output
+//   [memory]  — memory access for sanitizer checks
+//   [diag]    — residual recording
+//   [sanitizer] — sanitizer instrumentation runtime
+
+use core::fixed::Array16;
+use core::fixed::Array32;
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+use core::string::FixedString1024;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const SAN_ASAN_DETECT     : u64 = 0x19000u64;
+const SAN_UBSAN_DETECT    : u64 = 0x19001u64;
+const SAN_MSAN_DETECT     : u64 = 0x19002u64;
+const SAN_LEAK_DETECT     : u64 = 0x19003u64;
+const SAN_REPORT          : u64 = 0x19004u64;
+const SAN_ERROR           : u64 = 0x1900Fu64;
+
+// ──────────────────────────────────────────────
+// Sanitizer Types
+// ──────────────────────────────────────────────
+
+/// Sanitizer type.
+pub sealdatatype SanitizerKind : u8 {
+    AddressSanitizer = 0u8,
+    UBSanitizer = 1u8,
+    MemorySanitizer = 2u8,
+    LeakSanitizer = 3u8,
+}
+
+/// UB check kind.
+pub sealdatatype UbCheckKind : u8 {
+    SignedOverflow = 0u8,
+    UnsignedOverflow = 1u8,
+    ShiftExcessive = 2u8,
+    ShiftNegative = 3u8,
+    OutOfBounds = 4u8,
+    InvalidEnum = 5u8,
+    NullPointer = 6u8,
+    MisalignedAccess = 7u8,
+    FunctionTypeMismatch = 8u8,
+}
+
+/// ASan error type.
+pub sealdatatype AsanErrorKind : u8 {
+    HeapBufferOverflow = 0u8,
+    HeapUseAfterFree = 1u8,
+    StackBufferOverflow = 2u8,
+    StackUseAfterReturn = 3u8,
+    GlobalBufferOverflow = 4u8,
+    DoubleFree = 5u8,
+    InvalidFree = 6u8,
+    MemoryLeak = 7u8,
+}
+
+/// A redzone descriptor for ASan.
+pub struct Redzone {
+    /// Allocation address.
+    pub address : u64,
+    /// Allocation size (user-requested).
+    pub user_size : u64,
+    /// Total size including redzones.
+    pub total_size : u64,
+    /// Redzone magic value.
+    pub left_magic : u64,
+    pub right_magic : u64,
+    /// Whether this allocation is freed.
+    pub freed : bool,
+    /// Stack trace at allocation.
+    pub alloc_trace : Array64<u64>,
+    /// Stack trace at deallocation.
+    pub free_trace : Array64<u64>,
+    /// Thread ID.
+    pub thread_id : u32,
+    /// Allocation ID.
+    pub alloc_id : u64,
+}
+
+/// A quarantine entry (freed memory held for use-after-free detection).
+pub struct QuarantineEntry {
+    /// Original allocation address.
+    pub address : u64,
+    /// Size of allocation.
+    pub size : u64,
+    /// When it was freed (timestamp).
+    pub freed_timestamp : u64,
+    /// Stack trace at free.
+    pub free_trace : Array64<u64>,
+}
+
+/// An allocation tracking entry for leak detection.
+pub struct AllocationEntry {
+    /// Allocation address.
+    pub address : u64,
+    /// Size.
+    pub size : u64,
+    /// Stack trace at allocation.
+    pub alloc_trace : Array64<u64>,
+    /// Allocation timestamp.
+    pub timestamp : u64,
+    /// Whether this is a tracked allocation.
+    pub tracked : bool,
+}
+
+/// A sanitizer error report.
+pub struct SanitizerReport {
+    /// Sanitizer kind.
+    pub kind : SanitizerKind,
+    /// Error kind.
+    pub error_code : u32,
+    /// Error message.
+    pub message : FixedString256,
+    /// Address involved.
+    pub address : u64,
+    /// Size involved.
+    pub size : u64,
+    /// Instruction pointer.
+    pub ip : u64,
+    /// Stack trace.
+    pub stack_trace : Array64<u64>,
+    /// Thread ID.
+    pub thread_id : u32,
+    /// Timestamp.
+    pub timestamp : u64,
+}
+
+/// Sanitizer residual.
+pub struct SanitizerResidual {
+    pub code : u64,
+    pub message : FixedString256,
+    pub action : FixedString64,
+    pub kind : SanitizerKind,
+    pub address : u64,
+    pub timestamp : u64,
+}
+
+/// Main sanitizer runtime state.
+pub struct SanitizerRuntime {
+    /// Whether ASan is enabled.
+    pub asan_enabled : bool,
+    /// Whether UBSan is enabled.
+    pub ubsan_enabled : bool,
+    /// Whether MSan is enabled.
+    pub msan_enabled : bool,
+    /// Whether LSan is enabled.
+    pub lsan_enabled : bool,
+    /// Redzone size in bytes.
+    pub redzone_size : u32,
+    /// Active redzones (max 256).
+    pub redzones : Array256<Redzone>,
+    /// Quarantine (max 64).
+    pub quarantine : Array64<QuarantineEntry>,
+    /// Allocation tracking (max 512).
+    pub allocations : Array512<AllocationEntry>,
+    /// Next allocation ID.
+    pub next_alloc_id : u64,
+    /// Shadow memory base address.
+    pub shadow_base : u64,
+    /// Shadow memory size.
+    pub shadow_size : u64,
+    /// Total allocations.
+    pub total_allocations : u64,
+    /// Total frees.
+    pub total_frees : u64,
+    /// Total errors detected.
+    pub total_errors : u64,
+    /// Maximum stack trace depth.
+    pub max_stack_depth : u32,
+    /// Whether to print reports immediately.
+    pub print_reports : bool,
+    /// Whether to halt on error (for debugging).
+    pub halt_on_error : bool,
+    /// Residual log.
+    pub residual_log : Array128<SanitizerResidual>,
+}
+
+impl SanitizerRuntime {
+    /// Create a new sanitizer runtime.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> SanitizerRuntime [pure] {
+        SanitizerRuntime {
+            asan_enabled: false,
+            ubsan_enabled: false,
+            msan_enabled: false,
+            lsan_enabled: false,
+            redzone_size: 32u32,
+            redzones: Array256::new(),
+            quarantine: Array64::new(),
+            allocations: Array512::new(),
+            next_alloc_id: 1u64,
+            shadow_base: 0u64,
+            shadow_size: 0u64,
+            total_allocations: 0u64,
+            total_frees: 0u64,
+            total_errors: 0u64,
+            max_stack_depth: 32u32,
+            print_reports: true,
+            halt_on_error: false,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a sanitizer residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64, kind : SanitizerKind,
+                       address : u64) -> SanitizerRuntime [diag] {
+        let residual : SanitizerResidual = SanitizerResidual {
+            code: code,
+            message: message,
+            action: action,
+            kind: kind,
+            address: address,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Configuration
+    // ──────────────────────────────────────────
+
+    /// Enable/disable each sanitizer.
+    /// Effect: pure — configuration.
+    pub fn enable_asan(mut self, enabled : bool) -> SanitizerRuntime [pure] {
+        self.asan_enabled = enabled;
+        self
+    }
+
+    pub fn enable_ubsan(mut self, enabled : bool) -> SanitizerRuntime [pure] {
+        self.ubsan_enabled = enabled;
+        self
+    }
+
+    pub fn enable_msan(mut self, enabled : bool) -> SanitizerRuntime [pure] {
+        self.msan_enabled = enabled;
+        self
+    }
+
+    pub fn enable_lsan(mut self, enabled : bool) -> SanitizerRuntime [pure] {
+        self.lsan_enabled = enabled;
+        self
+    }
+
+    /// Set redzone size.
+    /// Effect: pure — redzone configuration.
+    pub fn set_redzone_size(mut self, size : u32) -> SanitizerRuntime [pure] {
+        if size < 8u32 { self.redzone_size = 8u32; }
+        else if size > 256u32 { self.redzone_size = 256u32; }
+        else { self.redzone_size = size; }
+        self
+    }
+
+    /// Set shadow memory region.
+    /// Effect: pure — shadow configuration.
+    pub fn set_shadow_region(mut self, base : u64, size : u64) -> SanitizerRuntime [pure] {
+        self.shadow_base = base;
+        self.shadow_size = size;
+        self
+    }
+
+    /// Set halt-on-error behavior.
+    /// Effect: pure — behavior configuration.
+    pub fn set_halt_on_error(mut self, halt : bool) -> SanitizerRuntime [pure] {
+        self.halt_on_error = halt;
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Stack Trace Capture
+    // ──────────────────────────────────────────
+
+    /// Capture the current stack trace.
+    /// Effect: memory — reads stack.
+    pub fn capture_stack_trace(&self, max_depth : u32) -> Array64<u64> [memory] {
+        var trace : Array64<u64> = Array64::new();
+        let rbp : u64 = __builtin_read_rbp();
+        var fp : u64 = rbp;
+        var depth : u32 = 0u32;
+
+        // loop: bounds[BOUND_SMALL] — bounded by max_depth (max 32).
+        loop: bounds[BOUND_MEDIUM] while fp != 0u64 && depth < max_depth && depth < 32u32 {
+            let ra : u64 = __builtin_read_u64(fp + 8u64);
+            if ra == 0u64 {
+                break;
+            }
+            let _ = trace.push(ra);
+            fp = __builtin_read_u64(fp);
+            depth += 1u32;
+        }
+
+        trace
+    }
+
+    // ──────────────────────────────────────────
+    // Address Sanitizer (ASan)
+    // ──────────────────────────────────────────
+
+    /// Register a heap allocation with redzones.
+    /// Effect: memory, sanitizer — poisons redzones.
+    pub fn asan_allocated(mut self, address : u64, user_size : u64,
+                          total_size : u64) -> SanitizerRuntime [memory, sanitizer, diag] {
+        if !self.asan_enabled {
+            return self;
+        }
+
+        if self.redzones.is_full() {
+            return self;
+        }
+
+        let alloc_id : u64 = self.next_alloc_id;
+        self.next_alloc_id += 1u64;
+
+        let trace : Array64<u64> = self.capture_stack_trace(self.max_stack_depth);
+
+        let redzone : Redzone = Redzone {
+            address: address,
+            user_size: user_size,
+            total_size: total_size,
+            left_magic: 0xFAFAFAFAFAFAFAFAu64,
+            right_magic: 0xFBFBFBFBFBFBFBFBu64,
+            freed: false,
+            alloc_trace: trace,
+            free_trace: Array64::new(),
+            thread_id: __builtin_current_thread_id(),
+            alloc_id: alloc_id,
+        };
+        let _ = self.redzones.push(redzone);
+        self.total_allocations += 1u64;
+
+        // Poison left redzone.
+        var offset : u64 = 0u64;
+        // loop: bounds[BOUND_SMALL] — bounded by redzone size.
+        for var i : u64 = 0u64; i < self.redzone_size as u64; i += 1u64 [self.redzone_size as u64] {
+            __builtin_shadow_set(address - self.redzone_size as u64 + i, 0xFAu8);
+        }
+
+        // Mark user region as addressable.
+        // loop: bounds[BOUND_MEDIUM] — bounded by user_size.
+        for var i : u64 = 0u64; i < user_size; i += 1u64 [user_size] {
+            __builtin_shadow_set(address + i, 0x00u8);
+        }
+
+        // Poison right redzone.
+        // loop: bounds[BOUND_SMALL] — bounded by redzone size.
+        for var i : u64 = 0u64; i < self.redzone_size as u64; i += 1u64 [self.redzone_size as u64] {
+            __builtin_shadow_set(address + user_size + i, 0xFBu8);
+        }
+
+        // Track allocation for leak detection.
+        if self.lsan_enabled {
+            let alloc_entry : AllocationEntry = AllocationEntry {
+                address: address,
+                size: user_size,
+                alloc_trace: trace,
+                timestamp: __builtin_timestamp(),
+                tracked: true,
+            };
+            let _ = self.allocations.push(alloc_entry);
+        }
+
+        self.record_residual(SAN_ASAN_DETECT,
+                             FixedString256::from("ASan allocation registered"),
+                             FixedString64::from("asan_alloc"),
+                             SanitizerKind::AddressSanitizer,
+                             address)
+    }
+
+    /// Mark a heap allocation as freed (for use-after-free detection).
+    /// Effect: memory, sanitizer — poisons memory, moves to quarantine.
+    pub fn asan_freed(mut self, address : u64) -> SanitizerRuntime [memory, sanitizer, diag] {
+        if !self.asan_enabled {
+            return self;
+        }
+
+        var found : bool = false;
+        var size : u64 = 0u64;
+
+        // Find the redzone entry.
+        // loop: bounds[BOUND_MEDIUM] — bounded by redzones.
+        for var i : u32 = 0u32; i < self.redzones.len(); i += 1u32 [self.redzones.len()] {
+            let mut r : Redzone = self.redzones.get(i);
+            if r.address == address {
+                if r.freed {
+                    // Double free detected.
+                    self = self.report_asan_error(AsanErrorKind::DoubleFree, address, 0u64,
+                                                  FixedString256::from("double free detected"));
+                    return self;
+                }
+
+                r.freed = true;
+                let trace : Array64<u64> = self.capture_stack_trace(self.max_stack_depth);
+                r.free_trace = trace;
+                size = r.user_size;
+                let _ = self.redzones.set(i, r);
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            // Invalid free.
+            self = self.report_asan_error(AsanErrorKind::InvalidFree, address, 0u64,
+                                          FixedString256::from("invalid free: address not found in allocations"));
+            return self;
+        }
+
+        // Poison entire region.
+        // loop: bounds[BOUND_MEDIUM] — bounded by total size with redzones.
+        for var i : u64 = 0u64; i < size + self.redzone_size as u64 * 2u64; i += 1u64 [size + self.redzone_size as u64 * 2u64] {
+            __builtin_shadow_set(address - self.redzone_size as u64 + i, 0xFCu8);
+        }
+
+        // Add to quarantine.
+        if !self.quarantine.is_full() {
+            let trace : Array64<u64> = self.capture_stack_trace(self.max_stack_depth);
+            let qentry : QuarantineEntry = QuarantineEntry {
+                address: address,
+                size: size,
+                freed_timestamp: __builtin_timestamp(),
+                free_trace: trace,
+            };
+            let _ = self.quarantine.push(qentry);
+        } else {
+            // Evict oldest if quarantine full.
+            let _ = self.quarantine.remove(0u32);
+            let trace : Array64<u64> = self.capture_stack_trace(self.max_stack_depth);
+            let qentry : QuarantineEntry = QuarantineEntry {
+                address: address,
+                size: size,
+                freed_timestamp: __builtin_timestamp(),
+                free_trace: trace,
+            };
+            let _ = self.quarantine.push(qentry);
+        }
+
+        // Remove from allocation tracking (for leak detection).
+        if self.lsan_enabled {
+            // loop: bounds[BOUND_MEDIUM] — bounded by allocations.
+            for var i : u32 = 0u32; i < self.allocations.len(); i += 1u32 [self.allocations.len()] {
+                let entry : AllocationEntry = self.allocations.get(i);
+                if entry.address == address {
+                    let _ = self.allocations.remove(i);
+                    break;
+                }
+            }
+        }
+
+        self.total_frees += 1u64;
+        self.record_residual(SAN_ASAN_DETECT,
+                             FixedString256::from("ASan free registered"),
+                             FixedString64::from("asan_free"),
+                             SanitizerKind::AddressSanitizer,
+                             address)
+    }
+
+    /// Check a memory access against shadow memory.
+    /// Effect: memory, sanitizer — checks shadow for poison.
+    pub fn asan_check_access(mut self, address : u64, size : u64,
+                             is_write : bool) -> SanitizerRuntime [memory, sanitizer, diag] {
+        if !self.asan_enabled {
+            return self;
+        }
+
+        // Check if the access overlaps poisoned shadow.
+        // loop: bounds[BOUND_SMALL] — bounded by access size.
+        for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+            let shadow_byte : u8 = __builtin_shadow_read(address + i);
+
+            if shadow_byte == 0xFAu8 {
+                // Left redzone — heap buffer overflow.
+                self = self.report_asan_error(AsanErrorKind::HeapBufferOverflow, address, size,
+                                              FixedString256::from("heap buffer overflow (left redzone)"));
+                if self.halt_on_error { break; }
+            } else if shadow_byte == 0xFBu8 {
+                // Right redzone — heap buffer overflow.
+                self = self.report_asan_error(AsanErrorKind::HeapBufferOverflow, address, size,
+                                              FixedString256::from("heap buffer overflow (right redzone)"));
+                if self.halt_on_error { break; }
+            } else if shadow_byte == 0xFCu8 {
+                // Freed memory — use-after-free.
+                self = self.report_asan_error(AsanErrorKind::HeapUseAfterFree, address, size,
+                                              FixedString256::from("heap use-after-free"));
+                if self.halt_on_error { break; }
+            }
+        }
+
+        self
+    }
+
+    /// Report an ASan error.
+    /// Effect: diag, io — generates report.
+    fn report_asan_error(mut self, kind : AsanErrorKind, address : u64, size : u64,
+                         message : FixedString256) -> SanitizerRuntime [diag, io] {
+        self.total_errors += 1u64;
+
+        let report : SanitizerReport = SanitizerReport {
+            kind: SanitizerKind::AddressSanitizer,
+            error_code: kind as u32,
+            message: message,
+            address: address,
+            size: size,
+            ip: __builtin_read_rip(),
+            stack_trace: self.capture_stack_trace(self.max_stack_depth),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+
+        if self.print_reports {
+            __builtin_serial_write_string(report.format());
+        }
+
+        if self.halt_on_error {
+            __builtin_breakpoint();
+        }
+
+        self.record_residual(SAN_ASAN_DETECT,
+                             FixedString256::from("ASan error detected"),
+                             FixedString64::from("asan_error"),
+                             SanitizerKind::AddressSanitizer,
+                             address)
+    }
+
+    // ──────────────────────────────────────────
+    // Undefined Behavior Sanitizer (UBSan)
+    // ──────────────────────────────────────────
+
+    /// Report a signed integer overflow.
+    /// Effect: diag, io — reports UB.
+    pub fn ubsan_report_overflow(mut self, kind : UbCheckKind, lhs : u64, rhs : u64,
+                                 operation : FixedString64) -> SanitizerRuntime [diag, io] {
+        if !self.ubsan_enabled {
+            return self;
+        }
+
+        self.total_errors += 1u64;
+        var msg : FixedString256 = FixedString256::new();
+        msg.push_str(FixedString256::from("integer overflow in "));
+        msg.push_str(FixedString256::from_buffer(operation));
+
+        let report : SanitizerReport = SanitizerReport {
+            kind: SanitizerKind::UBSanitizer,
+            error_code: kind as u32,
+            message: msg,
+            address: lhs,
+            size: rhs,
+            ip: __builtin_read_rip(),
+            stack_trace: self.capture_stack_trace(self.max_stack_depth),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+
+        if self.print_reports {
+            __builtin_serial_write_string(report.format());
+        }
+
+        if self.halt_on_error {
+            __builtin_breakpoint();
+        }
+
+        self.record_residual(SAN_UBSAN_DETECT,
+                             FixedString256::from("UBSan overflow detected"),
+                             FixedString64::from("ubsan_overflow"),
+                             SanitizerKind::UBSanitizer,
+                             lhs)
+    }
+
+    /// Report an out-of-bounds access.
+    /// Effect: diag, io — reports UB.
+    pub fn ubsan_report_oob(mut self, index : u64, bound : u64,
+                            array_type : FixedString64) -> SanitizerRuntime [diag, io] {
+        if !self.ubsan_enabled {
+            return self;
+        }
+
+        self.total_errors += 1u64;
+        var msg : FixedString256 = FixedString256::new();
+        msg.push_str(FixedString256::from("out-of-bounds access: index "));
+        msg.push_u64(index);
+        msg.push_str(FixedString256::from(" not within [0, "));
+        msg.push_u64(bound);
+        msg.push_str(FixedString256::from(") in array of "));
+        msg.push_str(FixedString256::from_buffer(array_type));
+
+        let report : SanitizerReport = SanitizerReport {
+            kind: SanitizerKind::UBSanitizer,
+            error_code: UbCheckKind::OutOfBounds as u32,
+            message: msg,
+            address: index,
+            size: bound,
+            ip: __builtin_read_rip(),
+            stack_trace: self.capture_stack_trace(self.max_stack_depth),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+
+        if self.print_reports {
+            __builtin_serial_write_string(report.format());
+        }
+
+        if self.halt_on_error {
+            __builtin_breakpoint();
+        }
+
+        self.record_residual(SAN_UBSAN_DETECT,
+                             FixedString256::from("UBSan OOB detected"),
+                             FixedString64::from("ubsan_oob"),
+                             SanitizerKind::UBSanitizer,
+                             index)
+    }
+
+    /// Report a shift with excessive or negative shift count.
+    /// Effect: diag, io — reports UB.
+    pub fn ubsan_report_shift(mut self, lhs : u64, rhs : u64,
+                              is_left : bool) -> SanitizerRuntime [diag, io] {
+        if !self.ubsan_enabled {
+            return self;
+        }
+
+        self.total_errors += 1u64;
+        var msg : FixedString256 = FixedString256::new();
+        msg.push_str(FixedString256::from("invalid shift: "));
+        msg.push_u64(lhs);
+        msg.push_str(if is_left { FixedString256::from(" << ") } else { FixedString256::from(" >> ") });
+        msg.push_u64(rhs);
+
+        let kind : UbCheckKind = if rhs >= 64u64 { UbCheckKind::ShiftExcessive } else { UbCheckKind::ShiftNegative };
+
+        let report : SanitizerReport = SanitizerReport {
+            kind: SanitizerKind::UBSanitizer,
+            error_code: kind as u32,
+            message: msg,
+            address: lhs,
+            size: rhs,
+            ip: __builtin_read_rip(),
+            stack_trace: self.capture_stack_trace(self.max_stack_depth),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+
+        if self.print_reports {
+            __builtin_serial_write_string(report.format());
+        }
+
+        if self.halt_on_error {
+            __builtin_breakpoint();
+        }
+
+        self.record_residual(SAN_UBSAN_DETECT,
+                             FixedString256::from("UBSan shift detected"),
+                             FixedString64::from("ubsan_shift"),
+                             SanitizerKind::UBSanitizer,
+                             lhs)
+    }
+
+    /// Report an invalid enum value.
+    /// Effect: diag, io — reports UB.
+    pub fn ubsan_report_enum(mut self, value : u64, enum_type : FixedString64) -> SanitizerRuntime [diag, io] {
+        if !self.ubsan_enabled {
+            return self;
+        }
+
+        self.total_errors += 1u64;
+        var msg : FixedString256 = FixedString256::new();
+        msg.push_str(FixedString256::from("invalid enum value "));
+        msg.push_u64(value);
+        msg.push_str(FixedString256::from(" for type "));
+        msg.push_str(FixedString256::from_buffer(enum_type));
+
+        let report : SanitizerReport = SanitizerReport {
+            kind: SanitizerKind::UBSanitizer,
+            error_code: UbCheckKind::InvalidEnum as u32,
+            message: msg,
+            address: value,
+            size: 0u64,
+            ip: __builtin_read_rip(),
+            stack_trace: self.capture_stack_trace(self.max_stack_depth),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+
+        if self.print_reports {
+            __builtin_serial_write_string(report.format());
+        }
+
+        if self.halt_on_error {
+            __builtin_breakpoint();
+        }
+
+        self.record_residual(SAN_UBSAN_DETECT,
+                             FixedString256::from("UBSan enum detected"),
+                             FixedString64::from("ubsan_enum"),
+                             SanitizerKind::UBSanitizer,
+                             value)
+    }
+
+    /// Report a null pointer access.
+    /// Effect: diag, io — reports UB.
+    pub fn ubsan_report_null(mut self) -> SanitizerRuntime [diag, io] {
+        if !self.ubsan_enabled {
+            return self;
+        }
+
+        self.total_errors += 1u64;
+
+        let report : SanitizerReport = SanitizerReport {
+            kind: SanitizerKind::UBSanitizer,
+            error_code: UbCheckKind::NullPointer as u32,
+            message: FixedString256::from("null pointer dereference"),
+            address: 0u64,
+            size: 0u64,
+            ip: __builtin_read_rip(),
+            stack_trace: self.capture_stack_trace(self.max_stack_depth),
+            thread_id: __builtin_current_thread_id(),
+            timestamp: __builtin_timestamp(),
+        };
+
+        if self.print_reports {
+            __builtin_serial_write_string(report.format());
+        }
+
+        if self.halt_on_error {
+            __builtin_breakpoint();
+        }
+
+        self.record_residual(SAN_UBSAN_DETECT,
+                             FixedString256::from("UBSan null detected"),
+                             FixedString64::from("ubsan_null"),
+                             SanitizerKind::UBSanitizer,
+                             0u64)
+    }
+
+    // ──────────────────────────────────────────
+    // Memory Sanitizer (MSan)
+    // ──────────────────────────────────────────
+
+    /// Mark memory as initialized.
+    /// Effect: memory, sanitizer — updates shadow map.
+    pub fn msan_mark_initialized(mut self, address : u64, size : u64) -> SanitizerRuntime [memory, sanitizer] {
+        if !self.msan_enabled {
+            return self;
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size.
+        for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+            __builtin_msan_shadow_set(address + i, 0x00u8);
+        }
+
+        self
+    }
+
+    /// Mark memory as uninitialized.
+    /// Effect: memory, sanitizer — updates shadow map.
+    pub fn msan_mark_uninitialized(mut self, address : u64, size : u64) -> SanitizerRuntime [memory, sanitizer] {
+        if !self.msan_enabled {
+            return self;
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size.
+        for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+            __builtin_msan_shadow_set(address + i, 0xFFu8);
+        }
+
+        self
+    }
+
+    /// Check if a memory region is fully initialized.
+    /// Effect: memory, sanitizer — checks shadow map.
+    pub fn msan_check_initialized(mut self, address : u64, size : u64,
+                                  description : FixedString256) -> SanitizerRuntime [memory, sanitizer, diag, io] {
+        if !self.msan_enabled {
+            return self;
+        }
+
+        var uninit_addr : u64 = 0u64;
+        var found_uninit : bool = false;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size.
+        for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+            let shadow : u8 = __builtin_msan_shadow_read(address + i);
+            if shadow != 0x00u8 {
+                uninit_addr = address + i;
+                found_uninit = true;
+                break;
+            }
+        }
+
+        if found_uninit {
+            self.total_errors += 1u64;
+
+            var msg : FixedString256 = FixedString256::new();
+            msg.push_str(FixedString256::from("use of uninitialized memory at 0x"));
+            msg.push_u64_hex(uninit_addr);
+            msg.push_str(FixedString256::from(" ("));
+            msg.push_str(description);
+            msg.push_str(FixedString256::from(")"));
+
+            let report : SanitizerReport = SanitizerReport {
+                kind: SanitizerKind::MemorySanitizer,
+                error_code: 0u32,
+                message: msg,
+                address: uninit_addr,
+                size: size,
+                ip: __builtin_read_rip(),
+                stack_trace: self.capture_stack_trace(self.max_stack_depth),
+                thread_id: __builtin_current_thread_id(),
+                timestamp: __builtin_timestamp(),
+            };
+
+            if self.print_reports {
+                __builtin_serial_write_string(report.format());
+            }
+
+            if self.halt_on_error {
+                __builtin_breakpoint();
+            }
+
+            self = self.record_residual(SAN_MSAN_DETECT,
+                                        FixedString256::from("MSan uninit read detected"),
+                                        FixedString64::from("msan_check"),
+                                        SanitizerKind::MemorySanitizer,
+                                        uninit_addr);
+        }
+
+        self
+    }
+
+    /// Propagate shadow when loading from a pointer.
+    /// Effect: memory, sanitizer — propagates shadow.
+    pub fn msan_propagate_load(mut self, dst_addr : u64, src_addr : u64,
+                               size : u64) -> SanitizerRuntime [memory, sanitizer] {
+        if !self.msan_enabled {
+            return self;
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by size.
+        for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+            let src_shadow : u8 = __builtin_msan_shadow_read(src_addr + i);
+            __builtin_msan_shadow_set(dst_addr + i, src_shadow);
+        }
+
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Leak Detection (LSan)
+    // ──────────────────────────────────────────
+
+    /// Run leak detection and report leaks.
+    /// Effect: memory, diag, io — checks for leaks.
+    pub fn lsan_detect_leaks(mut self) -> SanitizerRuntime [memory, diag, io] {
+        if !self.lsan_enabled {
+            return self;
+        }
+
+        var leaks_found : u32 = 0u32;
+        var leaked_bytes : u64 = 0u64;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by allocations.
+        for var i : u32 = 0u32; i < self.allocations.len(); i += 1u32 [self.allocations.len()] {
+            let entry : AllocationEntry = self.allocations.get(i);
+            if !entry.tracked {
+                continue;
+            }
+
+            // Check if the allocation is still referenced (simplified: all remaining = leaks).
+            leaks_found += 1u32;
+            leaked_bytes += entry.size;
+
+            self.total_errors += 1u64;
+
+            var msg : FixedString256 = FixedString256::new();
+            msg.push_str(FixedString256::from("memory leak: "));
+            msg.push_u64(entry.size);
+            msg.push_str(FixedString256::from(" bytes at 0x"));
+            msg.push_u64_hex(entry.address);
+            msg.push_str(FixedString256::from(" (not freed)"));
+
+            let report : SanitizerReport = SanitizerReport {
+                kind: SanitizerKind::LeakSanitizer,
+                error_code: AsanErrorKind::MemoryLeak as u32,
+                message: msg,
+                address: entry.address,
+                size: entry.size,
+                ip: 0u64,
+                stack_trace: entry.alloc_trace,
+                thread_id: 0u32,
+                timestamp: __builtin_timestamp(),
+            };
+
+            if self.print_reports {
+                __builtin_serial_write_string(report.format());
+            }
+        }
+
+        if leaks_found > 0u32 {
+            self = self.record_residual(SAN_LEAK_DETECT,
+                                        FixedString256::from("leaks detected"),
+                                        FixedString64::from("lsan_leaks"),
+                                        SanitizerKind::LeakSanitizer,
+                                        leaked_bytes);
+        }
+
+        self
+    }
+
+    /// Get the total number of errors detected.
+    /// Effect: pure — data query.
+    pub fn error_count(&self) -> u64 [pure] {
+        self.total_errors
+    }
+
+    /// Get a summary of sanitizer statistics.
+    /// Effect: io — summary output.
+    pub fn get_statistics(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("=== Sanitizer Statistics ===\n"));
+        output.push_str(FixedString256::from("ASan enabled: "));
+        output.push_str(if self.asan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        output.push_str(FixedString256::from("\nUBSan enabled: "));
+        output.push_str(if self.ubsan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        output.push_str(FixedString256::from("\nMSan enabled: "));
+        output.push_str(if self.msan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        output.push_str(FixedString256::from("\nLSan enabled: "));
+        output.push_str(if self.lsan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        output.push_str(FixedString256::from("\n\n"));
+
+        output.push_str(FixedString256::from("Total allocations: "));
+        output.push_u64(self.total_allocations);
+        output.push_str(FixedString256::from("\nTotal frees: "));
+        output.push_u64(self.total_frees);
+        output.push_str(FixedString256::from("\nTotal errors: "));
+        output.push_u64(self.total_errors);
+        output.push_str(FixedString256::from("\nActive redzones: "));
+        output.push_u32(self.redzones.len());
+        output.push_str(FixedString256::from("\nQuarantine entries: "));
+        output.push_u32(self.quarantine.len());
+        output.push_str(FixedString256::from("\nTracked allocations: "));
+        output.push_u32(self.allocations.len());
+
+        output
+    }
+
+    // ──────────────────────────────────────────
+    // Quarantine Management
+    // ──────────────────────────────────────────
+
+    /// Get the size of the quarantine.
+    /// Effect: pure — data query.
+    pub fn quarantine_size(&self) -> u32 [pure] {
+        self.quarantine.len()
+    }
+
+    /// Get the total memory held in quarantine.
+    /// Effect: pure — memory query.
+    pub fn quarantine_total_bytes(&self) -> u64 [pure] {
+        var total : u64 = 0u64;
+        // loop: bounds[BOUND_SMALL] — bounded by quarantine.
+        for var i : u32 = 0u32; i < self.quarantine.len(); i += 1u32 [self.quarantine.len()] {
+            let entry : QuarantineEntry = self.quarantine.get(i);
+            total += entry.size;
+        }
+        total
+    }
+
+    /// Drain the quarantine (release all entries back to the system).
+    /// Effect: memory — releases quarantine entries.
+    pub fn drain_quarantine(mut self) -> SanitizerRuntime [memory] {
+        // loop: bounds[BOUND_SMALL] — bounded by quarantine.
+        for var i : u32 = 0u32; i < self.quarantine.len(); i += 1u32 [self.quarantine.len()] {
+            let entry : QuarantineEntry = self.quarantine.get(i);
+            // Release the memory back.
+            __builtin_free(entry.address, entry.size);
+        }
+        self.quarantine.clear();
+        self
+    }
+
+    /// Check if a given address is currently in the quarantine.
+    /// Effect: pure — quarantine lookup.
+    pub fn is_in_quarantine(&self, address : u64) -> bool [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by quarantine.
+        for var i : u32 = 0u32; i < self.quarantine.len(); i += 1u32 [self.quarantine.len()] {
+            let entry : QuarantineEntry = self.quarantine.get(i);
+            if entry.address == address {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the number of currently active redzones.
+    /// Effect: pure — redzone count.
+    pub fn active_redzone_count(&self) -> u32 [pure] {
+        var count : u32 = 0u32;
+        // loop: bounds[BOUND_MEDIUM] — bounded by redzones.
+        for var i : u32 = 0u32; i < self.redzones.len(); i += 1u32 [self.redzones.len()] {
+            let rz : Redzone = self.redzones.get(i);
+            if !rz.freed {
+                count += 1u32;
+            }
+        }
+        count
+    }
+
+    /// Get the total memory consumed by active redzones.
+    /// Effect: pure — memory count.
+    pub fn active_redzone_bytes(&self) -> u64 [pure] {
+        var total : u64 = 0u64;
+        // loop: bounds[BOUND_MEDIUM] — bounded by redzones.
+        for var i : u32 = 0u32; i < self.redzones.len(); i += 1u32 [self.redzones.len()] {
+            let rz : Redzone = self.redzones.get(i);
+            if !rz.freed {
+                total += rz.total_size;
+            }
+        }
+        total
+    }
+
+    // ──────────────────────────────────────────
+    // UBSan Detailed Reporting
+    // ──────────────────────────────────────────
+
+    /// Get a human-readable name for a UB check kind.
+    /// Effect: pure — name lookup.
+    pub fn ubsan_check_name(kind : UbCheckKind) -> FixedString64 [pure] {
+        match kind {
+            UbCheckKind::SignedOverflow => FixedString64::from("signed-overflow"),
+            UbCheckKind::UnsignedOverflow => FixedString64::from("unsigned-overflow"),
+            UbCheckKind::ShiftExcessive => FixedString64::from("excessive-shift"),
+            UbCheckKind::ShiftNegative => FixedString64::from("negative-shift"),
+            UbCheckKind::OutOfBounds => FixedString64::from("out-of-bounds"),
+            UbCheckKind::InvalidEnum => FixedString64::from("invalid-enum"),
+            UbCheckKind::NullPointer => FixedString64::from("null-pointer"),
+            UbCheckKind::MisalignedAccess => FixedString64::from("misaligned-access"),
+            UbCheckKind::FunctionTypeMismatch => FixedString64::from("function-type-mismatch"),
+        }
+    }
+
+    /// Check if misaligned access should be reported.
+    /// Effect: pure — alignment check.
+    pub fn is_misaligned(address : u64, alignment : u64) -> bool [pure] {
+        address % alignment != 0u64
+    }
+
+    /// Check if a pointer is null.
+    /// Effect: pure — null check.
+    pub fn is_null_ptr(ptr : u64) -> bool [pure] {
+        ptr == 0u64
+    }
+
+    /// Check if a pointer falls within a reasonable memory region.
+    /// Effect: pure — range check.
+    pub fn is_valid_ptr_range(ptr : u64, size : u64) -> bool [pure] {
+        if ptr == 0u64 { return false; }
+        if ptr + size < ptr { return false; } // Overflow check.
+        if ptr >= 0xFFFF800000000000u64 { return false; } // Kernel space.
+        true
+    }
+}
+
+/// Implementation of SanitizerReport formatting.
+impl SanitizerReport {
+    /// Format the report as a human-readable string.
+    /// Effect: io — formatting.
+    pub fn format(&self) -> FixedString1024 [io] {
+        var output : FixedString1024 = FixedString1024::new();
+
+        output.push_str(FixedString256::from("====================\n"));
+        match self.kind {
+            SanitizerKind::AddressSanitizer => output.push_str(FixedString256::from("ADDRESS SANITIZER")),
+            SanitizerKind::UBSanitizer => output.push_str(FixedString256::from("UNDEFINED BEHAVIOR")),
+            SanitizerKind::MemorySanitizer => output.push_str(FixedString256::from("MEMORY SANITIZER")),
+            SanitizerKind::LeakSanitizer => output.push_str(FixedString256::from("LEAK SANITIZER")),
+        }
+        output.push_str(FixedString256::from("\n====================\n"));
+
+        output.push_str(FixedString256::from("ERROR: "));
+        output.push_str(self.message);
+        output.push_str(FixedString256::from("\n"));
+
+        output.push_str(FixedString256::from("Address: 0x"));
+        output.push_u64_hex(self.address);
+        output.push_str(FixedString256::from("\n"));
+
+        output.push_str(FixedString256::from("Size: "));
+        output.push_u64(self.size);
+        output.push_str(FixedString256::from("\n"));
+
+        output.push_str(FixedString256::from("IP: 0x"));
+        output.push_u64_hex(self.ip);
+        output.push_str(FixedString256::from("\n"));
+
+        output.push_str(FixedString256::from("Thread: "));
+        output.push_u32(self.thread_id);
+        output.push_str(FixedString256::from("\n"));
+
+        output.push_str(FixedString256::from("Stack trace:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by stack trace.
+        for var i : u32 = 0u32; i < self.stack_trace.len(); i += 1u32 [self.stack_trace.len()] {
+            output.push_str(FixedString256::from("  #"));
+            output.push_u32(i);
+            output.push_str(FixedString256::from(": 0x"));
+            output.push_u64_hex(self.stack_trace.get(i));
+            output.push_str(FixedString256::from("\n"));
+        }
+
+        output.push_str(FixedString256::from("====================\n"));
+        output
+    }
+}
+
+/// Check if a buffer overflow exists at a given address.
+pub fn check_buffer_overflow(sant : SanitizerRuntime, addr : u64) -> bool [memory] {
+    let shadow : u8 = __builtin_shadow_read(addr);
+    shadow == 0xFAu8 || shadow == 0xFBu8
+}
+
+/// Check if a use-after-free exists at a given address.
+pub fn check_uaf(sant : SanitizerRuntime, addr : u64) -> bool [memory] {
+    let shadow : u8 = __builtin_shadow_read(addr);
+    shadow == 0xFCu8
+}
+
+/// Get a summary of ASan status as a string.
+pub fn asan_status(sant : SanitizerRuntime) -> FixedString256 [pure] {
+    var s : FixedString256 = FixedString256::new();
+    s.push_str(FixedString256::from("ASan: enabled="));
+    s.push_str(if sant.asan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+    s.push_str(FixedString256::from(" errors="));
+    s.push_u64(sant.total_errors);
+    s.push_str(FixedString256::from(" redzones="));
+    s.push_u32(sant.redzones.len());
+    s
+}
+
+/// Compute the total memory overhead from redzones.
+pub fn redzone_overhead(sant : SanitizerRuntime) -> u64 [pure] {
+    let mut total : u64 = 0u64;
+    for var i : u32 = 0u32; i < sant.redzones.len(); i += 1u32 [sant.redzones.len()] {
+        let rz : Redzone = sant.redzones.get(i);
+        if !rz.freed {
+            total += rz.total_size - rz.user_size;
+        }
+    }
+    total
+}
+
+/// Print all active redzones to serial.
+pub fn dump_redzones(sant : SanitizerRuntime) [io] {
+    __builtin_serial_write_string(FixedString256::from("Active redzones:\n"));
+    for var i : u32 = 0u32; i < sant.redzones.len(); i += 1u32 [sant.redzones.len()] {
+        let rz : Redzone = sant.redzones.get(i);
+        if !rz.freed {
+            __builtin_serial_write_string(FixedString256::from("  ["));
+            __builtin_serial_write_hex_u32(i);
+            __builtin_serial_write_string(FixedString256::from("] alloc=0x"));
+            __builtin_serial_write_hex_u64(rz.address);
+            __builtin_serial_write_string(FixedString256::from(" size="));
+            __builtin_serial_write_u64(rz.user_size);
+            __builtin_serial_write_string(FixedString256::from("\n"));
+        }
+    }
+}

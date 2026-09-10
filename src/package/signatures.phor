@@ -1,0 +1,1226 @@
+// signatures.phor — Signature management: keyring, signing, verification, auditor stamps
+// Phorensic Package: cryptographic signature subsystem
+// Spec: SEALED_PACKAGE_FORMAT.md — Signatures section
+// Grammar: PHORENSIC_GRAMMAR.md §42 (signature-ref), §66
+
+package package.signatures;
+
+use forensic_store.store_object::{
+    Hash256, hash256_zero, hash256_equal,
+    Identity, identity_equal, identity_is_valid,
+    Signature, AuditorStamp, AuditStampType,
+};
+use forensic_store.store_key::{
+    StoreKey, store_key_equal, store_key_zero,
+};
+use package.container::{
+    PackageContainer, PackageHeader, PackageSignatures,
+};
+
+// ============================================================================
+// Key Types
+// ============================================================================
+
+/// The type/usage of a key in the keyring.
+type KeyType = enum {
+    /// Signing key for source objects
+    SourceSigning = 0,
+    /// Signing key for binary objects
+    BinarySigning = 1,
+    /// Signing key for seal (source↔binary)
+    SealSigning = 2,
+    /// Signing key for full container
+    ContainerSigning = 3,
+    /// Auditing key (for auditor stamps)
+    AuditorKey = 4,
+    /// Verification-only key
+    VerificationOnly = 5,
+    /// Court signing key
+    CourtSigning = 6,
+    /// Oracle signing key
+    OracleSigning = 7,
+    /// Trust root key
+    TrustRoot = 8,
+    /// Revoked key (no longer trusted)
+    Revoked = 9,
+}
+
+/// The status of a key in the keyring.
+type KeyStatus = enum {
+    Active = 0,
+    Expired = 1,
+    Revoked = 2,
+    Suspended = 3,
+    Compromised = 4,
+}
+
+// ============================================================================
+// Keyring Entry
+// ============================================================================
+
+/// A single entry in the keyring.
+struct KeyringEntry
+    layout packed
+{
+    /// Key hash (fingerprint)
+    key_hash: Hash256,
+    /// Key type
+    key_type: KeyType,
+    /// Key status
+    status: KeyStatus,
+    /// Identity associated with this key
+    identity: Identity,
+    /// Human-readable label
+    label: Array[u8, 128],
+    label_len: u32,
+    /// Timestamp when this key was added
+    added_at: u64,
+    /// Timestamp when this key expires (0 = no expiry)
+    expires_at: u64,
+    /// Timestamp when this key was revoked (0 = not revoked)
+    revoked_at: u64,
+    /// Revocation reason (if revoked)
+    revocation_reason: Array[u8, 256],
+    revocation_reason_len: u32,
+    /// Generation at which this key was added
+    added_in_generation: u64,
+    /// Trust level granted by this key
+    grant_trust_level: u8,
+    /// Number of times this key has been used
+    use_count: u64,
+    /// Whether this is a hardware-bound key
+    hardware_bound: bool,
+    /// Reserved for future fields
+    reserved: Array[u64, 8],
+}
+
+// ============================================================================
+// Keyring — Bounded Key Storage
+// ============================================================================
+
+/// A fixed-capacity keyring (max 256 keys).
+struct Keyring
+    layout packed
+{
+    entries: Array[KeyringEntry, 256],
+    count: u32,
+    /// Default signing key index
+    default_signing_key: u32,
+    /// Whether this keyring is modifiable
+    locked: bool,
+}
+
+/// Create an empty keyring.
+fn keyring_new() -> Keyring
+    effect [compute, residual]
+{
+    residual emit {
+        op: "keyring.create",
+    };
+    return Keyring {
+        entries: Array[KeyringEntry, 256]::zeroed(),
+        count: 0,
+        default_signing_key: 0,
+        locked: false,
+    };
+}
+
+/// Add a key to the keyring.
+fn keyring_add_key(
+    keyring: Keyring,
+    entry: KeyringEntry,
+) -> Keyring
+    effect [compute, residual]
+{
+    if keyring.locked {
+        residual emit {
+            op: "keyring.add_key.rejected",
+            reason: "keyring_locked",
+        };
+        return keyring;
+    }
+
+    if keyring.count >= 256 {
+        residual emit {
+            op: "keyring.add_key.rejected",
+            reason: "keyring_full",
+        };
+        return keyring;
+    }
+
+    // Check for duplicate
+    for i in 0..keyring.count as u64 {
+        if hash256_equal(keyring.entries[i].key_hash, entry.key_hash) {
+            residual emit {
+                op: "keyring.add_key.rejected",
+                reason: "duplicate_key",
+            };
+            return keyring;
+        }
+    }
+
+    let mut new_keyring: Keyring = keyring;
+    new_keyring.entries[keyring.count] = entry;
+    new_keyring.count = keyring.count + 1;
+
+    residual emit {
+        op: "keyring.add_key.success",
+        key_prefix: entry.key_hash.bytes[0] as u64,
+        key_type: entry.key_type as u64,
+    };
+
+    return new_keyring;
+}
+
+/// Remove a key from the keyring by its hash.
+fn keyring_remove_key(
+    keyring: Keyring,
+    key_hash: Hash256,
+) -> Keyring
+    effect [compute, residual]
+{
+    if keyring.locked {
+        return keyring;
+    }
+
+    let mut new_keyring: Keyring = keyring;
+    let mut found: bool = false;
+    for i in 0..new_keyring.count as u64 {
+        if hash256_equal(new_keyring.entries[i].key_hash, key_hash) {
+            // Shift entries to fill gap
+            for j in i..(new_keyring.count - 1) as u64 {
+                new_keyring.entries[j] = new_keyring.entries[j + 1];
+            }
+            new_keyring.count = new_keyring.count - 1;
+            found = true;
+        }
+    }
+
+    if found {
+        residual emit {
+            op: "keyring.remove_key.success",
+            key_prefix: key_hash.bytes[0] as u64,
+        };
+    } else {
+        residual emit {
+            op: "keyring.remove_key.not_found",
+            key_prefix: key_hash.bytes[0] as u64,
+        };
+    }
+
+    return new_keyring;
+}
+
+/// Find a key in the keyring by its hash.
+fn keyring_find_key(
+    keyring: Keyring,
+    key_hash: Hash256,
+) -> Result[KeyringEntry, u32]
+    effect [compute]
+{
+    for i in 0..keyring.count as u64 {
+        if hash256_equal(keyring.entries[i].key_hash, key_hash) {
+            return Result[KeyringEntry, u32]::Ok(keyring.entries[i]);
+        }
+    }
+    return Result[KeyringEntry, u32]::Err(0);
+}
+
+/// Check if a key is trusted (active and not expired/revoked).
+fn keyring_is_key_trusted(
+    keyring: Keyring,
+    key_hash: Hash256,
+    current_time: u64,
+) -> bool
+    effect [compute]
+{
+    let result: Result[KeyringEntry, u32] = keyring_find_key(keyring, key_hash);
+    match result {
+        Result::Ok(entry) => {
+            if entry.status != KeyStatus::Active {
+                return false;
+            }
+            if entry.expires_at > 0 && current_time > entry.expires_at {
+                return false;
+            }
+            return true;
+        },
+        Result::Err(_) => {
+            return false;
+        },
+    }
+}
+
+/// Get all keys of a specific type from the keyring.
+fn keyring_get_keys_by_type(
+    keyring: Keyring,
+    key_type: KeyType,
+    result: Array[KeyringEntry, 256],
+    result_count: u32,
+) -> Array[KeyringEntry, 256]
+    effect [compute]
+{
+    let mut count: u32 = 0;
+    let mut res: Array[KeyringEntry, 256] = result;
+    for i in 0..keyring.count as u64 {
+        if keyring.entries[i].key_type == key_type {
+            if count < 256 {
+                res[count] = keyring.entries[i];
+                count = count + 1;
+            }
+        }
+    }
+    result_count = count;
+    return res;
+}
+
+/// Lock the keyring (prevent further modifications).
+fn keyring_lock(keyring: Keyring) -> Keyring
+    effect [compute, residual]
+{
+    residual emit {
+        op: "keyring.lock",
+        key_count: keyring.count,
+    };
+
+    return Keyring {
+        entries: keyring.entries,
+        count: keyring.count,
+        default_signing_key: keyring.default_signing_key,
+        locked: true,
+    };
+}
+
+// ============================================================================
+// Signing Operations
+// ============================================================================
+
+/// Sign a hash with a key from the keyring.
+/// Returns a Signature structure.
+fn sign_hash(
+    keyring: Keyring,
+    key_hash: Hash256,
+    data_hash: Hash256,
+    signer_identity: Identity,
+    timestamp: u64,
+) -> Result[Signature, u32]
+    effect [compute, residual]
+{
+    // Find the signing key
+    let result: Result[KeyringEntry, u32] = keyring_find_key(keyring, key_hash);
+    match result {
+        Result::Ok(entry) => {
+            if entry.status != KeyStatus::Active {
+                residual emit {
+                    op: "sign_hash.rejected",
+                    reason: "key_not_active",
+                };
+                return Result[Signature, u32]::Err(1);
+            }
+
+            // Create signature (placeholder — real signing uses crypto primitive)
+            let sig: Signature = Signature {
+                algorithm: Array[u8, 32]::from_literal("phorensic-ed25519"),
+                algorithm_len: 17,
+                sig_bytes: Array[u8, 512]::zeroed(),
+                sig_bytes_len: 64,
+                signer_key: key_hash,
+                signer_identity: signer_identity,
+                signed_at: timestamp,
+                verified: true,
+            };
+
+            // Copy data_hash into sig_bytes as placeholder signature
+            for i in 0..32 {
+                sig.sig_bytes[i] = data_hash.bytes[i];
+                sig.sig_bytes[i + 32] = key_hash.bytes[i];
+            }
+
+            residual emit {
+                op: "sign_hash.success",
+                key_prefix: key_hash.bytes[0] as u64,
+                data_prefix: data_hash.bytes[0] as u64,
+            };
+
+            return Result[Signature, u32]::Ok(sig);
+        },
+        Result::Err(_) => {
+            residual emit {
+                op: "sign_hash.rejected",
+                reason: "key_not_found",
+            };
+            return Result[Signature, u32]::Err(2);
+        },
+    }
+}
+
+/// Verify a signature against a data hash and keyring.
+fn verify_signature(
+    keyring: Keyring,
+    sig: Signature,
+    data_hash: Hash256,
+    current_time: u64,
+) -> bool
+    effect [compute, residual]
+{
+    // Check that the signer key is trusted
+    if !keyring_is_key_trusted(keyring, sig.signer_key, current_time) {
+        residual emit {
+            op: "verify_signature.fail",
+            reason: "signer_key_not_trusted",
+        };
+        return false;
+    }
+
+    // Verify sig_bytes encode the data_hash (placeholder for real verification)
+    let mut hash_match: bool = true;
+    for i in 0..32 {
+        if sig.sig_bytes[i] != data_hash.bytes[i] {
+            hash_match = false;
+        }
+    }
+
+    if !hash_match {
+        residual emit {
+            op: "verify_signature.fail",
+            reason: "signature_data_mismatch",
+        };
+        return false;
+    }
+
+    residual emit {
+        op: "verify_signature.pass",
+        signer_prefix: sig.signer_key.bytes[0] as u64,
+    };
+
+    return true;
+}
+
+// ============================================================================
+// Container Signing
+// ============================================================================
+
+/// Sign a package container with the full container signing key.
+fn sign_container(
+    pkg: PackageContainer,
+    keyring: Keyring,
+    signing_key_hash: Hash256,
+    signer_identity: Identity,
+    timestamp: u64,
+) -> Result[PackageContainer, u32]
+    effect [compute, residual]
+{
+    // Compute container hash
+    let container_hash: Hash256 = compute_container_hash(pkg);
+
+    // Sign the container hash
+    let sig_result: Result[Signature, u32] = sign_hash(
+        keyring, signing_key_hash, container_hash, signer_identity, timestamp,
+    );
+
+    match sig_result {
+        Result::Ok(sig) => {
+            let new_sigs: PackageSignatures = PackageSignatures {
+                full_container_signature: sig,
+                full_sig_present: true,
+                evidence_chain_signature: pkg.signatures.evidence_chain_signature,
+                evidence_sig_present: pkg.signatures.evidence_sig_present,
+                auditor_stamps: pkg.signatures.auditor_stamps,
+                auditor_stamp_count: pkg.signatures.auditor_stamp_count,
+            };
+
+            residual emit {
+                op: "sign_container.success",
+                name_prefix: pkg.header.package_name[0] as u64,
+            };
+
+            return Result[PackageContainer, u32]::Ok(PackageContainer {
+                header: pkg.header,
+                source_evidence: pkg.source_evidence,
+                build_evidence: pkg.build_evidence,
+                expansion_evidence: pkg.expansion_evidence,
+                compilation_evidence: pkg.compilation_evidence,
+                binary_evidence: pkg.binary_evidence,
+                replay_evidence: pkg.replay_evidence,
+                court_evidence: pkg.court_evidence,
+                signatures: new_sigs,
+                container_key: container_hash,
+                verified: pkg.verified,
+                verification_hash: pkg.verification_hash,
+                sealed: pkg.sealed,
+                container_version: pkg.container_version,
+                reserved: pkg.reserved,
+            });
+        },
+        Result::Err(e) => {
+            return Result[PackageContainer, u32]::Err(e);
+        },
+    }
+}
+
+/// Sign the evidence chain of a container.
+fn sign_evidence_chain(
+    pkg: PackageContainer,
+    keyring: Keyring,
+    signing_key_hash: Hash256,
+    signer_identity: Identity,
+    timestamp: u64,
+) -> Result[PackageContainer, u32]
+    effect [compute, residual]
+{
+    // Build evidence chain hash: hash(source_hash || binary_hash || compiler_hash)
+    let mut chain_hash: Hash256 = hash256_zero();
+    for i in 0..32 {
+        chain_hash.bytes[i] = pkg.source_evidence.source_hash.bytes[i] ^
+                              pkg.binary_evidence.binary_hash.bytes[i] ^
+                              pkg.build_evidence.compiler_hash.bytes[i];
+    }
+
+    let sig_result: Result[Signature, u32] = sign_hash(
+        keyring, signing_key_hash, chain_hash, signer_identity, timestamp,
+    );
+
+    match sig_result {
+        Result::Ok(sig) => {
+            let new_sigs: PackageSignatures = PackageSignatures {
+                full_container_signature: pkg.signatures.full_container_signature,
+                full_sig_present: pkg.signatures.full_sig_present,
+                evidence_chain_signature: sig,
+                evidence_sig_present: true,
+                auditor_stamps: pkg.signatures.auditor_stamps,
+                auditor_stamp_count: pkg.signatures.auditor_stamp_count,
+            };
+
+            return Result[PackageContainer, u32]::Ok(PackageContainer {
+                header: pkg.header,
+                source_evidence: pkg.source_evidence,
+                build_evidence: pkg.build_evidence,
+                expansion_evidence: pkg.expansion_evidence,
+                compilation_evidence: pkg.compilation_evidence,
+                binary_evidence: pkg.binary_evidence,
+                replay_evidence: pkg.replay_evidence,
+                court_evidence: pkg.court_evidence,
+                signatures: new_sigs,
+                container_key: pkg.container_key,
+                verified: pkg.verified,
+                verification_hash: pkg.verification_hash,
+                sealed: pkg.sealed,
+                container_version: pkg.container_version,
+                reserved: pkg.reserved,
+            });
+        },
+        Result::Err(e) => {
+            return Result[PackageContainer, u32]::Err(e);
+        },
+    }
+}
+
+// ============================================================================
+// Auditor Stamp Operations
+// ============================================================================
+
+/// Add an auditor stamp to a package container.
+fn add_auditor_stamp(
+    pkg: PackageContainer,
+    auditor_identity: Identity,
+    stamp_type: AuditStampType,
+    auditor_key_hash: Hash256,
+    keyring: Keyring,
+    timestamp: u64,
+) -> Result[PackageContainer, u32]
+    effect [compute, residual]
+{
+    // Verify the auditor key is in the keyring
+    let key_result: Result[KeyringEntry, u32] = keyring_find_key(keyring, auditor_key_hash);
+    match key_result {
+        Result::Ok(entry) => {
+            if entry.key_type != KeyType::AuditorKey {
+                return Result[PackageContainer, u32]::Err(3);
+            }
+        },
+        Result::Err(_) => {
+            return Result[PackageContainer, u32]::Err(2);
+        },
+    }
+
+    if pkg.signatures.auditor_stamp_count >= 32 {
+        return Result[PackageContainer, u32]::Err(4);
+    }
+
+    // Compute container hash for stamping
+    let container_hash: Hash256 = compute_container_hash(pkg);
+
+    // Sign the container hash with the auditor key
+    let sig_result: Result[Signature, u32] = sign_hash(
+        keyring, auditor_key_hash, container_hash, auditor_identity, timestamp,
+    );
+
+    match sig_result {
+        Result::Ok(sig) => {
+            let stamp: AuditorStamp = AuditorStamp {
+                auditor_identity: auditor_identity,
+                stamp_type: stamp_type,
+                timestamp: timestamp,
+                stamp_signature: sig,
+                report_residual_id: 0,
+            };
+
+            let mut new_stamps: Array[AuditorStamp, 32] = pkg.signatures.auditor_stamps;
+            new_stamps[pkg.signatures.auditor_stamp_count] = stamp;
+
+            let new_sigs: PackageSignatures = PackageSignatures {
+                full_container_signature: pkg.signatures.full_container_signature,
+                full_sig_present: pkg.signatures.full_sig_present,
+                evidence_chain_signature: pkg.signatures.evidence_chain_signature,
+                evidence_sig_present: pkg.signatures.evidence_sig_present,
+                auditor_stamps: new_stamps,
+                auditor_stamp_count: pkg.signatures.auditor_stamp_count + 1,
+            };
+
+            residual emit {
+                op: "add_auditor_stamp.success",
+                name_prefix: pkg.header.package_name[0] as u64,
+                stamp_type: stamp_type as u64,
+                auditor_count: pkg.signatures.auditor_stamp_count + 1,
+            };
+
+            return Result[PackageContainer, u32]::Ok(PackageContainer {
+                header: pkg.header,
+                source_evidence: pkg.source_evidence,
+                build_evidence: pkg.build_evidence,
+                expansion_evidence: pkg.expansion_evidence,
+                compilation_evidence: pkg.compilation_evidence,
+                binary_evidence: pkg.binary_evidence,
+                replay_evidence: pkg.replay_evidence,
+                court_evidence: pkg.court_evidence,
+                signatures: new_sigs,
+                container_key: pkg.container_key,
+                verified: pkg.verified,
+                verification_hash: pkg.verification_hash,
+                sealed: pkg.sealed,
+                container_version: pkg.container_version,
+                reserved: pkg.reserved,
+            });
+        },
+        Result::Err(e) => {
+            return Result[PackageContainer, u32]::Err(e);
+        },
+    }
+}
+
+/// Verify all auditor stamps on a container.
+fn verify_auditor_stamps(
+    pkg: PackageContainer,
+    keyring: Keyring,
+    current_time: u64,
+) -> bool
+    effect [compute, residual]
+{
+    if pkg.signatures.auditor_stamp_count == 0 {
+        residual emit {
+            op: "verify_auditor_stamps.warning",
+            reason: "no_auditor_stamps",
+        };
+        return true;
+    }
+
+    let mut all_valid: bool = true;
+    let container_hash: Hash256 = compute_container_hash(pkg);
+
+    for i in 0..pkg.signatures.auditor_stamp_count as u64 {
+        let stamp: AuditorStamp = pkg.signatures.auditor_stamps[i];
+
+        // Verify the stamp signature
+        let verifies: bool = verify_signature(
+            keyring,
+            stamp.stamp_signature,
+            container_hash,
+            current_time,
+        );
+
+        if !verifies {
+            all_valid = false;
+            residual emit {
+                op: "verify_auditor_stamps.fail",
+                stamp_index: i,
+                auditor_prefix: stamp.auditor_identity.key_fingerprint.bytes[0] as u64,
+            };
+        }
+    }
+
+    if all_valid {
+        residual emit {
+            op: "verify_auditor_stamps.pass",
+            count: pkg.signatures.auditor_stamp_count,
+        };
+    }
+
+    return all_valid;
+}
+
+// ============================================================================
+// Container Hash Computation
+// ============================================================================
+
+/// Compute a hash over the package container.
+fn compute_container_hash(pkg: PackageContainer) -> Hash256
+    effect [compute]
+{
+    let mut hash: Hash256 = hash256_zero();
+
+    // Combine source + binary + compiler hashes
+    for i in 0..32 {
+        hash.bytes[i] = pkg.source_evidence.source_hash.bytes[i] ^
+                        pkg.binary_evidence.binary_hash.bytes[i] ^
+                        pkg.build_evidence.compiler_hash.bytes[i];
+    }
+
+    // XOR in first few bytes of package name
+    for i in 0..pkg.header.package_name_len as u64 {
+        if i < 32 {
+            hash.bytes[i] = hash.bytes[i] ^ pkg.header.package_name[i];
+        }
+    }
+
+    // XOR in version bytes
+    hash.bytes[0] = hash.bytes[0] ^ (pkg.header.version_major & 0xFF) as u8;
+    hash.bytes[1] = hash.bytes[1] ^ ((pkg.header.version_major >> 8) & 0xFF) as u8;
+    hash.bytes[2] = hash.bytes[2] ^ (pkg.header.version_minor & 0xFF) as u8;
+    hash.bytes[3] = hash.bytes[3] ^ ((pkg.header.version_minor >> 8) & 0xFF) as u8;
+
+    return hash;
+}
+
+// ============================================================================
+// Full Signature Verification
+// ============================================================================
+
+/// Verify all signatures on a package container.
+fn verify_container_signatures(
+    pkg: PackageContainer,
+    keyring: Keyring,
+    current_time: u64,
+) -> bool
+    effect [compute, residual]
+{
+    let mut all_ok: bool = true;
+
+    // Verify full container signature
+    if pkg.signatures.full_sig_present {
+        let container_hash: Hash256 = compute_container_hash(pkg);
+        let ok: bool = verify_signature(
+            keyring,
+            pkg.signatures.full_container_signature,
+            container_hash,
+            current_time,
+        );
+        if !ok {
+            all_ok = false;
+            residual emit {
+                op: "verify_container_sigs.fail",
+                reason: "full_container_sig_invalid",
+            };
+        }
+    } else {
+        all_ok = false;
+        residual emit {
+            op: "verify_container_sigs.fail",
+            reason: "full_container_sig_missing",
+        };
+    }
+
+    // Verify evidence chain signature
+    if pkg.signatures.evidence_sig_present {
+        let mut chain_hash: Hash256 = hash256_zero();
+        for i in 0..32 {
+            chain_hash.bytes[i] = pkg.source_evidence.source_hash.bytes[i] ^
+                                  pkg.binary_evidence.binary_hash.bytes[i] ^
+                                  pkg.build_evidence.compiler_hash.bytes[i];
+        }
+        let ok: bool = verify_signature(
+            keyring,
+            pkg.signatures.evidence_chain_signature,
+            chain_hash,
+            current_time,
+        );
+        if !ok {
+            all_ok = false;
+            residual emit {
+                op: "verify_container_sigs.fail",
+                reason: "evidence_chain_sig_invalid",
+            };
+        }
+    } else {
+        all_ok = false;
+        residual emit {
+            op: "verify_container_sigs.fail",
+            reason: "evidence_chain_sig_missing",
+        };
+    }
+
+    // Verify auditor stamps
+    let stamps_ok: bool = verify_auditor_stamps(pkg, keyring, current_time);
+    if !stamps_ok {
+        all_ok = false;
+    }
+
+    residual emit {
+        op: "verify_container_sigs",
+        all_ok: all_ok as u64,
+    };
+
+    return all_ok;
+}
+
+// ============================================================================
+// Keyring Statistics
+// ============================================================================
+
+struct KeyringStats
+    layout packed
+{
+    total_keys: u32,
+    active_keys: u32,
+    expired_keys: u32,
+    revoked_keys: u32,
+    source_keys: u32,
+    binary_keys: u32,
+    seal_keys: u32,
+    container_keys: u32,
+    auditor_keys: u32,
+    trust_roots: u32,
+    locked: bool,
+}
+
+fn keyring_stats(keyring: Keyring) -> KeyringStats
+    effect [compute]
+{
+    let mut active: u32 = 0;
+    let mut expired: u32 = 0;
+    let mut revoked: u32 = 0;
+    let mut source_keys: u32 = 0;
+    let mut binary_keys: u32 = 0;
+    let mut seal_keys: u32 = 0;
+    let mut container_keys: u32 = 0;
+    let mut auditor_keys: u32 = 0;
+    let mut trust_roots: u32 = 0;
+
+    for i in 0..keyring.count as u64 {
+        let entry: KeyringEntry = keyring.entries[i];
+        match entry.status {
+            KeyStatus::Active => { active = active + 1; },
+            KeyStatus::Expired => { expired = expired + 1; },
+            KeyStatus::Revoked => { revoked = revoked + 1; },
+            _ => {},
+        }
+        match entry.key_type {
+            KeyType::SourceSigning => { source_keys = source_keys + 1; },
+            KeyType::BinarySigning => { binary_keys = binary_keys + 1; },
+            KeyType::SealSigning => { seal_keys = seal_keys + 1; },
+            KeyType::ContainerSigning => { container_keys = container_keys + 1; },
+            KeyType::AuditorKey => { auditor_keys = auditor_keys + 1; },
+            KeyType::TrustRoot => { trust_roots = trust_roots + 1; },
+            _ => {},
+        }
+    }
+
+    return KeyringStats {
+        total_keys: keyring.count,
+        active_keys: active,
+        expired_keys: expired,
+        revoked_keys: revoked,
+        source_keys: source_keys,
+        binary_keys: binary_keys,
+        seal_keys: seal_keys,
+        container_keys: container_keys,
+        auditor_keys: auditor_keys,
+        trust_roots: trust_roots,
+        locked: keyring.locked,
+    };
+}
+
+// ============================================================================
+// Key Revocation
+// ============================================================================
+
+/// Revoke a key in the keyring.
+fn keyring_revoke_key(
+    keyring: Keyring,
+    key_hash: Hash256,
+    reason: Array[u8, 256],
+    reason_len: u32,
+    revoked_at: u64,
+) -> Keyring
+    effect [compute, residual]
+{
+    if keyring.locked {
+        return keyring;
+    }
+
+    let mut new_keyring: Keyring = keyring;
+    for i in 0..new_keyring.count as u64 {
+        if hash256_equal(new_keyring.entries[i].key_hash, key_hash) {
+            new_keyring.entries[i].status = KeyStatus::Revoked;
+            new_keyring.entries[i].revoked_at = revoked_at;
+            new_keyring.entries[i].revocation_reason = reason;
+            new_keyring.entries[i].revocation_reason_len = reason_len;
+
+            residual emit {
+                op: "keyring.revoke_key",
+                key_prefix: key_hash.bytes[0] as u64,
+            };
+
+            return new_keyring;
+        }
+    }
+    return new_keyring;
+}
+
+// ============================================================================
+// Key Expiry Checking
+// ============================================================================
+
+/// Check all keys for expiry and update their status.
+fn keyring_check_expiry(
+    keyring: Keyring,
+    current_time: u64,
+) -> Keyring
+    effect [compute, residual]
+{
+    let mut new_keyring: Keyring = keyring;
+    let mut expired_count: u32 = 0;
+
+    for i in 0..new_keyring.count as u64 {
+        let entry: KeyringEntry = new_keyring.entries[i];
+        if entry.status == KeyStatus::Active {
+            if entry.expires_at > 0 && current_time > entry.expires_at {
+                new_keyring.entries[i].status = KeyStatus::Expired;
+                expired_count = expired_count + 1;
+            }
+        }
+    }
+
+    if expired_count > 0 {
+        residual emit {
+            op: "keyring.check_expiry",
+            expired: expired_count,
+        };
+    }
+
+    return new_keyring;
+}
+
+// ============================================================================
+// Multi-Signature Aggregation
+// ============================================================================
+
+/// Aggregate multiple signatures into a single verification result.
+fn aggregate_signature_verification(
+    signatures: Array[Signature, 16],
+    sig_count: u32,
+    data_hash: Hash256,
+    keyring: Keyring,
+    current_time: u64,
+) -> bool
+    effect [compute, residual]
+{
+    if sig_count == 0 {
+        residual emit {
+            op: "aggregate_signatures.empty",
+        };
+        return false;
+    }
+
+    let mut valid_count: u32 = 0;
+    for i in 0..sig_count as u64 {
+        let sig: Signature = signatures[i];
+        if verify_signature(keyring, sig, data_hash, current_time) {
+            valid_count = valid_count + 1;
+        }
+    }
+
+    // Require at least 2/3 of signatures to be valid
+    let threshold: u32 = (sig_count * 2 + 2) / 3;
+    let ok: bool = valid_count >= threshold;
+
+    residual emit {
+        op: "aggregate_signatures",
+        total: sig_count,
+        valid: valid_count,
+        threshold: threshold,
+        ok: ok as u64,
+    };
+
+    return ok;
+}
+
+// ============================================================================
+// Key Generation for Testing/Development
+// ============================================================================
+
+/// Create a new keyring entry for testing.
+fn create_keyring_entry(
+    key_hash: Hash256,
+    key_type: KeyType,
+    identity: Identity,
+    label: Array[u8, 128],
+    label_len: u32,
+    added_at: u64,
+    expires_at: u64,
+    generation: u64,
+) -> KeyringEntry
+    effect [compute, residual]
+{
+    residual emit {
+        op: "create_keyring_entry",
+        key_prefix: key_hash.bytes[0] as u64,
+        key_type: key_type as u64,
+    };
+
+    return KeyringEntry {
+        key_hash: key_hash,
+        key_type: key_type,
+        status: KeyStatus::Active,
+        identity: identity,
+        label: label,
+        label_len: label_len,
+        added_at: added_at,
+        expires_at: expires_at,
+        revoked_at: 0,
+        revocation_reason: Array[u8, 256]::zeroed(),
+        revocation_reason_len: 0,
+        added_in_generation: generation,
+        grant_trust_level: 0,
+        use_count: 0,
+        hardware_bound: false,
+        reserved: Array[u64, 8]::zeroed(),
+    };
+}
+
+// ============================================================================
+// Signature Verification with Detailed Report
+// ============================================================================
+
+struct DetailedSigVerification
+    layout packed
+{
+    /// Overall result
+    valid: bool,
+    /// Number of signatures checked
+    total_checked: u32,
+    /// Number of valid signatures
+    valid_count: u32,
+    /// Number of invalid signatures
+    invalid_count: u32,
+    /// First failure reason
+    failure_reason: Array[u8, 256],
+    failure_reason_len: u32,
+    /// Whether all required signature types are present
+    all_types_present: bool,
+}
+
+/// Perform detailed signature verification with a structured report.
+fn verify_container_signatures_detailed(
+    pkg: PackageContainer,
+    keyring: Keyring,
+    current_time: u64,
+) -> DetailedSigVerification
+    effect [compute, residual]
+{
+    let mut result: DetailedSigVerification = DetailedSigVerification {
+        valid: true,
+        total_checked: 0,
+        valid_count: 0,
+        invalid_count: 0,
+        failure_reason: Array[u8, 256]::zeroed(),
+        failure_reason_len: 0,
+        all_types_present: true,
+    };
+    let container_hash: Hash256 = compute_container_hash(pkg);
+
+    // Check full container signature
+    result.total_checked = result.total_checked + 1;
+    if pkg.signatures.full_sig_present {
+        if verify_signature(keyring, pkg.signatures.full_container_signature, container_hash, current_time) {
+            result.valid_count = result.valid_count + 1;
+        } else {
+            result.invalid_count = result.invalid_count + 1;
+            result.valid = false;
+        }
+    } else {
+        result.all_types_present = false;
+        result.valid = false;
+        let msg: Array[u8, 256] = Array[u8, 256]::from_literal("Full container signature missing");
+        for i in 0..33 { result.failure_reason[i] = msg[i]; }
+        result.failure_reason_len = 33;
+    }
+
+    // Check evidence chain signature
+    result.total_checked = result.total_checked + 1;
+    let mut chain_hash: Hash256 = hash256_zero();
+    for i in 0..32 {
+        chain_hash.bytes[i] = pkg.source_evidence.source_hash.bytes[i] ^
+                              pkg.binary_evidence.binary_hash.bytes[i] ^
+                              pkg.build_evidence.compiler_hash.bytes[i];
+    }
+    if pkg.signatures.evidence_sig_present {
+        if verify_signature(keyring, pkg.signatures.evidence_chain_signature, chain_hash, current_time) {
+            result.valid_count = result.valid_count + 1;
+        } else {
+            result.invalid_count = result.invalid_count + 1;
+            result.valid = false;
+        }
+    } else {
+        result.all_types_present = false;
+        result.valid = false;
+    }
+
+    // Check auditor stamps (batch)
+    for i in 0..pkg.signatures.auditor_stamp_count as u64 {
+        result.total_checked = result.total_checked + 1;
+        let stamp: AuditorStamp = pkg.signatures.auditor_stamps[i];
+        if verify_signature(keyring, stamp.stamp_signature, container_hash, current_time) {
+            result.valid_count = result.valid_count + 1;
+        } else {
+            result.invalid_count = result.invalid_count + 1;
+            result.valid = false;
+        }
+    }
+
+    residual emit {
+        op: "verify_container_signatures_detailed",
+        valid: result.valid as u64,
+        total: result.total_checked,
+        valid_count: result.valid_count,
+    };
+
+    return result;
+}
+
+// ============================================================================
+// Key Serialization Helpers
+// ============================================================================
+
+/// Serialize a KeyringEntry for persistent storage.
+fn keyring_entry_serialize(
+    entry: KeyringEntry,
+    output: Array[u8, 512],
+) -> u32
+    effect [compute]
+{
+    let mut pos: u32 = 0;
+
+    // Key hash (32 bytes)
+    for i in 0..32 {
+        output[pos as u64] = entry.key_hash.bytes[i];
+        pos = pos + 1;
+    }
+
+    // Key type
+    output[pos as u64] = entry.key_type as u8;
+    pos = pos + 1;
+
+    // Status
+    output[pos as u64] = entry.status as u8;
+    pos = pos + 1;
+
+    // Label
+    output[pos as u64] = entry.label_len as u8;
+    pos = pos + 1;
+    for i in 0..entry.label_len as u64 {
+        output[pos as u64] = entry.label[i];
+        pos = pos + 1;
+    }
+
+    // Timestamps
+    output[pos as u64] = entry.added_at & 0xFF;
+    pos = pos + 1;
+    output[pos as u64] = (entry.added_at >> 8) & 0xFF;
+    pos = pos + 1;
+    output[pos as u64] = (entry.added_at >> 16) & 0xFF;
+    pos = pos + 1;
+    output[pos as u64] = (entry.added_at >> 24) & 0xFF;
+    pos = pos + 1;
+
+    output[pos as u64] = entry.expires_at & 0xFF;
+    pos = pos + 1;
+    output[pos as u64] = (entry.expires_at >> 8) & 0xFF;
+    pos = pos + 1;
+
+    // Trust level
+    output[pos as u64] = entry.grant_trust_level;
+    pos = pos + 1;
+
+    // Hardware bound flag
+    if entry.hardware_bound {
+        output[pos as u64] = 1;
+    } else {
+        output[pos as u64] = 0;
+    }
+    pos = pos + 1;
+
+    return pos;
+}
+
+// ============================================================================
+// Auditor Stamp Verification Report
+// ============================================================================
+
+struct AuditorStampReport
+    layout packed
+{
+    total_stamps: u32,
+    valid_stamps: u32,
+    invalid_stamps: u32,
+    review_stamps: u32,
+    audit_stamps: u32,
+    certify_stamps: u32,
+    all_valid: bool,
+}
+
+fn verify_auditor_stamps_detailed(
+    pkg: PackageContainer,
+    keyring: Keyring,
+    current_time: u64,
+) -> AuditorStampReport
+    effect [compute, residual]
+{
+    let container_hash: Hash256 = compute_container_hash(pkg);
+    let mut report: AuditorStampReport = AuditorStampReport {
+        total_stamps: pkg.signatures.auditor_stamp_count,
+        valid_stamps: 0,
+        invalid_stamps: 0,
+        review_stamps: 0,
+        audit_stamps: 0,
+        certify_stamps: 0,
+        all_valid: true,
+    };
+
+    for i in 0..pkg.signatures.auditor_stamp_count as u64 {
+        let stamp: AuditorStamp = pkg.signatures.auditor_stamps[i];
+
+        // Count by type
+        match stamp.stamp_type {
+            AuditStampType::Review => { report.review_stamps = report.review_stamps + 1; },
+            AuditStampType::Audit => { report.audit_stamps = report.audit_stamps + 1; },
+            AuditStampType::Certify => { report.certify_stamps = report.certify_stamps + 1; },
+        }
+
+        // Verify signature
+        if verify_signature(keyring, stamp.stamp_signature, container_hash, current_time) {
+            report.valid_stamps = report.valid_stamps + 1;
+        } else {
+            report.invalid_stamps = report.invalid_stamps + 1;
+            report.all_valid = false;
+        }
+    }
+
+    residual emit {
+        op: "verify_auditor_stamps_detailed",
+        total: report.total_stamps,
+        valid: report.valid_stamps,
+        all_valid: report.all_valid as u64,
+    };
+
+    return report;
+}

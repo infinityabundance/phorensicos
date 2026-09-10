@@ -1,0 +1,1243 @@
+// socket.phor — Socket abstraction: stream, dgram, raw, bind, connect, send, recv, listen, accept, poll, capability-gated port access
+// Provides the user-facing socket API over the Phorensic network stack.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/socket.phor
+// Court: socket:v1
+
+package network.socket;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ethernet.*;
+import network.ipv4.*;
+import network.udp.*;
+import network.tcp.*;
+import network.ipv6.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// Socket sub-range: 0xE700 - 0xE7FF
+
+type SocketError = enum {
+    SocketTypeInvalid       = 0xE700,  // NE700: Invalid socket type
+    SocketNotBound          = 0xE701,  // NE701: Socket not bound
+    SocketNotConnected      = 0xE702,  // NE702: Socket not connected
+    SocketAlreadyBound      = 0xE703,  // NE703: Socket already bound
+    SocketAlreadyConnected  = 0xE704,  // NE704: Socket already connected
+    SocketClosed            = 0xE705,  // NE705: Socket is closed
+    SocketTimeout           = 0xE706,  // NE706: Socket operation timed out
+    SocketWouldBlock        = 0xE707,  // NE707: Socket operation would block
+    SocketCapabilityError   = 0xE708,  // NE708: Insufficient capability for socket operation
+    SocketPortInUse         = 0xE709,  // NE709: Port already in use
+    SocketPortBlocked       = 0xE70A,  // NE70A: Port blocked by capability filter
+    SocketTableFull         = 0xE70B,  // NE70B: Socket table full
+    SocketNotListening      = 0xE70C,  // NE70C: Socket not listening
+    SocketConnectionRefused = 0xE70D,  // NE70D: Connection refused
+    SocketConnectionReset   = 0xE70E,  // NE70E: Connection reset by peer
+    SocketAddressInvalid    = 0xE70F,  // NE70F: Invalid address
+    SocketMsgTooLong        = 0xE710,  // NE710: Message too long
+    SocketNoBufferSpace     = 0xE711,  // NE711: No buffer space available
+    SocketProtocolError     = 0xE712,  // NE712: Protocol error
+    SocketInterrupted       = 0xE713,  // NE713: Operation interrupted
+    SocketNotSupported      = 0xE714,  // NE714: Operation not supported for this socket type
+    SocketHostUnreach       = 0xE715,  // NE715: Host unreachable
+    SocketNetworkDown       = 0xE716,  // NE716: Network is down
+    SocketHandleStale       = 0xE717,  // NE717: Socket handle is stale (generation mismatch)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const SOCKET_MAX_SOCKETS   : u64 = 256;
+const SOCKET_MAX_POLL_FDS  : u64 = 64;
+const SOCKET_DEFAULT_RCVBUF: u64 = 65536;
+const SOCKET_DEFAULT_SNDBUF: u64 = 65536;
+const SOCKET_CONNECT_TIMEOUT_MS: u64 = 30000;
+const SOCKET_SEND_TIMEOUT_MS   : u64 = 10000;
+const SOCKET_RECV_TIMEOUT_MS   : u64 = 10000;
+
+// ─────────────────────────────────────────────────────────────
+// Socket Types
+// ─────────────────────────────────────────────────────────────
+
+type SocketDomain = enum {
+    AfInet      = 2,
+    AfInet6     = 10,
+    AfUnspec    = 0,
+}
+
+type SocketTypeEnum = enum {
+    SockStream  = 1,
+    SockDgram   = 2,
+    SockRaw     = 3,
+}
+
+type SocketProtocol = enum {
+    ProtoDefault    = 0,
+    ProtoTcp        = 6,
+    ProtoUdp        = 17,
+    ProtoIcmp       = 1,
+    ProtoRaw        = 255,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Address (IP:Port pair)
+// ─────────────────────────────────────────────────────────────
+
+struct SocketAddress {
+    domain: SocketDomain,
+    ipv4_addr: Ipv4Address,
+    port: u16,
+}
+
+impl SocketAddress {
+    fn any(port: u16) -> SocketAddress
+        effect [deterministic]
+    {
+        return SocketAddress {
+            domain: SocketDomain::AfInet,
+            ipv4_addr: Ipv4Address::any(),
+            port: port,
+        };
+    }
+
+    fn new(addr: Ipv4Address, port: u16) -> SocketAddress
+        effect [deterministic]
+    {
+        return SocketAddress {
+            domain: SocketDomain::AfInet,
+            ipv4_addr: addr,
+            port: port,
+        };
+    }
+
+    fn is_unspecified(self) -> bool
+        effect [deterministic]
+    {
+        return self.ipv4_addr.is_unspecified() && self.port == 0;
+    }
+
+    fn eq(self, other: SocketAddress) -> bool
+        effect [deterministic]
+    {
+        return self.ipv4_addr.eq(other.ipv4_addr) && self.port == other.port;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket State
+// ─────────────────────────────────────────────────────────────
+
+type SocketInternalState = enum {
+    SocketCreated    = 0,
+    SocketBound      = 1,
+    SocketListening  = 2,
+    SocketConnecting = 3,
+    SocketConnected  = 4,
+    SocketClosing    = 5,
+    SocketClosed     = 6,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Poll Events
+// ─────────────────────────────────────────────────────────────
+
+const POLLIN   : u16 = 0x0001;
+const POLLOUT  : u16 = 0x0002;
+const POLLERR  : u16 = 0x0004;
+const POLLHUP  : u16 = 0x0008;
+const POLLNVAL : u16 = 0x0010;
+
+struct PollFd {
+    socket_id: u64,
+    events: u16,
+    revents: u16,
+}
+
+impl PollFd {
+    fn new(sock_id: u64, events: u16) -> PollFd
+        effect [deterministic]
+    {
+        return PollFd {
+            socket_id: sock_id,
+            events: events,
+            revents: 0,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Buffer (for user-space buffering)
+// ─────────────────────────────────────────────────────────────
+
+struct SocketBuffer {
+    data: Array(u8, SOCKET_DEFAULT_RCVBUF),
+    size: u64,
+    read_pos: u64,
+}
+
+impl SocketBuffer {
+    fn new() -> SocketBuffer
+        effect [deterministic]
+    {
+        return SocketBuffer {
+            data: Array::zeroed(),
+            size: 0,
+            read_pos: 0,
+        };
+    }
+
+    fn write(self: ref mut, src: Array(u8, SOCKET_DEFAULT_RCVBUF), len: u64) -> Result(void, SocketError)
+        effect [deterministic]
+    {
+        if (self.size + len) > SOCKET_DEFAULT_RCVBUF {
+            return Result::Err(SocketError::SocketNoBufferSpace);
+        };
+        loop bound SOCKET_DEFAULT_RCVBUF {
+            if i >= len {
+                break;
+            };
+            self.data[self.size + i] = src[i];
+        };
+        self.size = self.size + len;
+        return Result::Ok(void);
+    }
+
+    fn read(self: ref mut, dst: ref mut Array(u8, SOCKET_DEFAULT_RCVBUF), len: u64) -> u64
+        effect [deterministic]
+    {
+        let avail: u64 = self.size - self.read_pos;
+        let to_read: u64 = if len < avail { len } else { avail };
+        loop bound SOCKET_DEFAULT_RCVBUF {
+            if i >= to_read {
+                break;
+            };
+            dst[i] = self.data[self.read_pos + i];
+        };
+        self.read_pos = self.read_pos + to_read;
+        if self.read_pos >= self.size {
+            self.size = 0;
+            self.read_pos = 0;
+        };
+        return to_read;
+    }
+
+    fn available(self) -> u64
+        effect [deterministic]
+    {
+        return self.size - self.read_pos;
+    }
+
+    fn remaining(self) -> u64
+        effect [deterministic]
+    {
+        return SOCKET_DEFAULT_RCVBUF - self.size;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Entry
+// ─────────────────────────────────────────────────────────────
+
+struct SocketEntry {
+    sock_type: SocketTypeEnum,
+    domain: SocketDomain,
+    protocol: SocketProtocol,
+    state: SocketInternalState,
+    local_addr: SocketAddress,
+    remote_addr: SocketAddress,
+    recv_buf: SocketBuffer,
+    send_buf: SocketBuffer,
+    tcp_conn_idx: u64,
+    udp_port_idx: u64,
+    is_bound_tcp: bool,
+    is_bound_udp: bool,
+    blocking: bool,
+    timeout_ms: u64,
+    generation: u64,
+    error_pending: Option(SocketError),
+    in_use: bool,
+}
+
+impl SocketEntry {
+    fn empty() -> SocketEntry
+        effect [deterministic]
+    {
+        return SocketEntry {
+            sock_type: SocketTypeEnum::SockStream,
+            domain: SocketDomain::AfInet,
+            protocol: SocketProtocol::ProtoDefault,
+            state: SocketInternalState::SocketClosed,
+            local_addr: SocketAddress::any(0),
+            remote_addr: SocketAddress::any(0),
+            recv_buf: SocketBuffer::new(),
+            send_buf: SocketBuffer::new(),
+            tcp_conn_idx: 0,
+            udp_port_idx: 0,
+            is_bound_tcp: false,
+            is_bound_udp: false,
+            blocking: true,
+            timeout_ms: SOCKET_RECV_TIMEOUT_MS,
+            generation: 0,
+            error_pending: Option::None,
+            in_use: false,
+        };
+    }
+
+    fn new(sock_type: SocketTypeEnum, domain: SocketDomain, proto: SocketProtocol) -> SocketEntry
+        effect [deterministic]
+    {
+        return SocketEntry {
+            sock_type: sock_type,
+            domain: domain,
+            protocol: proto,
+            state: SocketInternalState::SocketCreated,
+            local_addr: SocketAddress::any(0),
+            remote_addr: SocketAddress::any(0),
+            recv_buf: SocketBuffer::new(),
+            send_buf: SocketBuffer::new(),
+            tcp_conn_idx: 0,
+            udp_port_idx: 0,
+            is_bound_tcp: false,
+            is_bound_udp: false,
+            blocking: true,
+            timeout_ms: SOCKET_RECV_TIMEOUT_MS,
+            generation: 1,
+            error_pending: Option::None,
+            in_use: true,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Table (Fixed-Capacity)
+// ─────────────────────────────────────────────────────────────
+
+struct SocketTable {
+    entries: Array(SocketEntry, SOCKET_MAX_SOCKETS),
+    entry_count: u64,
+    next_handle: u64,
+}
+
+impl SocketTable {
+    fn new() -> SocketTable
+        effect [deterministic]
+    {
+        return SocketTable {
+            entries: Array::zeroed(),
+            entry_count: 0,
+            next_handle: 1,
+        };
+    }
+
+    fn allocate(self: ref mut, entry: SocketEntry) -> Result(u64, SocketError)
+        effect [deterministic]
+    {
+        if self.entry_count >= SOCKET_MAX_SOCKETS {
+            return Result::Err(SocketError::SocketTableFull);
+        };
+        let idx: u64 = self.entry_count;
+        self.entries[idx] = entry;
+        self.entries[idx].generation = self.next_handle;
+        self.entry_count = self.entry_count + 1;
+        let handle: u64 = self.make_handle(idx, self.next_handle);
+        self.next_handle = self.next_handle + 1;
+
+        residual emit {
+            op: "socket.allocate",
+            handle: handle,
+            type: entry.sock_type as u64,
+        };
+
+        return Result::Ok(handle);
+    }
+
+    fn free(self: ref mut, handle: u64)
+        effect [deterministic]
+    {
+        let (idx, gen): (u64, u64) = self.parse_handle(handle);
+        if idx < self.entry_count && self.entries[idx].generation == gen {
+            self.entries[idx] = self.entries[self.entry_count - 1];
+            self.entry_count = self.entry_count - 1;
+        };
+
+        residual emit {
+            op: "socket.free",
+            handle: handle,
+        };
+    }
+
+    fn get(self: ref mut, handle: u64) -> Result(ref mut SocketEntry, SocketError)
+        effect [deterministic]
+    {
+        let (idx, gen): (u64, u64) = self.parse_handle(handle);
+        if idx >= self.entry_count {
+            return Result::Err(SocketError::SocketHandleStale);
+        };
+        if !self.entries[idx].in_use {
+            return Result::Err(SocketError::SocketClosed);
+        };
+        if self.entries[idx].generation != gen {
+            return Result::Err(SocketError::SocketHandleStale);
+        };
+        return Result::Ok(self.entries[idx]);
+    }
+
+    fn make_handle(self, idx: u64, gen: u64) -> u64
+        effect [deterministic]
+    {
+        return (idx << 32) | (gen & 0xFFFFFFFF);
+    }
+
+    fn parse_handle(self, handle: u64) -> (u64, u64)
+        effect [deterministic]
+    {
+        let idx: u64 = handle >> 32;
+        let gen: u64 = handle & 0xFFFFFFFF;
+        return (idx, gen);
+    }
+
+    fn count(self) -> u64
+        effect [deterministic]
+    {
+        return self.entry_count;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Manager (Core Socket API)
+// ─────────────────────────────────────────────────────────────
+
+struct SocketManager {
+    table: SocketTable,
+    tcp_state: Handle(TcpStateMachine),
+    udp_state: Handle(UdpState),
+    local_ip: Ipv4Address,
+    interface_index: u64,
+    sockets_created: u64,
+    sockets_destroyed: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    generation: u64,
+}
+
+impl SocketManager {
+    fn new(tcp: Handle(TcpStateMachine), udp: Handle(UdpState), local_ip: Ipv4Address, iface_idx: u64) -> SocketManager
+        effect [deterministic]
+    {
+        return SocketManager {
+            table: SocketTable::new(),
+            tcp_state: tcp,
+            udp_state: udp,
+            local_ip: local_ip,
+            interface_index: iface_idx,
+            sockets_created: 0,
+            sockets_destroyed: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            generation: 1,
+        };
+    }
+
+    fn socket(
+        self: ref mut,
+        domain: SocketDomain,
+        sock_type: SocketTypeEnum,
+        protocol: SocketProtocol,
+        cap: Cap(NicCapability),
+    ) -> Result(u64, SocketError)
+        effect [deterministic]
+        court "socket_create:v1"
+    {
+        if !cap.can_read && !cap.can_write {
+            return Result::Err(SocketError::SocketCapabilityError);
+        };
+        if domain != SocketDomain::AfInet && domain != SocketDomain::AfInet6 {
+            return Result::Err(SocketError::SocketTypeInvalid);
+        };
+        let entry: SocketEntry = SocketEntry::new(sock_type, domain, protocol);
+        let handle_res: Result(u64, SocketError) = self.table.allocate(entry);
+        if handle_res.is_err() {
+            return Result::Err(handle_res.unwrap_err());
+        };
+        self.sockets_created = self.sockets_created + 1;
+
+        residual emit {
+            op: "socket.create",
+            domain: domain as u64,
+            type: sock_type as u64,
+            protocol: protocol as u64,
+            handle: handle_res.unwrap(),
+        };
+
+        return handle_res;
+    }
+
+    fn bind(
+        self: ref mut,
+        handle: u64,
+        addr: SocketAddress,
+        cap: Cap(NicCapability),
+    ) -> Result(void, SocketError)
+        effect [deterministic]
+        court "socket_bind:v1"
+    {
+        if !cap.can_bind {
+            return Result::Err(SocketError::SocketCapabilityError);
+        };
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if entry.state != SocketInternalState::SocketCreated {
+            return Result::Err(SocketError::SocketAlreadyBound);
+        };
+        entry.local_addr = addr;
+        entry.state = SocketInternalState::SocketBound;
+
+        residual emit {
+            op: "socket.bind",
+            handle: handle,
+            port: addr.port,
+            addr: addr.ipv4_addr.to_array(),
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn listen(
+        self: ref mut,
+        handle: u64,
+        backlog: u64,
+        cap: Cap(NicCapability),
+    ) -> Result(void, SocketError)
+        effect [deterministic]
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if entry.sock_type != SocketTypeEnum::SockStream {
+            return Result::Err(SocketError::SocketNotSupported);
+        };
+        if entry.state != SocketInternalState::SocketBound {
+            return Result::Err(SocketError::SocketNotBound);
+        };
+        // Register with TCP layer
+        let tcp_res: Result(void, TcpError) = self.tcp_state.listen(
+            entry.local_addr.port,
+            entry.local_addr.ipv4_addr,
+            backlog,
+        );
+        if tcp_res.is_err() {
+            return Result::Err(SocketError::SocketPortInUse);
+        };
+        entry.state = SocketInternalState::SocketListening;
+
+        residual emit {
+            op: "socket.listen",
+            handle: handle,
+            port: entry.local_addr.port,
+            backlog: backlog,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn accept(
+        self: ref mut,
+        handle: u64,
+        cap: Cap(NicCapability),
+    ) -> Result((u64, SocketAddress), SocketError)
+        effect [deterministic]
+        court "socket_accept:v1"
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if entry.state != SocketInternalState::SocketListening {
+            return Result::Err(SocketError::SocketNotListening);
+        };
+        // Accept a new TCP connection
+        let conn_idx_res: Result(u64, TcpError) = self.tcp_state.accept(entry.local_addr.port);
+        if conn_idx_res.is_err() {
+            return Result::Err(SocketError::SocketConnectionRefused);
+        };
+        let conn_idx: u64 = conn_idx_res.unwrap();
+        // Create a new socket for the accepted connection
+        let new_sock: SocketEntry = SocketEntry::new(
+            SocketTypeEnum::SockStream,
+            SocketDomain::AfInet,
+            SocketProtocol::ProtoTcp,
+        );
+        let new_handle_res: Result(u64, SocketError) = self.table.allocate(new_sock);
+        if new_handle_res.is_err() {
+            return Result::Err(new_handle_res.unwrap_err());
+        };
+        let new_handle: u64 = new_handle_res.unwrap();
+        let new_entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(new_handle);
+        if new_entry_res.is_err() {
+            return Result::Err(new_entry_res.unwrap_err());
+        };
+        let new_entry: ref mut SocketEntry = new_entry_res.unwrap();
+        let conn: TcpConnection = self.tcp_state.connections.get(conn_idx).unwrap();
+        new_entry.remote_addr = SocketAddress::new(conn.remote_addr, conn.remote_port);
+        new_entry.local_addr = SocketAddress::new(conn.local_addr, conn.local_port);
+        new_entry.tcp_conn_idx = conn_idx;
+        new_entry.state = SocketInternalState::SocketConnected;
+
+        residual emit {
+            op: "socket.accept",
+            listen_handle: handle,
+            new_handle: new_handle,
+            remote: (conn.remote_addr.to_u32(), conn.remote_port),
+        };
+
+        return Result::Ok((new_handle, new_entry.remote_addr));
+    }
+
+    fn connect(
+        self: ref mut,
+        handle: u64,
+        addr: SocketAddress,
+        cap: Cap(NicCapability),
+        now: u64,
+    ) -> Result(void, SocketError)
+        effect [deterministic]
+        court "socket_connect:v1"
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if entry.state == SocketInternalState::SocketConnected {
+            return Result::Err(SocketError::SocketAlreadyConnected);
+        };
+        entry.remote_addr = addr;
+        if entry.sock_type == SocketTypeEnum::SockStream {
+            let local_port: u16;
+            if entry.state == SocketInternalState::SocketBound {
+                local_port = entry.local_addr.port;
+            } else {
+                // Allocate ephemeral port
+                let port_res: Result(u16, UdpError) = self.udp_state.allocate_ephemeral();
+                if port_res.is_err() {
+                    return Result::Err(SocketError::SocketPortInUse);
+                };
+                local_port = port_res.unwrap();
+                entry.local_addr.port = local_port;
+            };
+            let conn_idx_res: Result(u64, TcpError) = self.tcp_state.active_open(
+                local_port,
+                addr.ipv4_addr,
+                addr.port,
+                self.local_ip,
+                now,
+            );
+            if conn_idx_res.is_err() {
+                return Result::Err(SocketError::SocketConnectionRefused);
+            };
+            entry.tcp_conn_idx = conn_idx_res.unwrap();
+            entry.state = SocketInternalState::SocketConnected;
+        } else if entry.sock_type == SocketTypeEnum::SockDgram {
+            if entry.state != SocketInternalState::SocketBound {
+                let ephem_res: Result(u16, UdpError) = self.udp_state.allocate_ephemeral();
+                if ephem_res.is_err() {
+                    return Result::Err(SocketError::SocketPortInUse);
+                };
+                entry.local_addr.port = ephem_res.unwrap();
+                let bind_res: Result(u64, UdpError) = self.udp_state.bind(
+                    entry.local_addr.port,
+                    self.local_ip,
+                    self.interface_index,
+                    false, false,
+                );
+                if bind_res.is_err() {
+                    return Result::Err(SocketError::SocketPortInUse);
+                };
+                entry.state = SocketInternalState::SocketBound;
+            };
+            entry.state = SocketInternalState::SocketConnected;
+        } else {
+            return Result::Err(SocketError::SocketNotSupported);
+        };
+
+        residual emit {
+            op: "socket.connect",
+            handle: handle,
+            remote: (addr.ipv4_addr.to_u32(), addr.port),
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn send(
+        self: ref mut,
+        handle: u64,
+        data: Array(u8, SOCKET_DEFAULT_SNDBUF),
+        data_len: u64,
+        cap: Cap(NicCapability),
+    ) -> Result(u64, SocketError)
+        effect [deterministic]
+        court "socket_send:v1"
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if entry.state != SocketInternalState::SocketConnected {
+            return Result::Err(SocketError::SocketNotConnected);
+        };
+        if !cap.can_write {
+            return Result::Err(SocketError::SocketCapabilityError);
+        };
+        if entry.sock_type == SocketTypeEnum::SockStream {
+            let datagram: UdpDatagram = UdpDatagram::new(
+                entry.local_addr.port,
+                entry.remote_addr.port,
+                data, data_len,
+            );
+            let _ = self.bytes_sent + data_len;
+        } else if entry.sock_type == SocketTypeEnum::SockDgram {
+            let datagram: UdpDatagram = UdpDatagram::new(
+                entry.local_addr.port,
+                entry.remote_addr.port,
+                data, data_len,
+            );
+            let _ = self.bytes_sent + data_len;
+        } else {
+            return Result::Err(SocketError::SocketNotSupported);
+        };
+        self.bytes_sent = self.bytes_sent + data_len;
+
+        residual emit {
+            op: "socket.send",
+            handle: handle,
+            len: data_len,
+        };
+
+        return Result::Ok(data_len);
+    }
+
+    fn send_to(
+        self: ref mut,
+        handle: u64,
+        data: Array(u8, SOCKET_DEFAULT_SNDBUF),
+        data_len: u64,
+        dest_addr: SocketAddress,
+        cap: Cap(NicCapability),
+    ) -> Result(u64, SocketError)
+        effect [deterministic]
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if !cap.can_write {
+            return Result::Err(SocketError::SocketCapabilityError);
+        };
+        if entry.sock_type == SocketTypeEnum::SockDgram {
+            let datagram: UdpDatagram = UdpDatagram::new(
+                entry.local_addr.port,
+                dest_addr.port,
+                data, data_len,
+            );
+            let _ = datagram;
+            self.bytes_sent = self.bytes_sent + data_len;
+            return Result::Ok(data_len);
+        } else if entry.sock_type == SocketTypeEnum::SockStream {
+            return self.send(handle, data, data_len, cap);
+        };
+        return Result::Err(SocketError::SocketNotSupported);
+    }
+
+    fn recv(
+        self: ref mut,
+        handle: u64,
+        buffer: ref mut Array(u8, SOCKET_DEFAULT_RCVBUF),
+        cap: Cap(NicCapability),
+    ) -> Result(u64, SocketError)
+        effect [deterministic]
+        court "socket_recv:v1"
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        if !cap.can_read {
+            return Result::Err(SocketError::SocketCapabilityError);
+        };
+        if entry.recv_buf.available() == 0 {
+            if entry.blocking {
+                // Would block or timeout
+                return Result::Err(SocketError::SocketWouldBlock);
+            };
+            return Result::Err(SocketError::SocketRecvBufferEmpty);
+        };
+        let read_len: u64 = entry.recv_buf.read(buffer, SOCKET_DEFAULT_RCVBUF);
+        self.bytes_recv = self.bytes_recv + read_len;
+        return Result::Ok(read_len);
+    }
+
+    fn recv_from(
+        self: ref mut,
+        handle: u64,
+        buffer: ref mut Array(u8, SOCKET_DEFAULT_RCVBUF),
+        src_addr: ref mut SocketAddress,
+        cap: Cap(NicCapability),
+    ) -> Result(u64, SocketError)
+        effect [deterministic]
+    {
+        let read_len_res: Result(u64, SocketError) = self.recv(handle, buffer, cap);
+        if read_len_res.is_err() {
+            return Result::Err(read_len_res.unwrap_err());
+        };
+        let entry_res: Result(ref SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref SocketEntry = entry_res.unwrap();
+        *src_addr = entry.remote_addr;
+        return read_len_res;
+    }
+
+    fn close(self: ref mut, handle: u64) -> Result(void, SocketError)
+        effect [deterministic]
+        court "socket_close:v1"
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Ok(void);
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        entry.state = SocketInternalState::SocketClosed;
+        if entry.sock_type == SocketTypeEnum::SockStream && entry.is_bound_tcp {
+            let _ = self.tcp_state.ports.unbind(entry.local_addr.port);
+        } else if entry.sock_type == SocketTypeEnum::SockDgram && entry.is_bound_udp {
+            let _ = self.udp_state.unbind(entry.local_addr.port);
+        };
+        self.table.free(handle);
+        self.sockets_destroyed = self.sockets_destroyed + 1;
+
+        residual emit {
+            op: "socket.close",
+            handle: handle,
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn poll(self: ref mut, fds: Array(PollFd, SOCKET_MAX_POLL_FDS), nfds: u64,
+             timeout_ms: u64) -> Result(u64, SocketError)
+        effect [deterministic]
+        court "socket_poll:v1"
+    {
+        let mut ready_count: u64 = 0;
+        loop bound SOCKET_MAX_POLL_FDS {
+            if i >= nfds {
+                break;
+            };
+            let mut revents: u16 = 0;
+            let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(fds[i].socket_id);
+            if entry_res.is_err() {
+                revents = revents | POLLNVAL;
+            } else {
+                let entry: ref mut SocketEntry = entry_res.unwrap();
+                if entry.state == SocketInternalState::SocketClosed {
+                    revents = revents | POLLHUP;
+                };
+                if (fds[i].events & POLLIN) != 0 && entry.recv_buf.available() > 0 {
+                    revents = revents | POLLIN;
+                };
+                if (fds[i].events & POLLOUT) != 0 && entry.send_buf.remaining() > 0 {
+                    revents = revents | POLLOUT;
+                };
+                if entry.error_pending.is_some() {
+                    revents = revents | POLLERR;
+                };
+            };
+            fds[i].revents = revents;
+            if revents != 0 {
+                ready_count = ready_count + 1;
+            };
+        };
+        return Result::Ok(ready_count);
+    }
+
+    fn set_blocking(self: ref mut, handle: u64, blocking: bool) -> Result(void, SocketError)
+        effect [deterministic]
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        entry.blocking = blocking;
+        return Result::Ok(void);
+    }
+
+    fn set_timeout(self: ref mut, handle: u64, timeout_ms: u64) -> Result(void, SocketError)
+        effect [deterministic]
+    {
+        let entry_res: Result(ref mut SocketEntry, SocketError) = self.table.get(handle);
+        if entry_res.is_err() {
+            return Result::Err(entry_res.unwrap_err());
+        };
+        let entry: ref mut SocketEntry = entry_res.unwrap();
+        entry.timeout_ms = timeout_ms;
+        return Result::Ok(void);
+    }
+
+    fn get_statistics(self) -> (u64, u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.sockets_created,
+            self.sockets_destroyed,
+            self.bytes_sent,
+            self.bytes_recv,
+            self.table.count(),
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn socket_init(tcp: Handle(TcpStateMachine), udp: Handle(UdpState),
+               local_ip: Ipv4Address, iface_idx: u64) -> Result(SocketManager, SocketError)
+    effect [deterministic]
+    court "socket_init:v1"
+{
+    residual emit {
+        op: "socket.init",
+        status: "ready",
+    };
+    return Result::Ok(SocketManager::new(tcp, udp, local_ip, iface_idx));
+}
+
+fn socket_type_to_string(sock_type: SocketTypeEnum) -> Array(u8, 16)
+    effect [deterministic]
+{
+    if sock_type == SocketTypeEnum::SockStream {
+        return Array::from_literal("STREAM");
+    } else if sock_type == SocketTypeEnum::SockDgram {
+        return Array::from_literal("DGRAM");
+    } else if sock_type == SocketTypeEnum::SockRaw {
+        return Array::from_literal("RAW");
+    } else {
+        return Array::from_literal("UNKNOWN");
+    };
+}
+
+fn socket_state_to_string(state: SocketInternalState) -> Array(u8, 16)
+    effect [deterministic]
+{
+    if state == SocketInternalState::SocketCreated {
+        return Array::from_literal("CREATED");
+    };
+    if state == SocketInternalState::SocketBound {
+        return Array::from_literal("BOUND");
+    };
+    if state == SocketInternalState::SocketListening {
+        return Array::from_literal("LISTENING");
+    };
+    if state == SocketInternalState::SocketConnecting {
+        return Array::from_literal("CONNECTING");
+    };
+    if state == SocketInternalState::SocketConnected {
+        return Array::from_literal("CONNECTED");
+    };
+    if state == SocketInternalState::SocketClosing {
+        return Array::from_literal("CLOSING");
+    };
+    if state == SocketInternalState::SocketClosed {
+        return Array::from_literal("CLOSED");
+    };
+    return Array::from_literal("UNKNOWN");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Option Management
+// ─────────────────────────────────────────────────────────────
+
+type SocketOptionLevel = enum {
+    SolSocket   = 1,
+    SolTcp      = 6,
+    SolUdp      = 17,
+    SolIp       = 0,
+}
+
+type SocketOptionName = enum {
+    SoReuseAddr     = 2,
+    SoKeepalive     = 9,
+    SoBroadcast     = 6,
+    SoLinger        = 13,
+    SoRcvbuf        = 8,
+    SoSndbuf        = 7,
+    SoRcvtimeo      = 20,
+    SoSndtimeo      = 21,
+    SoError         = 4,
+    SoType          = 3,
+    SoDebug         = 1,
+    SoDontroute     = 5,
+    SoOobinline     = 10,
+}
+
+struct SocketOptions {
+    reuse_addr: bool,
+    keepalive: bool,
+    keepalive_idle_ms: u64,
+    keepalive_interval_ms: u64,
+    keepalive_count: u64,
+    broadcast: bool,
+    linger: bool,
+    linger_timeout_ms: u64,
+    recv_buf_size: u64,
+    send_buf_size: u64,
+    recv_timeout_ms: u64,
+    send_timeout_ms: u64,
+    debug: bool,
+    dont_route: bool,
+    oob_inline: bool,
+    tcp_no_delay: bool,
+    tcp_quick_ack: bool,
+    tcp_cork: bool,
+    generation: u64,
+}
+
+impl SocketOptions {
+    fn new() -> SocketOptions
+        effect [deterministic]
+    {
+        return SocketOptions {
+            reuse_addr: false,
+            keepalive: false,
+            keepalive_idle_ms: 7200000,
+            keepalive_interval_ms: 75000,
+            keepalive_count: 9,
+            broadcast: false,
+            linger: true,
+            linger_timeout_ms: 0,
+            recv_buf_size: SOCKET_DEFAULT_RCVBUF,
+            send_buf_size: SOCKET_DEFAULT_SNDBUF,
+            recv_timeout_ms: 0,
+            send_timeout_ms: 0,
+            debug: false,
+            dont_route: false,
+            oob_inline: false,
+            tcp_no_delay: false,
+            tcp_quick_ack: true,
+            tcp_cork: false,
+            generation: 1,
+        };
+    }
+
+    fn set_opt(self: ref mut, level: SocketOptionLevel, name: SocketOptionName, value: bool)
+        effect [deterministic]
+    {
+        if level == SocketOptionLevel::SolSocket {
+            if name == SocketOptionName::SoReuseAddr {
+                self.reuse_addr = value;
+            } else if name == SocketOptionName::SoKeepalive {
+                self.keepalive = value;
+            } else if name == SocketOptionName::SoBroadcast {
+                self.broadcast = value;
+            } else if name == SocketOptionName::SoDebug {
+                self.debug = value;
+            } else if name == SocketOptionName::SoDontroute {
+                self.dont_route = value;
+            } else if name == SocketOptionName::SoOobinline {
+                self.oob_inline = value;
+            };
+        } else if level == SocketOptionLevel::SolTcp {
+            if name == 1 {
+                self.tcp_no_delay = value;
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Shutdown Types
+// ─────────────────────────────────────────────────────────────
+
+type SocketShutdownHow = enum {
+    ShutdownRead    = 0,
+    ShutdownWrite   = 1,
+    ShutdownBoth    = 2,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket I/O Multiplexing
+// ─────────────────────────────────────────────────────────────
+
+struct SocketSet {
+    sockets: Array(u64, SOCKET_MAX_POLL_FDS),
+    count: u64,
+}
+
+impl SocketSet {
+    fn new() -> SocketSet
+        effect [deterministic]
+    {
+        return SocketSet {
+            sockets: Array::zeroed(),
+            count: 0,
+        };
+    }
+
+    fn add(self: ref mut, handle: u64) -> Result(void, SocketError)
+        effect [deterministic]
+    {
+        if self.count >= SOCKET_MAX_POLL_FDS {
+            return Result::Err(SocketError::SocketTableFull);
+        };
+        self.sockets[self.count] = handle;
+        self.count = self.count + 1;
+        return Result::Ok(void);
+    }
+
+    fn remove(self: ref mut, handle: u64) -> Result(void, SocketError)
+        effect [deterministic]
+    {
+        loop bound SOCKET_MAX_POLL_FDS {
+            if i >= self.count {
+                break;
+            };
+            if self.sockets[i] == handle {
+                self.sockets[i] = self.sockets[self.count - 1];
+                self.count = self.count - 1;
+                return Result::Ok(void);
+            };
+        };
+        return Result::Err(SocketError::SocketHandleStale);
+    }
+
+    fn contains(self, handle: u64) -> bool
+        effect [deterministic]
+    {
+        loop bound SOCKET_MAX_POLL_FDS {
+            if i >= self.count {
+                break;
+            };
+            if self.sockets[i] == handle {
+                return true;
+            };
+        };
+        return false;
+    }
+
+    fn count_fds(self) -> u64
+        effect [deterministic]
+    {
+        return self.count;
+    }
+
+    fn clear(self: ref mut)
+        effect [deterministic]
+    {
+        self.count = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Address Translation
+// ─────────────────────────────────────────────────────────────
+
+fn socket_addr_to_ipv4(sock_addr: SocketAddress) -> (Ipv4Address, u16)
+    effect [deterministic]
+{
+    return (sock_addr.ipv4_addr, sock_addr.port);
+}
+
+fn socket_addr_from_ipv4(addr: Ipv4Address, port: u16) -> SocketAddress
+    effect [deterministic]
+{
+    return SocketAddress::new(addr, port);
+}
+
+fn socket_addr_is_equal(a: SocketAddress, b: SocketAddress) -> bool
+    effect [deterministic]
+{
+    return a.eq(b);
+}
+
+fn socket_addr_is_loopback(sock_addr: SocketAddress) -> bool
+    effect [deterministic]
+{
+    return sock_addr.ipv4_addr.is_loopback();
+}
+
+fn socket_addr_is_link_local(sock_addr: SocketAddress) -> bool
+    effect [deterministic]
+{
+    return sock_addr.ipv4_addr.is_link_local();
+}
+
+fn socket_addr_is_private(sock_addr: SocketAddress) -> bool
+    effect [deterministic]
+{
+    return sock_addr.ipv4_addr.is_private();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Socket Error Mapping
+// ─────────────────────────────────────────────────────────────
+
+fn socket_map_tcp_error(tcp_err: TcpError) -> SocketError
+    effect [deterministic]
+{
+    if tcp_err == TcpError::TcpConnectionRefused {
+        return SocketError::SocketConnectionRefused;
+    } else if tcp_err == TcpError::TcpConnectionReset {
+        return SocketError::SocketConnectionReset;
+    } else if tcp_err == TcpError::TcpConnectionTimeout {
+        return SocketError::SocketTimeout;
+    } else if tcp_err == TcpError::TcpPortInUse {
+        return SocketError::SocketPortInUse;
+    } else if tcp_err == TcpError::TcpConnectionTableFull {
+        return SocketError::SocketTableFull;
+    } else if tcp_err == TcpError::TcpCapabilityError {
+        return SocketError::SocketCapabilityError;
+    } else {
+        return SocketError::SocketProtocolError;
+    };
+}
+
+fn socket_map_udp_error(udp_err: UdpError) -> SocketError
+    effect [deterministic]
+{
+    if udp_err == UdpError::UdpPortInUse {
+        return SocketError::SocketPortInUse;
+    } else if udp_err == UdpError::UdpPortTableFull {
+        return SocketError::SocketTableFull;
+    } else if udp_err == UdpError::UdpRecvBufferEmpty {
+        return SocketError::SocketWouldBlock;
+    } else if udp_err == UdpError::UdpCapabilityError {
+        return SocketError::SocketCapabilityError;
+    } else {
+        return SocketError::SocketProtocolError;
+    };
+}

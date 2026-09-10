@@ -1,0 +1,1236 @@
+// file: heap_allocator.phor
+// purpose: Bounded heap allocator with fixed-size pool allocator, slab allocator,
+//          region-based allocation, allocation bounds checking, OOM handling,
+//          and heap metadata management. All operations use bounded loops and
+//          record residuals for all heap state changes.
+// evidence: MEM-HEAP-ARCH-001 through MEM-HEAP-ARCH-260
+// residual: Every allocation, free, and compaction records a residual.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::math::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use core::effects::*
+use core::traits::*
+
+use memory::phys_page_allocator::*
+
+// ──────────────────────────────────────────────
+// Diagnostic Code Range
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-DIAG-001 through MEM-HEAP-DIAG-010
+
+const DIAG_HEAP_BASE        : Word64 = Word64::from_u64(0xA200)
+const DIAG_HEAP_OK          : Word64 = DIAG_HEAP_BASE | 0x000
+const DIAG_HEAP_OOM         : Word64 = DIAG_HEAP_BASE | 0x001
+const DIAG_HEAP_INVALID_PTR : Word64 = DIAG_HEAP_BASE | 0x002
+const DIAG_HEAP_DOUBLE_FREE : Word64 = DIAG_HEAP_BASE | 0x003
+const DIAG_HEAP_CORRUPTION  : Word64 = DIAG_HEAP_BASE | 0x004
+const DIAG_HEAP_TOO_LARGE   : Word64 = DIAG_HEAP_BASE | 0x005
+const DIAG_HEAP_ALIGNMENT   : Word64 = DIAG_HEAP_BASE | 0x006
+const DIAG_HEAP_FRAGMENTED  : Word64 = DIAG_HEAP_BASE | 0x007
+const DIAG_HEAP_BOUNDS      : Word64 = DIAG_HEAP_BASE | 0x008
+const DIAG_HEAP_POOL_FULL   : Word64 = DIAG_HEAP_BASE | 0x009
+const DIAG_HEAP_METADATA    : Word64 = DIAG_HEAP_BASE | 0x00A
+
+// ──────────────────────────────────────────────
+// Heap Constants
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-CONST-001 through MEM-HEAP-CONST-020
+
+const HEAP_MIN_ALIGNMENT        : u32 = 8
+const HEAP_MAX_ALLOCATION       : u64 = 1024 * 1024  // 1MB max single allocation
+const HEAP_METADATA_OVERHEAD    : u32 = 32  // bytes per allocation header
+const HEAP_SLAB_SIZE            : u32 = 4096  // 4KB per slab
+const HEAP_MAX_REGIONS          : u32 = 256
+const HEAP_MAX_POOLS            : u32 = 16
+const HEAP_MAX_SLABS            : u32 = 64
+const HEAP_MAGIC_FREE           : u64 = 0x_FREE_HEAP_MAGIC  // "FREE" tag
+const HEAP_MAGIC_ALLOC          : u64 = 0x_ALLOC_HEAP_MAGIC // "ALLOC" tag
+const HEAP_MAGIC_SLAB           : u64 = 0x_SLAB_HEAP_MAGIC  // "SLAB" tag
+const HEAP_MAGIC_POOL           : u64 = 0x_POOL_HEAP_MAGIC  // "POOL" tag
+const HEAP_CANARY_SIZE          : u32 = 8
+const HEAP_MAX_COMPACT_PASSES   : u32 = 4
+const HEAP_MIN_REGION_SIZE      : u64 = 64 * 1024  // 64KB
+const HEAP_MAX_REGION_SIZE      : u64 = 16 * 1024 * 1024  // 16MB
+const HEAP_FREE_LIST_MAX        : u32 = 256
+
+// ──────────────────────────────────────────────
+// Pool Size Classes (powers of 2 from 8 to 2048)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-SIZE-001 through MEM-HEAP-SIZE-010
+
+const POOL_SIZE_CLASSES   : u32 = 9
+const POOL_SIZES          : u32 = 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+
+// ──────────────────────────────────────────────
+// HeapError
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-ERR-001 through MEM-HEAP-ERR-010
+
+pub type HeapError : struct {
+    code: Word64,
+    message: FixedString[128],
+}
+
+impl HeapError {
+    pub fn new(code: Word64, message: FixedString[128]) -> HeapError
+        effects: [deterministic]
+    {
+        HeapError { code: code, message: message }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.message
+    }
+}
+
+pub fn heap_error(code: Word64, message: FixedString[128]) -> HeapError
+    effects: [deterministic]
+{
+    HeapError::new(code, message)
+}
+
+// ──────────────────────────────────────────────
+// Allocation Header (placed before each allocation)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-HDR-001 through MEM-HEAP-HDR-015
+
+pub type AllocationHeader : struct {
+    magic: Word64,
+    size: u64,
+    alignment: u32,
+    is_free: bool,
+    pool_index: u32,
+    canary: Word64,
+    next_free: u64,
+    prev_free: u64,
+}
+
+impl AllocationHeader {
+    pub fn new(size: u64, alignment: u32) -> AllocationHeader
+        effects: [deterministic]
+    {
+        AllocationHeader {
+            magic: Word64::from_u64(HEAP_MAGIC_ALLOC),
+            size: size,
+            alignment: alignment,
+            is_free: false,
+            pool_index: 0xFFFF_FFFF,
+            canary: Word64::zero(),
+            next_free: 0,
+            prev_free: 0,
+        }
+    }
+
+    pub fn mark_free(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_free = true
+        self.magic = Word64::from_u64(HEAP_MAGIC_FREE)
+    }
+
+    pub fn mark_allocated(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_free = false
+        self.magic = Word64::from_u64(HEAP_MAGIC_ALLOC)
+    }
+
+    pub fn validate_magic(self) -> bool
+        effects: [deterministic]
+    {
+        let val: u64 = self.magic.to_u64()
+        val == HEAP_MAGIC_ALLOC || val == HEAP_MAGIC_FREE
+    }
+
+    pub fn total_size(self) -> u64
+        effects: [deterministic]
+    {
+        self.size + (HEAP_METADATA_OVERHEAD as u64) + (HEAP_CANARY_SIZE as u64)
+    }
+
+    pub fn data_address(self, header_addr: u64) -> u64
+        effects: [deterministic]
+    {
+        header_addr + (HEAP_METADATA_OVERHEAD as u64)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Free Chunk (for the free list)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-FREE-001 through MEM-HEAP-FREE-012
+
+pub type FreeChunk : struct {
+    header: AllocationHeader,
+    next: u64,
+    prev: u64,
+}
+
+impl FreeChunk {
+    pub fn new(addr: u64, size: u64) -> FreeChunk
+        effects: [deterministic]
+    {
+        FreeChunk {
+            header: AllocationHeader::new(size, HEAP_MIN_ALIGNMENT),
+            next: 0,
+            prev: 0,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Slab Descriptor
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-SLAB-001 through MEM-HEAP-SLAB-020
+
+pub type SlabDescriptor : struct {
+    base_addr: u64,
+    object_size: u32,
+    total_objects: u32,
+    free_objects: u32,
+    free_bitmap: FixedArray[64, Word64],  // Bitmap of free objects (64 * 64 = 4096 bits)
+    is_full: bool,
+    is_empty: bool,
+    pool_index: u32,
+    next_slab: u32,
+}
+
+impl SlabDescriptor {
+    pub fn new(base_addr: u64, object_size: u32, pool_index: u32) -> SlabDescriptor
+        effects: [deterministic]
+    {
+        let total_objs: u32 = (HEAP_SLAB_SIZE - HEAP_METADATA_OVERHEAD) / object_size
+        let mut slab: SlabDescriptor = SlabDescriptor {
+            base_addr: base_addr,
+            object_size: object_size,
+            total_objects: total_objs,
+            free_objects: total_objs,
+            free_bitmap: FixedArray::new(),
+            is_full: false,
+            is_empty: true,
+            pool_index: pool_index,
+            next_slab: 0xFFFF_FFFF,
+        }
+        // Initialize bitmap: all objects free (set bits to 1)
+        // loop: bounds[BOUND_MEDIUM] — bounded by bitmap size (64)
+        loop: bounds[BOUND_MEDIUM] for i in 0..64 {
+            slab.free_bitmap.push(Word64::from_u64(0xFFFF_FFFF_FFFF_FFFF))
+        }
+        slab
+    }
+
+    pub fn allocate(self: ref mut) -> Result[u64, HeapError]
+        effects: [deterministic]
+    {
+        if self.is_full {
+            return Result::Err(heap_error(
+                DIAG_HEAP_POOL_FULL,
+                FixedString[128]::from_slice("Slab is full")))
+        }
+        // loop: bounds[BOUND_SMALL] — bounded by bitmap entries (64)
+        loop: bounds[BOUND_SMALL] for i in 0..64 {
+            let bitmap_entry: Word64 = self.free_bitmap.get(i)
+            if !bitmap_entry.is_zero() {
+                // Find first set bit
+                let bit_pos: u32 = __builtin_ctz64(bitmap_entry.to_u64())
+                // Clear the bit
+                let mask: u64 = 1u64 << bit_pos
+                let new_entry: u64 = bitmap_entry.to_u64() & !mask
+                self.free_bitmap.set(i, Word64::from_u64(new_entry))
+                self.free_objects = self.free_objects - 1
+                if self.free_objects == 0 {
+                    self.is_full = true
+                }
+                self.is_empty = false
+                let object_index: u32 = i * 64 + bit_pos
+                let offset: u64 = (object_index as u64) * (self.object_size as u64)
+                let addr: u64 = self.base_addr + HEAP_METADATA_OVERHEAD as u64 + offset
+                return Result::Ok(addr)
+            }
+        }
+        Result::Err(heap_error(
+            DIAG_HEAP_POOL_FULL,
+            FixedString[128]::from_slice("Slab bitmap exhausted")))
+    }
+
+    pub fn free(self: ref mut, addr: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        let offset: u64 = addr - self.base_addr - (HEAP_METADATA_OVERHEAD as u64)
+        let object_index: u32 = (offset / (self.object_size as u64)) as u32
+        let bitmap_index: u32 = object_index / 64
+        let bit_pos: u32 = object_index % 64
+        if bitmap_index >= 64 {
+            return Result::Err(heap_error(
+                DIAG_HEAP_INVALID_PTR,
+                FixedString[128]::from_slice("Object index out of range")))
+        }
+        let entry: Word64 = self.free_bitmap.get(bitmap_index)
+        let mask: u64 = 1u64 << bit_pos
+        // Check if already free (double-free detection)
+        if (entry.to_u64() & mask) != 0 {
+            return Result::Err(heap_error(
+                DIAG_HEAP_DOUBLE_FREE,
+                FixedString[128]::from_slice("Double free detected in slab")))
+        }
+        let new_entry: u64 = entry.to_u64() | mask
+        self.free_bitmap.set(bitmap_index, Word64::from_u64(new_entry))
+        self.free_objects = self.free_objects + 1
+        if self.free_objects == self.total_objects {
+            self.is_empty = true
+        }
+        self.is_full = false
+        Result::Ok(())
+    }
+
+    pub defrag(self: ref mut)
+        effects: [deterministic]
+    {
+        // Slab defrag: no-op for bitmap-based slabs since they don't fragment
+        // (all objects are same size). Just update state flags.
+        if self.free_objects > 0 {
+            self.is_full = false
+        }
+        if self.free_objects == self.total_objects {
+            self.is_empty = true
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Pool Descriptor (fixed-size object pool)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-POOL-001 through MEM-HEAP-POOL-025
+
+pub type PoolDescriptor : struct {
+    object_size: u32,
+    slab_size: u32,
+    slabs: FixedArray[HEAP_MAX_SLABS, SlabDescriptor],
+    num_slabs: u32,
+    total_objects: u32,
+    free_objects: u32,
+    allocations: u64,
+    deallocations: u64,
+    pool_id: u32,
+}
+
+impl PoolDescriptor {
+    pub fn new(object_size: u32, pool_id: u32) -> PoolDescriptor
+        effects: [deterministic]
+    {
+        PoolDescriptor {
+            object_size: object_size,
+            slab_size: HEAP_SLAB_SIZE,
+            slabs: FixedArray::new(),
+            num_slabs: 0,
+            total_objects: 0,
+            free_objects: 0,
+            allocations: 0,
+            deallocations: 0,
+            pool_id: pool_id,
+        }
+    }
+
+    pub fn add_slab(self: ref mut, base_addr: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        if self.num_slabs >= HEAP_MAX_SLABS {
+            return Result::Err(heap_error(
+                DIAG_HEAP_POOL_FULL,
+                FixedString[128]::from_slice("Max slabs per pool reached")))
+        }
+        let slab: SlabDescriptor = SlabDescriptor::new(
+            base_addr, self.object_size, self.pool_id)
+        self.slabs.push(slab);
+        self.num_slabs = self.num_slabs + 1
+        self.total_objects = self.total_objects + (HEAP_SLAB_SIZE / self.object_size)
+        self.free_objects = self.free_objects + (HEAP_SLAB_SIZE / self.object_size)
+        Result::Ok(())
+    }
+
+    pub fn allocate(self: ref mut) -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_slabs (<=64)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_slabs {
+            let slab: ref mut SlabDescriptor = self.slabs.get_mut(i)
+            if !slab.is_full {
+                let addr: u64 = slab.allocate()?
+                self.free_objects = self.free_objects - 1
+                self.allocations = self.allocations + 1
+                return Result::Ok(addr)
+            }
+        }
+        Result::Err(heap_error(
+            DIAG_HEAP_OOM,
+            FixedString[128]::from_slice("No free slabs in pool")))
+    }
+
+    pub fn free(self: ref mut, addr: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_slabs (<=64)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_slabs {
+            let slab: ref SlabDescriptor = self.slabs.get(i)
+            let slab_end: u64 = slab.base_addr + HEAP_SLAB_SIZE as u64
+            if addr >= slab.base_addr && addr < slab_end {
+                let slab_mut: ref mut SlabDescriptor = self.slabs.get_mut(i)
+                slab_mut.free(addr)?;
+                self.free_objects = self.free_objects + 1
+                self.deallocations = self.deallocations + 1
+                return Result::Ok(())
+            }
+        }
+        Result::Err(heap_error(
+            DIAG_HEAP_INVALID_PTR,
+            FixedString[128]::from_slice("Address does not belong to any slab in pool")))
+    }
+
+    pub fn contains(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_slabs (<=64)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_slabs {
+            let slab: ref SlabDescriptor = self.slabs.get(i)
+            let slab_end: u64 = slab.base_addr + HEAP_SLAB_SIZE as u64
+            if addr >= slab.base_addr && addr < slab_end {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.total_objects == 0 {
+            return 0
+        }
+        let used: u32 = self.total_objects - self.free_objects
+        ((used as u64) * 100 / (self.total_objects as u64)) as u8
+    }
+}
+
+// ──────────────────────────────────────────────
+// Region Descriptor (for region-based allocation)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-REGION-001 through MEM-HEAP-REGION-020
+
+pub type RegionDescriptor : struct {
+    base_addr: u64,
+    size: u64,
+    used: u64,
+    allocation_count: u32,
+    is_active: bool,
+    can_expand: bool,
+    region_id: Word32,
+}
+
+impl RegionDescriptor {
+    pub fn new(base_addr: u64, size: u64, can_expand: bool) -> RegionDescriptor
+        effects: [deterministic]
+    {
+        RegionDescriptor {
+            base_addr: base_addr,
+            size: size,
+            used: 0,
+            allocation_count: 0,
+            is_active: true,
+            can_expand: can_expand,
+            region_id: Word32::initial(),
+        }
+    }
+
+    pub fn allocate(self: ref mut, alloc_size: u64, alignment: u32)
+        -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        let aligned_size: u64 = (alloc_size + (alignment as u64) - 1) & !((alignment as u64) - 1)
+        let aligned_base: u64 = (self.base_addr + self.used)
+        let aligned_addr: u64 = (aligned_base + (alignment as u64) - 1) & !((alignment as u64) - 1)
+        let end_addr: u64 = aligned_addr + aligned_size + (HEAP_METADATA_OVERHEAD as u64)
+        if end_addr > self.base_addr + self.size {
+            return Result::Err(heap_error(
+                DIAG_HEAP_OOM,
+                FixedString[128]::from_slice("Region exhausted")))
+        }
+        self.used = end_addr - self.base_addr
+        self.allocation_count = self.allocation_count + 1
+        // Write allocation header at aligned_addr
+        // trust: using raw memory for heap metadata
+        trusted("region allocation: write allocation header at aligned address") {
+            let hdr: AllocationHeader = AllocationHeader::new(aligned_size, alignment)
+            __builtin_write_mem(aligned_addr, hdr)
+        }
+        let data_addr: u64 = aligned_addr + (HEAP_METADATA_OVERHEAD as u64)
+        Result::Ok(data_addr)
+    }
+
+    pub fn free_all(self: ref mut)
+        effects: [deterministic]
+    {
+        self.used = 0
+        self.allocation_count = 0
+    }
+
+    pub fn remaining(self) -> u64
+        effects: [deterministic]
+    {
+        self.size - self.used
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.size == 0 {
+            return 0
+        }
+        ((self.used * 100) / self.size) as u8
+    }
+}
+
+// ──────────────────────────────────────────────
+// Heap Allocator (main structure)
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-CORE-001 through MEM-HEAP-CORE-100
+
+pub type HeapAllocator : struct {
+    // Region-based allocator for large allocations
+    regions: FixedArray[HEAP_MAX_REGIONS, RegionDescriptor],
+    num_regions: u32,
+    current_region_index: u32,
+    // Pool allocators for fixed-size allocations
+    pools: FixedArray[HEAP_MAX_POOLS, PoolDescriptor],
+    num_pools: u32,
+    // Free list for general allocations (best-fit)
+    free_list: FixedArray[HEAP_FREE_LIST_MAX, u64],
+    free_list_count: u32,
+    // Metadata
+    total_allocated: u64,
+    total_freed: u64,
+    total_heap_size: u64,
+    peak_usage: u64,
+    allocation_count: u64,
+    free_count: u64,
+    fail_count: u64,
+    oom_count: u64,
+    compaction_count: u64,
+    generation: Word32,
+    is_initialized: bool,
+}
+
+impl HeapAllocator {
+    pub fn new() -> HeapAllocator
+        effects: [deterministic]
+    {
+        HeapAllocator {
+            regions: FixedArray::new(),
+            num_regions: 0,
+            current_region_index: 0,
+            pools: FixedArray::new(),
+            num_pools: 0,
+            free_list: FixedArray::new(),
+            free_list_count: 0,
+            total_allocated: 0,
+            total_freed: 0,
+            total_heap_size: 0,
+            peak_usage: 0,
+            allocation_count: 0,
+            free_count: 0,
+            fail_count: 0,
+            oom_count: 0,
+            compaction_count: 0,
+            generation: Word32::initial(),
+            is_initialized: false,
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Initialization
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-INIT-001 through MEM-HEAP-INIT-020
+
+    pub fn init(self: ref mut, heap_base: u64, heap_size: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        if heap_size < HEAP_MIN_REGION_SIZE {
+            return Result::Err(heap_error(
+                DIAG_HEAP_BOUNDS,
+                FixedString[128]::from_slice("Heap region too small")))
+        }
+        // Add the initial region
+        let region: RegionDescriptor = RegionDescriptor::new(heap_base, heap_size, true)
+        self.regions.push(region);
+        self.num_regions = 1
+        self.current_region_index = 0
+        self.total_heap_size = heap_size
+        // Initialize pool allocators
+        self.init_pools()?;
+        self.is_initialized = true
+        self.generation.bump();
+        self.record_init_residual(heap_base, heap_size)
+        Result::Ok(())
+    }
+
+    fn init_pools(self: ref mut) -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        let pool_sizes: FixedArray[POOL_SIZE_CLASSES, u32] = FixedArray::from_array(
+            [8, 16, 32, 64, 128, 256, 512, 1024, 2048])
+        // loop: bounds[BOUND_TINY] — bounded by POOL_SIZE_CLASSES (9)
+        loop: bounds[BOUND_TINY] for i in 0..POOL_SIZE_CLASSES {
+            let size: u32 = pool_sizes.get(i)
+            let pool: PoolDescriptor = PoolDescriptor::new(size, i)
+            self.pools.push(pool);
+            self.num_pools = i + 1
+        }
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Allocation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-ALLOC-001 through MEM-HEAP-ALLOC-040
+
+    pub fn allocate(self: ref mut, size: u64, alignment: u32)
+        -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        if !self.is_initialized {
+            return Result::Err(heap_error(
+                DIAG_HEAP_METADATA,
+                FixedString[128]::from_slice("Heap not initialized")))
+        }
+        if size == 0 {
+            return Result::Err(heap_error(
+                DIAG_HEAP_TOO_LARGE,
+                FixedString[128]::from_slice("Zero-size allocation")))
+        }
+        if size > HEAP_MAX_ALLOCATION {
+            self.fail_count = self.fail_count + 1
+            self.oom_count = self.oom_count + 1
+            return Result::Err(heap_error(
+                DIAG_HEAP_TOO_LARGE,
+                FixedString[128]::from_slice("Allocation too large")))
+        }
+        let aligned: u32 = if alignment < HEAP_MIN_ALIGNMENT {
+            HEAP_MIN_ALIGNMENT
+        } else {
+            alignment
+        }
+        // For small allocations, use pool allocator
+        if size <= 2048 {
+            let pool_index: u32 = self.find_pool_for_size(size)
+            if pool_index < self.num_pools {
+                let pool: ref mut PoolDescriptor = self.pools.get_mut(pool_index)
+                let addr: u64 = pool.allocate()?;
+                self.total_allocated = self.total_allocated + size
+                self.allocation_count = self.allocation_count + 1
+                let current_usage: u64 = self.total_allocated - self.total_freed
+                if current_usage > self.peak_usage {
+                    self.peak_usage = current_usage
+                }
+                self.generation.bump();
+                self.record_alloc_residual(size, addr, pool_index)
+                return Result::Ok(addr)
+            }
+        }
+        // For larger allocations, use region allocator
+        let alloc_result: Result[u64, HeapError] = self.region_allocate(size, aligned)
+        match alloc_result {
+            Result::Ok(addr) => {
+                self.total_allocated = self.total_allocated + size
+                self.allocation_count = self.allocation_count + 1
+                let current_usage: u64 = self.total_allocated - self.total_freed
+                if current_usage > self.peak_usage {
+                    self.peak_usage = current_usage
+                }
+                self.generation.bump();
+                self.record_alloc_residual(size, addr, 0xFFFF)
+                Result::Ok(addr)
+            },
+            Result::Err(e) => {
+                self.fail_count = self.fail_count + 1
+                self.oom_count = self.oom_count + 1
+                // Try compaction before failing
+                let compacted: bool = self.compact()
+                if compacted {
+                    let retry: Result[u64, HeapError] = self.region_allocate(size, aligned)
+                    match retry {
+                        Result::Ok(addr) => {
+                            self.total_allocated = self.total_allocated + size
+                            self.allocation_count = self.allocation_count + 1
+                            self.generation.bump();
+                            self.record_alloc_residual(size, addr, 0xFFFF)
+                            return Result::Ok(addr)
+                        },
+                        Result::Err(_) => {},
+                    }
+                }
+                Result::Err(e)
+            },
+        }
+    }
+
+    pub fn allocate_zeroed(self: ref mut, size: u64, alignment: u32)
+        -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        let addr: u64 = self.allocate(size, alignment)?
+        // trust: zeroing allocated memory is safe
+        trusted("zero allocation: write zeros to allocated memory") {
+            __builtin_memzero(addr, size)
+        }
+        Result::Ok(addr)
+    }
+
+    // Find which pool to use for a given size
+    fn find_pool_for_size(self, size: u64) -> u32
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_TINY] — bounded by POOL_SIZE_CLASSES (9)
+        loop: bounds[BOUND_TINY] for i in 0..POOL_SIZE_CLASSES {
+            let pool: ref PoolDescriptor = self.pools.get(i)
+            if (pool.object_size as u64) >= size {
+                return i
+            }
+        }
+        0xFFFF_FFFF  // Not found
+    }
+
+    // Region-based allocation for larger allocations
+    fn region_allocate(self: ref mut, size: u64, alignment: u32)
+        -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions (<=256)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+            let region_index: u32 = (self.current_region_index + i) % self.num_regions
+            let region: ref mut RegionDescriptor = self.regions.get_mut(region_index)
+            if region.is_active && region.remaining() >= size + (HEAP_METADATA_OVERHEAD as u64) {
+                let addr: u64 = region.allocate(size, alignment)?
+                self.current_region_index = region_index
+                return Result::Ok(addr)
+            }
+        }
+        Result::Err(heap_error(
+            DIAG_HEAP_OOM,
+            FixedString[128]::from_slice("No region with sufficient space")))
+    }
+
+    // ──────────────────────────────────────────────
+    // Deallocation
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-FREE-001 through MEM-HEAP-FREE-025
+
+    pub fn free(self: ref mut, addr: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        if addr == 0 {
+            return Result::Ok(())  // Free(NULL) is a no-op
+        }
+        // Try freeing from pool allocators first
+        // loop: bounds[BOUND_TINY] — bounded by num_pools (<=16)
+        loop: bounds[BOUND_TINY] for i in 0..self.num_pools {
+            let pool: ref PoolDescriptor = self.pools.get(i)
+            if pool.contains(addr) {
+                let pool_mut: ref mut PoolDescriptor = self.pools.get_mut(i)
+                pool_mut.free(addr)?;
+                self.total_freed = self.total_freed + (pool.object_size as u64)
+                self.free_count = self.free_count + 1
+                self.generation.bump();
+                self.record_free_residual(addr, pool.object_size as u64)
+                return Result::Ok(())
+            }
+        }
+        // For region-allocated memory, look up the header before the data
+        // trust: read allocation header from metadata preceding the data pointer
+        let header_addr: u64 = addr - (HEAP_METADATA_OVERHEAD as u64)
+        let hdr: AllocationHeader = trusted("heap free: read allocation header") {
+            __builtin_read_mem(header_addr)
+        }
+        if !hdr.validate_magic() {
+            return Result::Err(heap_error(
+                DIAG_HEAP_CORRUPTION,
+                FixedString[128]::from_slice("Invalid allocation header magic"))))
+        }
+        if hdr.is_free {
+            return Result::Err(heap_error(
+                DIAG_HEAP_DOUBLE_FREE,
+                FixedString[128]::from_slice("Double free detected"))))
+        }
+        let size: u64 = hdr.size
+        self.total_freed = self.total_freed + size
+        self.free_count = self.free_count + 1
+        self.generation.bump();
+        self.record_free_residual(addr, size)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Compaction
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-COMPACT-001 through MEM-HEAP-COMPACT-020
+
+    pub fn compact(self: ref mut) -> bool
+        effects: [deterministic]
+    {
+        let mut any_freed: bool = false
+        // loop: bounds[BOUND_SMALL] — bounded by compact passes (4)
+        loop: bounds[BOUND_SMALL] for pass in 0..HEAP_MAX_COMPACT_PASSES {
+            let mut pass_freed: bool = false
+            // loop: bounds[BOUND_MEDIUM] — bounded by num_regions (<=256)
+            loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+                let region: ref mut RegionDescriptor = self.regions.get_mut(i)
+                if region.is_active && region.utilization() < 50 {
+                    // Low utilization; could trigger region cleanup
+                    region.free_all();
+                    pass_freed = true
+                    any_freed = true
+                }
+            }
+            if !pass_freed {
+                break
+            }
+        }
+        if any_freed {
+            self.compaction_count = self.compaction_count + 1
+            self.generation.bump();
+            self.record_compaction_residual()
+        }
+        any_freed
+    }
+
+    // ──────────────────────────────────────────────
+    // Pool Expansion (add new slab to a pool)
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-POOL-EXPAND-001 through MEM-HEAP-POOL-EXPAND-010
+
+    pub fn expand_pool(self: ref mut, pool_index: u32, slab_addr: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        if pool_index >= self.num_pools {
+            return Result::Err(heap_error(
+                DIAG_HEAP_BOUNDS,
+                FixedString[128]::from_slice("Invalid pool index")))
+        }
+        let pool: ref mut PoolDescriptor = self.pools.get_mut(pool_index)
+        pool.add_slab(slab_addr)?;
+        self.total_heap_size = self.total_heap_size + (HEAP_SLAB_SIZE as u64)
+        self.generation.bump();
+        self.record_pool_expand_residual(pool_index, slab_addr)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // Region Expansion
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-REGION-EXPAND-001 through MEM-HEAP-REGION-EXPAND-010
+
+    pub fn add_region(self: ref mut, base_addr: u64, size: u64, can_expand: bool)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        if self.num_regions >= HEAP_MAX_REGIONS {
+            return Result::Err(heap_error(
+                DIAG_HEAP_OOM,
+                FixedString[128]::from_slice("Max regions reached")))
+        }
+        if size < HEAP_MIN_REGION_SIZE || size > HEAP_MAX_REGION_SIZE {
+            return Result::Err(heap_error(
+                DIAG_HEAP_BOUNDS,
+                FixedString[128]::from_slice("Invalid region size")))
+        }
+        let region: RegionDescriptor = RegionDescriptor::new(base_addr, size, can_expand)
+        self.regions.push(region);
+        self.num_regions = self.num_regions + 1
+        self.total_heap_size = self.total_heap_size + size
+        self.generation.bump();
+        self.record_region_add_residual(base_addr, size)
+        Result::Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // OOM Handler
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-OOM-001 through MEM-HEAP-OOM-015
+
+    pub fn handle_oom(self: ref mut) -> bool
+        effects: [deterministic]
+    {
+        self.oom_count = self.oom_count + 1
+        // Attempt compaction
+        let compacted: bool = self.compact()
+        if compacted {
+            // Try to reclaim empty slabs
+            // loop: bounds[BOUND_TINY] — bounded by num_pools (<=16)
+            loop: bounds[BOUND_TINY] for i in 0..self.num_pools {
+                let pool: ref mut PoolDescriptor = self.pools.get_mut(i)
+                pool.defrag()
+            }
+            self.record_oom_recovery_residual(true)
+            return true
+        }
+        self.record_oom_recovery_residual(false)
+        false
+    }
+
+    pub fn oom_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.oom_count
+    }
+
+    // ──────────────────────────────────────────────
+    // Bounds Checking
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-BOUNDS-001 through MEM-HEAP-BOUNDS-012
+
+    pub fn validate_pointer(self, addr: u64) -> bool
+        effects: [deterministic]
+    {
+        if addr == 0 {
+            return false
+        }
+        // Check if address falls in any region
+        // loop: bounds[BOUND_MEDIUM] — bounded by num_regions (<=256)
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.num_regions {
+            let region: ref RegionDescriptor = self.regions.get(i)
+            if addr >= region.base_addr && addr < region.base_addr + region.size {
+                return true
+            }
+        }
+        // Check if address falls in any pool slab
+        // loop: bounds[BOUND_TINY] — bounded by num_pools (<=16)
+        loop: bounds[BOUND_TINY] for i in 0..self.num_pools {
+            let pool: ref PoolDescriptor = self.pools.get(i)
+            if pool.contains(addr) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn get_allocation_size(self, addr: u64) -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        if !self.validate_pointer(addr) {
+            return Result::Err(heap_error(
+                DIAG_HEAP_INVALID_PTR,
+                FixedString[128]::from_slice("Invalid pointer"))))
+        }
+        // Read the header before the data pointer
+        let header_addr: u64 = addr - (HEAP_METADATA_OVERHEAD as u64)
+        let hdr: AllocationHeader = trusted("get allocation size: read allocation header") {
+            __builtin_read_mem(header_addr)
+        }
+        if !hdr.validate_magic() {
+            return Result::Err(heap_error(
+                DIAG_HEAP_CORRUPTION,
+                FixedString[128]::from_slice("Invalid header at pointer"))))
+        }
+        Result::Ok(hdr.size)
+    }
+
+    // ──────────────────────────────────────────────
+    // Statistics and Queries
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-STATS-001 through MEM-HEAP-STATS-020
+
+    pub fn total_allocated(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_allocated
+    }
+
+    pub fn total_freed(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_freed
+    }
+
+    pub fn current_usage(self) -> u64
+        effects: [deterministic]
+    {
+        if self.total_allocated > self.total_freed {
+            self.total_allocated - self.total_freed
+        } else {
+            0
+        }
+    }
+
+    pub fn peak_usage(self) -> u64
+        effects: [deterministic]
+    {
+        self.peak_usage
+    }
+
+    pub fn total_heap_size(self) -> u64
+        effects: [deterministic]
+    {
+        self.total_heap_size
+    }
+
+    pub fn allocation_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.allocation_count
+    }
+
+    pub fn free_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.free_count
+    }
+
+    pub fn fail_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.fail_count
+    }
+
+    pub fn compaction_count(self) -> u64
+        effects: [deterministic]
+    {
+        self.compaction_count
+    }
+
+    pub fn utilization(self) -> u8
+        effects: [deterministic]
+    {
+        if self.total_heap_size == 0 {
+            return 0
+        }
+        ((self.current_usage() * 100) / self.total_heap_size) as u8
+    }
+
+    pub fn generation(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn is_initialized(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_initialized
+    }
+
+    pub fn pool_utilization(self, pool_index: u32) -> u8
+        effects: [deterministic]
+    {
+        if pool_index >= self.num_pools {
+            return 0
+        }
+        let pool: ref PoolDescriptor = self.pools.get(pool_index)
+        pool.utilization()
+    }
+
+    // ──────────────────────────────────────────────
+    // Defragment All Pools
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-DEFRAG-001 through MEM-HEAP-DEFRAG-010
+
+    pub fn defrag_pools(self: ref mut)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_TINY] — bounded by num_pools (<=16)
+        loop: bounds[BOUND_TINY] for i in 0..self.num_pools {
+            let pool: ref mut PoolDescriptor = self.pools.get_mut(i)
+            pool.defrag()
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────────
+    // Evidence path: MEM-HEAP-RESID-001 through MEM-HEAP-RESID-020
+
+    fn record_init_residual(self, base: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Heap allocator initialization",
+            code: DIAG_HEAP_OK,
+            data: (base, size),
+        )
+    }
+
+    fn record_alloc_residual(self, size: u64, addr: u64, pool: u32)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Heap allocation",
+            code: DIAG_HEAP_OK,
+            data: (size, addr, pool),
+        )
+    }
+
+    fn record_free_residual(self, addr: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Heap deallocation",
+            code: DIAG_HEAP_OK,
+            data: (addr, size),
+        )
+    }
+
+    fn record_compaction_residual(self)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Heap compaction",
+            code: DIAG_HEAP_OK,
+            data: (),
+        )
+    }
+
+    fn record_pool_expand_residual(self, pool_index: u32, slab_addr: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Pool expansion",
+            code: DIAG_HEAP_OK,
+            data: (pool_index, slab_addr),
+        )
+    }
+
+    fn record_region_add_residual(self, base: u64, size: u64)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "Region addition",
+            code: DIAG_HEAP_OK,
+            data: (base, size),
+        )
+    }
+
+    fn record_oom_recovery_residual(self, success: bool)
+        effects: [deterministic]
+    {
+        @emit_residual(
+            message: "OOM recovery attempted",
+            code: DIAG_HEAP_OK,
+            data: (success),
+        )
+    }
+}
+
+// ──────────────────────────────────────────────
+// Global Heap Management
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-GLOBAL-001 through MEM-HEAP-GLOBAL-015
+
+pub type GlobalHeap : struct {
+    allocator: HeapAllocator,
+    is_ready: bool,
+    initial_base: u64,
+    initial_size: u64,
+}
+
+impl GlobalHeap {
+    pub fn new() -> GlobalHeap
+        effects: [deterministic]
+    {
+        GlobalHeap {
+            allocator: HeapAllocator::new(),
+            is_ready: false,
+            initial_base: 0,
+            initial_size: 0,
+        }
+    }
+
+    pub fn init(self: ref mut, base: u64, size: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        self.allocator.init(base, size)?;
+        self.initial_base = base
+        self.initial_size = size
+        self.is_ready = true
+        Result::Ok(())
+    }
+
+    pub fn allocate(self: ref mut, size: u64, align: u32)
+        -> Result[u64, HeapError>
+        effects: [deterministic]
+    {
+        if !self.is_ready {
+            return Result::Err(heap_error(
+                DIAG_HEAP_METADATA,
+                FixedString[128]::from_slice("Global heap not initialized")))
+        }
+        self.allocator.allocate(size, align)
+    }
+
+    pub fn free(self: ref mut, addr: u64)
+        -> Result[(), HeapError>
+        effects: [deterministic]
+    {
+        if !self.is_ready {
+            return Result::Err(heap_error(
+                DIAG_HEAP_METADATA,
+                FixedString[128]::from_slice("Global heap not initialized")))
+        }
+        self.allocator.free(addr)
+    }
+
+    pub fn is_ready(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_ready
+    }
+}
+
+// ──────────────────────────────────────────────
+// Convenience Functions
+// ──────────────────────────────────────────────
+// Evidence path: MEM-HEAP-CONV-001 through MEM-HEAP-CONV-010
+
+pub fn round_up_to_power_of_two(size: u64) -> u64
+    effects: [deterministic]
+{
+    if size == 0 {
+        return HEAP_MIN_ALIGNMENT as u64
+    }
+    let mut v: u64 = size - 1
+    v = v | (v >> 1)
+    v = v | (v >> 2)
+    v = v | (v >> 4)
+    v = v | (v >> 8)
+    v = v | (v >> 16)
+    v = v | (v >> 32)
+    v + 1
+}
+
+pub fn is_power_of_two(value: u64) -> bool
+    effects: [deterministic]
+{
+    value != 0 && (value & (value - 1)) == 0
+}
+
+pub fn heap_metadata_overhead() -> u32
+    effects: [deterministic]
+{
+    HEAP_METADATA_OVERHEAD
+}

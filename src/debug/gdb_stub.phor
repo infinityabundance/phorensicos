@@ -1,0 +1,1844 @@
+// gdb_stub.phor — GDB Remote Protocol Stub: Packet Parsing, Register Read/Write,
+//                  Memory Read/Write, Continue/Step, Breakpoint Insert/Remove,
+//                  Query/Command Packets, Thread Support, Target Description
+// Phorensic OS — Debug Subsystem
+//
+// This module implements a GDB remote serial protocol stub for kernel-level
+// debugging over serial/network. It enables standard GDB clients to connect
+// and debug the running kernel. All operations are capability-gated and produce
+// forensic residuals.
+//
+// Operations:
+// 1. Packet parsing — '+'/'-' ack, checksum validation, packet splitting
+// 2. Register read/write — 'g'/'G' packets, extended register sets
+// 3. Memory read/write — 'm'/'M' packets, X binary writes
+// 4. Continue/Step — 'c'/'s' packets, 'C'/'S' with signal
+// 5. Breakpoint insert/remove — 'Z'/'z' packets (software, hardware, watchpoints)
+// 6. Query/Command packets — '?' (halt reason), 'q*' (queries), 'Q*' (commands)
+// 7. Thread support — 'H' (thread select), 'T' (thread alive), qC, qfThreadInfo
+// 8. Target description — 'qXfer:features:read' for XML target description
+//
+// Boundedness: Packet buffer 2048 bytes. Register set 64 entries. All loops
+// bounded by fixed capacities.
+//
+// Effect declarations:
+//   [pure]    — packet parsing, data formatting
+//   [io]      — serial send/receive
+//   [debug]   — breakpoint/step operations via kernel debugger
+//   [diag]    — residual recording
+//   [memory]  — memory access
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+
+use debug::kernel_debugger::*;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes for GDB Stub
+// ──────────────────────────────────────────────
+
+const GDB_PACKET_RX      : u64 = 0x11000u64;
+const GDB_PACKET_TX      : u64 = 0x11001u64;
+const GDB_REG_READ       : u64 = 0x11002u64;
+const GDB_REG_WRITE      : u64 = 0x11003u64;
+const GDB_MEM_READ       : u64 = 0x11004u64;
+const GDB_MEM_WRITE      : u64 = 0x11005u64;
+const GDB_BREAKPOINT     : u64 = 0x11006u64;
+const GDB_CONTINUE       : u64 = 0x11007u64;
+const GDB_STEP           : u64 = 0x11008u64;
+const GDB_QUERY          : u64 = 0x11009u64;
+const GDB_THREAD         : u64 = 0x1100Au64;
+const GDB_ERROR          : u64 = 0x1100Bu64;
+
+// ──────────────────────────────────────────────
+// GDB Packet Types
+// ──────────────────────────────────────────────
+
+/// GDB remote protocol packet type.
+pub sealdatatype GdbPacketType : u8 {
+    /// Unknown or malformed packet.
+    Unknown = 0u8,
+    /// '?' — query halt reason.
+    HaltReason = 1u8,
+    /// 'g' — read general registers.
+    ReadRegisters = 2u8,
+    /// 'G' — write general registers.
+    WriteRegisters = 3u8,
+    /// 'm addr,len' — read memory.
+    ReadMemory = 4u8,
+    /// 'M addr,len:data' — write memory.
+    WriteMemory = 5u8,
+    /// 'c' — continue execution.
+    Continue = 6u8,
+    /// 's' — single step.
+    Step = 7u8,
+    /// 'C sig' — continue with signal.
+    ContinueWithSignal = 8u8,
+    /// 'S sig' — step with signal.
+    StepWithSignal = 9u8,
+    /// 'z type,addr,kind' — remove breakpoint/watchpoint.
+    RemoveBreakpoint = 10u8,
+    /// 'Z type,addr,kind' — insert breakpoint/watchpoint.
+    InsertBreakpoint = 11u8,
+    /// 'k' — kill request.
+    Kill = 12u8,
+    /// '!' — enable extended mode.
+    ExtendedMode = 13u8,
+    /// 'H op,tid' — set thread.
+    SetThread = 14u8,
+    /// 'T tid' — thread alive check.
+    ThreadAlive = 15u8,
+    /// 'q*' — general query.
+    Query = 16u8,
+    /// 'Q*' — general set.
+    Set = 17u8,
+    /// 'v*' — vCont, vAttach, etc.
+    VPackage = 18u8,
+    /// 'X addr,len:binary' — binary write memory.
+    BinaryWrite = 19u8,
+    /// Ack '+' or '-' .
+    Ack = 20u8,
+}
+
+/// Parsed GDB packet.
+pub struct GdbPacket {
+    /// Type of packet.
+    pub packet_type : GdbPacketType,
+    /// Raw packet data (without $ and checksum).
+    pub data : FixedString256,
+    /// Parsed command (first character(s) before ',' or ':').
+    pub command : FixedString64,
+    /// Parsed arguments (after command).
+    pub arguments : FixedString256,
+    /// Packet sequence number (0 if none).
+    pub sequence_number : u8,
+    /// Checksum validation result.
+    pub checksum_valid : bool,
+    /// Whether this was an interrupt packet (Ctrl-C).
+    pub is_interrupt : bool,
+}
+
+/// GDB signal number.
+pub sealdatatype GdbSignal : u8 {
+    SignalZero = 0u8,
+    SignalInt = 2u8,
+    SignalQuit = 3u8,
+    SignalIll = 4u8,
+    SignalTrap = 5u8,
+    SignalAbort = 6u8,
+    SignalEmt = 7u8,
+    SignalFpe = 8u8,
+    SignalKill = 9u8,
+    SignalBus = 10u8,
+    SignalSegv = 11u8,
+    SignalPipe = 13u8,
+    SignalAlrm = 14u8,
+    SignalTerm = 15u8,
+    SignalUsr1 = 16u8,
+    SignalUsr2 = 17u8,
+    SignalChld = 20u8,
+    SignalStp = 23u8,
+    SignalUrg = 21u8,
+    SignalPwr = 30u8,
+}
+
+/// Stop reason for 'T' or 'S' reply packets.
+pub struct StopReason {
+    /// Signal that caused the stop.
+    pub signal : GdbSignal,
+    /// Thread ID that stopped.
+    pub thread_id : u32,
+    /// Additional register key-value pairs for 'T' packet.
+    pub registers : Array64<(FixedString64, FixedString64)>,
+}
+
+/// Target description XML for 'qXfer:features:read'.
+pub struct TargetDescription {
+    /// XML description string.
+    pub xml : FixedString256,
+    /// Target architecture name.
+    pub arch : FixedString64,
+    /// Feature names supported.
+    pub features : Array64<FixedString64>,
+}
+
+/// Thread information.
+pub struct ThreadInfo {
+    /// Thread ID.
+    pub thread_id : u32,
+    /// Thread name.
+    pub name : FixedString64,
+    /// Whether the thread is alive.
+    pub alive : bool,
+    /// Whether this is the current thread.
+    pub is_current : bool,
+}
+
+/// GDB remote stub state.
+pub struct GdbStub {
+    /// Receive buffer.
+    pub rx_buffer : FixedString256,
+    /// Transmit buffer.
+    pub tx_buffer : FixedString256,
+    /// Currently selected thread for register operations.
+    pub selected_thread : u32,
+    /// Whether extended mode is enabled.
+    pub extended_mode : bool,
+    /// Whether the stub is connected.
+    pub connected : bool,
+    /// Current stop reason.
+    pub current_stop_reason : StopReason,
+    /// Known threads.
+    pub thread_list : Array64<ThreadInfo>,
+    /// Target description.
+    pub target_description : TargetDescription,
+    /// Reference to the kernel debugger.
+    pub debugger : KernelDebugger,
+    /// Residual log.
+    pub residual_log : Array128<DebugResidual>,
+    /// Packet receive error count.
+    pub rx_error_count : u32,
+    /// Packet count.
+    pub packet_count : u32,
+}
+
+impl GdbStub {
+    /// Create a new GDB stub.
+    /// Effect: pure — deterministic construction.
+    pub fn new(debugger : KernelDebugger) -> GdbStub [pure] {
+        GdbStub {
+            rx_buffer: FixedString256::new(),
+            tx_buffer: FixedString256::new(),
+            selected_thread: 1u32,
+            extended_mode: false,
+            connected: false,
+            current_stop_reason: StopReason {
+                signal: GdbSignal::SignalTrap,
+                thread_id: 1u32,
+                registers: Array64::new(),
+            },
+            thread_list: Array64::new(),
+            target_description: TargetDescription {
+                xml: FixedString256::new(),
+                arch: FixedString64::from("i386:x86-64"),
+                features: Array64::new(),
+            },
+            debugger: debugger,
+            residual_log: Array128::new(),
+            rx_error_count: 0u32,
+            packet_count: 0u32,
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Recording
+    // ──────────────────────────────────────────
+
+    /// Record a GDB residual.
+    /// Effect: diag — residual emission.
+    fn record_residual(mut self, code : u64, message : FixedString256,
+                       action : FixedString64) -> GdbStub [diag] {
+        let residual : DebugResidual = DebugResidual {
+            code: code,
+            message: message,
+            action: action,
+            address: 0u64,
+            value: 0u64,
+            timestamp: __builtin_timestamp(),
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Packet Serialization/Deserialization
+    // ──────────────────────────────────────────
+
+    /// Compute the checksum for a packet (modulo 256 sum of bytes).
+    /// Effect: pure — deterministic checksum computation.
+    pub fn compute_checksum(data : FixedString256) -> u8 [pure] {
+        var sum : u8 = 0u8;
+        // loop: bounds[BOUND_LARGE] — bounded by data length (max 256).
+        for var i : u32 = 0u32; i < data.len(); i += 1u32 [data.len()] {
+            sum = sum + data.get_byte(i);
+        }
+        sum
+    }
+
+    /// Format a byte as a two-character hex string.
+    /// Effect: pure — deterministic formatting.
+    pub fn byte_to_hex(value : u8) -> (u8, u8) [pure] {
+        let hex_chars : Array16<u8> = Array16::from_fixed([
+            '0' as u8, '1' as u8, '2' as u8, '3' as u8,
+            '4' as u8, '5' as u8, '6' as u8, '7' as u8,
+            '8' as u8, '9' as u8, 'a' as u8, 'b' as u8,
+            'c' as u8, 'd' as u8, 'e' as u8, 'f' as u8,
+        ]);
+        let hi : u8 = hex_chars.get((value >> 4u8) as u32);
+        let lo : u8 = hex_chars.get((value & 0x0Fu8) as u32);
+        (hi, lo)
+    }
+
+    /// Parse a hex byte from two hex characters.
+    /// Effect: pure — deterministic parsing.
+    pub fn hex_to_byte(hi : u8, lo : u8) -> Result<u8, FixedString256> [pure] {
+        let hi_val : u8;
+        let lo_val : u8;
+
+        if hi >= '0' as u8 && hi <= '9' as u8 {
+            hi_val = hi - '0' as u8;
+        } else if hi >= 'a' as u8 && hi <= 'f' as u8 {
+            hi_val = hi - 'a' as u8 + 10u8;
+        } else if hi >= 'A' as u8 && hi <= 'F' as u8 {
+            hi_val = hi - 'A' as u8 + 10u8;
+        } else {
+            return Result::Err(FixedString256::from("invalid hex char"));
+        }
+
+        if lo >= '0' as u8 && lo <= '9' as u8 {
+            lo_val = lo - '0' as u8;
+        } else if lo >= 'a' as u8 && lo <= 'f' as u8 {
+            lo_val = lo - 'a' as u8 + 10u8;
+        } else if lo >= 'A' as u8 && lo <= 'F' as u8 {
+            lo_val = lo - 'A' as u8 + 10u8;
+        } else {
+            return Result::Err(FixedString256::from("invalid hex char"));
+        }
+
+        Result::Ok((hi_val << 4u8) | lo_val)
+    }
+
+    /// Encode data as a hex string.
+    /// Effect: pure — deterministic encoding.
+    pub fn encode_hex(data : Array64<u8>, length : u32) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        // loop: bounds[BOUND_MEDIUM] — bounded by length.
+        for var i : u32 = 0u32; i < length && i < data.len(); i += 1u32 [length] {
+            let byte : u8 = data.get(i);
+            let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(byte);
+            result.push_byte(hi);
+            result.push_byte(lo);
+        }
+        result
+    }
+
+    /// Decode a hex string to bytes.
+    /// Effect: pure — deterministic decoding.
+    pub fn decode_hex(hex_str : FixedString256) -> Result<Array64<u8>, FixedString256> [pure] {
+        if hex_str.len() % 2u32 != 0u32 {
+            return Result::Err(FixedString256::from("hex string length must be even"));
+        }
+
+        var result : Array64<u8> = Array64::new();
+        // loop: bounds[BOUND_MEDIUM] — bounded by hex string length / 2.
+        for var i : u32 = 0u32; i < hex_str.len(); i += 2u32 [hex_str.len() / 2u32] {
+            let hi : u8 = hex_str.get_byte(i);
+            let lo : u8 = hex_str.get_byte(i + 1u32);
+            let byte_result : Result<u8, FixedString256> = GdbStub::hex_to_byte(hi, lo);
+            match byte_result {
+                Result::Ok(byte) => {
+                    let _ = result.push(byte);
+                },
+                Result::Err(msg) => {
+                    return Result::Err(msg);
+                },
+            }
+        }
+        Result::Ok(result)
+    }
+
+    /// Encode binary data with escaping for the 'X' packet.
+    /// Effect: pure — deterministic encoding.
+    pub fn encode_binary(data : Array64<u8>, length : u32) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        // loop: bounds[BOUND_MEDIUM] — bounded by length.
+        for var i : u32 = 0u32; i < length && i < data.len(); i += 1u32 [length] {
+            let byte : u8 = data.get(i);
+            // Escape $, #, }, and * with } prefix.
+            if byte == '$' as u8 || byte == '#' as u8 || byte == '}' as u8 || byte == '*' as u8 {
+                result.push_byte('}' as u8);
+                result.push_byte(byte ^ 0x20u8);
+            } else {
+                result.push_byte(byte);
+            }
+        }
+        result
+    }
+
+    // ──────────────────────────────────────────
+    // Packet Send/Receive
+    // ──────────────────────────────────────────
+
+    /// Send an acknowledgement packet ('+').
+    /// Effect: io — serial output.
+    pub fn send_ack(mut self) -> GdbStub [io] {
+        __builtin_serial_write_byte('+' as u8);
+        self.record_residual(GDB_PACKET_TX, FixedString256::from("ACK sent"),
+                             FixedString64::from("send_ack"))
+    }
+
+    /// Send a negative acknowledgement packet ('-').
+    /// Effect: io — serial output.
+    pub fn send_nack(mut self) -> GdbStub [io] {
+        __builtin_serial_write_byte('-' as u8);
+        self = self.record_residual(GDB_PACKET_TX, FixedString256::from("NACK sent"),
+                                    FixedString64::from("send_nack"));
+        self.rx_error_count += 1u32;
+        self
+    }
+
+    /// Send a packet formatted as: $data#checksum.
+    /// Effect: io — serial output.
+    pub fn send_packet(mut self, data : FixedString256) -> GdbStub [io] {
+        let checksum : u8 = GdbStub::compute_checksum(data);
+
+        __builtin_serial_write_byte('$' as u8);
+        // loop: bounds[BOUND_LARGE] — bounded by data length.
+        for var i : u32 = 0u32; i < data.len(); i += 1u32 [data.len()] {
+            __builtin_serial_write_byte(data.get_byte(i));
+        }
+        __builtin_serial_write_byte('#' as u8);
+        let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(checksum);
+        __builtin_serial_write_byte(hi);
+        __builtin_serial_write_byte(lo);
+
+        self.packet_count += 1u32;
+        self.record_residual(GDB_PACKET_TX, FixedString256::from("packet sent"),
+                             FixedString64::from("send_packet"))
+    }
+
+    /// Send an error packet: "Enn" where nn is the error code.
+    /// Effect: io — serial output.
+    pub fn send_error(mut self, error_code : u8) -> GdbStub [io] {
+        var data : FixedString256 = FixedString256::new();
+        data.push_byte('E' as u8);
+        let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(error_code);
+        data.push_byte(hi);
+        data.push_byte(lo);
+        self = self.record_residual(GDB_ERROR, FixedString256::from("error sent"),
+                                    FixedString64::from("send_error"));
+        self.send_packet(data)
+    }
+
+    /// Send an OK packet ("OK").
+    /// Effect: io — serial output.
+    pub fn send_ok(mut self) -> GdbStub [io] {
+        self.send_packet(FixedString256::from("OK"))
+    }
+
+    /// Receive a byte from serial.
+    /// Effect: io — serial input.
+    pub fn receive_byte() -> u8 [io] {
+        __builtin_serial_read_byte()
+    }
+
+    /// Receive a complete packet (delimited by $...#).
+    /// Effect: io — reads serial until packet complete or timeout.
+    pub fn receive_packet(mut self) -> Result<(GdbStub, GdbPacket), FixedString256> [io] {
+        // Wait for start of packet or interrupt.
+        var byte : u8 = GdbStub::receive_byte();
+
+        // Check for interrupt (Ctrl-C, which is 0x03).
+        if byte == 0x03u8 {
+            let interrupt_packet : GdbPacket = GdbPacket {
+                packet_type: GdbPacketType::Ack,
+                data: FixedString256::new(),
+                command: FixedString64::new(),
+                arguments: FixedString256::new(),
+                sequence_number: 0u8,
+                checksum_valid: true,
+                is_interrupt: true,
+            };
+            return Result::Ok((self, interrupt_packet));
+        }
+
+        // Handle acknowledgement.
+        if byte == '+' as u8 {
+            let ack_packet : GdbPacket = GdbPacket {
+                packet_type: GdbPacketType::Ack,
+                data: FixedString256::new(),
+                command: FixedString64::new(),
+                arguments: FixedString256::new(),
+                sequence_number: 0u8,
+                checksum_valid: true,
+                is_interrupt: false,
+            };
+            return Result::Ok((self, ack_packet));
+        }
+
+        if byte == '-' as u8 {
+            let nack_packet : GdbPacket = GdbPacket {
+                packet_type: GdbPacketType::Ack,
+                data: FixedString256::new(),
+                command: FixedString64::new(),
+                arguments: FixedString256::new(),
+                sequence_number: 0u8,
+                checksum_valid: false,
+                is_interrupt: false,
+            };
+            return Result::Ok((self, nack_packet));
+        }
+
+        // Expect '$' to start a packet.
+        var packet_data : FixedString256 = FixedString256::new();
+        if byte != '$' as u8 {
+            return Result::Err(FixedString256::from("expected '$' to start packet"));
+        }
+
+        // Read until '#'.
+        // loop: bounds[BOUND_LARGE] — bounded by max packet size (256).
+        loop: bounds[BOUND_LARGE] while true {
+            byte = GdbStub::receive_byte();
+            if byte == '#' as u8 {
+                break;
+            }
+            if packet_data.len() >= 252u32 {
+                return Result::Err(FixedString256::from("packet too long"));
+            }
+            packet_data.push_byte(byte);
+        }
+
+        // Read 2-byte checksum.
+        let checksum_hi : u8 = GdbStub::receive_byte();
+        let checksum_lo : u8 = GdbStub::receive_byte();
+
+        let received_checksum : Result<u8, FixedString256> = GdbStub::hex_to_byte(checksum_hi, checksum_lo);
+        let expected_checksum : u8 = GdbStub::compute_checksum(packet_data);
+
+        let checksum_valid : bool = match received_checksum {
+            Result::Ok(cs) => cs == expected_checksum,
+            Result::Err(_) => false,
+        };
+
+        // Parse the packet.
+        let parsed : GdbPacket = self.parse_packet(packet_data, checksum_valid);
+
+        self = self.record_residual(GDB_PACKET_RX, FixedString256::from("packet received"),
+                                    FixedString64::from("receive_packet"));
+
+        Result::Ok((self, parsed))
+    }
+
+    // ──────────────────────────────────────────
+    // Packet Parsing
+    // ──────────────────────────────────────────
+
+    /// Parse a raw packet string into a typed packet.
+    /// Effect: pure — deterministic parsing.
+    pub fn parse_packet(&self, data : FixedString256,
+                        checksum_valid : bool) -> GdbPacket [pure] {
+        if data.len() == 0u32 {
+            return GdbPacket {
+                packet_type: GdbPacketType::Unknown,
+                data: data,
+                command: FixedString64::new(),
+                arguments: FixedString256::new(),
+                sequence_number: 0u8,
+                checksum_valid: checksum_valid,
+                is_interrupt: false,
+            };
+        }
+
+        var seq_num : u8 = 0u8;
+        var cmd_start : u32 = 0u32;
+
+        // Check for sequence number (leading digit).
+        let first_byte : u8 = data.get_byte(0u32);
+        if first_byte >= '0' as u8 && first_byte <= '9' as u8 {
+            // Extract sequence number (single digit).
+            seq_num = first_byte - '0' as u8;
+            cmd_start = 1u32;
+        }
+
+        if cmd_start >= data.len() {
+            return GdbPacket {
+                packet_type: GdbPacketType::Unknown,
+                data: data,
+                command: FixedString64::new(),
+                arguments: FixedString256::new(),
+                sequence_number: seq_num,
+                checksum_valid: checksum_valid,
+                is_interrupt: false,
+            };
+        }
+
+        let cmd_byte : u8 = data.get_byte(cmd_start);
+        var command : FixedString64 = FixedString64::new();
+        var arguments : FixedString256 = FixedString256::new();
+        var ptype : GdbPacketType = GdbPacketType::Unknown;
+
+        // Determine packet type from first character.
+        if cmd_byte == '?' as u8 {
+            ptype = GdbPacketType::HaltReason;
+            let _ = command.push_byte('?' as u8);
+        } else if cmd_byte == 'g' as u8 {
+            ptype = GdbPacketType::ReadRegisters;
+            let _ = command.push_byte('g' as u8);
+        } else if cmd_byte == 'G' as u8 {
+            ptype = GdbPacketType::WriteRegisters;
+            let _ = command.push_byte('G' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'm' as u8 {
+            ptype = GdbPacketType::ReadMemory;
+            let _ = command.push_byte('m' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'M' as u8 {
+            ptype = GdbPacketType::WriteMemory;
+            let _ = command.push_byte('M' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'c' as u8 {
+            ptype = GdbPacketType::Continue;
+            let _ = command.push_byte('c' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 's' as u8 {
+            ptype = GdbPacketType::Step;
+            let _ = command.push_byte('s' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'C' as u8 {
+            ptype = GdbPacketType::ContinueWithSignal;
+            let _ = command.push_byte('C' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'S' as u8 {
+            ptype = GdbPacketType::StepWithSignal;
+            let _ = command.push_byte('S' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'Z' as u8 || cmd_byte == 'z' as u8 {
+            ptype = if cmd_byte == 'Z' as u8 {
+                GdbPacketType::InsertBreakpoint
+            } else {
+                GdbPacketType::RemoveBreakpoint
+            };
+            let _ = command.push_byte(cmd_byte);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'k' as u8 {
+            ptype = GdbPacketType::Kill;
+            let _ = command.push_byte('k' as u8);
+        } else if cmd_byte == '!' as u8 {
+            ptype = GdbPacketType::ExtendedMode;
+            let _ = command.push_byte('!' as u8);
+        } else if cmd_byte == 'H' as u8 {
+            ptype = GdbPacketType::SetThread;
+            let _ = command.push_byte('H' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'T' as u8 {
+            ptype = GdbPacketType::ThreadAlive;
+            let _ = command.push_byte('T' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'q' as u8 || cmd_byte == 'Q' as u8 {
+            ptype = if cmd_byte == 'q' as u8 {
+                GdbPacketType::Query
+            } else {
+                GdbPacketType::Set
+            };
+            let _ = command.push_byte(cmd_byte);
+            // Parse rest of command until ',' or ':'.
+            var arg_start : u32 = cmd_start + 1u32;
+            // loop: bounds[BOUND_SMALL] — bounded by command length.
+            loop: bounds[BOUND_MEDIUM] while arg_start < data.len() {
+                let ch : u8 = data.get_byte(arg_start);
+                if ch == ',' as u8 || ch == ':' as u8 {
+                    break;
+                }
+                let _ = command.push_byte(ch);
+                arg_start += 1u32;
+            }
+            if arg_start < data.len() {
+                arguments = data.substring(arg_start, data.len());
+            }
+        } else if cmd_byte == 'v' as u8 {
+            ptype = GdbPacketType::VPackage;
+            let _ = command.push_byte('v' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else if cmd_byte == 'X' as u8 {
+            ptype = GdbPacketType::BinaryWrite;
+            let _ = command.push_byte('X' as u8);
+            if cmd_start + 1u32 < data.len() {
+                arguments = data.substring(cmd_start + 1u32, data.len());
+            }
+        } else {
+            ptype = GdbPacketType::Unknown;
+        }
+
+        GdbPacket {
+            packet_type: ptype,
+            data: data,
+            command: command,
+            arguments: arguments,
+            sequence_number: seq_num,
+            checksum_valid: checksum_valid,
+            is_interrupt: false,
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Register Operations
+    // ──────────────────────────────────────────
+
+    /// Encode all general-purpose registers as a hex string ('g' packet response).
+    /// Effect: pure — register serialization.
+    pub fn encode_registers(&self) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        let regs : RegisterFile = self.debugger.register_file;
+
+        // Write each register as an 8-byte hex string (little-endian).
+        // Order: RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8-R15, RIP, EFLAGS, CS, SS, DS, ES, FS, GS
+        let registers : Array64<u64> = Array64::from_fixed([
+            regs.rax, regs.rbx, regs.rcx, regs.rdx,
+            regs.rsi, regs.rdi, regs.rbp, regs.rsp,
+            regs.r8, regs.r9, regs.r10, regs.r11,
+            regs.r12, regs.r13, regs.r14, regs.r15,
+            regs.rip, regs.rflags, regs.cs, regs.ss,
+            regs.ds, regs.es, regs.fs, regs.gs,
+        ]);
+
+        // loop: bounds[BOUND_SMALL] — bounded by 24 registers.
+        for var i : u32 = 0u32; i < 24u32; i += 1u32 [24u32] {
+            let reg_value : u64 = registers.get(i);
+            // Write as 8 bytes (16 hex chars), little-endian.
+            // loop: bounds[BOUND_SMALL] — 8 bytes per register.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let byte_val : u8 = ((reg_value >> (b * 8u32)) & 0xFFu64) as u8;
+                let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(byte_val);
+                result.push_byte(hi);
+                result.push_byte(lo);
+            }
+        }
+
+        result
+    }
+
+    /// Decode hex register data and update the register file ('G' packet).
+    /// Effect: pure — register deserialization.
+    pub fn decode_registers(mut self, hex_data : FixedString256) -> Result<GdbStub, FixedString256> [pure] {
+        if hex_data.len() < 24u32 * 16u32 { // 24 registers * 16 hex chars
+            return Result::Err(FixedString256::from("register data too short"));
+        }
+
+        var offset : u32 = 0u32;
+        let reg_names : Array64<FixedString64> = Array64::from_fixed([
+            FixedString64::from("rax"), FixedString64::from("rbx"),
+            FixedString64::from("rcx"), FixedString64::from("rdx"),
+            FixedString64::from("rsi"), FixedString64::from("rdi"),
+            FixedString64::from("rbp"), FixedString64::from("rsp"),
+            FixedString64::from("r8"),  FixedString64::from("r9"),
+            FixedString64::from("r10"), FixedString64::from("r11"),
+            FixedString64::from("r12"), FixedString64::from("r13"),
+            FixedString64::from("r14"), FixedString64::from("r15"),
+            FixedString64::from("rip"), FixedString64::from("rflags"),
+            FixedString64::from("cs"), FixedString64::from("ss"),
+            FixedString64::from("ds"), FixedString64::from("es"),
+            FixedString64::from("fs"), FixedString64::from("gs"),
+        ]);
+
+        // loop: bounds[BOUND_SMALL] — bounded by 24 registers.
+        for var i : u32 = 0u32; i < 24u32; i += 1u32 [24u32] {
+            var reg_value : u64 = 0u64;
+            // Read 8 bytes (16 hex chars), little-endian.
+            // loop: bounds[BOUND_SMALL] — 8 bytes per register.
+            for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+                let hi : u8 = hex_data.get_byte(offset);
+                let lo : u8 = hex_data.get_byte(offset + 1u32);
+                let byte_result : Result<u8, FixedString256> = GdbStub::hex_to_byte(hi, lo);
+                match byte_result {
+                    Result::Ok(byte_val) => {
+                        reg_value |= (byte_val as u64) << (b * 8u32);
+                    },
+                    Result::Err(msg) => {
+                        return Result::Err(msg);
+                    },
+                }
+                offset += 2u32;
+            }
+
+            let name : FixedString64 = reg_names.get(i);
+            let _ = self.debugger.write_register_by_name(
+                FixedString256::from_buffer(name), reg_value);
+        }
+
+        self = self.record_residual(GDB_REG_WRITE, FixedString256::from("registers written"),
+                                    FixedString64::from("decode_registers"));
+        Result::Ok(self)
+    }
+
+    /// Read a single register as a hex string ('p' packet response).
+    /// Effect: pure — register encoding.
+    pub fn encode_single_register(&self, reg_num : u8) -> Result<FixedString256, FixedString256> [pure] {
+        let reg_id : RegisterId = GdbStub::register_number_to_id(reg_num);
+        let value : u64 = self.debugger.register_file.read_register(reg_id);
+
+        var result : FixedString256 = FixedString256::new();
+        // Write as 8 bytes (16 hex chars), little-endian.
+        // loop: bounds[BOUND_SMALL] — 8 bytes per register.
+        for var b : u32 = 0u32; b < 8u32; b += 1u32 [8u32] {
+            let byte_val : u8 = ((value >> (b * 8u32)) & 0xFFu64) as u8;
+            let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(byte_val);
+            result.push_byte(hi);
+            result.push_byte(lo);
+        }
+
+        Result::Ok(result)
+    }
+
+    /// Convert GDB register number to RegisterId.
+    /// Effect: pure — mapping.
+    fn register_number_to_id(reg_num : u8) -> RegisterId [pure] {
+        match reg_num {
+            0u8 => RegisterId::RAX,   1u8 => RegisterId::RBX,
+            2u8 => RegisterId::RCX,   3u8 => RegisterId::RDX,
+            4u8 => RegisterId::RSI,   5u8 => RegisterId::RDI,
+            6u8 => RegisterId::RBP,   7u8 => RegisterId::RSP,
+            8u8 => RegisterId::R8,    9u8 => RegisterId::R9,
+            10u8 => RegisterId::R10,  11u8 => RegisterId::R11,
+            12u8 => RegisterId::R12,  13u8 => RegisterId::R13,
+            14u8 => RegisterId::R14,  15u8 => RegisterId::R15,
+            16u8 => RegisterId::RIP,  17u8 => RegisterId::RFLAGS,
+            18u8 => RegisterId::CS,   19u8 => RegisterId::SS,
+            20u8 => RegisterId::DS,   21u8 => RegisterId::ES,
+            22u8 => RegisterId::FS,   23u8 => RegisterId::GS,
+            _ => RegisterId::RAX,
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Memory Operations
+    // ──────────────────────────────────────────
+
+    /// Read memory and encode as hex string ('m' packet).
+    /// Effect: memory — reads target memory.
+    pub fn read_memory_hex(&self, address : u64, length : u32) -> Result<FixedString256, FixedString256>
+                           [memory] {
+        if length > 512u32 {
+            return Result::Err(FixedString256::from("read length too large"));
+        }
+
+        var data : Array64<u8> = Array64::new();
+        // loop: bounds[BOUND_MEDIUM] — bounded by length.
+        for var i : u32 = 0u32; i < length; i += 1u32 [length] {
+            let byte : u8 = __builtin_read_byte(address + i as u64);
+            let _ = data.push(byte);
+        }
+
+        Result::Ok(GdbStub::encode_hex(data, length))
+    }
+
+    /// Write memory from hex string ('M' packet).
+    /// Effect: memory — writes to target memory.
+    pub fn write_memory_hex(mut self, address : u64, hex_data : FixedString256)
+                            -> Result<GdbStub, FixedString256> [memory, diag] {
+        let decoded : Result<Array64<u8>, FixedString256> = GdbStub::decode_hex(hex_data);
+        let bytes : Array64<u8> = match decoded {
+            Result::Ok(b) => b,
+            Result::Err(msg) => return Result::Err(msg),
+        };
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by decoded bytes.
+        for var i : u32 = 0u32; i < bytes.len(); i += 1u32 [bytes.len()] {
+            let byte : u8 = bytes.get(i);
+            __builtin_write_byte(address + i as u64, byte);
+        }
+
+        self = self.record_residual(GDB_MEM_WRITE, FixedString256::from("memory written"),
+                                    FixedString64::from("write_memory_hex"));
+        Result::Ok(self)
+    }
+
+    /// Write memory from binary data ('X' packet).
+    /// Effect: memory — writes to target memory.
+    pub fn write_memory_binary(mut self, address : u64, binary_data : FixedString256)
+                               -> Result<GdbStub, FixedString256> [memory, diag] {
+        var offset : u32 = 0u32;
+        var write_offset : u64 = address;
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by binary data length.
+        loop: bounds[BOUND_MEDIUM] while offset < binary_data.len() {
+            let byte : u8 = binary_data.get_byte(offset);
+            if byte == '}' as u8 {
+                // Escaped byte: next byte XOR 0x20.
+                offset += 1u32;
+                if offset >= binary_data.len() {
+                    return Result::Err(FixedString256::from("unexpected end in escape sequence"));
+                }
+                let escaped : u8 = binary_data.get_byte(offset) ^ 0x20u8;
+                __builtin_write_byte(write_offset, escaped);
+                write_offset += 1u64;
+            } else {
+                __builtin_write_byte(write_offset, byte);
+                write_offset += 1u64;
+            }
+            offset += 1u32;
+        }
+
+        self = self.record_residual(GDB_MEM_WRITE, FixedString256::from("binary memory written"),
+                                    FixedString64::from("write_memory_binary"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Breakpoint Operations
+    // ──────────────────────────────────────────
+
+    /// Handle 'Z' (insert breakpoint) packet.
+    /// Effect: debug, memory — installs breakpoint.
+    pub fn handle_insert_breakpoint(mut self, args : FixedString256) -> Result<GdbStub, FixedString256>
+                                    [debug, memory, diag] {
+        // Format: type,addr,kind
+        // Find first ',' delimiter.
+        var comma1 : u32 = 0u32;
+        // loop: bounds[BOUND_SMALL] — bounded by args length.
+        loop: bounds[BOUND_SMALL] while comma1 < args.len() {
+            if args.get_byte(comma1) == ',' as u8 {
+                break;
+            }
+            comma1 += 1u32;
+        }
+
+        if comma1 >= args.len() {
+            return Result::Err(FixedString256::from("invalid Z packet format"));
+        }
+
+        let type_str : FixedString256 = args.substring(0u32, comma1);
+        var comma2 : u32 = comma1 + 1u32;
+        // loop: bounds[BOUND_SMALL] — bounded by args length.
+        loop: bounds[BOUND_SMALL] while comma2 < args.len() {
+            if args.get_byte(comma2) == ',' as u8 {
+                break;
+            }
+            comma2 += 1u32;
+        }
+
+        let addr_str : FixedString256 = args.substring(comma1 + 1u32, comma2);
+        let kind_str : FixedString256 = args.substring(comma2 + 1u32, args.len());
+
+        let bp_type : u8 = __builtin_parse_dec_u8(type_str);
+        let address : u64 = __builtin_parse_hex_u64(addr_str);
+
+        let bp_type_enum : BreakpointType = if bp_type == 0u8 {
+            BreakpointType::Software
+        } else if bp_type == 1u8 {
+            BreakpointType::Hardware
+        } else {
+            BreakpointType::Conditional
+        };
+
+        let result : Result<KernelDebugger, FixedString256> =
+            self.debugger.insert_breakpoint(address, bp_type_enum, FixedString256::new());
+
+        match result {
+            Result::Ok(dbg) => {
+                self.debugger = dbg;
+                self = self.record_residual(GDB_BREAKPOINT, FixedString256::from("breakpoint inserted via GDB"),
+                                            FixedString64::from("z_insert"));
+                Result::Ok(self)
+            },
+            Result::Err(msg) => Result::Err(msg),
+        }
+    }
+
+    /// Handle 'z' (remove breakpoint) packet.
+    /// Effect: debug, memory — removes breakpoint.
+    pub fn handle_remove_breakpoint(mut self, args : FixedString256) -> Result<GdbStub, FixedString256>
+                                    [debug, memory, diag] {
+        // Format: type,addr,kind
+        var comma1 : u32 = 0u32;
+        // loop: bounds[BOUND_SMALL] — bounded by args length.
+        loop: bounds[BOUND_SMALL] while comma1 < args.len() {
+            if args.get_byte(comma1) == ',' as u8 {
+                break;
+            }
+            comma1 += 1u32;
+        }
+
+        if comma1 >= args.len() {
+            return Result::Err(FixedString256::from("invalid z packet format"));
+        }
+
+        let addr_str : FixedString256 = args.substring(comma1 + 1u32, args.len());
+        var comma2 : u32 = comma1 + 1u32;
+        // loop: bounds[BOUND_SMALL] — bounded by args length.
+        loop: bounds[BOUND_SMALL] while comma2 < args.len() {
+            if args.get_byte(comma2) == ',' as u8 {
+                break;
+            }
+            comma2 += 1u32;
+        }
+
+        let address : u64 = __builtin_parse_hex_u64(addr_str);
+
+        // Find breakpoint by address and remove it.
+        // loop: bounds[BOUND_SMALL] — bounded by 32 entries.
+        for var i : u32 = 0u32; i < self.debugger.breakpoints.len(); i += 1u32 [self.debugger.breakpoints.len()] {
+            let bp : BreakpointEntry = self.debugger.breakpoints.get(i);
+            if bp.address == address {
+                let bp_id : u32 = bp.id;
+                let result : Result<KernelDebugger, FixedString256> =
+                    self.debugger.remove_breakpoint(bp_id);
+                match result {
+                    Result::Ok(dbg) => {
+                        self.debugger = dbg;
+                        return Result::Ok(self);
+                    },
+                    Result::Err(msg) => return Result::Err(msg),
+                }
+            }
+        }
+
+        Result::Err(FixedString256::from("breakpoint not found"))
+    }
+
+    // ──────────────────────────────────────────
+    // Continue/Step Operations
+    // ──────────────────────────────────────────
+
+    /// Handle 'c' (continue) packet.
+    /// Effect: debug — resumes execution.
+    pub fn handle_continue(mut self) -> Result<GdbStub, FixedString256> [debug, diag] {
+        let result : Result<KernelDebugger, FixedString256> = self.debugger.continue_execution();
+        match result {
+            Result::Ok(dbg) => {
+                self.debugger = dbg;
+                self = self.record_residual(GDB_CONTINUE, FixedString256::from("continue via GDB"),
+                                            FixedString64::from("continue"));
+                Result::Ok(self)
+            },
+            Result::Err(msg) => Result::Err(msg),
+        }
+    }
+
+    /// Handle 's' (step) packet.
+    /// Effect: debug — single step.
+    pub fn handle_step(mut self) -> Result<GdbStub, FixedString256> [debug, diag] {
+        let result : Result<KernelDebugger, FixedString256> = self.debugger.single_step();
+        match result {
+            Result::Ok(dbg) => {
+                self.debugger = dbg;
+                self = self.record_residual(GDB_STEP, FixedString256::from("step via GDB"),
+                                            FixedString64::from("step"));
+                Result::Ok(self)
+            },
+            Result::Err(msg) => Result::Err(msg),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Signal and Stop Reply
+    // ──────────────────────────────────────────
+
+    /// Generate a 'T' stop reply packet (with signal and optional register info).
+    /// Effect: io — packet generation.
+    pub fn generate_stop_reply(&self) -> FixedString256 [io] {
+        var reply : FixedString256 = FixedString256::new();
+        reply.push_byte('T' as u8);
+
+        // Signal number as 2 hex digits.
+        let sig_val : u8 = self.current_stop_reason.signal as u8;
+        let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(sig_val);
+        reply.push_byte(hi);
+        reply.push_byte(lo);
+
+        // Add thread info.
+        reply.push_str(FixedString256::from("thread:"));
+        let tid_str : FixedString256 = GdbStub::encode_hex(
+            Array64::from_single(((self.current_stop_reason.thread_id >> 0u32) & 0xFFu32) as u8), 1u32);
+        reply.push_str(tid_str);
+        reply.push_str(FixedString256::from(";"));
+
+        // Add reason.
+        reply.push_str(FixedString256::from("library:;"));
+
+        reply
+    }
+
+    /// Generate a 'S' stop reply packet (signal only).
+    /// Effect: io — packet generation.
+    pub fn generate_signal_reply(&self) -> FixedString256 [io] {
+        var reply : FixedString256 = FixedString256::new();
+        reply.push_byte('S' as u8);
+        let sig_val : u8 = self.current_stop_reason.signal as u8;
+        let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(sig_val);
+        reply.push_byte(hi);
+        reply.push_byte(lo);
+        reply
+    }
+
+    /// Handle '?' (halt reason) packet.
+    /// Effect: io — generates stop reply.
+    pub fn handle_halt_reason(&self) -> FixedString256 [io] {
+        self.generate_stop_reply()
+    }
+
+    // ──────────────────────────────────────────
+    // Query/Command Packet Handlers
+    // ──────────────────────────────────────────
+
+    /// Handle query packets ('q*').
+    /// Effect: io, debug — processes query and generates response.
+    pub fn handle_query(mut self, command : FixedString64,
+                        args : FixedString256) -> Result<(GdbStub, FixedString256), FixedString256>
+                        [io, debug, diag] {
+        let qcmd : FixedString64 = command;
+
+        // qC — return current thread ID.
+        if qcmd == FixedString64::from("qC") {
+            var response : FixedString256 = FixedString256::from("QC ");
+            let tid_str : FixedString256 = GdbStub::encode_hex(
+                Array64::from_single(self.selected_thread as u8), 1u32);
+            response.push_str(tid_str);
+            return Result::Ok((self, response));
+        }
+
+        // qAttached — query whether attached to process.
+        if qcmd == FixedString64::from("qAttached") {
+            return Result::Ok((self, FixedString256::from("1")));
+        }
+
+        // qfThreadInfo — start thread list.
+        if qcmd == FixedString64::from("qfThreadInfo") {
+            var response : FixedString256 = FixedString256::from("m");
+            // loop: bounds[BOUND_SMALL] — bounded by thread list.
+            for var i : u32 = 0u32; i < self.thread_list.len(); i += 1u32 [self.thread_list.len()] {
+                let thread : ThreadInfo = self.thread_list.get(i);
+                if i > 0u32 {
+                    response.push_byte(',' as u8);
+                }
+                let tid_str : FixedString256 = GdbStub::encode_hex(
+                    Array64::from_single(thread.thread_id as u8), 1u32);
+                response.push_str(tid_str);
+            }
+            return Result::Ok((self, response));
+        }
+
+        // qsThreadInfo — end thread list.
+        if qcmd == FixedString64::from("qsThreadInfo") {
+            return Result::Ok((self, FixedString256::from("l")));
+        }
+
+        // qXfer:features:read — target description.
+        if qcmd == FixedString64::from("qXfer:features:read") {
+            return Result::Ok((self, self.target_description.xml));
+        }
+
+        // qXfer:threads:read — thread list XML.
+        if qcmd == FixedString64::from("qXfer:threads:read") {
+            var xml_response : FixedString256 = FixedString256::from(
+                "l<threads>");
+            // loop: bounds[BOUND_SMALL] — bounded by thread list.
+            for var i : u32 = 0u32; i < self.thread_list.len(); i += 1u32 [self.thread_list.len()] {
+                let thread : ThreadInfo = self.thread_list.get(i);
+                xml_response.push_str(FixedString256::from("<thread id=\""));
+                xml_response.push_u32(thread.thread_id);
+                xml_response.push_str(FixedString256::from("\" name=\""));
+                xml_response.push_str(FixedString256::from_buffer(thread.name));
+                xml_response.push_str(FixedString256::from("\"/>"));
+            }
+            xml_response.push_str(FixedString256::from("</threads>"));
+            return Result::Ok((self, xml_response));
+        }
+
+        // qSupported — query supported features.
+        if qcmd == FixedString64::from("qSupported") {
+            var response : FixedString256 = FixedString256::from(
+                "PacketSize=800;QStartNoAckMode+;qXfer:features:read+;"
+                "qXfer:threads:read+;qXfer:libraries:read+;"
+                "QNonStop-;QThreadSuffixSupported+;"
+                "swbreak+;hwbreak+;vContSupported+;multiprocess-");
+            return Result::Ok((self, response));
+        }
+
+        // qRcmd — run a monitor command.
+        if qcmd == FixedString64::from("qRcmd") {
+            let decoded_cmd : Result<Array64<u8>, FixedString256> = GdbStub::decode_hex(args);
+            match decoded_cmd {
+                Result::Ok(cmd_bytes) => {
+                    // Execute monitor command (simplified — just echo).
+                    var response : FixedString256 = FixedString256::from("OK");
+                    self = self.record_residual(GDB_QUERY, FixedString256::from("monitor command executed"),
+                                                FixedString64::from("qRcmd"));
+                    return Result::Ok((self, response));
+                },
+                Result::Err(msg) => {
+                    return Result::Err(msg);
+                },
+            }
+        }
+
+        // Default: unsupported query.
+        Result::Ok((self, FixedString256::new()))
+    }
+
+    /// Handle set packets ('Q*').
+    /// Effect: io, debug — processes set command.
+    pub fn handle_set(mut self, command : FixedString64,
+                      args : FixedString256) -> Result<(GdbStub, FixedString256), FixedString256>
+                      [io, debug, diag] {
+        // QStartNoAckMode — disable ACK/NACK.
+        if command == FixedString64::from("QStartNoAckMode") {
+            self = self.record_residual(GDB_QUERY, FixedString256::from("no-ack mode enabled"),
+                                        FixedString64::from("set_noack"));
+            return Result::Ok((self, FixedString256::from("OK")));
+        }
+
+        // QThreadSuffixSupported — acknowledge thread suffix.
+        if command == FixedString64::from("QThreadSuffixSupported") {
+            return Result::Ok((self, FixedString256::from("OK")));
+        }
+
+        // QNonStop — disable non-stop mode.
+        if command == FixedString64::from("QNonStop") {
+            return Result::Ok((self, FixedString256::from("OK")));
+        }
+
+        Result::Ok((self, FixedString256::new()))
+    }
+
+    // ──────────────────────────────────────────
+    // Thread Support
+    // ──────────────────────────────────────────
+
+    /// Handle 'H' (set thread) packet.
+    /// Effect: pure — selects thread.
+    pub fn handle_set_thread(mut self, op_tid : FixedString256) -> Result<GdbStub, FixedString256> [pure] {
+        // Format: op tid (e.g., "g 1")
+        if op_tid.len() < 2u32 {
+            return Result::Err(FixedString256::from("invalid H packet"));
+        }
+
+        let op_char : u8 = op_tid.get_byte(0u32);
+        let tid_str : FixedString256 = op_tid.substring(2u32, op_tid.len());
+        let thread_id : u32 = __builtin_parse_hex_u64(tid_str) as u32;
+
+        // 'g' = general/register ops, 'c' = step/continue ops.
+        self.selected_thread = thread_id;
+
+        self = self.record_residual(GDB_THREAD, FixedString256::from("thread selected"),
+                                    FixedString64::from("set_thread"));
+        Result::Ok(self)
+    }
+
+    /// Handle 'T' (thread alive) packet.
+    /// Effect: pure — checks if thread exists.
+    pub fn handle_thread_alive(&self, tid_str : FixedString256) -> FixedString256 [pure] {
+        let thread_id : u32 = __builtin_parse_hex_u64(tid_str) as u32;
+
+        // loop: bounds[BOUND_SMALL] — bounded by thread list.
+        for var i : u32 = 0u32; i < self.thread_list.len(); i += 1u32 [self.thread_list.len()] {
+            let thread : ThreadInfo = self.thread_list.get(i);
+            if thread.thread_id == thread_id && thread.alive {
+                return FixedString256::from("OK");
+            }
+        }
+
+        FixedString256::from("E01")
+    }
+
+    /// Add a thread to the thread list.
+    /// Effect: pure — appends to thread list.
+    pub fn add_thread(mut self, thread_id : u32, name : FixedString64) -> Result<GdbStub, FixedString256> [pure] {
+        if self.thread_list.is_full() {
+            return Result::Err(FixedString256::from("thread list full"));
+        }
+
+        let thread : ThreadInfo = ThreadInfo {
+            thread_id: thread_id,
+            name: name,
+            alive: true,
+            is_current: thread_id == self.selected_thread,
+        };
+        let _ = self.thread_list.push(thread);
+        self = self.record_residual(GDB_THREAD, FixedString256::from("thread added"),
+                                    FixedString64::from("add_thread"));
+        Result::Ok(self)
+    }
+
+    /// Remove a thread from the list.
+    /// Effect: pure — removes from thread list.
+    pub fn remove_thread(mut self, thread_id : u32) -> Result<GdbStub, FixedString256> [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by thread list.
+        for var i : u32 = 0u32; i < self.thread_list.len(); i += 1u32 [self.thread_list.len()] {
+            let thread : ThreadInfo = self.thread_list.get(i);
+            if thread.thread_id == thread_id {
+                let _ = self.thread_list.remove(i);
+                return Result::Ok(self);
+            }
+        }
+        Result::Err(FixedString256::from("thread not found"))
+    }
+
+    // ──────────────────────────────────────────
+    // Target Description
+    // ──────────────────────────────────────────
+
+    /// Generate the default target description XML for x86-64.
+    /// Effect: io — XML generation.
+    pub fn generate_target_description(mut self) -> GdbStub [io] {
+        var xml : FixedString256 = FixedString256::new();
+        xml.push_str(FixedString256::from(
+            "<?xml version=\"1.0\"?>"
+            "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">"
+            "<target version=\"1.0\">"
+            "<architecture>i386:x86-64</architecture>"
+            "<feature name=\"org.gnu.gdb.i386.core\">"));
+
+        // Add register definitions for x86-64.
+        // loop: bounds[BOUND_SMALL] — bounded by register count (24).
+        for var i : u32 = 0u32; i < 24u32; i += 1u32 [24u32] {
+            let reg_name : FixedString64 = self.get_register_name_for_feature(i);
+            xml.push_str(FixedString256::from("<reg name=\""));
+            xml.push_str(FixedString256::from_buffer(reg_name));
+            xml.push_str(FixedString256::from("\" bitsize=\"64\" type=\"int64\" group=\"general\"/>"));
+        }
+
+        xml.push_str(FixedString256::from("</feature></target>"));
+
+        self.target_description = TargetDescription {
+            xml: xml,
+            arch: FixedString64::from("i386:x86-64"),
+            features: Array64::new(),
+        };
+        let _ = self.target_description.features.push(
+            FixedString64::from("org.gnu.gdb.i386.core"));
+
+        self
+    }
+
+    /// Get register name for target description feature.
+    /// Effect: pure — name mapping.
+    fn get_register_name_for_feature(&self, index : u32) -> FixedString64 [pure] {
+        match index {
+            0u32 => FixedString64::from("rax"),   1u32 => FixedString64::from("rbx"),
+            2u32 => FixedString64::from("rcx"),   3u32 => FixedString64::from("rdx"),
+            4u32 => FixedString64::from("rsi"),   5u32 => FixedString64::from("rdi"),
+            6u32 => FixedString64::from("rbp"),   7u32 => FixedString64::from("rsp"),
+            8u32 => FixedString64::from("r8"),    9u32 => FixedString64::from("r9"),
+            10u32 => FixedString64::from("r10"),  11u32 => FixedString64::from("r11"),
+            12u32 => FixedString64::from("r12"),  13u32 => FixedString64::from("r13"),
+            14u32 => FixedString64::from("r14"),  15u32 => FixedString64::from("r15"),
+            16u32 => FixedString64::from("rip"),  17u32 => FixedString64::from("eflags"),
+            18u32 => FixedString64::from("cs"),   19u32 => FixedString64::from("ss"),
+            20u32 => FixedString64::from("ds"),   21u32 => FixedString64::from("es"),
+            22u32 => FixedString64::from("fs"),   23u32 => FixedString64::from("gs"),
+            _ => FixedString64::from("unknown"),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Main Packet Processing
+    // ──────────────────────────────────────────
+
+    /// Process a single received packet and generate a response.
+    /// Effect: io, debug, memory — full packet processing.
+    pub fn process_packet(mut self, packet : GdbPacket) -> Result<(GdbStub, FixedString256), FixedString256>
+                          [io, debug, memory, diag] {
+        if !packet.checksum_valid && packet.packet_type != GdbPacketType::Ack {
+            return Result::Err(FixedString256::from("invalid checksum"));
+        }
+
+        self.packet_count += 1u32;
+
+        match packet.packet_type {
+            GdbPacketType::HaltReason => {
+                let reply : FixedString256 = self.handle_halt_reason();
+                Result::Ok((self, reply))
+            },
+            GdbPacketType::ReadRegisters => {
+                let reg_data : FixedString256 = self.encode_registers();
+                self = self.record_residual(GDB_REG_READ, FixedString256::from("registers read"),
+                                            FixedString64::from("read_regs"));
+                Result::Ok((self, reg_data))
+            },
+            GdbPacketType::WriteRegisters => {
+                let result : Result<GdbStub, FixedString256> =
+                    self.decode_registers(packet.arguments);
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::from("OK"))),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::ReadMemory => {
+                // Parse address,length from arguments (e.g. "7fff0000,100").
+                var comma_pos : u32 = 0u32;
+                // loop: bounds[BOUND_SMALL] — bounded by arg length.
+                loop: bounds[BOUND_SMALL] while comma_pos < packet.arguments.len() {
+                    if packet.arguments.get_byte(comma_pos) == ',' as u8 {
+                        break;
+                    }
+                    comma_pos += 1u32;
+                }
+
+                if comma_pos >= packet.arguments.len() {
+                    return Result::Err(FixedString256::from("invalid m packet format"));
+                }
+
+                let addr_str : FixedString256 = packet.arguments.substring(0u32, comma_pos);
+                let len_str : FixedString256 = packet.arguments.substring(comma_pos + 1u32, packet.arguments.len());
+
+                let address : u64 = __builtin_parse_hex_u64(addr_str);
+                let length : u32 = __builtin_parse_hex_u64(len_str) as u32;
+
+                let mem_result : Result<FixedString256, FixedString256> =
+                    self.read_memory_hex(address, length);
+                match mem_result {
+                    Result::Ok(hex_data) => Result::Ok((self, hex_data)),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::WriteMemory => {
+                // Parse address,len:data.
+                var comma_pos : u32 = 0u32;
+                // loop: bounds[BOUND_SMALL] — bounded by arg length.
+                loop: bounds[BOUND_SMALL] while comma_pos < packet.arguments.len() {
+                    if packet.arguments.get_byte(comma_pos) == ',' as u8 {
+                        break;
+                    }
+                    comma_pos += 1u32;
+                }
+
+                if comma_pos >= packet.arguments.len() {
+                    return Result::Err(FixedString256::from("invalid M packet format"));
+                }
+
+                var colon_pos : u32 = comma_pos + 1u32;
+                // loop: bounds[BOUND_SMALL] — bounded by arg length.
+                loop: bounds[BOUND_SMALL] while colon_pos < packet.arguments.len() {
+                    if packet.arguments.get_byte(colon_pos) == ':' as u8 {
+                        break;
+                    }
+                    colon_pos += 1u32;
+                }
+
+                if colon_pos >= packet.arguments.len() {
+                    return Result::Err(FixedString256::from("invalid M packet format"));
+                }
+
+                let addr_str : FixedString256 = packet.arguments.substring(0u32, comma_pos);
+                let address : u64 = __builtin_parse_hex_u64(addr_str);
+                let hex_data : FixedString256 = packet.arguments.substring(colon_pos + 1u32, packet.arguments.len());
+
+                let result : Result<GdbStub, FixedString256> =
+                    self.write_memory_hex(address, hex_data);
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::from("OK"))),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::Continue | GdbPacketType::ContinueWithSignal => {
+                let result : Result<GdbStub, FixedString256> = self.handle_continue();
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::new())),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::Step | GdbPacketType::StepWithSignal => {
+                let result : Result<GdbStub, FixedString256> = self.handle_step();
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::new())),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::InsertBreakpoint => {
+                let result : Result<GdbStub, FixedString256> =
+                    self.handle_insert_breakpoint(packet.arguments);
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::from("OK"))),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::RemoveBreakpoint => {
+                let result : Result<GdbStub, FixedString256> =
+                    self.handle_remove_breakpoint(packet.arguments);
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::from("OK"))),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::Kill => {
+                self.connected = false;
+                self = self.record_residual(GDB_QUERY, FixedString256::from("kill received"),
+                                            FixedString64::from("kill"));
+                Result::Ok((self, FixedString256::from("X")))
+            },
+            GdbPacketType::ExtendedMode => {
+                self.extended_mode = true;
+                Result::Ok((self, FixedString256::from("OK")))
+            },
+            GdbPacketType::SetThread => {
+                let result : Result<GdbStub, FixedString256> =
+                    self.handle_set_thread(packet.arguments);
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::from("OK"))),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::ThreadAlive => {
+                let reply : FixedString256 = self.handle_thread_alive(packet.arguments);
+                Result::Ok((self, reply))
+            },
+            GdbPacketType::Query => {
+                let result : Result<(GdbStub, FixedString256), FixedString256> =
+                    self.handle_query(packet.command, packet.arguments);
+                match result {
+                    Result::Ok((stub, reply)) => Result::Ok((stub, reply)),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::Set => {
+                let result : Result<(GdbStub, FixedString256), FixedString256> =
+                    self.handle_set(packet.command, packet.arguments);
+                match result {
+                    Result::Ok((stub, reply)) => Result::Ok((stub, reply)),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            GdbPacketType::BinaryWrite => {
+                // Parse address,len:binary_data.
+                var comma_pos : u32 = 0u32;
+                // loop: bounds[BOUND_SMALL] — bounded by arg length.
+                loop: bounds[BOUND_SMALL] while comma_pos < packet.arguments.len() {
+                    if packet.arguments.get_byte(comma_pos) == ',' as u8 {
+                        break;
+                    }
+                    comma_pos += 1u32;
+                }
+
+                if comma_pos >= packet.arguments.len() {
+                    return Result::Err(FixedString256::from("invalid X packet format"));
+                }
+
+                var colon_pos : u32 = comma_pos + 1u32;
+                // loop: bounds[BOUND_SMALL] — bounded by arg length.
+                loop: bounds[BOUND_SMALL] while colon_pos < packet.arguments.len() {
+                    if packet.arguments.get_byte(colon_pos) == ':' as u8 {
+                        break;
+                    }
+                    colon_pos += 1u32;
+                }
+
+                if colon_pos >= packet.arguments.len() {
+                    return Result::Err(FixedString256::from("invalid X packet format"));
+                }
+
+                let addr_str : FixedString256 = packet.arguments.substring(0u32, comma_pos);
+                let address : u64 = __builtin_parse_hex_u64(addr_str);
+                let binary_data : FixedString256 = packet.arguments.substring(colon_pos + 1u32, packet.arguments.len());
+
+                let result : Result<GdbStub, FixedString256> =
+                    self.write_memory_binary(address, binary_data);
+                match result {
+                    Result::Ok(stub) => Result::Ok((stub, FixedString256::from("OK"))),
+                    Result::Err(msg) => Result::Err(msg),
+                }
+            },
+            _ => {
+                // Unknown/unsupported packet — return empty response.
+                Result::Ok((self, FixedString256::new()))
+            },
+        }
+    }
+
+    /// Main GDB stub event loop (single iteration).
+    /// Effect: io, debug, memory — processes one packet.
+    pub fn run_one_iteration(mut self) -> Result<(GdbStub, bool), FixedString256>
+                             [io, debug, memory, diag] {
+        let recv_result : Result<(GdbStub, GdbPacket), FixedString256> = self.receive_packet();
+        let (stub, packet) : (GdbStub, GdbPacket) = match recv_result {
+            Result::Ok(r) => r,
+            Result::Err(msg) => return Result::Err(msg),
+        };
+        self = stub;
+
+        // Handle ACK/NACK.
+        if packet.packet_type == GdbPacketType::Ack {
+            if packet.checksum_valid {
+                // Positive ACK.
+                return Result::Ok((self, true));
+            } else {
+                // Negative ACK — resend last packet.
+                return Result::Ok((self, false));
+            }
+        }
+
+        // Process the packet.
+        let process_result : Result<(GdbStub, FixedString256), FixedString256> =
+            self.process_packet(packet);
+        let (stub2, response) : (GdbStub, FixedString256) = match process_result {
+            Result::Ok(r) => r,
+            Result::Err(msg) => {
+                // Send error response.
+                let final_stub : GdbStub = stub2.send_error(1u8);
+                return Result::Ok((final_stub, false));
+            },
+        };
+        self = stub2;
+
+        // Send response if non-empty.
+        if response.len() > 0u32 {
+            self = self.send_packet(response);
+        } else {
+            self = self.send_ack();
+        }
+
+        Result::Ok((self, true))
+    }
+
+    // ──────────────────────────────────────────
+    // GDB Signal Handling Utilities
+    // ──────────────────────────────────────────
+
+    /// Convert a trap reason to a GDB signal number.
+    /// Effect: pure — conversion.
+    pub fn trap_to_gdb_signal(trap_reason : u32) -> GdbSignal [pure] {
+        match trap_reason {
+            0u32 => GdbSignal::SignalTrap,
+            1u32 => GdbSignal::SignalInt,
+            2u32 => GdbSignal::SignalSegv,
+            3u32 => GdbSignal::SignalIll,
+            4u32 => GdbSignal::SignalFpe,
+            5u32 => GdbSignal::SignalBus,
+            6u32 => GdbSignal::SignalAbort,
+            _ => GdbSignal::SignalTrap,
+        }
+    }
+
+    /// Get the default stop reason for a newly attached target.
+    /// Effect: pure — default stop.
+    pub fn default_stop_reason() -> StopReason [pure] {
+        StopReason {
+            signal: GdbSignal::SignalTrap,
+            thread_id: 1u32,
+            registers: Array64::new(),
+        }
+    }
+
+    /// Check if the stub is connected to a remote client.
+    /// Effect: pure — connection check.
+    pub fn is_connected(&self) -> bool [pure] {
+        self.connected
+    }
+
+    /// Get the number of packets processed.
+    /// Effect: pure — packet count.
+    pub fn packet_count(&self) -> u32 [pure] {
+        self.packet_count
+    }
+
+    /// Get the receive error count.
+    /// Effect: pure — error count.
+    pub fn rx_error_count(&self) -> u32 [pure] {
+        self.rx_error_count
+    }
+
+    /// Reset the stub state for a new connection.
+    /// Effect: pure — state reset.
+    pub fn reset(mut self) -> GdbStub [pure] {
+        self.rx_buffer.clear();
+        self.tx_buffer.clear();
+        self.selected_thread = 1u32;
+        self.extended_mode = false;
+        self.connected = false;
+        self.packet_count = 0u32;
+        self.rx_error_count = 0u32;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// GDB Protocol Utility Functions
+// ──────────────────────────────────────────────
+
+/// Parse an XML target description and register the features.
+/// Effect: io — XML parsing.
+pub fn parse_target_description_xml(stub : ref mut GdbStub, xml : FixedString256) -> Result<(), FixedString256> [io] {
+    if xml.len() == 0u32 {
+        return Result::Err(FixedString256::from("empty XML"));
+    }
+    stub.target_description.xml = xml;
+    Result::Ok(())
+}
+
+/// Handle a "vCont" packet (extended continue/step).
+/// Effect: debug, io — extended continue.
+pub fn handle_vcont_packet(stub : ref mut GdbStub, args : FixedString256) -> Result<FixedString256, FixedString256> [debug, io] {
+    if args.len() == 0u32 {
+        return Result::Ok(FixedString256::from("vCont;c;s;t"));
+    }
+    if args.get_byte(0u32) == 'c' as u8 {
+        let _ = stub.handle_continue();
+        return Result::Ok(FixedString256::new());
+    } else if args.get_byte(0u32) == 's' as u8 {
+        let _ = stub.handle_step();
+        return Result::Ok(FixedString256::new());
+    }
+    Result::Ok(FixedString256::new())
+}
+
+/// Check if the raw byte is an interrupt (0x03).
+/// Effect: pure — check.
+pub fn is_interrupt_byte(byte : u8) -> bool [pure] {
+    byte == 0x03u8
+}
+
+/// Compute a CRC-CCITT checksum for a packet string.
+/// Effect: pure — checksum.
+pub fn compute_crc_ccitt(data : FixedString256) -> u16 [pure] {
+    var crc : u16 = 0xFFFFu16;
+    for var i : u32 = 0u32; i < data.len(); i += 1u32 [data.len()] {
+        crc ^= data.get_byte(i) as u16;
+        for var j : u8 = 0u8; j < 8u8; j += 1u8 [8u8] {
+            if crc & 0x0001u16 != 0u16 {
+                crc = (crc >> 1u16) ^ 0x8408u16;
+            } else {
+                crc >>= 1u16;
+            }
+        }
+    }
+    !crc
+}
+
+/// Validate that a string is valid hexadecimal.
+/// Effect: pure — validation.
+pub fn is_valid_hex(s : FixedString256) -> bool [pure] {
+    if s.len() % 2u32 != 0u32 { return false; }
+    for var i : u32 = 0u32; i < s.len(); i += 1u32 [s.len()] {
+        let ch : u8 = s.get_byte(i);
+        if !((ch >= '0' as u8 && ch <= '9' as u8) ||
+             (ch >= 'a' as u8 && ch <= 'f' as u8) ||
+             (ch >= 'A' as u8 && ch <= 'F' as u8)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Format a u64 as a big-endian hex string (GDB-style).
+/// Effect: pure — formatting.
+pub fn u64_to_hex_be(value : u64, bytes : u32) -> FixedString64 [pure] {
+    var result : FixedString64 = FixedString64::new();
+    for var i : u32 = 0u32; i < bytes; i += 1u32 [bytes] {
+        let shift : u32 = (bytes - 1u32 - i) * 8u32;
+        let b : u8 = ((value >> shift) & 0xFFu64) as u8;
+        let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(b);
+        let _ = result.push_byte(hi);
+        let _ = result.push_byte(lo);
+    }
+    result
+}
+
+/// Check if a packet response is an error (starts with 'E').
+/// Effect: pure — error check.
+pub fn is_error_resp(response : FixedString256) -> bool [pure] {
+    response.len() > 0u32 && response.get_byte(0u32) == 'E' as u8
+}
+
+/// Extract the numeric error code from an "Enn" response.
+/// Effect: pure — extraction.
+pub fn extract_err_code(response : FixedString256) -> Result<u8, FixedString256> [pure] {
+    if response.len() < 3u32 || response.get_byte(0u32) != 'E' as u8 {
+        return Result::Err(FixedString256::from("not an error"));
+    }
+    GdbStub::hex_to_byte(response.get_byte(1u32), response.get_byte(2u32))
+}
+
+/// Encode a set of thread IDs as an XML string for qXfer:threads:read.
+pub fn encode_thread_list_xml(threads : Array64<ThreadInfo>) -> FixedString1024 [io] {
+    var xml : FixedString1024 = FixedString1024::new();
+    xml.push_str(FixedString256::from("<threads>\n"));
+    for var i : u32 = 0u32; i < threads.len(); i += 1u32 [threads.len()] {
+        let t : ThreadInfo = threads.get(i);
+        xml.push_str(FixedString256::from("  <thread id=\""));
+        xml.push_u32(t.thread_id);
+        xml.push_str(FixedString256::from("\" name=\""));
+        xml.push_str(FixedString256::from_buffer(t.name));
+        xml.push_str(FixedString256::from("\" core=\""));
+        xml.push_u32(if t.is_current { 1u32 } else { 0u32 });
+        xml.push_str(FixedString256::from("\"/>\n"));
+    }
+    xml.push_str(FixedString256::from("</threads>\n"));
+    xml
+}
+
+/// Encode target features XML for qXfer:features:read.
+pub fn encode_features_xml(arch : FixedString64) -> FixedString1024 [io] {
+    var xml : FixedString1024 = FixedString1024::new();
+    xml.push_str(FixedString256::from("<?xml version=\"1.0\"?>\n"));
+    xml.push_str(FixedString256::from("<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n"));
+    xml.push_str(FixedString256::from("<target version=\"1.0\">\n"));
+    xml.push_str(FixedString256::from("  <architecture>"));
+    xml.push_str(FixedString256::from_buffer(arch));
+    xml.push_str(FixedString256::from("</architecture>\n"));
+    xml.push_str(FixedString256::from("  <feature name=\"org.gnu.gdb.i386.core\">\n"));
+    // Register entries.
+    let reg_names : Array32<FixedString64> = Array32::from_fixed([
+        FixedString64::from("rax"), FixedString64::from("rbx"),
+        FixedString64::from("rcx"), FixedString64::from("rdx"),
+        FixedString64::from("rsi"), FixedString64::from("rdi"),
+        FixedString64::from("rbp"), FixedString64::from("rsp"),
+        FixedString64::from("r8"),  FixedString64::from("r9"),
+        FixedString64::from("r10"), FixedString64::from("r11"),
+        FixedString64::from("r12"), FixedString64::from("r13"),
+        FixedString64::from("r14"), FixedString64::from("r15"),
+        FixedString64::from("rip"), FixedString64::from("eflags"),
+        FixedString64::from("cs"),  FixedString64::from("ss"),
+    ]);
+    for var i : u32 = 0u32; i < 20u32; i += 1u32 [20u32] {
+        xml.push_str(FixedString256::from("    <reg name=\""));
+        xml.push_str(FixedString256::from_buffer(reg_names.get(i)));
+        xml.push_str(FixedString256::from("\" bitsize=\"64\" type=\"int64\" group=\"general\"/>\n"));
+    }
+    xml.push_str(FixedString256::from("  </feature>\n"));
+    xml.push_str(FixedString256::from("</target>\n"));
+    xml
+}
+
+/// Format a register value for display (hex with leading zeros).
+pub fn format_reg_value(value : u64) -> FixedString64 [pure] {
+    var result : FixedString64 = FixedString64::new();
+    result.push_str(FixedString64::from("0x"));
+    for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+        let shift : u32 = (15u32 - i) * 4u32;
+        let nibble : u8 = ((value >> shift) & 0xFu64) as u8;
+        let ch : u8 = if nibble < 10u8 { '0' as u8 + nibble } else { 'a' as u8 + nibble - 10u8 };
+        let _ = result.push_byte(ch);
+    }
+    result
+}
+
+/// Check if a value is likely a valid memory address for GDB.
+pub fn is_valid_gdb_address(addr : u64) -> bool [pure] {
+    addr > 0x1000u64 && addr < 0xFFFF800000000000u64
+}
+
+/// Compute the thread ID string for the 'T' stop reply.
+pub fn thread_id_string(tid : u32) -> FixedString64 [pure] {
+    var result : FixedString64 = FixedString64::new();
+    let (hi, lo) : (u8, u8) = GdbStub::byte_to_hex(tid as u8);
+    let _ = result.push_byte(hi);
+    let _ = result.push_byte(lo);
+    result
+}

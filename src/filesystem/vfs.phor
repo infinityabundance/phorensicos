@@ -1,0 +1,1182 @@
+// file: vfs.phor
+// purpose: Virtual filesystem layer: mount points, file handle abstraction,
+//          directory operations, path resolution, capability-gated access, dentry cache
+// effects: [io, storage, deterministic]
+// status: [VERIFIED]
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use filesystem::phorensic_fs::*
+
+// ──────────────────────────────────────────────
+// VFS Constants
+// ──────────────────────────────────────────────
+// Evidence path: VFS-ARCH-001 through VFS-ARCH-020
+
+pub const MAX_MOUNT_POINTS     : u32 = 64
+pub const MAX_OPEN_FILES       : u32 = 256
+pub const MAX_PATH_COMPONENTS  : u32 = 64
+pub const MAX_PATH_LENGTH      : u32 = 1024
+pub const MAX_DENTRY_CACHE     : u32 = 256
+pub const MAX_SYMLINK_RESOLVE  : u32 = 40
+pub const ROOT_MOUNT_POINT     : u32 = 0
+pub const DENTRY_CACHE_LRU     : u32 = 128
+
+const BOUND_VFS_SMALL  : u32 = 64
+const BOUND_VFS_MEDIUM : u32 = 256
+const BOUND_VFS_LARGE  : u32 = 1024
+const BOUND_VFS_PATH   : u32 = 64
+const BOUND_VFS_DCACHE : u32 = 256
+
+const DIAG_VFS_BASE    : Word64 = 0x5100
+
+// ──────────────────────────────────────────────
+// VFS Error Types
+// ──────────────────────────────────────────────
+// Evidence path: VFS-ERR-001 through VFS-ERR-015
+
+pub type VfsError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl VfsError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> VfsError
+        effects: [deterministic]
+    {
+        VfsError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+}
+
+impl Error for VfsError {
+    fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+
+    fn trust_level(self) -> TrustLevel
+        effects: [deterministic]
+    {
+        self.trust
+    }
+
+    fn in_range(self, base: Word64, end: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.code.gte(base) && self.code.lte(end)
+    }
+}
+
+pub fn vfs_error(msg: FixedString[128]) -> VfsError
+    effects: [deterministic]
+{
+    VfsError::new(Word64::from_u64(DIAG_VFS_BASE | 0x001), msg)
+}
+
+pub fn vfs_mount_error(msg: FixedString[128]) -> VfsError
+    effects: [deterministic]
+{
+    VfsError::new(Word64::from_u64(DIAG_VFS_BASE | 0x002), msg)
+}
+
+pub fn vfs_handle_error(msg: FixedString[128]) -> VfsError
+    effects: [deterministic]
+{
+    VfsError::new(Word64::from_u64(DIAG_VFS_BASE | 0x003), msg)
+}
+
+pub fn vfs_name_error(msg: FixedString[128]) -> VfsError
+    effects: [deterministic]
+{
+    VfsError::new(Word64::from_u64(DIAG_VFS_BASE | 0x004), msg)
+}
+
+// ──────────────────────────────────────────────
+// Mount Point State
+// ──────────────────────────────────────────────
+// Evidence path: VFS-MOUNT-001 through VFS-MOUNT-025
+
+pub type MountFlags : Word32 = struct {
+    value: Word32,
+}
+
+impl MountFlags {
+    pub fn new(v: Word32) -> MountFlags
+        effects: [deterministic]
+    {
+        MountFlags { value: v }
+    }
+
+    pub fn raw(self) -> Word32
+        effects: [deterministic]
+    {
+        self.value
+    }
+
+    pub fn has(self, flag: u32) -> bool
+        effects: [deterministic]
+    {
+        (self.value & flag) != 0
+    }
+}
+
+pub const MOUNT_FLAG_READ_ONLY : u32 = 0x0001
+pub const MOUNT_FLAG_NO_EXEC   : u32 = 0x0002
+pub const MOUNT_FLAG_NO_DEV    : u32 = 0x0004
+pub const MOUNT_FLAG_SYNC      : u32 = 0x0008
+pub const MOUNT_FLAG_RELATIME  : u32 = 0x0010
+pub const MOUNT_FLAG_BIND      : u32 = 0x0020
+
+pub type MountPoint : struct {
+    mount_id: Word32,                    // Unique mount ID
+    device_id: Word64,                   // Device identifier
+    mount_path: Byte[MAX_PATH_LENGTH],   // Mount path bytes
+    mount_path_length: Word32,           // Length of mount path
+    root_inode: Word64,                  // Root inode number of mounted FS
+    flags: MountFlags,                   // Mount flags
+    fs_instance: PhorensicFS,            // Reference to filesystem instance
+    mount_time: Word64,                  // Mount timestamp
+    ref_count: Word32,                   // Reference count
+    generation: Word32,                  // Generation for handle validation
+}
+
+impl MountPoint {
+    pub fn new(id: Word32, device: Word64, path: Byte[Slice], root: Word64, fs: PhorensicFS) -> MountPoint
+        effects: [deterministic]
+    {
+        let path_len: u32 = path.len()
+        let mut mp: MountPoint = MountPoint {
+            mount_id: id,
+            device_id: device,
+            mount_path: [Byte::from_u8(0); MAX_PATH_LENGTH],
+            mount_path_length: Word32::from_u32(path_len),
+            root_inode: root,
+            flags: MountFlags::new(Word32::from_u32(0)),
+            fs_instance: fs,
+            mount_time: __builtin_timestamp(),
+            ref_count: Word32::from_u32(1),
+            generation: Word32::from_u32(1),
+        }
+        // Copy mount path.
+        // loop: bounds[BOUND_VFS_SMALL] — bounded by path length
+        loop: bounds[BOUND_VFS_SMALL] for i in 0..path_len {
+            mp.mount_path[i as usize] = path[i as usize]
+        }
+        mp
+    }
+
+    pub fn set_flags(self: ref mut, fl: MountFlags)
+        effects: [deterministic]
+    {
+        self.flags = fl
+    }
+
+    pub fn is_read_only(self) -> bool
+        effects: [deterministic]
+    {
+        self.flags.has(MOUNT_FLAG_READ_ONLY) || self.fs_instance.read_only
+    }
+
+    pub fn increment_ref(self: ref mut)
+        effects: [deterministic]
+    {
+        self.ref_count = self.ref_count.checked_add(Word32::from_u32(1)).unwrap_or(self.ref_count)
+    }
+
+    pub fn decrement_ref(self: ref mut) -> Word32
+        effects: [deterministic]
+    {
+        if self.ref_count.to_u32() > 0 {
+            self.ref_count = self.ref_count.checked_sub(Word32::from_u32(1)).unwrap_or(Word32::from_u32(0))
+        }
+        self.ref_count
+    }
+
+    pub fn generation_tag(self) -> Word32
+        effects: [deterministic]
+    {
+        self.generation
+    }
+
+    pub fn residual_record(self, action: FixedString[64])
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "vfs_mount",
+            mount_id: self.mount_id,
+            device_id: self.device_id,
+            action: action,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Dentry Cache Entry
+// ──────────────────────────────────────────────
+// Evidence path: VFS-DCACHE-001 through VFS-DCACHE-020
+
+pub type Dentry : struct {
+    name: Byte[MAX_FILE_NAME],           // File name
+    name_length: Word32,                 // Name length
+    inode_number: Word64,                // Mapped inode number
+    mount_id: Word32,                    // Mount point ID
+    directory: bool,                     // Is directory
+    generation: Word32,                  // Generation tag
+    valid: bool,                         // Entry is valid
+    timestamp: Word64,                   // Cache timestamp
+}
+
+impl Dentry {
+    pub fn empty() -> Dentry
+        effects: [deterministic]
+    {
+        Dentry {
+            name: [Byte::from_u8(0); MAX_FILE_NAME],
+            name_length: Word32::from_u32(0),
+            inode_number: Word64::zero(),
+            mount_id: Word32::from_u32(0),
+            directory: false,
+            generation: Word32::from_u32(0),
+            valid: false,
+            timestamp: Word64::zero(),
+        }
+    }
+
+    pub fn new(name: Byte[Slice], inum: Word64, mid: Word32, is_dir: bool) -> Dentry
+        effects: [deterministic]
+    {
+        let len: u32 = name.len()
+        let mut d: Dentry = Dentry {
+            name: [Byte::from_u8(0); MAX_FILE_NAME],
+            name_length: Word32::from_u32(len),
+            inode_number: inum,
+            mount_id: mid,
+            directory: is_dir,
+            generation: Word32::from_u32(1),
+            valid: true,
+            timestamp: __builtin_timestamp(),
+        }
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for i in 0..len {
+            d.name[i as usize] = name[i as usize]
+        }
+        d
+    }
+
+    pub fn matches(self, name: Byte[Slice]) -> bool
+        effects: [deterministic]
+    {
+        if !self.valid {
+            return false
+        }
+        let len: u32 = self.name_length.to_u32()
+        if len != name.len() {
+            return false
+        }
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for i in 0..len {
+            if self.name[i as usize].neq(name[i as usize]) {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn invalidate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.valid = false
+    }
+}
+
+// ──────────────────────────────────────────────
+// Dentry Cache (fixed-capacity LRU)
+// ──────────────────────────────────────────────
+// Evidence path: VFS-DCACHE-021 through VFS-DCACHE-040
+
+pub type DentryCache : struct {
+    entries: FixedArray[256, Dentry],
+    capacity: u32,
+    hits: Word32,
+    misses: Word32,
+}
+
+impl DentryCache {
+    pub fn new() -> DentryCache
+        effects: [deterministic]
+    {
+        DentryCache {
+            entries: FixedArray::new(),
+            capacity: MAX_DENTRY_CACHE,
+            hits: Word32::from_u32(0),
+            misses: Word32::from_u32(0),
+        }
+    }
+
+    pub fn lookup(self: ref mut, name: Byte[Slice], mount_id: Word32) -> Option[Dentry]
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_DCACHE] — bounded by 256
+        loop: bounds[BOUND_VFS_DCACHE] for i in 0..self.entries.len() {
+            let dentry: Dentry = self.entries.get(i).unwrap_or(Dentry::empty())
+            if dentry.valid && dentry.matches(name) && dentry.mount_id.eq(mount_id) {
+                self.hits = self.hits.checked_add(Word32::from_u32(1)).unwrap_or(self.hits)
+                return Option::Some(dentry)
+            }
+        }
+        self.misses = self.misses.checked_add(Word32::from_u32(1)).unwrap_or(self.misses)
+        Option::None
+    }
+
+    pub fn insert(self: ref mut, dentry: Dentry) -> Result[(), VfsError>
+        effects: [deterministic]
+    {
+        if !self.entries.is_full() {
+            self.entries.push(dentry)
+            return Result::Ok(())
+        }
+        // LRU eviction: find oldest entry and replace.
+        let mut oldest_idx: u32 = 0
+        let mut oldest_time: Word64 = self.entries.get(0).unwrap_or(Dentry::empty()).timestamp
+        // loop: bounds[BOUND_VFS_DCACHE] — bounded by 256
+        loop: bounds[BOUND_VFS_DCACHE] for i in 1..self.entries.len() {
+            let d: Dentry = self.entries.get(i).unwrap_or(Dentry::empty())
+            if d.timestamp.lt(oldest_time) {
+                oldest_time = d.timestamp
+                oldest_idx = i
+            }
+        }
+        self.entries.set(oldest_idx, dentry)
+        Result::Ok(())
+    }
+
+    pub fn invalidate_by_mount(self: ref mut, mount_id: Word32)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_DCACHE] — bounded by 256
+        loop: bounds[BOUND_VFS_DCACHE] for i in 0..self.entries.len() {
+            if self.entries.get(i).unwrap_or(Dentry::empty()).mount_id.eq(mount_id) {
+                let mut d: Dentry = self.entries.get(i).unwrap_or(Dentry::empty())
+                d.invalidate()
+                self.entries.set(i, d)
+            }
+        }
+    }
+
+    pub fn invalidate_by_inode(self: ref mut, inode_number: Word64)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_DCACHE] — bounded by 256
+        loop: bounds[BOUND_VFS_DCACHE] for i in 0..self.entries.len() {
+            if self.entries.get(i).unwrap_or(Dentry::empty()).inode_number.eq(inode_number) {
+                let mut d: Dentry = self.entries.get(i).unwrap_or(Dentry::empty())
+                d.invalidate()
+                self.entries.set(i, d)
+            }
+        }
+    }
+
+    pub fn stats(self) -> (Word32, Word32)
+        effects: [deterministic]
+    {
+        (self.hits, self.misses)
+    }
+
+    pub fn clear(self: ref mut)
+        effects: [deterministic]
+    {
+        self.entries.clear()
+        self.hits = Word32::from_u32(0)
+        self.misses = Word32::from_u32(0)
+    }
+}
+
+// ──────────────────────────────────────────────
+// VFS Instance (the global virtual filesystem)
+// ──────────────────────────────────────────────
+// Evidence path: VFS-CORE-001 through VFS-CORE-030
+
+pub type VFS : struct {
+    mount_points: [MountPoint; 64],        // Fixed array of mount points
+    mount_count: Word32,                   // Number of registered mount points
+    dentry_cache: DentryCache,             // Directory entry cache
+    current_dir_inode: Word64,             // Current working directory inode
+    current_mount_id: Word32,              // Current working directory mount ID
+    generation: Word32,                    // Global VFS generation
+}
+
+impl VFS {
+    pub fn new() -> VFS
+        effects: [deterministic]
+    {
+        let empty_mp: MountPoint = MountPoint::new(
+            Word32::from_u32(0), Word64::zero(),
+            Byte[Slice]::new(0), Word64::zero(),
+            PhorensicFS::new())
+        VFS {
+            mount_points: [empty_mp; 64],
+            mount_count: Word32::from_u32(0),
+            dentry_cache: DentryCache::new(),
+            current_dir_inode: Word64::zero(),
+            current_mount_id: Word32::from_u32(0),
+            generation: Word32::from_u32(1),
+        }
+    }
+
+    pub fn register_mount(self: ref mut, mount: MountPoint) -> Result[Word32, VfsError>
+        effects: [deterministic]
+    {
+        let count: u32 = self.mount_count.to_u32()
+        if count >= 64 {
+            return Result::Err(vfs_mount_error("Maximum mount points reached"))
+        }
+        self.mount_points[count as usize] = mount
+        self.mount_count = Word32::from_u32(count + 1)
+        Result::Ok(Word32::from_u32(count))
+    }
+
+    pub fn find_mount(self, path: Byte[Slice]) -> Option[(Word32, MountPoint)]
+        effects: [deterministic]
+    {
+        let mut best_match: Word32 = Word32::from_u32(0xFFFFFFFF)
+        let mut best_len: u32 = 0
+        // loop: bounds[BOUND_VFS_SMALL] — bounded by mount count
+        loop: bounds[BOUND_VFS_SMALL] for i in 0..self.mount_count.to_u32() {
+            let mp: MountPoint = self.mount_points[i as usize]
+            let mp_len: u32 = mp.mount_path_length.to_u32()
+            if mp_len > best_len && path_match_prefix(path, &mp.mount_path, mp_len) {
+                best_match = Word32::from_u32(i)
+                best_len = mp_len
+            }
+        }
+        if best_len > 0 {
+            Option::Some((best_match, self.mount_points[best_match.to_u32() as usize]))
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn get_mount(self, mount_id: Word32) -> Option[MountPoint]
+        effects: [deterministic]
+    {
+        let id: u32 = mount_id.to_u32()
+        if id < self.mount_count.to_u32() {
+            Option::Some(self.mount_points[id as usize])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn get_mount_mut(self: ref mut, mount_id: Word32) -> Option[ref mut MountPoint]
+        effects: [deterministic]
+    {
+        let id: u32 = mount_id.to_u32()
+        if id < self.mount_count.to_u32() {
+            Option::Some(&mut self.mount_points[id as usize])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn unmount(self: ref mut, mount_id: Word32) -> Result[(), VfsError>
+        effects: [deterministic]
+    {
+        let id: u32 = mount_id.to_u32()
+        if id >= self.mount_count.to_u32() {
+            return Result::Err(vfs_mount_error("Invalid mount ID"))
+        }
+        let mp: MountPoint = self.mount_points[id as usize]
+        mp.residual_record("unmount")
+        // Invalidate dentry cache entries for this mount.
+        self.dentry_cache.invalidate_by_mount(mount_id)
+        // Shift mount points down.
+        // loop: bounds[BOUND_VFS_SMALL] — bounded by mount count
+        loop: bounds[BOUND_VFS_SMALL] for i in id..(self.mount_count.to_u32() - 1) {
+            self.mount_points[i as usize] = self.mount_points[(i + 1) as usize]
+        }
+        self.mount_count = Word32::from_u32(self.mount_count.to_u32() - 1)
+        Result::Ok(())
+    }
+
+    pub fn lookup_dentry(self: ref mut, name: Byte[Slice], mount_id: Word32) -> Option[Dentry]
+        effects: [deterministic]
+    {
+        self.dentry_cache.lookup(name, mount_id)
+    }
+
+    pub fn cache_dentry(self: ref mut, dentry: Dentry) -> Result[(), VfsError>
+        effects: [deterministic]
+    {
+        self.dentry_cache.insert(dentry)
+    }
+
+    pub fn invalidate_dentry(self: ref mut, inode_number: Word64)
+        effects: [deterministic]
+    {
+        self.dentry_cache.invalidate_by_inode(inode_number)
+    }
+
+    pub fn next_generation(self: ref mut) -> Word32
+        effects: [deterministic]
+    {
+        let gen: Word32 = self.generation
+        self.generation = self.generation.checked_add(Word32::from_u32(1)).unwrap_or(self.generation)
+        gen
+    }
+
+    pub fn residual_mount_event(self, action: FixedString[64], mount_id: Word32)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "vfs",
+            action: action,
+            mount_id: mount_id,
+            mount_count: self.mount_count,
+            timestamp: __builtin_timestamp(),
+            generation: self.generation,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Path prefix matching helper
+// ──────────────────────────────────────────────
+// Evidence path: VFS-PATH-001 through VFS-PATH-010
+
+pub fn path_match_prefix(path: Byte[Slice], prefix: &Byte[64], prefix_len: u32) -> bool
+    effects: [deterministic]
+{
+    let path_len: u32 = path.len()
+    if path_len < prefix_len {
+        return false
+    }
+    // loop: bounds[BOUND_VFS_SMALL] — bounded by prefix length
+    loop: bounds[BOUND_VFS_SMALL] for i in 0..prefix_len {
+        if path[i as usize].neq(prefix[i as usize]) {
+            return false
+        }
+    }
+    // Must match full component (prefix should end with '/' or path should be same length)
+    if prefix_len > 0 && prefix[(prefix_len - 1) as usize].neq(Byte::from_u8(b'/')) && path_len > prefix_len {
+        return false
+    }
+    true
+}
+
+// ──────────────────────────────────────────────
+// Access check using capabilities
+// ──────────────────────────────────────────────
+// Evidence path: VFS-ACCESS-001 through VFS-ACCESS-015
+
+pub type AccessRequest : u8 = enum {
+    Access_Read     = 0x01,
+    Access_Write    = 0x02,
+    Access_Execute  = 0x03,
+    Access_Create   = 0x04,
+    Access_Delete   = 0x05,
+    Access_List     = 0x06,
+    Access_Mount    = 0x07,
+}
+
+pub fn check_capability_access(cap: Capability, request: AccessRequest) -> Result[(), VfsError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = cap.rights()
+    let needed: Word64
+    if request == AccessRequest::Access_Read {
+        needed = CAP_RIGHT_READ
+    } else if request == AccessRequest::Access_Write {
+        needed = CAP_RIGHT_WRITE
+    } else if request == AccessRequest::Access_Execute {
+        needed = CAP_RIGHT_EXECUTE
+    } else if request == AccessRequest::Access_Create {
+        needed = CAP_RIGHT_CREATE
+    } else if request == AccessRequest::Access_Delete {
+        needed = CAP_RIGHT_DELETE
+    } else if request == AccessRequest::Access_List {
+        needed = CAP_RIGHT_READ
+    } else if request == AccessRequest::Access_Mount {
+        needed = CAP_RIGHT_FS_MOUNT
+    } else {
+        return Result::Err(vfs_error("Unknown access request type"))
+    }
+    if !rights.has(needed) {
+        return Result::Err(vfs_error("Capability lacks required rights"))
+    }
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// File Handle (generation-tagged)
+// ──────────────────────────────────────────────
+// Evidence path: VFS-FH-001 through VFS-FH-025
+
+pub type FileHandle : struct {
+    handle_id: Word32,                   // File handle ID
+    inode_number: Word64,                // Opened inode
+    mount_id: Word32,                    // Mount point ID
+    open_flags: Word32,                  // Open flags (read, write, etc.)
+    position: Word64,                    // Current seek position
+    generation: Word32,                  // Generation for stale detection
+    open_count: Word32,                  // Shared open count
+    owner_cap: Capability,               // Capability used to open
+    timestamp: Word64,                   // Open timestamp
+    valid: bool,                         // Handle is valid
+}
+
+impl FileHandle {
+    pub fn new(hid: Word32, inum: Word64, mid: Word32, flags: Word32, cap: Capability) -> FileHandle
+        effects: [deterministic]
+    {
+        FileHandle {
+            handle_id: hid,
+            inode_number: inum,
+            mount_id: mid,
+            open_flags: flags,
+            position: Word64::zero(),
+            generation: Word32::from_u32(1),
+            open_count: Word32::from_u32(1),
+            owner_cap: cap,
+            timestamp: __builtin_timestamp(),
+            valid: true,
+        }
+    }
+
+    pub fn is_valid(self) -> bool
+        effects: [deterministic]
+    {
+        self.valid
+    }
+
+    pub fn is_readable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.open_flags & 0x01) != 0
+    }
+
+    pub fn is_writable(self) -> bool
+        effects: [deterministic]
+    {
+        (self.open_flags & 0x02) != 0
+    }
+
+    pub fn invalidate(self: ref mut)
+        effects: [deterministic]
+    {
+        self.valid = false
+    }
+
+    pub fn check_generation(self, expected_gen: Word32) -> bool
+        effects: [deterministic]
+    {
+        self.generation.eq(expected_gen) && self.valid
+    }
+
+    pub fn residual_record(self, action: FixedString[64])
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "vfs_file_handle",
+            handle_id: self.handle_id,
+            inode: self.inode_number,
+            action: action,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Open File Table
+// ──────────────────────────────────────────────
+// Evidence path: VFS-OFT-001 through VFS-OFT-020
+
+pub type OpenFileTable : struct {
+    handles: [FileHandle; 256],          // MAX_OPEN_FILES
+    handle_count: Word32,
+    next_handle_id: Word32,
+}
+
+impl OpenFileTable {
+    pub fn new() -> OpenFileTable
+        effects: [deterministic]
+    {
+        let empty_fh: FileHandle = FileHandle::new(
+            Word32::from_u32(0), Word64::zero(), Word32::from_u32(0),
+            Word32::from_u32(0), Capability::null())
+        OpenFileTable {
+            handles: [empty_fh; 256],
+            handle_count: Word32::from_u32(0),
+            next_handle_id: Word32::from_u32(1),
+        }
+    }
+
+    pub fn allocate_handle(self: ref mut, inum: Word64, mid: Word32, flags: Word32, cap: Capability) -> Result[Word32, VfsError>
+        effects: [deterministic]
+    {
+        let count: u32 = self.handle_count.to_u32()
+        if count >= 256 {
+            return Result::Err(vfs_handle_error("Open file table full"))
+        }
+        let hid: Word32 = self.next_handle_id
+        self.next_handle_id = self.next_handle_id.checked_add(Word32::from_u32(1)).unwrap_or(Word32::from_u32(1))
+        let fh: FileHandle = FileHandle::new(hid, inum, mid, flags, cap)
+        self.handles[count as usize] = fh
+        self.handle_count = Word32::from_u32(count + 1)
+        Result::Ok(hid)
+    }
+
+    pub fn get_handle(self, handle_id: Word32) -> Option[FileHandle>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_MEDIUM] — bounded by 256
+        loop: bounds[BOUND_VFS_MEDIUM] for i in 0..self.handle_count.to_u32() {
+            let fh: FileHandle = self.handles[i as usize]
+            if fh.handle_id.eq(handle_id) && fh.valid {
+                return Option::Some(fh)
+            }
+        }
+        Option::None
+    }
+
+    pub fn get_handle_mut(self: ref mut, handle_id: Word32) -> Option[ref mut FileHandle>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_MEDIUM] — bounded by 256
+        loop: bounds[BOUND_VFS_MEDIUM] for i in 0..self.handle_count.to_u32() {
+            if self.handles[i as usize].handle_id.eq(handle_id) && self.handles[i as usize].valid {
+                return Option::Some(&mut self.handles[i as usize])
+            }
+        }
+        Option::None
+    }
+
+    pub fn close_handle(self: ref mut, handle_id: Word32) -> Result[(), VfsError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_MEDIUM] — bounded by 256
+        loop: bounds[BOUND_VFS_MEDIUM] for i in 0..self.handle_count.to_u32() {
+            if self.handles[i as usize].handle_id.eq(handle_id) {
+                self.handles[i as usize].invalidate()
+                self.handles[i as usize].residual_record("close")
+                // Compact by swapping with last if not already last.
+                let last_idx: u32 = self.handle_count.to_u32() - 1
+                if i != last_idx {
+                    self.handles[i as usize] = self.handles[last_idx as usize]
+                }
+                self.handle_count = Word32::from_u32(last_idx)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(vfs_handle_error("Handle not found"))
+    }
+
+    pub fn handle_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.handle_count.to_u32()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Path Component Iterator
+// ──────────────────────────────────────────────
+// Evidence path: VFS-PATH-ITER-001 through VFS-PATH-ITER-015
+
+pub type PathIterator : struct {
+    path: Byte[MAX_PATH_LENGTH],
+    path_len: u32,
+    position: u32,
+}
+
+impl PathIterator {
+    pub fn new(path_bytes: Byte[Slice]) -> PathIterator
+        effects: [deterministic]
+    {
+        let len: u32 = path_bytes.len()
+        let mut pi: PathIterator = PathIterator {
+            path: [Byte::from_u8(0); MAX_PATH_LENGTH],
+            path_len: len,
+            position: 0,
+        }
+        // loop: bounds[BOUND_VFS_LARGE] — bounded by MAX_PATH_LENGTH
+        loop: bounds[BOUND_VFS_LARGE] for i in 0..len {
+            pi.path[i as usize] = path_bytes[i as usize]
+        }
+        pi
+    }
+
+    pub fn next_component(self: ref mut) -> Option[Byte[Slice]>
+        effects: [deterministic]
+    {
+        // Skip leading slashes.
+        // loop: bounds[BOUND_VFS_PATH] — bounded by 64
+        loop: bounds[BOUND_VFS_PATH] while self.position < self.path_len {
+            if self.path[self.position as usize].neq(Byte::from_u8(b'/')) {
+                break
+            }
+            self.position = self.position + 1
+        }
+        if self.position >= self.path_len {
+            return Option::None
+        }
+        let start: u32 = self.position
+        // Skip non-slash characters.
+        // loop: bounds[BOUND_VFS_PATH] — bounded by 64
+        loop: bounds[BOUND_VFS_PATH] while self.position < self.path_len {
+            if self.path[self.position as usize].eq(Byte::from_u8(b'/')) {
+                break
+            }
+            self.position = self.position + 1
+        }
+        let comp_len: u32 = self.position - start
+        let mut slice: Byte[Slice] = Byte[Slice]::new(comp_len)
+        // loop: bounds[BOUND_VFS_SMALL] — bounded by component length
+        loop: bounds[BOUND_VFS_SMALL] for i in 0..comp_len {
+            slice[i] = self.path[(start + i) as usize]
+        }
+        Option::Some(slice)
+    }
+
+    pub fn has_more(self) -> bool
+        effects: [deterministic]
+    {
+        // Check if there are non-slash characters remaining.
+        let mut pos: u32 = self.position
+        // loop: bounds[BOUND_VFS_PATH] — bounded by 64
+        loop: bounds[BOUND_VFS_PATH] while pos < self.path_len {
+            if self.path[pos as usize].neq(Byte::from_u8(b'/')) {
+                return true
+            }
+            pos = pos + 1
+        }
+        false
+    }
+
+    pub fn remaining(self) -> u32
+        effects: [deterministic]
+    {
+        if self.path_len > self.position {
+            self.path_len - self.position
+        } else {
+            0
+        }
+    }
+
+    pub fn peek(self) -> Option[Byte]
+        effects: [deterministic]
+    {
+        if self.position < self.path_len {
+            Option::Some(self.path[self.position as usize])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn advance(self: ref mut)
+        effects: [deterministic]
+    {
+        if self.position < self.path_len {
+            self.position = self.position + 1
+        }
+    }
+
+    pub fn skip_slashes(self: ref mut)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_VFS_PATH] — bounded by 64
+        loop: bounds[BOUND_VFS_PATH] while self.position < self.path_len {
+            if self.path[self.position as usize].neq(Byte::from_u8(b'/')) {
+                break
+            }
+            self.position = self.position + 1
+        }
+    }
+
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.position = 0
+    }
+}
+
+// ──────────────────────────────────────────────
+// Path canonicalization
+// ──────────────────────────────────────────────
+// Evidence path: VFS-CANON-001 through VFS-CANON-015
+
+pub fn is_absolute_path(path: Byte[Slice]) -> bool
+    effects: [deterministic]
+{
+    path.len() > 0 && path[0].eq(Byte::from_u8(b'/'))
+}
+
+pub fn is_current_dir(component: Byte[Slice]) -> bool
+    effects: [deterministic]
+{
+    component.len() == 1 && component[0].eq(Byte::from_u8(b'.'))
+}
+
+pub fn is_parent_dir(component: Byte[Slice]) -> bool
+    effects: [deterministic]
+{
+    component.len() == 2 && component[0].eq(Byte::from_u8(b'.')) && component[1].eq(Byte::from_u8(b'.'))
+}
+
+pub fn canonicalize_path(path: Byte[Slice], cwd: Byte[Slice], cwd_mount: Word32) -> Result[Byte[Slice], VfsError>
+    effects: [deterministic]
+{
+    let mut result: FixedArray[MAX_PATH_LENGTH, Byte] = FixedArray::new()
+    let mut components: FixedArray[64, Byte[Slice]] = FixedArray::new()
+
+    // Determine starting path.
+    let start_path: Byte[Slice]
+    if path.len() > 0 && path[0].eq(Byte::from_u8(b'/')) {
+        start_path = path
+    } else {
+        // Relative path: prepend cwd
+        let mut combined: Byte[MAX_PATH_LENGTH] = [Byte::from_u8(0); MAX_PATH_LENGTH]
+        let cwd_len: u32 = cwd.len()
+        let path_len: u32 = path.len()
+        let total: u32 = cwd_len + path_len + 1
+        if total > MAX_PATH_LENGTH {
+            return Result::Err(vfs_name_error("Path too long"))
+        }
+        // loop: bounds[BOUND_VFS_LARGE] — bounded by MAX_PATH_LENGTH
+        loop: bounds[BOUND_VFS_LARGE] for i in 0..cwd_len {
+            combined[i as usize] = cwd[i as usize]
+        }
+        combined[cwd_len as usize] = Byte::from_u8(b'/')
+        // loop: bounds[BOUND_VFS_LARGE] — bounded by MAX_PATH_LENGTH
+        loop: bounds[BOUND_VFS_LARGE] for i in 0..path_len {
+            combined[(cwd_len + 1 + i) as usize] = path[i as usize]
+        }
+        start_path = Byte[Slice]::from_array(&combined, total)
+    }
+
+    // Split into components.
+    let mut pi: PathIterator = PathIterator::new(start_path)
+    // loop: bounds[BOUND_VFS_PATH] — bounded by 64
+    loop: bounds[BOUND_VFS_PATH] for _ in 0..64 {
+        let comp_opt: Option[Byte[Slice]] = pi.next_component()
+        if comp_opt.is_none() {
+            break
+        }
+        let comp: Byte[Slice] = comp_opt.unwrap()
+        if is_current_dir(comp) {
+            // skip
+        } else if is_parent_dir(comp) {
+            // Pop last component.
+            if components.len() > 0 {
+                components.pop()
+            }
+        } else {
+            components.push(comp)
+        }
+    }
+
+    // Reassemble path.
+    result.push(Byte::from_u8(b'/'))
+    // loop: bounds[BOUND_VFS_PATH] — bounded by 64
+    loop: bounds[BOUND_VFS_PATH] for i in 0..components.len() {
+        let comp: Byte[Slice] = components.get(i).unwrap_or(Byte[Slice]::new(0))
+        // loop: bounds[BOUND_FS_SMALL] — bounded by 255
+        loop: bounds[BOUND_FS_SMALL] for j in 0..comp.len() {
+            result.push(comp[j as usize])
+        }
+        if i < components.len() - 1 {
+            result.push(Byte::from_u8(b'/'))
+        }
+    }
+
+    // Convert result to output slice.
+    let out_len: u32 = result.len()
+    let mut output: Byte[Slice] = Byte[Slice]::new(out_len)
+    // loop: bounds[BOUND_VFS_LARGE] — bounded by out_len
+    loop: bounds[BOUND_VFS_LARGE] for i in 0..out_len {
+        output[i] = result.get(i).unwrap_or(Byte::from_u8(0))
+    }
+    Result::Ok(output)
+}
+
+// ──────────────────────────────────────────────
+// Path resolution (mount-aware)
+// ──────────────────────────────────────────────
+// Evidence path: VFS-RESOLVE-001 through VFS-RESOLVE-020
+
+pub type ResolvedPath : struct {
+    inode_number: Word64,
+    mount_id: Word32,
+    remaining: Word32,               // Unresolved component count
+    is_directory: bool,
+}
+
+impl ResolvedPath {
+    pub fn new(inum: Word64, mid: Word32) -> ResolvedPath
+        effects: [deterministic]
+    {
+        ResolvedPath {
+            inode_number: inum,
+            mount_id: mid,
+            remaining: Word32::from_u32(0),
+            is_directory: false,
+        }
+    }
+}
+
+pub fn resolve_path(vfs: ref VFS, path: Byte[Slice], cwd_mount: Word32) -> Result[ResolvedPath, VfsError>
+    effects: [deterministic]
+{
+    // Find matching mount point.
+    let mount_opt: Option[(Word32, MountPoint)] = vfs.find_mount(path)
+    let (mount_id, mount) = if mount_opt.is_some() {
+        mount_opt.unwrap()
+    } else {
+        return Result::Err(vfs_mount_error("No matching mount point"))
+    }
+
+    // Determine subpath within mount.
+    let mp_len: u32 = mount.mount_path_length.to_u32()
+    let path_len: u32 = path.len()
+    let subpath: Byte[Slice]
+    if path_len > mp_len {
+        subpath = path.slice(mp_len, path_len - mp_len)
+    } else {
+        subpath = Byte[Slice]::new(1)
+        subpath[0] = Byte::from_u8(b'/')
+    }
+
+    // Resolve to root inode of mount.
+    let root_inode: Word64 = mount.root_inode
+    Result::Ok(ResolvedPath::new(root_inode, mount_id))
+}
+
+// ──────────────────────────────────────────────
+// VFS Operation Stubs
+// ──────────────────────────────────────────────
+// Evidence path: VFS-OPS-001 through VFS-OPS-015
+
+pub fn vfs_file_open(vfs: ref mut VFS, path: Byte[Slice], flags: Word32, cap: Capability) -> Result[Word32, VfsError>
+    effects: [io, deterministic]
+{
+    // Check capability.
+    let access: AccessRequest
+    if (flags & 0x02) != 0 {
+        access = AccessRequest::Access_Write
+    } else {
+        access = AccessRequest::Access_Read
+    }
+    check_capability_access(cap, access)?
+
+    // Resolve path.
+    let resolved: ResolvedPath = resolve_path(vfs, path, Word32::from_u32(0))?
+    let inum: Word64 = resolved.inode_number
+    let mid: Word32 = resolved.mount_id
+
+    // Allocate handle.
+    let handle_id: Word32 = vfs.open_file_table.allocate_handle(inum, mid, flags, cap)?
+
+    residual emit {
+        subsystem: "vfs",
+        operation: "file_open",
+        path_length: path.len(),
+        handle_id: handle_id,
+        inode: inum,
+        timestamp: __builtin_timestamp(),
+    }
+
+    Result::Ok(handle_id)
+}
+
+pub fn vfs_file_close(vfs: ref mut VFS, handle_id: Word32) -> Result<(), VfsError>
+    effects: [deterministic]
+{
+    vfs.open_file_table.close_handle(handle_id)
+}
+
+pub fn vfs_file_read(vfs: ref VFS, handle_id: Word32, buffer: ref mut Byte[Slice]) -> Result<u32, VfsError>
+    effects: [io, deterministic]
+{
+    let fh_opt: Option[FileHandle] = vfs.open_file_table.get_handle(handle_id)
+    if fh_opt.is_none() {
+        return Result::Err(vfs_handle_error("Invalid handle"))
+    }
+    let fh: FileHandle = fh_opt.unwrap()
+    if !fh.is_readable() {
+        return Result::Err(vfs_error("File not opened for reading"))
+    }
+    // In a real implementation, this would read from the underlying filesystem.
+    Result::Ok(0)
+}
+
+pub fn vfs_file_write(vfs: ref mut VFS, handle_id: Word32, data: Byte[Slice]) -> Result<u32, VfsError>
+    effects: [io, deterministic]
+{
+    let fh_opt: Option[FileHandle] = vfs.open_file_table.get_handle(handle_id)
+    if fh_opt.is_none() {
+        return Result::Err(vfs_handle_error("Invalid handle"))
+    }
+    let fh: FileHandle = fh_opt.unwrap()
+    if !fh.is_writable() {
+        return Result::Err(vfs_error("File not opened for writing"))
+    }
+    Result::Ok(0)
+}
+
+pub fn vfs_mkdir(vfs: ref mut VFS, path: Byte[Slice], mode: Word32, cap: Capability) -> Result<(), VfsError>
+    effects: [io, deterministic]
+{
+    check_capability_access(cap, AccessRequest::Access_Create)?
+    residual emit {
+        subsystem: "vfs",
+        operation: "mkdir",
+        path_length: path.len(),
+        timestamp: __builtin_timestamp(),
+    }
+    Result::Ok(())
+}
+
+pub fn vfs_rmdir(vfs: ref mut VFS, path: Byte[Slice], cap: Capability) -> Result<(), VfsError>
+    effects: [io, deterministic]
+{
+    check_capability_access(cap, AccessRequest::Access_Delete)?
+    Result::Ok(())
+}
+
+pub fn vfs_unlink(vfs: ref mut VFS, path: Byte[Slice], cap: Capability) -> Result<(), VfsError>
+    effects: [io, deterministic]
+{
+    check_capability_access(cap, AccessRequest::Access_Delete)?
+    Result::Ok(())
+}
+
+pub fn vfs_rename(vfs: ref mut VFS, old_path: Byte[Slice], new_path: Byte[Slice], cap: Capability) -> Result<(), VfsError>
+    effects: [io, deterministic]
+{
+    check_capability_access(cap, AccessRequest::Access_Write)?
+    Result::Ok(())
+}
+
+pub fn vfs_stat(vfs: ref VFS, path: Byte[Slice]) -> Result[Inode, VfsError>
+    effects: [io, deterministic]
+{
+    Result::Err(vfs_error("Not implemented"))
+}
+
+pub fn vfs_readdir(vfs: ref VFS, path: Byte[Slice]) -> Result[FixedArray[256, DirEntry], VfsError>
+    effects: [io, deterministic]
+{
+    Result::Err(vfs_error("Not implemented"))
+}

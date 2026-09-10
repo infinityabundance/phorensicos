@@ -1,0 +1,1099 @@
+// sanitizer_compiler.phor — Sanitizer Instrumentation Passes: ASAN (Shadow Memory Mapping,
+//                            Load/Store Instrumentation, Redzone Padding), UBSAN (Overflow
+//                            Checks, Shift Checks, Enum Checks), MSAN (Shadow Propagation,
+//                            Uninitialized Load Detection)
+// Phorensic Compiler Infrastructure — Sanitizer Instrumentation Phase
+//
+// This module implements compiler instrumentation passes for runtime sanitizers.
+// It inserts shadow memory checks for address sanitization, overflow/bound checks
+// for undefined behavior detection, and shadow propagation for memory sanitization.
+//
+// Operations:
+// 1. ASAN — shadow memory mapping, load/store instrumentation, redzone padding
+// 2. UBSAN — overflow checks on arithmetic, shift checks, enum validation checks
+// 3. MSAN — shadow propagation through operations, uninitialized load detection
+//
+// Boundedness: Instrumentation sites 1024 max. Checks inserted per function 256.
+// All loops bounded.
+//
+// Effect declarations:
+//   [pure] — deterministic instrumentation logic
+//   [diag] — residual recording
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::fixed::Array512;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+use core::string::FixedString64;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+use compiler::lowerer::*;
+use compiler::ast::*;
+
+// ──────────────────────────────────────────────
+// Diagnostic Codes
+// ──────────────────────────────────────────────
+
+const SAN_INSTR_ASAN      : u64 = 0x1C000u64;
+const SAN_INSTR_UBSAN     : u64 = 0x1C001u64;
+const SAN_INSTR_MSAN      : u64 = 0x1C002u64;
+const SAN_INSTR_SITE      : u64 = 0x1C003u64;
+const SAN_ERROR           : u64 = 0x1C00Fu64;
+
+// ──────────────────────────────────────────────
+// ASAN Instrumentation Types
+// ──────────────────────────────────────────────
+
+/// ASAN shadow memory mapping mode.
+pub sealdatatype AsanMappingMode : u8 {
+    /// Linear mapping: Shadow = (Addr >> 3) + Offset.
+    Linear = 0u8,
+    /// High memory mapping for 64-bit.
+    HighMemory = 1u8,
+    /// Low memory mapping.
+    LowMemory = 2u8,
+}
+
+/// A memory access instrumentation site.
+pub struct AsanInstrumentationSite {
+    /// Site ID.
+    pub site_id : u32,
+    /// Instruction index in IR.
+    pub inst_index : u32,
+    /// Access address.
+    pub address : u64,
+    /// Access size (1, 2, 4, 8, 16 bytes).
+    pub access_size : u8,
+    /// Whether this is a write access.
+    pub is_write : bool,
+    /// Whether instrumentation has been applied.
+    pub instrumented : bool,
+    /// Whether this access is on the stack.
+    pub is_stack : bool,
+    /// Stack offset (if stack access).
+    pub stack_offset : i32,
+}
+
+/// Redzone descriptor for stack variables.
+pub struct StackRedzone {
+    /// Variable name.
+    pub var_name : FixedString64,
+    /// Stack offset.
+    pub offset : i32,
+    /// Size of the variable.
+    pub size : u32,
+    /// Left redzone size.
+    pub left_redzone : u32,
+    /// Right redzone size.
+    pub right_redzone : u32,
+}
+
+// ──────────────────────────────────────────────
+// UBSAN Instrumentation Types
+// ──────────────────────────────────────────────
+
+/// UBSAN check types.
+pub sealdatatype UbsanCheckType : u8 {
+    /// Signed addition overflow.
+    SignedAddOverflow = 0u8,
+    /// Signed subtraction overflow.
+    SignedSubOverflow = 1u8,
+    /// Signed multiplication overflow.
+    SignedMulOverflow = 2u8,
+    /// Unsigned overflow (wrapping not allowed).
+    UnsignedOverflow = 3u8,
+    /// Shift with excessive count (>= bit width).
+    ShiftExcessive = 4u8,
+    /// Shift with negative count.
+    ShiftNegative = 5u8,
+    /// Out-of-bounds array access.
+    OutOfBounds = 6u8,
+    /// Invalid enum value.
+    InvalidEnumValue = 7u8,
+    /// Null pointer dereference.
+    NullPointer = 8u8,
+    /// Misaligned pointer access.
+    MisalignedAccess = 9u8,
+    /// Function pointer type mismatch.
+    FunctionTypeMismatch = 10u8,
+}
+
+/// A UBSAN check instrumentation site.
+pub struct UbsanCheckSite {
+    /// Site ID.
+    pub site_id : u32,
+    /// Instruction index.
+    pub inst_index : u32,
+    /// Check type.
+    pub check_type : UbsanCheckType,
+    /// Left operand (for binary checks).
+    pub lhs : u64,
+    /// Right operand (for binary checks).
+    pub rhs : u64,
+    /// Source location.
+    pub source_line : u32,
+    /// Whether the check has been inserted.
+    pub inserted : bool,
+}
+
+// ──────────────────────────────────────────────
+// MSAN Instrumentation Types
+// ──────────────────────────────────────────────
+
+/// MSAN shadow propagation rule.
+pub sealdatatype MsanPropagationRule : u8 {
+    /// Union: shadow = shadow_a | shadow_b.
+    Or = 0u8,
+    /// Copy: shadow = shadow_a.
+    Copy = 1u8,
+    /// Zero: shadow = 0 (producing initialized data).
+    Zero = 2u8,
+    /// Conditional: shadow depends on condition.
+    Conditional = 3u8,
+}
+
+/// An MSAN shadow operation.
+pub struct MsanShadowOp {
+    /// Operation ID.
+    pub op_id : u32,
+    /// Result shadow location.
+    pub result_shadow : u64,
+    /// Source shadow A.
+    pub src_shadow_a : u64,
+    /// Source shadow B.
+    pub src_shadow_b : u64,
+    /// Propagation rule.
+    pub rule : MsanPropagationRule,
+}
+
+// ──────────────────────────────────────────────
+// Main Sanitizer Instrumentation Pass
+// ──────────────────────────────────────────────
+
+/// Sanitizer instrumentation pass state.
+pub struct SanitizerInstrumentationPass {
+    /// ASAN instrumentation sites.
+    pub asan_sites : Array512<AsanInstrumentationSite>,
+    /// Stack redzones.
+    pub stack_redzones : Array256<StackRedzone>,
+    /// UBSAN check sites.
+    pub ubsan_sites : Array256<UbsanCheckSite>,
+    /// MSAN shadow operations.
+    pub msan_ops : Array256<MsanShadowOp>,
+    /// Whether ASAN pass is enabled.
+    pub asan_enabled : bool,
+    /// Whether UBSAN pass is enabled.
+    pub ubsan_enabled : bool,
+    /// Whether MSAN pass is enabled.
+    pub msan_enabled : bool,
+    /// Shadow memory base address.
+    pub shadow_base : u64,
+    /// Shadow memory scale (log2).
+    pub shadow_scale : u8,
+    /// ASAN mapping mode.
+    pub mapping_mode : AsanMappingMode,
+    /// Redzone size for heap allocations.
+    pub heap_redzone_size : u32,
+    /// Redzone size for stack allocations.
+    pub stack_redzone_size : u32,
+    /// Total instrumentation sites processed.
+    pub total_sites : u32,
+    /// Total checks inserted.
+    pub total_checks : u32,
+    /// Whether the pass has run.
+    pub pass_completed : bool,
+    /// Residual log.
+    pub residual_log : Array128<DiagnosticPayload>,
+}
+
+impl SanitizerInstrumentationPass {
+    /// Create a new sanitizer instrumentation pass.
+    /// Effect: pure — deterministic construction.
+    pub fn new() -> SanitizerInstrumentationPass [pure] {
+        SanitizerInstrumentationPass {
+            asan_sites: Array512::new(),
+            stack_redzones: Array256::new(),
+            ubsan_sites: Array256::new(),
+            msan_ops: Array256::new(),
+            asan_enabled: false,
+            ubsan_enabled: false,
+            msan_enabled: false,
+            shadow_base: 0x7FFF8000u64,
+            shadow_scale: 3u8,
+            mapping_mode: AsanMappingMode::Linear,
+            heap_redzone_size: 32u32,
+            stack_redzone_size: 32u32,
+            total_sites: 0u32,
+            total_checks: 0u32,
+            pass_completed: false,
+            residual_log: Array128::new(),
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // Configuration
+    // ──────────────────────────────────────────
+
+    /// Enable or disable ASAN instrumentation.
+    /// Effect: pure — configuration.
+    pub fn set_asan_enabled(mut self, enabled : bool) -> SanitizerInstrumentationPass [pure] {
+        self.asan_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable UBSAN instrumentation.
+    /// Effect: pure — configuration.
+    pub fn set_ubsan_enabled(mut self, enabled : bool) -> SanitizerInstrumentationPass [pure] {
+        self.ubsan_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable MSAN instrumentation.
+    /// Effect: pure — configuration.
+    pub fn set_msan_enabled(mut self, enabled : bool) -> SanitizerInstrumentationPass [pure] {
+        self.msan_enabled = enabled;
+        self
+    }
+
+    /// Set the shadow memory parameters.
+    /// Effect: pure — shadow configuration.
+    pub fn set_shadow_params(mut self, base : u64, scale : u8) -> SanitizerInstrumentationPass [pure] {
+        self.shadow_base = base;
+        self.shadow_scale = scale;
+        self
+    }
+
+    /// Set redzone sizes.
+    /// Effect: pure — redzone configuration.
+    pub fn set_redzone_sizes(mut self, heap_size : u32,
+                             stack_size : u32) -> SanitizerInstrumentationPass [pure] {
+        self.heap_redzone_size = heap_size;
+        self.stack_redzone_size = stack_size;
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // ASAN — Shadow Memory Mapping
+    // ──────────────────────────────────────────
+
+    /// Compute the shadow memory address for a given application address.
+    /// Effect: pure — shadow address computation.
+    pub fn compute_shadow_address(&self, addr : u64) -> u64 [pure] {
+        match self.mapping_mode {
+            AsanMappingMode::Linear => {
+                (addr >> self.shadow_scale as u64) + self.shadow_base
+            },
+            AsanMappingMode::HighMemory => {
+                if addr >= 0x0000800000000000u64 {
+                    (addr >> self.shadow_scale as u64) + (0x1000000000000000u64 - 0x0000800000000000u64)
+                } else {
+                    (addr >> self.shadow_scale as u64) + self.shadow_base
+                }
+            },
+            AsanMappingMode::LowMemory => {
+                (addr >> self.shadow_scale as u64) + self.shadow_base
+            },
+        }
+    }
+
+    /// Generate shadow check code for a memory access.
+    /// Effect: pure — generates IR instructions for shadow check.
+    pub fn generate_shadow_check(mut self, site_id : u32,
+                                 ir_fn : ref mut IrFunction) -> SanitizerInstrumentationPass [pure] {
+        // Find the instrumentation site.
+        var site_found : bool = false;
+        // loop: bounds[BOUND_LARGE] — bounded by sites.
+        for var i : u32 = 0u32; i < self.asan_sites.len(); i += 1u32 [self.asan_sites.len()] {
+            let mut site : AsanInstrumentationSite = self.asan_sites.get(i);
+            if site.site_id == site_id && !site.instrumented {
+                let shadow_addr : u64 = self.compute_shadow_address(site.address);
+
+                // Generate the check: if shadow[addr] != 0, report error.
+                // This produces IR instructions that will be lowered later.
+                let load_shadow : IrInstruction = IrInstruction::Load(
+                    IrOperand::Immediate(shadow_addr));
+                let check_zero : IrInstruction = IrInstruction::Compare(
+                    IrOperand::Immediate(shadow_addr), IrOperand::Immediate(0u64));
+                let branch_error : IrInstruction = IrInstruction::Branch(
+                    IrOperand::Immediate(1u64), IrOperand::Immediate(0u64));
+
+                let _ = ir_fn.body.push(load_shadow);
+                let _ = ir_fn.body.push(check_zero);
+                let _ = ir_fn.body.push(branch_error);
+
+                site.instrumented = true;
+                let _ = self.asan_sites.set(i, site);
+                site_found = true;
+                self.total_checks += 1u32;
+                break;
+            }
+        }
+
+        if site_found {
+            self = self.add_residual(SAN_INSTR_ASAN,
+                                     FixedString256::from("shadow check generated"),
+                                     FixedString64::from("gen_shadow_check"));
+        }
+        self
+    }
+
+    /// Record a memory access for ASAN instrumentation.
+    /// Effect: pure — site registration.
+    pub fn record_memory_access(mut self, inst_index : u32, address : u64,
+                                access_size : u8, is_write : bool,
+                                is_stack : bool) -> Result<SanitizerInstrumentationPass, FixedString256> [pure] {
+        if self.asan_sites.is_full() {
+            return Result::Err(FixedString256::from("ASAN site table full"));
+        }
+
+        let site : AsanInstrumentationSite = AsanInstrumentationSite {
+            site_id: self.total_sites,
+            inst_index: inst_index,
+            address: address,
+            access_size: access_size,
+            is_write: is_write,
+            instrumented: false,
+            is_stack: is_stack,
+            stack_offset: 0i32,
+        };
+        let _ = self.asan_sites.push(site);
+        self.total_sites += 1u32;
+
+        self = self.add_residual(SAN_INSTR_SITE,
+                                 FixedString256::from("ASAN site recorded"),
+                                 FixedString64::from("record_mem_access"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // ASAN — Redzone Padding
+    // ──────────────────────────────────────────
+
+    /// Add a stack redzone for a local variable.
+    /// Effect: pure — redzone registration.
+    pub fn add_stack_redzone(mut self, var_name : FixedString64, offset : i32,
+                             size : u32) -> Result<SanitizerInstrumentationPass, FixedString256> [pure] {
+        if self.stack_redzones.is_full() {
+            return Result::Err(FixedString256::from("stack redzone table full"));
+        }
+
+        let rz : StackRedzone = StackRedzone {
+            var_name: var_name,
+            offset: offset - self.stack_redzone_size as i32,
+            size: size,
+            left_redzone: self.stack_redzone_size,
+            right_redzone: self.stack_redzone_size,
+        };
+
+        // Poison left redzone in initialization.
+        let left_start : u64 = (offset - self.stack_redzone_size as i32) as u64;
+        // loop: bounds[BOUND_SMALL] — bounded by redzone size.
+        for var i : u32 = 0u32; i < self.stack_redzone_size; i += 1u32 [self.stack_redzone_size] {
+            let shadow_addr : u64 = self.compute_shadow_address(left_start + i as u64);
+            let _ = self.asan_sites.push(AsanInstrumentationSite {
+                site_id: self.total_sites,
+                inst_index: 0u32,
+                address: left_start + i as u64,
+                access_size: 1u8,
+                is_write: true,
+                instrumented: true,
+                is_stack: true,
+                stack_offset: (left_start + i as u64) as i32,
+            });
+            self.total_sites += 1u32;
+        }
+
+        let _ = self.stack_redzones.push(rz);
+        Result::Ok(self)
+    }
+
+    /// Generate stack redzone poisoning at function entry.
+    /// Effect: pure — generates poison code.
+    pub fn poison_stack_redzones(&self, ir_fn : ref mut IrFunction) [pure] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by redzones.
+        for var i : u32 = 0u32; i < self.stack_redzones.len(); i += 1u32 [self.stack_redzones.len()] {
+            let rz : StackRedzone = self.stack_redzones.get(i);
+            // Emit shadow store for left redzone.
+            let left_addr : u64 = (rz.offset) as u64;
+            let shadow_left : u64 = self.compute_shadow_address(left_addr);
+            let _ = ir_fn.body.push(IrInstruction::Store(
+                IrOperand::Immediate(shadow_left),
+                IrOperand::Immediate(0xFAu64), // Left redzone poison.
+                IrOperand::Immediate(0u64)));
+
+            // Emit shadow store for right redzone.
+            let right_start : u64 = (rz.offset + rz.size as i32) as u64;
+            let shadow_right : u64 = self.compute_shadow_address(right_start);
+            let _ = ir_fn.body.push(IrInstruction::Store(
+                IrOperand::Immediate(shadow_right),
+                IrOperand::Immediate(0xFBu64), // Right redzone poison.
+                IrOperand::Immediate(0u64)));
+        }
+    }
+
+    // ──────────────────────────────────────────
+    // UBSAN — Overflow Checks
+    // ──────────────────────────────────────────
+
+    /// Record a UBSAN check site.
+    /// Effect: pure — site registration.
+    pub fn record_ubsan_check(mut self, inst_index : u32, check_type : UbsanCheckType,
+                              lhs : u64, rhs : u64,
+                              source_line : u32) -> Result<SanitizerInstrumentationPass, FixedString256> [pure] {
+        if self.ubsan_sites.is_full() {
+            return Result::Err(FixedString256::from("UBSAN site table full"));
+        }
+
+        let site : UbsanCheckSite = UbsanCheckSite {
+            site_id: self.total_sites,
+            inst_index: inst_index,
+            check_type: check_type,
+            lhs: lhs,
+            rhs: rhs,
+            source_line: source_line,
+            inserted: false,
+        };
+        let _ = self.ubsan_sites.push(site);
+        self.total_sites += 1u32;
+
+        self = self.add_residual(SAN_INSTR_UBSAN,
+                                 FixedString256::from("UBSAN check site recorded"),
+                                 FixedString64::from("record_ubsan"));
+        Result::Ok(self)
+    }
+
+    /// Generate a signed addition overflow check.
+    /// Effect: pure — generates overflow check IR.
+    pub fn generate_signed_add_overflow(mut self, site_id : u32,
+                                        ir_fn : ref mut IrFunction) -> SanitizerInstrumentationPass [pure] {
+        var found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by UBSAN sites.
+        for var i : u32 = 0u32; i < self.ubsan_sites.len(); i += 1u32 [self.ubsan_sites.len()] {
+            let mut site : UbsanCheckSite = self.ubsan_sites.get(i);
+            if site.site_id == site_id && !site.inserted {
+                // Emit: if (lhs > 0 && rhs > INT64_MAX - lhs) -> overflow
+                let check_inst : IrInstruction = IrInstruction::Compare(
+                    IrOperand::Immediate(site.lhs),
+                    IrOperand::Immediate(0x7FFFFFFFFFFFFFFFu64 - site.rhs));
+                let _ = ir_fn.body.push(check_inst);
+                let branch_inst : IrInstruction = IrInstruction::Branch(
+                    IrOperand::Immediate(1u64), IrOperand::Immediate(0u64));
+                let _ = ir_fn.body.push(branch_inst);
+
+                site.inserted = true;
+                let _ = self.ubsan_sites.set(i, site);
+                found = true;
+                self.total_checks += 1u32;
+                break;
+            }
+        }
+
+        if found {
+            self = self.add_residual(SAN_INSTR_UBSAN,
+                                     FixedString256::from("signed add overflow check generated"),
+                                     FixedString64::from("gen_sadd_overflow"));
+        }
+        self
+    }
+
+    /// Generate a shift check (excessive or negative shift).
+    /// Effect: pure — generates shift check IR.
+    pub fn generate_shift_check(mut self, site_id : u32,
+                                ir_fn : ref mut IrFunction) -> SanitizerInstrumentationPass [pure] {
+        var found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by UBSAN sites.
+        for var i : u32 = 0u32; i < self.ubsan_sites.len(); i += 1u32 [self.ubsan_sites.len()] {
+            let mut site : UbsanCheckSite = self.ubsan_sites.get(i);
+            if site.site_id == site_id && !site.inserted {
+                // Emit: if (rhs < 0 || rhs >= bit_width) -> UB
+                let check_neg : IrInstruction = IrInstruction::Compare(
+                    IrOperand::Immediate(site.rhs),
+                    IrOperand::Immediate(0u64)); // Less than 0 check.
+                let _ = ir_fn.body.push(check_neg);
+                let check_width : IrInstruction = IrInstruction::Compare(
+                    IrOperand::Immediate(site.rhs),
+                    IrOperand::Immediate(64u64)); // Greater-or-equal 64 check.
+                let _ = ir_fn.body.push(check_width);
+                let branch_inst : IrInstruction = IrInstruction::Branch(
+                    IrOperand::Immediate(1u64), IrOperand::Immediate(0u64));
+                let _ = ir_fn.body.push(branch_inst);
+
+                site.inserted = true;
+                let _ = self.ubsan_sites.set(i, site);
+                found = true;
+                self.total_checks += 1u32;
+                break;
+            }
+        }
+
+        if found {
+            self = self.add_residual(SAN_INSTR_UBSAN,
+                                     FixedString256::from("shift check generated"),
+                                     FixedString64::from("gen_shift_check"));
+        }
+        self
+    }
+
+    /// Generate an enum value check.
+    /// Effect: pure — generates enum validation IR.
+    pub fn generate_enum_check(mut self, site_id : u32, min_val : u64, max_val : u64,
+                               ir_fn : ref mut IrFunction) -> SanitizerInstrumentationPass [pure] {
+        var found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by UBSAN sites.
+        for var i : u32 = 0u32; i < self.ubsan_sites.len(); i += 1u32 [self.ubsan_sites.len()] {
+            let mut site : UbsanCheckSite = self.ubsan_sites.get(i);
+            if site.site_id == site_id && !site.inserted {
+                // Emit: if (val < min_val || val > max_val) -> UB
+                let check_low : IrInstruction = IrInstruction::Compare(
+                    IrOperand::Immediate(site.lhs),
+                    IrOperand::Immediate(min_val));
+                let _ = ir_fn.body.push(check_low);
+                let check_high : IrInstruction = IrInstruction::Compare(
+                    IrOperand::Immediate(site.lhs),
+                    IrOperand::Immediate(max_val));
+                let _ = ir_fn.body.push(check_high);
+                let branch_inst : IrInstruction = IrInstruction::Branch(
+                    IrOperand::Immediate(1u64), IrOperand::Immediate(0u64));
+                let _ = ir_fn.body.push(branch_inst);
+
+                site.inserted = true;
+                let _ = self.ubsan_sites.set(i, site);
+                found = true;
+                self.total_checks += 1u32;
+                break;
+            }
+        }
+
+        if found {
+            self = self.add_residual(SAN_INSTR_UBSAN,
+                                     FixedString256::from("enum check generated"),
+                                     FixedString64::from("gen_enum_check"));
+        }
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // MSAN — Shadow Propagation
+    // ──────────────────────────────────────────
+
+    /// Record an MSAN shadow propagation operation.
+    /// Effect: pure — MSAN op recording.
+    pub fn record_msan_operation(mut self, result_shadow : u64, src_shadow_a : u64,
+                                 src_shadow_b : u64,
+                                 rule : MsanPropagationRule) -> Result<SanitizerInstrumentationPass, FixedString256> [pure] {
+        if self.msan_ops.is_full() {
+            return Result::Err(FixedString256::from("MSAN op table full"));
+        }
+
+        let op : MsanShadowOp = MsanShadowOp {
+            op_id: self.total_sites,
+            result_shadow: result_shadow,
+            src_shadow_a: src_shadow_a,
+            src_shadow_b: src_shadow_b,
+            rule: rule,
+        };
+        let _ = self.msan_ops.push(op);
+        self.total_sites += 1u32;
+        Result::Ok(self)
+    }
+
+    /// Generate shadow propagation for an arithmetic operation.
+    /// Effect: pure — generates MSAN shadow code.
+    pub fn generate_arithmetic_shadow(mut self, op_id : u32,
+                                      ir_fn : ref mut IrFunction) -> SanitizerInstrumentationPass [pure] {
+        var found : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by MSAN ops.
+        for var i : u32 = 0u32; i < self.msan_ops.len(); i += 1u32 [self.msan_ops.len()] {
+            let op : MsanShadowOp = self.msan_ops.get(i);
+            if op.op_id == op_id {
+                // Load shadow_a and shadow_b, OR them, store to result_shadow.
+                let load_a : IrInstruction = IrInstruction::Load(IrOperand::Immediate(op.src_shadow_a));
+                let _ = ir_fn.body.push(load_a);
+                let load_b : IrInstruction = IrInstruction::Load(IrOperand::Immediate(op.src_shadow_b));
+                let _ = ir_fn.body.push(load_b);
+                let or_op : IrInstruction = IrInstruction::Bitwise(
+                    IrOperand::Immediate(op.src_shadow_a),
+                    IrOperand::Immediate(op.src_shadow_b),
+                    IrOperand::Immediate(0u64));
+                let _ = ir_fn.body.push(or_op);
+                let store_result : IrInstruction = IrInstruction::Store(
+                    IrOperand::Immediate(op.result_shadow),
+                    IrOperand::Immediate(0u64),
+                    IrOperand::Immediate(0u64));
+                let _ = ir_fn.body.push(store_result);
+
+                found = true;
+                self.total_checks += 1u32;
+                break;
+            }
+        }
+
+        if found {
+            self = self.add_residual(SAN_INSTR_MSAN,
+                                     FixedString256::from("MSAN shadow propagation generated"),
+                                     FixedString64::from("gen_msan_arith"));
+        }
+        self
+    }
+
+    /// Generate a check for uninitialized load.
+    /// Effect: pure — generates MSAN load check.
+    pub fn generate_uninitialized_load_check(mut self, shadow_addr : u64,
+                                             ir_fn : ref mut IrFunction) -> SanitizerInstrumentationPass [pure] {
+        // Load shadow value and check if != 0.
+        let load_shadow : IrInstruction = IrInstruction::Load(IrOperand::Immediate(shadow_addr));
+        let _ = ir_fn.body.push(load_shadow);
+        let check_zero : IrInstruction = IrInstruction::Compare(
+            IrOperand::Immediate(shadow_addr), IrOperand::Immediate(0u64));
+        let _ = ir_fn.body.push(check_zero);
+        let branch_report : IrInstruction = IrInstruction::Branch(
+            IrOperand::Immediate(1u64), IrOperand::Immediate(0u64));
+        let _ = ir_fn.body.push(branch_report);
+
+        self.total_checks += 1u32;
+        self = self.add_residual(SAN_INSTR_MSAN,
+                                 FixedString256::from("MSAN load check generated"),
+                                 FixedString64::from("gen_msan_load_check"));
+        self
+    }
+
+    // ──────────────────────────────────────────
+    // Pass Execution
+    // ──────────────────────────────────────────
+
+    /// Run the full sanitizer instrumentation pass on a function.
+    /// Effect: pure — full pass.
+    pub fn run_pass_on_function(mut self, ir_fn : ref mut IrFunction) -> Result<SanitizerInstrumentationPass, FixedString256>
+                                [pure] {
+        // ASAN: Generate shadow checks for all recorded sites in this function.
+        if self.asan_enabled {
+            // loop: bounds[BOUND_LARGE] — bounded by ASAN sites.
+            for var i : u32 = 0u32; i < self.asan_sites.len(); i += 1u32 [self.asan_sites.len()] {
+                let site : AsanInstrumentationSite = self.asan_sites.get(i);
+                if !site.instrumented {
+                    self = self.generate_shadow_check(site.site_id, ir_fn);
+                }
+            }
+
+            // Poison stack redzones.
+            self.poison_stack_redzones(ir_fn);
+        }
+
+        // UBSAN: Generate overflow checks.
+        if self.ubsan_enabled {
+            // loop: bounds[BOUND_MEDIUM] — bounded by UBSAN sites.
+            for var i : u32 = 0u32; i < self.ubsan_sites.len(); i += 1u32 [self.ubsan_sites.len()] {
+                let site : UbsanCheckSite = self.ubsan_sites.get(i);
+                if !site.inserted {
+                    match site.check_type {
+                        UbsanCheckType::SignedAddOverflow |
+                        UbsanCheckType::SignedSubOverflow |
+                        UbsanCheckType::SignedMulOverflow => {
+                            self = self.generate_signed_add_overflow(site.site_id, ir_fn);
+                        },
+                        UbsanCheckType::ShiftExcessive |
+                        UbsanCheckType::ShiftNegative => {
+                            self = self.generate_shift_check(site.site_id, ir_fn);
+                        },
+                        UbsanCheckType::InvalidEnumValue => {
+                            self = self.generate_enum_check(site.site_id, 0u64, 255u64, ir_fn);
+                        },
+                        _ => {},
+                    }
+                }
+            }
+        }
+
+        // MSAN: Generate shadow propagation.
+        if self.msan_enabled {
+            // loop: bounds[BOUND_MEDIUM] — bounded by MSAN ops.
+            for var i : u32 = 0u32; i < self.msan_ops.len(); i += 1u32 [self.msan_ops.len()] {
+                let op : MsanShadowOp = self.msan_ops.get(i);
+                self = self.generate_arithmetic_shadow(op.op_id, ir_fn);
+            }
+        }
+
+        self = self.add_residual(SAN_INSTR_SITE,
+                                 FixedString256::from("sanitizer pass on function complete"),
+                                 FixedString64::from("run_pass_func"));
+        Result::Ok(self)
+    }
+
+    /// Run the pass on all functions in a module.
+    /// Effect: pure — full module pass.
+    pub fn run_pass(mut self, ir_module : ref mut IrModule) -> Result<SanitizerInstrumentationPass, FixedString256>
+                    [pure] {
+        if self.pass_completed {
+            return Result::Err(FixedString256::from("pass already completed"));
+        }
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by module functions.
+        for var i : u32 = 0u32; i < ir_module.functions.len(); i += 1u32 [ir_module.functions.len()] {
+            let mut ir_fn : IrFunction = ir_module.functions.get_mut(i);
+            let result : Result<SanitizerInstrumentationPass, FixedString256> =
+                self.run_pass_on_function(&mut ir_fn);
+            match result {
+                Result::Ok(pass) => { self = pass; },
+                Result::Err(msg) => { return Result::Err(msg); },
+            }
+        }
+
+        self.pass_completed = true;
+        self = self.add_residual(SAN_INSTR_SITE,
+                                 FixedString256::from("sanitizer instrumentation pass complete"),
+                                 FixedString64::from("run_pass"));
+        Result::Ok(self)
+    }
+
+    // ──────────────────────────────────────────
+    // Residual Management
+    // ──────────────────────────────────────────
+
+    /// Add a diagnostic residual.
+    /// Effect: diag — residual emission.
+    fn add_residual(mut self, code : u64, message : FixedString256,
+                    action : FixedString64) -> SanitizerInstrumentationPass [diag] {
+        let residual : DiagnosticPayload = DiagnosticPayload {
+            code: code,
+            message: message,
+            severity: DiagnosticSeverity::Info,
+            location: SourceLocation::default(),
+            phase: CompilerPhase::Optimizer,
+        };
+        let _ = self.residual_log.push(residual);
+        self
+    }
+
+    /// Get pass statistics.
+    /// Effect: pure — statistics.
+    pub fn get_statistics(&self) -> FixedString256 [pure] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("ASAN enabled: "));
+        result.push_str(if self.asan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result.push_str(FixedString256::from("\nUBSAN enabled: "));
+        result.push_str(if self.ubsan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result.push_str(FixedString256::from("\nMSAN enabled: "));
+        result.push_str(if self.msan_enabled { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result.push_str(FixedString256::from("\nTotal sites: "));
+        result.push_u32(self.total_sites);
+        result.push_str(FixedString256::from("\nTotal checks inserted: "));
+        result.push_u32(self.total_checks);
+        result.push_str(FixedString256::from("\nASAN sites: "));
+        result.push_u32(self.asan_sites.len());
+        result.push_str(FixedString256::from("\nUBSAN sites: "));
+        result.push_u32(self.ubsan_sites.len());
+        result.push_str(FixedString256::from("\nMSAN ops: "));
+        result.push_u32(self.msan_ops.len());
+        result.push_str(FixedString256::from("\nPass completed: "));
+        result.push_str(if self.pass_completed { FixedString256::from("yes") } else { FixedString256::from("no") });
+        result
+    }
+}
+
+/// Diagnostic severity for this module.
+pub sealdatatype DiagnosticSeverity : u8 {
+    Info = 0u8,
+    Warning = 1u8,
+    Error = 2u8,
+}
+
+/// Source location.
+pub struct SourceLocation {
+    pub file : FixedString256,
+    pub line : u32,
+    pub column : u32,
+}
+
+impl SourceLocation {
+    pub fn default() -> SourceLocation [pure] {
+        SourceLocation {
+            file: FixedString256::new(),
+            line: 0u32,
+            column: 0u32,
+        }
+    }
+}
+
+/// Diagnostic payload.
+pub struct DiagnosticPayload {
+    pub code : u64,
+    pub message : FixedString256,
+    pub severity : DiagnosticSeverity,
+    pub location : SourceLocation,
+    pub phase : CompilerPhase,
+}
+
+/// Compiler phase.
+pub sealdatatype CompilerPhase : u8 {
+    Lexer = 0u8,
+    Parser = 1u8,
+    Expander = 2u8,
+    Lowerer = 3u8,
+    Optimizer = 4u8,
+    Codegen = 5u8,
+    Linker = 6u8,
+    Sealer = 7u8,
+    PreCompile = 8u8,
+}
+
+/// IR instruction stub.
+pub sealdatatype IrInstruction : u8 {
+    Nop = 0u8,
+    Load = 1u8,
+    Store = 2u8,
+    Add = 3u8,
+    Compare = 4u8,
+    Branch = 5u8,
+    Call = 6u8,
+    Return = 7u8,
+    Bitwise = 8u8,
+}
+
+/// IR operand.
+pub sealdatatype IrOperand : u8 {
+    Immediate = 0u8,
+    Register = 1u8,
+    Memory = 2u8,
+}
+
+impl IrOperand {
+    pub fn new() -> IrOperand [pure] { IrOperand::Immediate }
+}
+
+/// IR function.
+pub struct IrFunction {
+    pub name : FixedString256,
+    pub return_type : u8,
+    pub parameters : Array64<IrParameter>,
+    pub body : Array64<IrInstruction>,
+    pub is_global : bool,
+}
+
+/// IR module.
+pub struct IrModule {
+    pub functions : Array256<IrFunction>,
+}
+
+impl IrModule {
+    pub fn new() -> IrModule [pure] {
+        IrModule {
+            functions: Array256::new(),
+        }
+    }
+
+    pub fn get_mut(&mut self, index : u32) -> IrFunction [pure] {
+        self.functions.get(index)
+    }
+}
+
+/// IR parameter.
+pub struct IrParameter {
+    pub name : FixedString64,
+    pub param_type : u8,
+}
+
+// ──────────────────────────────────────────────
+// Sanitizer Runtime Support Structures
+// ──────────────────────────────────────────────
+
+/// Sanitizer callback function type for error reporting.
+pub type SanitizerErrorCallback = fn(code : u32, address : u64, message : FixedString256) [diag, io];
+
+/// Sanitizer initialization parameters.
+pub struct SanitizerInitParams {
+    /// Shadow memory base address.
+    pub shadow_base : u64,
+    /// Shadow memory size.
+    pub shadow_size : u64,
+    /// Redzone size for heap allocations.
+    pub heap_redzone_size : u32,
+    /// Redzone size for stack allocations.
+    pub stack_redzone_size : u32,
+    /// Whether to halt on error.
+    pub halt_on_error : bool,
+    /// Whether to print error reports.
+    pub print_reports : bool,
+    /// Maximum stack trace depth.
+    pub max_stack_depth : u32,
+    /// Error callback function.
+    pub error_callback : SanitizerErrorCallback,
+}
+
+impl SanitizerInitParams {
+    /// Create default sanitizer initialization parameters.
+    /// Effect: pure — default parameters.
+    pub fn default() -> SanitizerInitParams [pure] {
+        SanitizerInitParams {
+            shadow_base: 0x7FFF8000u64,
+            shadow_size: 0x10000000u64,
+            heap_redzone_size: 32u32,
+            stack_redzone_size: 32u32,
+            halt_on_error: false,
+            print_reports: true,
+            max_stack_depth: 32u32,
+            error_callback: SanitizerInitParams::default_error_callback,
+        }
+    }
+
+    /// Default error callback.
+    /// Effect: diag, io — reports error.
+    fn default_error_callback(code : u32, address : u64, message : FixedString256) [diag, io] {
+        __builtin_serial_write_string(FixedString256::from("SANITIZER: "));
+        __builtin_serial_write_hex_u32(code);
+        __builtin_serial_write_string(FixedString256::from(" at 0x"));
+        __builtin_serial_write_hex_u64(address);
+        __builtin_serial_write_string(FixedString256::from(": "));
+        __builtin_serial_write_string(message);
+        __builtin_serial_write_string(FixedString256::from("\n"));
+    }
+}
+
+/// Sanitizer shadow byte encoding constants.
+pub const SAN_SHADOW_ADDRESSABLE : u8 = 0x00u8;
+pub const SAN_SHADOW_PARTIAL_1  : u8 = 0x01u8;
+pub const SAN_SHADOW_PARTIAL_2  : u8 = 0x02u8;
+pub const SAN_SHADOW_PARTIAL_3  : u8 = 0x03u8;
+pub const SAN_SHADOW_PARTIAL_4  : u8 = 0x04u8;
+pub const SAN_SHADOW_PARTIAL_5  : u8 = 0x05u8;
+pub const SAN_SHADOW_PARTIAL_6  : u8 = 0x06u8;
+pub const SAN_SHADOW_PARTIAL_7  : u8 = 0x07u8;
+pub const SAN_SHADOW_LEFT_REDZONE : u8 = 0xFAu8;
+pub const SAN_SHADOW_RIGHT_REDZONE : u8 = 0xFBu8;
+pub const SAN_SHADOW_FREED     : u8 = 0xFCu8;
+pub const SAN_SHADOW_UNINITIALIZED : u8 = 0xFFu8;
+
+/// Compute the shadow memory address for a given application address.
+/// Uses the standard ASAN shadow mapping: shadow = (addr >> 3) + offset.
+pub fn compute_shadow_addr(addr : u64, shadow_base : u64) -> u64 [pure] {
+    (addr >> 3u64) + shadow_base
+}
+
+/// Check if a memory region is addressable via shadow memory.
+/// Returns the first poisoned offset, or size if all addressable.
+/// Effect: memory — reads shadow memory.
+pub fn shadow_check_region(addr : u64, size : u64, shadow_base : u64) -> u64 [memory] {
+    // loop: bounds[BOUND_MEDIUM] — bounded by size.
+    for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+        let shadow : u8 = __builtin_read_byte(compute_shadow_addr(addr + i, shadow_base));
+        if shadow != SAN_SHADOW_ADDRESSABLE {
+            return i;
+        }
+    }
+    size
+}
+
+/// Check if a memory access is valid for a given size at an address.
+/// Effect: memory — reads shadow memory.
+pub fn shadow_is_valid_access(addr : u64, size : u8, shadow_base : u64) -> bool [memory] {
+    let shadow : u8 = __builtin_read_byte(compute_shadow_addr(addr, shadow_base));
+    if shadow == SAN_SHADOW_ADDRESSABLE {
+        return true;
+    }
+    // Partial check: for unaligned accesses, some bytes may be addressable.
+    if shadow < size {
+        return true;
+    }
+    false
+}
+
+/// Check the shadow for a range of addresses, returning the first bad offset.
+pub fn shadow_check_range(addr : u64, size : u64, shadow_base : u64) -> u64 [memory] {
+    for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+        let s : u8 = __builtin_read_byte(compute_shadow_addr(addr + i, shadow_base));
+        if s != SAN_SHADOW_ADDRESSABLE {
+            return i;
+        }
+    }
+    size
+}
+
+/// Poison a range of shadow memory.
+pub fn shadow_poison_range(addr : u64, size : u64, value : u8, shadow_base : u64) [memory] {
+    for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+        let shadow_addr : u64 = compute_shadow_addr(addr + i, shadow_base);
+        __builtin_write_byte(shadow_addr, value);
+    }
+}
+
+/// Make a range of shadow memory addressable (clear poison).
+pub fn shadow_make_addressable(addr : u64, size : u64, shadow_base : u64) [memory] {
+    shadow_poison_range(addr, size, SAN_SHADOW_ADDRESSABLE, shadow_base);
+}
+
+/// Count the number of consecutive addressable bytes from a start address.
+pub fn shadow_count_addressable(addr : u64, max_count : u64, shadow_base : u64) -> u64 [memory] {
+    var count : u64 = 0u64;
+    for var i : u64 = 0u64; i < max_count; i += 1u64 [max_count] {
+        let s : u8 = __builtin_read_byte(compute_shadow_addr(addr + i, shadow_base));
+        if s == SAN_SHADOW_ADDRESSABLE {
+            count += 1u64;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Get the total number of shadow bytes needed for a region.
+pub fn shadow_size_for_region(region_size : u64, scale : u8) -> u64 [pure] {
+    region_size >> scale as u64
+}
+
+/// Check if a shadow address is within the valid shadow region.
+pub fn shadow_addr_valid(shadow_addr : u64, shadow_base : u64, shadow_size : u64) -> bool [pure] {
+    shadow_addr >= shadow_base && shadow_addr < shadow_base + shadow_size
+}
+
+/// Compute the application address from a shadow address (inverse mapping).
+pub fn compute_app_address(shadow_addr : u64, shadow_base : u64, scale : u8) -> u64 [pure] {
+    (shadow_addr - shadow_base) << scale as u64
+}
+
+/// Check if a value is a valid heap pointer (for ASan).
+pub fn is_heap_pointer(ptr : u64, heap_start : u64, heap_end : u64) -> bool [pure] {
+    ptr >= heap_start && ptr < heap_end
+}
+
+/// Format a shadow byte value as a human-readable string.
+pub fn format_shadow_byte(byte : u8) -> FixedString64 [pure] {
+    match byte {
+        0x00u8 => FixedString64::from("addr"),
+        0xFAu8 => FixedString64::from("left_rz"),
+        0xFBu8 => FixedString64::from("right_rz"),
+        0xFCu8 => FixedString64::from("freed"),
+        0xFFu8 => FixedString64::from("uninit"),
+        _ => {
+            let mut s : FixedString64 = FixedString64::from("part:");
+            s.push_u8_hex(byte);
+            s
+        },
+    }
+}
+
+/// Dump shadow memory for a range of application addresses.
+pub fn dump_shadow_range(app_start : u64, app_end : u64, shadow_base : u64) [io] {
+    __builtin_serial_write_string(FixedString256::from("Shadow dump:\n"));
+    for var addr : u64 = app_start; addr < app_end; addr += 8u64 [128u64] {
+        let s : u8 = __builtin_read_byte(compute_shadow_addr(addr, shadow_base));
+        __builtin_serial_write_string(FixedString256::from("  0x"));
+        __builtin_serial_write_hex_u64(addr);
+        __builtin_serial_write_string(FixedString256::from(": "));
+        __builtin_serial_write_string(format_shadow_byte(s));
+        __builtin_serial_write_string(FixedString256::from("\n"));
+    }
+}
+
+/// Verify shadow memory consistency for a region.
+pub fn verify_shadow_consistency(app_start : u64, size : u64, shadow_base : u64) -> bool [memory] {
+    for var i : u64 = 0u64; i < size; i += 1u64 [size] {
+        let s : u8 = __builtin_read_byte(compute_shadow_addr(app_start + i, shadow_base));
+        if s == 0xFAu8 || s == 0xFBu8 || s == 0xFCu8 {
+            return false;
+        }
+    }
+    true
+}

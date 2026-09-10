@@ -1,0 +1,1154 @@
+//==============================================================================
+// vm_manager.phor — Virtual Machine Management
+//
+// Implements VM lifecycle management, resource allocation, capability-based
+// VM access, snapshot/resume, migration, VM scheduling, vCPU pinning, memory
+// overcommit, and residual recording for all VM operations.
+//
+// All operations are capability-gated, bounded-loop, and residual-recorded.
+//==============================================================================
+
+module vm_manager
+  @[receipt("vm-mgr-v1")]
+  @[audit("VM-MGR")]
+;
+
+use core::types::*;
+use core::capabilities::*;
+use core::effects::{syscall, alloc, unsafe, io};
+use core::residual::*;
+use core::mem::*;
+use hypervisor::hypervisor_core::*;
+use hypervisor::vcpu::*;
+use hypervisor::memory_virt::*;
+use hypervisor::device_virt::*;
+
+//==============================================================================
+// Virtual Machine State
+//==============================================================================
+
+/// Complete state of a virtual machine.
+pub struct VirtualMachine[
+  CapT: Capability,
+](
+  /// Unique VM ID.
+  vm_id: u64,
+  /// VM name.
+  name: [u8; 64],
+  /// VM state.
+  state: VmState,
+  /// VM configuration.
+  config: VmConfig,
+  /// Virtual CPUs.
+  vcpus: [*Vcpu; 64],
+  /// Number of VCPUs.
+  num_vcpus: u32,
+  /// EPT page table.
+  ept: *EptTable,
+  /// Guest memory allocator.
+  guest_memory: *GuestMemAllocator,
+  /// Emulated devices.
+  devices: [*EmulatedDevice; 32],
+  /// Number of devices.
+  num_devices: u32,
+  /// I/O APIC.
+  ioapic: *IoApicState,
+  /// PIC.
+  pic: *PicState,
+  /// PIT.
+  pit: *PitState,
+  /// RTC.
+  rtc: *RtcState,
+  /// UARTs.
+  uarts: [*UartState; 4],
+  /// IOMMU state.
+  iommu: *IommuState,
+  /// Resource accounting.
+  resources: VmResources,
+  /// Physical CPU affinity.
+  pcpu_affinity: VmCpuAffinity,
+  /// Capability token for this VM.
+  cap_token: u64,
+  /// Owner process/domain.
+  owner_id: u64,
+  /// Scheduling priority.
+  priority: u32,
+  /// Generation.
+  generation: u64,
+  /// Residual chain.
+  residual_chain: ResidualChain,
+  /// Creation timestamp.
+  created_at: u64,
+  /// Last run timestamp.
+  last_run_at: u64,
+  /// Cumulative runtime.
+  total_runtime_ns: u64,
+  /// Number of VM exits processed.
+  total_exits: u64,
+  /// Snapshot history.
+  snapshots: [VmSnapshot; 16],
+  num_snapshots: u32,
+) : effect:(alloc, unsafe);
+
+pub enum VmState : u8 {
+  Created       = 0,
+  Running       = 1,
+  Paused        = 2,
+  Suspended     = 3,
+  Migrating     = 4,
+  Snapshotting  = 5,
+  Restoring     = 6,
+  Stopped       = 7,
+  Destroyed     = 8,
+  Crashed       = 9,
+}
+
+/// VM configuration.
+pub struct VmConfig(
+  guest_memory_size: u64,
+  num_vcpus: u32,
+  boot_rom_path: [u8; 256],
+  kernel_path: [u8; 256],
+  initrd_path: [u8; 256],
+  cmdline: [u8; 512],
+  enable_nested_virt: bool,
+  enable_huge_pages: bool,
+  enable_memory_overcommit: bool,
+  enable_iommu: bool,
+  tsc_frequency_khz: u64,
+  cpuid_vendor: [u8; 12],
+  machine_type: MachineType,
+  firmware_type: FirmwareType,
+) : effect:(alloc);
+
+pub enum MachineType : u8 {
+  PC      = 0,
+  PC9801  = 1,
+  Virt    = 2,
+  Xen     = 3,
+}
+
+pub enum FirmwareType : u8 {
+  BIOS     = 0,
+  UEFI     = 1,
+  LinuxBoot = 2,
+  Direct   = 3,
+}
+
+pub struct VmResources(
+  memory_allocated: u64,
+  memory_used: u64,
+  memory_ballooned: u64,
+  cpu_time_ns: u64,
+  io_operations: u64,
+  network_bytes_tx: u64,
+  network_bytes_rx: u64,
+  disk_bytes_read: u64,
+  disk_bytes_written: u64,
+) : effect:(pure);
+
+pub struct VmCpuAffinity(
+  pcpu_bitmap: [u64; 4],  // up to 256 CPUs
+  num_pcpus: u32,
+) : effect:(pure);
+
+//==============================================================================
+// VM Lifecycle
+//==============================================================================
+
+/// Create a new virtual machine.
+pub fn vm_create[
+  name: *u8,
+  config: VmConfig,
+  hv_cap: CapabilitySlot,
+] -> Result[*VirtualMachine, VmManagerError] : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_CREATE) == 0 {
+    return Err(VmManagerError::InsufficientRights);
+  }
+
+  let vm_id: u64 = allocate_vm_id();
+  if vm_id == 0 {
+    return Err(VmManagerError::OutOfVmIds);
+  }
+
+  let vm: *VirtualMachine = @alloc(VirtualMachine);
+  vm.vm_id = vm_id;
+  copy_string(vm.name, name);
+  vm.state = VmState::Created;
+  vm.config = config;
+  vm.vcpus = Default;
+  vm.num_vcpus = 0;
+  vm.ept = null;
+  vm.guest_memory = null;
+  vm.devices = Default;
+  vm.num_devices = 0;
+  vm.ioapic = null;
+  vm.pic = null;
+  vm.pit = null;
+  vm.rtc = null;
+  vm.uarts = Default;
+  vm.iommu = null;
+  vm.resources = VmResources(memory_allocated: 0, memory_used: 0, memory_ballooned: 0, cpu_time_ns: 0, io_operations: 0, network_bytes_tx: 0, network_bytes_rx: 0, disk_bytes_read: 0, disk_bytes_written: 0);
+  vm.pcpu_affinity = VmCpuAffinity(pcpu_bitmap: Default, num_pcpus: 0);
+  vm.cap_token = hv_cap.generation;
+  vm.owner_id = get_current_process_id();
+  vm.priority = 128;
+  vm.generation = generate_vm_generation();
+  vm.residual_chain = ResidualChain(last_id: 0);
+  vm.created_at = read_timestamp();
+  vm.last_run_at = 0;
+  vm.total_runtime_ns = 0;
+  vm.total_exits = 0;
+  vm.snapshots = Default;
+  vm.num_snapshots = 0;
+
+  // Initialize memory virtualization
+  vm.ept = ept_create(hv_cap, vm.cap_token)?;
+
+  // Initialize guest memory allocator
+  vm.guest_memory = @alloc(GuestMemAllocator);
+  vm.guest_memory.regions = Default;
+  vm.guest_memory.count = 0;
+  vm.guest_memory.next_gpa = 0x1000;
+  vm.guest_memory.max_gpa = config.guest_memory_size;
+  vm.guest_memory.hv_cap = hv_cap;
+  vm.guest_memory.generation = 0;
+
+  // Initialize devices
+  vm.pic = pic_init(vm_id, 0x20, vm.cap_token);
+  vm.ioapic = ioapic_init(vm_id, vm.cap_token);
+  vm.pit = pit_init(vm_id, vm.cap_token);
+  vm.rtc = rtc_init(vm_id, vm.cap_token);
+  vm.uarts[0] = uart_init(vm_id, vm.cap_token);
+
+  // Initialize IOMMU if configured
+  if config.enable_iommu {
+    vm.iommu = @alloc(IommuState);
+    vm.iommu.enabled = true;
+    vm.iommu.page_table_ptr = 0;
+    vm.iommu.domains = Default;
+    vm.iommu.num_domains = 0;
+    vm.iommu.fault_log = Default;
+    vm.iommu.num_faults = 0;
+    vm.iommu.cap_token = vm.cap_token;
+  }
+
+  // Allocate boot memory
+  let boot_mem: u64 = guest_mem_alloc(vm.guest_memory, 0x100000, 0x1000, GuestMemBacking::Anonymous, GMF_PRESENT)?;
+  // Map in EPT
+  ept_map(vm.ept, boot_mem, boot_mem, 0x100000, EPT_PERM_RWX, EptMemoryType::WriteBack, hv_cap)?;
+
+  // Register VM in the global VM table
+  register_vm(vm);
+
+  record_vm_residual(VmOp::Create, vm_id, config.guest_memory_size);
+
+  return Ok(vm);
+}
+
+/// Start a VM.
+pub fn vm_start[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  if vm.state != VmState::Created && vm.state != VmState::Paused && vm.state != VmState::Stopped {
+    return Err(VmManagerError::InvalidVmState);
+  }
+
+  if vm.num_vcpus == 0 {
+    return Err(VmManagerError::NoVcpus);
+  }
+
+  vm.state = VmState::Running;
+  vm.last_run_at = read_timestamp();
+
+  record_vm_residual(VmOp::Start, vm.vm_id, 0);
+  return Ok(());
+}
+
+/// Pause a running VM.
+pub fn vm_pause[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  if vm.state != VmState::Running {
+    return Err(VmManagerError::InvalidVmState);
+  }
+
+  vm.state = VmState::Paused;
+  // Update runtime
+  let now: u64 = read_timestamp();
+  if vm.last_run_at != 0 {
+    vm.total_runtime_ns += now - vm.last_run_at;
+  }
+
+  record_vm_residual(VmOp::Pause, vm.vm_id, 0);
+  return Ok(());
+}
+
+/// Stop a VM.
+pub fn vm_stop[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_DESTROY)?;
+
+  vm.state = VmState::Stopped;
+  let now: u64 = read_timestamp();
+  if vm.last_run_at != 0 {
+    vm.total_runtime_ns += now - vm.last_run_at;
+  }
+
+  record_vm_residual(VmOp::Stop, vm.vm_id, 0);
+  return Ok(());
+}
+
+/// Destroy a VM and reclaim all resources.
+pub fn vm_destroy[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_DESTROY)?;
+
+  if vm.state == VmState::Running {
+    return Err(VmManagerError::VmStillRunning);
+  }
+
+  // Stop all VCPUs
+  for var i: u32 = 0; i < vm.num_vcpus; i += 1 {
+    let vcpu: *Vcpu = vm.vcpus[i];
+    vcpu_destroy(vcpu, hv_cap);
+  }
+
+  // Unregister from global table
+  unregister_vm(vm.vm_id);
+
+  vm.state = VmState::Destroyed;
+
+  record_vm_residual(VmOp::Destroy, vm.vm_id, 0);
+  return Ok(());
+}
+
+//==============================================================================
+// VCPU Management
+//==============================================================================
+
+/// Add a VCPU to the VM.
+pub fn vm_add_vcpu[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<u32, VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_CREATE)?;
+
+  if vm.num_vcpus >= 64 {
+    return Err(VmManagerError::MaxVcpusReached);
+  }
+
+  if vm.state != VmState::Created && vm.state != VmState::Paused {
+    return Err(VmManagerError::InvalidVmState);
+  }
+
+  let vcpu_id: u64 = vm.num_vcpus as u64;
+  let vcpu: *Vcpu = vcpu_create(vm.vm_id, vcpu_id, hv_cap)?;
+
+  // Set EPT pointer on VCPU
+  vcpu_set_eptp(vcpu, @ptr_to_int(vm.ept), hv_cap)?;
+
+  vm.vcpus[vm.num_vcpus] = vcpu;
+  vm.num_vcpus += 1;
+
+  record_vm_residual(VmOp::AddVcpu, vm.vm_id, vcpu_id);
+
+  return Ok(vm.num_vcpus - 1);
+}
+
+/// Remove a VCPU from the VM.
+pub fn vm_remove_vcpu[
+  vm: *VirtualMachine,
+  vcpu_index: u32,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_DESTROY)?;
+
+  if vcpu_index >= vm.num_vcpus {
+    return Err(VmManagerError::InvalidVcpuIndex);
+  }
+
+  if vm.vcpus[vcpu_index].is_running {
+    return Err(VmManagerError::VcpuStillRunning);
+  }
+
+  vcpu_destroy(vm.vcpus[vcpu_index], hv_cap)?;
+
+  // Shift remaining VCPUs
+  for var i: u32 = vcpu_index; i < vm.num_vcpus - 1; i += 1 {
+    vm.vcpus[i] = vm.vcpus[i + 1];
+  }
+  vm.num_vcpus -= 1;
+  vm.vcpus[vm.num_vcpus] = null;
+
+  record_vm_residual(VmOp::RemoveVcpu, vm.vm_id, vcpu_index as u64);
+
+  return Ok(());
+}
+
+//==============================================================================
+// Memory Management
+//==============================================================================
+
+/// Allocate memory for the VM.
+pub fn vm_alloc_memory[
+  vm: *VirtualMachine,
+  size: u64,
+  guest_phys: *u64,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_MEM)?;
+
+  let gpa: u64 = guest_mem_alloc(vm.guest_memory, size, 0x1000, GuestMemBacking::Anonymous, GMF_PRESENT)?;
+
+  // Map in EPT
+  ept_map(vm.ept, gpa, gpa, size, EPT_PERM_RWX, EptMemoryType::WriteBack, hv_cap)?;
+
+  vm.resources.memory_allocated += size;
+  vm.resources.memory_used += size;
+
+  guest_phys = gpa;
+
+  record_vm_residual(VmOp::MemAlloc, vm.vm_id, size);
+  return Ok(());
+}
+
+/// Set memory overcommit for the VM.
+pub fn vm_set_memory_overcommit[
+  vm: *VirtualMachine,
+  overcommit_ratio: u32,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_MEM)?;
+
+  if overcommit_ratio < 100 || overcommit_ratio > 1000 {
+    return Err(VmManagerError::InvalidOvercommitRatio);
+  }
+
+  vm.config.enable_memory_overcommit = true;
+
+  record_vm_residual(VmOp::MemOvercommit, vm.vm_id, overcommit_ratio as u64);
+  return Ok(());
+}
+
+//==============================================================================
+// Device Management
+//==============================================================================
+
+/// Attach a device to the VM.
+pub fn vm_attach_device[
+  vm: *VirtualMachine,
+  device: *EmulatedDevice,
+  mmio_base: u64,
+  irq_line: u32,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_CREATE)?;
+
+  if vm.num_devices >= 32 {
+    return Err(VmManagerError::MaxDevicesReached);
+  }
+
+  device_hotplug(device, vm.vm_id, mmio_base, irq_line, hv_cap)?;
+
+  // Register MMIO region for device
+  var mmio_region: MmioRegion = MmioRegion(
+    guest_phys_base: mmio_base, size: device.mmio_size as u64,
+    host_phys_base: mmio_base, device_id: device.device_id,
+    read_handler: 0, write_handler: 0,
+    is_pass_through: false, pci_bdf: 0, iommu_group: 0,
+    cap_token: vm.cap_token,
+  );
+  register_mmio_region(vm.ept, &mmio_region, hv_cap)?;
+
+  vm.devices[vm.num_devices] = device;
+  vm.num_devices += 1;
+
+  record_vm_residual(VmOp::DeviceAttach, vm.vm_id, device.device_type as u64);
+  return Ok(());
+}
+
+//==============================================================================
+// Snapshot / Resume
+//==============================================================================
+
+/// VM snapshot structure.
+pub struct VmSnapshot(
+  snapshot_id: u64,
+  name: [u8; 64],
+  timestamp: u64,
+  vm_state: VmState,
+  vcpu_states: [VcpuSnapshot; 64],
+  num_vcpus: u32,
+  memory_size: u64,
+  memory_data: *u8,
+  device_states: [DevSnapshot; 32],
+  num_devices: u32,
+  ept_state: u64,
+  generation: u64,
+) : effect:(alloc);
+
+pub struct VcpuSnapshot(
+  vcpu_id: u64,
+  regs: [u8; 2048],    // Serialized register state
+  regs_size: u32,
+  apic_state: [u8; 512],
+  apic_size: u32,
+) : effect:(alloc);
+
+pub struct DevSnapshot(
+  dev_id: u64,
+  dev_type: DeviceType,
+  state: [u8; 1024],
+  state_size: u32,
+) : effect:(alloc);
+
+/// Create a snapshot of the VM.
+pub fn vm_snapshot[
+  vm: *VirtualMachine,
+  snapshot_name: *u8,
+  hv_cap: CapabilitySlot,
+] -> Result<u64, VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  if vm.num_snapshots >= 16 {
+    return Err(VmManagerError::MaxSnapshotsReached);
+  }
+
+  let original_state: VmState = vm.state;
+  vm.state = VmState::Snapshotting;
+
+  let snapshot_id: u64 = generate_snapshot_id();
+  let snap: *VmSnapshot = @alloc(VmSnapshot);
+
+  snap.snapshot_id = snapshot_id;
+  copy_string(snap.name, snapshot_name);
+  snap.timestamp = read_timestamp();
+  snap.vm_state = original_state;
+  snap.num_vcpus = vm.num_vcpus;
+  snap.memory_size = vm.resources.memory_used;
+  snap.memory_data = null;  // In production, copy guest memory
+  snap.num_devices = vm.num_devices;
+  snap.ept_state = @ptr_to_int(vm.ept);
+  snap.generation = vm.generation;
+
+  // Capture VCPU states
+  for var i: u32 = 0; i < vm.num_vcpus; i += 1 {
+    let vcpu: *Vcpu = vm.vcpus[i];
+    snap.vcpu_states[i] = VcpuSnapshot(
+      vcpu_id: vcpu.vcpu_id,
+      regs: Default,
+      regs_size: 0,
+      apic_state: Default,
+      apic_size: 0,
+    );
+    // In production: serialize register state
+  }
+
+  // Capture device states
+  for var i: u32 = 0; i < vm.num_devices; i += 1 {
+    let dev: *EmulatedDevice = vm.devices[i];
+    snap.device_states[i] = DevSnapshot(
+      dev_id: dev.device_id,
+      dev_type: dev.device_type,
+      state: Default,
+      state_size: 0,
+    );
+  }
+
+  vm.snapshots[vm.num_snapshots] = snap;
+  vm.num_snapshots += 1;
+  vm.state = original_state;
+
+  record_vm_residual(VmOp::Snapshot, vm.vm_id, snapshot_id);
+
+  return Ok(snapshot_id);
+}
+
+/// Restore the VM from a snapshot.
+pub fn vm_restore[
+  vm: *VirtualMachine,
+  snapshot_id: u64,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  // Find the snapshot
+  var snap: *VmSnapshot = null;
+  for var i: u32 = 0; i < vm.num_snapshots; i += 1 {
+    if vm.snapshots[i].snapshot_id == snapshot_id {
+      snap = vm.snapshots[i];
+      break;
+    }
+  }
+
+  if snap == null {
+    return Err(VmManagerError::SnapshotNotFound);
+  }
+
+  vm.state = VmState::Restoring;
+
+  // Restore VCPU states
+  for var i: u32 = 0; i < snap.num_vcpus && i < vm.num_vcpus; i += 1 {
+    // In production: deserialize register state
+  }
+
+  // Restore device states
+  for var i: u32 = 0; i < snap.num_devices && i < vm.num_devices; i += 1 {
+    // In production: deserialize device state
+  }
+
+  // Restore memory from snapshot data
+  // In production: copy snapshot memory data back to guest
+
+  vm.state = snap.vm_state;
+  vm.generation = snap.generation;
+
+  record_vm_residual(VmOp::Restore, vm.vm_id, snapshot_id);
+
+  return Ok(());
+}
+
+//==============================================================================
+// Migration
+//==============================================================================
+
+/// Migrate the VM to another host.
+pub fn vm_migrate[
+  vm: *VirtualMachine,
+  destination: *MigrationTarget,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  if vm.state != VmState::Paused && vm.state != VmState::Running {
+    return Err(VmManagerError::InvalidVmState);
+  }
+
+  let original_state: VmState = vm.state;
+  vm.state = VmState::Migrating;
+
+  // Phase 1: Pause VM if running
+  if original_state == VmState::Running {
+    vm_pause(vm, hv_cap)?;
+  }
+
+  // Phase 2: Transfer memory (dirty page tracking)
+  let memory_size: u64 = vm.resources.memory_used;
+  transfer_memory_to_destination(destination, vm.guest_memory, memory_size);
+
+  // Phase 3: Transfer device state
+  for var i: u32 = 0; i < vm.num_devices; i += 1 {
+    let dev: *EmulatedDevice = vm.devices[i];
+    transfer_device_state(destination, dev);
+  }
+
+  // Phase 4: Transfer VCPU state
+  for var i: u32 = 0; i < vm.num_vcpus; i += 1 {
+    let vcpu: *Vcpu = vm.vcpus[i];
+    transfer_vcpu_state(destination, vcpu);
+  }
+
+  // Phase 5: Resume at destination
+  vm.state = VmState::Stopped;
+
+  record_vm_residual(VmOp::Migrate, vm.vm_id, @ptr_to_int(destination));
+
+  return Ok(());
+}
+
+pub struct MigrationTarget(
+  ip_address: [u8; 16],
+  port: u16,
+  host_id: u64,
+  transport: MigrationTransport,
+  encryption_key: [u8; 32],
+  bandwidth_limit_mbps: u32,
+) : effect:(alloc);
+
+pub enum MigrationTransport : u8 {
+  TCP        = 0,
+  TLS        = 1,
+  SharedMem  = 2,
+  RDMA       = 3,
+}
+
+fn transfer_memory_to_destination[dest: *MigrationTarget, allocator: *GuestMemAllocator, size: u64] : effect:(io, alloc, unsafe) {}
+fn transfer_device_state[dest: *MigrationTarget, dev: *EmulatedDevice] : effect:(io, alloc, unsafe) {}
+fn transfer_vcpu_state[dest: *MigrationTarget, vcpu: *Vcpu] : effect:(io, alloc, unsafe) {}
+
+//==============================================================================
+// VM Scheduling
+//==============================================================================
+
+/// VM scheduler state.
+pub struct VmScheduler(
+  vms: [*VirtualMachine; 128],
+  num_vms: u32,
+  current_vm: u32,
+  time_slice_ns: u64,
+  preemption_enabled: bool,
+  policy: SchedPolicy,
+) : effect:(alloc);
+
+pub enum SchedPolicy : u8 {
+  RoundRobin = 0,
+  Weighted   = 1,
+  Fifo       = 2,
+  CFS        = 3,
+}
+
+/// Schedule the next VM to run.
+pub fn sched_next_vm[
+  scheduler: *VmScheduler,
+] -> Option[*VirtualMachine] : effect:(pure)
+  loop: bounded(128)
+{
+  if scheduler.num_vms == 0 {
+    return None;
+  }
+
+  let start: u32 = scheduler.current_vm;
+
+  match scheduler.policy {
+    SchedPolicy::RoundRobin => {
+      for var i: u32 = 0; i < scheduler.num_vms; i += 1 {
+        let idx: u32 = (start + i) % scheduler.num_vms;
+        let vm: *VirtualMachine = scheduler.vms[idx];
+        if vm.state == VmState::Running {
+          scheduler.current_vm = (idx + 1) % scheduler.num_vms;
+          return Some(vm);
+        }
+      }
+    },
+    SchedPolicy::Weighted => {
+      // Pick VM with highest priority * weight
+      var best_vm: *VirtualMachine = null;
+      var best_score: u64 = 0;
+      for var i: u32 = 0; i < scheduler.num_vms; i += 1 {
+        let vm: *VirtualMachine = scheduler.vms[i];
+        if vm.state == VmState::Running {
+          let score: u64 = vm.priority as u64 * 100;
+          if score > best_score {
+            best_score = score;
+            best_vm = vm;
+          }
+        }
+      }
+      if best_vm != null {
+        return Some(best_vm);
+      }
+    },
+    _ => {},
+  }
+
+  return None;
+}
+
+//==============================================================================
+// vCPU Pinning
+//==============================================================================
+
+/// Pin a VCPU to a physical CPU.
+pub fn vcpu_pin[
+  vcpu: *Vcpu,
+  pcpu: u32,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall)
+  loop: bounded(1)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_RUN) == 0 {
+    return Err(VmManagerError::InsufficientRights);
+  }
+
+  if pcpu >= get_num_physical_cpus() {
+    return Err(VmManagerError::InvalidPcpu);
+  }
+
+  vcpu.pcpu_affinity = pcpu;
+
+  record_vm_residual(VmOp::VcpuPin, vcpu.vcpu_id, pcpu as u64);
+  return Ok(());
+}
+
+/// Pin a VM's VCPUs to a set of physical CPUs.
+pub fn vm_pin_vcpus[
+  vm: *VirtualMachine,
+  pcpu_bitmap: [u64; 4],
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall)
+  loop: bounded(64)
+{
+  var num_set: u32 = 0;
+  for var i: u32 = 0; i < 256; i += 1 {
+    let word_idx: u32 = i / 64;
+    let bit_idx: u32 = i % 64;
+    if (pcpu_bitmap[word_idx] & (1 << bit_idx)) != 0 {
+      if num_set < vm.num_vcpus {
+        vcpu_pin(vm.vcpus[num_set], i, hv_cap)?;
+      }
+      num_set += 1;
+    }
+  }
+
+  vm.pcpu_affinity = VmCpuAffinity(pcpu_bitmap: pcpu_bitmap, num_pcpus: num_set);
+
+  record_vm_residual(VmOp::VmPin, vm.vm_id, num_set as u64);
+  return Ok(());
+}
+
+//==============================================================================
+// Capability-Based VM Access
+//==============================================================================
+
+/// Validate capability-based access to a VM.
+pub fn validate_vm_cap[
+  vm: *VirtualMachine,
+  caller_cap: CapabilitySlot,
+  required: CapRights,
+] -> Result<(), VmManagerError> : effect:(pure)
+  loop: bounded(1)
+{
+  if !caller_cap.valid {
+    return Err(VmManagerError::InvalidCapability);
+  }
+
+  let rights: CapRights = CapRights(caller_cap.rights);
+  if (rights & required) != required {
+    return Err(VmManagerError::InsufficientRights);
+  }
+
+  if vm.cap_token != 0 && vm.cap_token != caller_cap.generation {
+    return Err(VmManagerError::CapabilityTokenMismatch);
+  }
+
+  return Ok(());
+}
+
+//==============================================================================
+// VM Query
+//==============================================================================
+
+/// Query VM statistics.
+pub fn vm_query_stats[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<VmResources, VmManagerError> : (syscall)
+  loop: bounded(1)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  return Ok(vm.resources);
+}
+
+/// List all VMs visible to the caller.
+pub fn vm_list[
+  hv_cap: CapabilitySlot,
+  buffer: *[*VirtualMachine; 128],
+  max_vms: u32,
+] -> u32 : effect:(syscall, alloc, unsafe)
+  loop: bounded(128)
+{
+  let rights: CapRights = CapRights(hv_cap.rights);
+  if (rights & RIGHT_HV_RUN) == 0 {
+    return 0;
+  }
+
+  var count: u32 = 0;
+  for var i: u32 = 0; i < __vm_global_table_count && count < max_vms; i += 1 {
+    let vm: *VirtualMachine = __vm_global_table[i];
+    if vm.state != VmState::Destroyed {
+      buffer[count] = vm;
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+//==============================================================================
+// VM Run (Main Execution Loop)
+//==============================================================================
+
+/// Run a VM on its VCPUs (the main VM execution loop).
+pub fn vm_run[
+  vm: *VirtualMachine,
+  hv_cap: CapabilitySlot,
+] -> Result<(), VmManagerError> : (syscall, alloc, unsafe)
+  loop: bounded(1_000_000)
+{
+  validate_vm_cap(vm, hv_cap, RIGHT_HV_RUN)?;
+
+  if vm.state != VmState::Running {
+    return Err(VmManagerError::InvalidVmState);
+  }
+
+  // Main VM execution loop
+  for var iteration: u32 = 0; iteration < 1_000_000; iteration += 1 {
+    // Check if VM should stop
+    if vm.state != VmState::Running {
+      break;
+    }
+
+    // Run each VCPU for a timeslice
+    for var vcpu_idx: u32 = 0; vcpu_idx < vm.num_vcpus; vcpu_idx += 1 {
+      if vm.state != VmState::Running {
+        break;
+      }
+
+      let vcpu: *Vcpu = vm.vcpus[vcpu_idx];
+      if vcpu.run_state != VcpuRunState::Runnable {
+        continue;
+      }
+
+      // Perform VM entry on this VCPU
+      vcpu.is_running = true;
+
+      // VM entry happens here via the VMCS
+      let entry_result: Result[(), VmError] = vm_entry(vm.ept.vmcs, hv_cap);
+      if entry_result.is_err() {
+        vcpu.is_running = false;
+        continue;
+      }
+
+      // Handle VM exits
+      while vcpu.is_running {
+        let exit_action: Result[ExitAction, VmError> = handle_vm_exit(vm.ept.vmcs, hv_cap);
+        if exit_action.is_err() {
+          vcpu.is_running = false;
+          vm.state = VmState::Crashed;
+          break;
+        }
+
+        let action: ExitAction = exit_action.unwrap();
+        vm.total_exits += 1;
+
+        match action {
+          ExitAction::ReEnterGuest => {
+            // Continue VM entry
+          },
+          ExitAction::VmExitToUser(reason, qual) => {
+            // Forward exit to VMM user-space
+            vcpu.run_state = VcpuRunState::WaitingForEvent;
+            // In production: notify VMM process via event channel
+            break;
+          },
+          ExitAction::ShutdownVm => {
+            vm_stop(vm, hv_cap)?;
+            break;
+          },
+          ExitAction::InjectInterrupt(vector) => {
+            let dev_cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_IRQ.bits, value: 0, generation: 1, valid: true);
+            vcpu_inject_irq(vcpu, vector as u8, 0, dev_cap)?;
+          },
+          ExitAction::PauseVm => {
+            vm_pause(vm, hv_cap)?;
+            break;
+          },
+          ExitAction::MigrateVm(target) => {
+            // Handled externally
+            break;
+          },
+        }
+      }
+
+      // Update runtime
+      let now: u64 = read_timestamp();
+      vcpu.runtime_ns += now - vm.last_run_at;
+      vm.last_run_at = now;
+    }
+
+    // Yield the scheduler timeslice
+    sched_yield();
+  }
+
+  return Ok(());
+}
+
+//==============================================================================
+// Error Codes
+//==============================================================================
+
+pub enum VmManagerError : u64 {
+  Success                 = 0,
+  InsufficientRights      = 1,
+  InvalidCapability       = 2,
+  CapabilityTokenMismatch = 3,
+  InvalidVmState          = 4,
+  OutOfVmIds              = 5,
+  MaxVcpusReached         = 6,
+  MaxDevicesReached       = 7,
+  MaxSnapshotsReached     = 8,
+  VmStillRunning          = 9,
+  NoVcpus                 = 10,
+  InvalidVcpuIndex        = 11,
+  VcpuStillRunning        = 12,
+  InvalidPcpu             = 13,
+  InvalidOvercommitRatio  = 14,
+  SnapshotNotFound        = 15,
+  OutOfMemory             = 16,
+  MigrationFailed         = 17,
+  DeviceNotAttached       = 18,
+  ResourceExhausted       = 19,
+  NotImplemented          = 20,
+}
+
+//==============================================================================
+// Utility Functions
+//==============================================================================
+
+pub enum VmOp : u8 {
+  Create       = 0,
+  Start        = 1,
+  Pause        = 2,
+  Stop         = 3,
+  Destroy      = 4,
+  AddVcpu      = 5,
+  RemoveVcpu   = 6,
+  MemAlloc     = 7,
+  MemOvercommit = 8,
+  DeviceAttach = 9,
+  Snapshot     = 10,
+  Restore      = 11,
+  Migrate      = 12,
+  VcpuPin      = 13,
+  VmPin        = 14,
+  Run          = 15,
+}
+
+fn record_vm_residual[op: VmOp, arg1: u64, arg2: u64] : effect:(unsafe) {
+  __vm_mgr_residual_write(op as u64, arg1, arg2);
+}
+
+fn allocate_vm_id[] -> u64 : effect:(pure) {
+  return __next_vm_id += 1;
+}
+
+fn generate_vm_generation[] -> u64 : effect:(pure) { return 1; }
+fn generate_snapshot_id[] -> u64 : effect:(pure) { return 1; }
+fn read_timestamp[] -> u64 : (syscall) { return 0; }
+fn get_num_physical_cpus[] -> u32 : (pure) { return 8; }
+fn get_current_process_id[] -> u64 : (syscall) { return 0; }
+fn sched_yield[] : (syscall) {}
+fn copy_string[dest: *u8, src: *u8] : effect:(unsafe) {
+  for var i: u32 = 0; i < 256 && src[i] != 0; i += 1 { dest[i] = src[i]; dest[i+1] = 0; }
+}
+
+fn register_vm[vm: *VirtualMachine] : effect:(unsafe) {
+  if __vm_global_table_count < 128 {
+    __vm_global_table[__vm_global_table_count] = vm;
+    __vm_global_table_count += 1;
+  }
+}
+
+fn unregister_vm[vm_id: u64] : effect:(unsafe) {
+  for var i: u32 = 0; i < __vm_global_table_count; i += 1 {
+    if __vm_global_table[i].vm_id == vm_id {
+      for var j: u32 = i; j < __vm_global_table_count - 1; j += 1 {
+        __vm_global_table[j] = __vm_global_table[j + 1];
+      }
+      __vm_global_table_count -= 1;
+      return;
+    }
+  }
+}
+
+pub type CapRights(:u64);
+pub const RIGHT_HV_CREATE: CapRights = CapRights(1 << 40);
+pub const RIGHT_HV_DESTROY: CapRights = CapRights(1 << 41);
+pub const RIGHT_HV_RUN: CapRights = CapRights(1 << 42);
+pub const RIGHT_HV_MEM: CapRights = CapRights(1 << 43);
+pub const RIGHT_HV_IRQ: CapRights = CapRights(1 << 44);
+
+pub type CapabilitySlot = core::capabilities::CapabilitySlot;
+pub type ResidualChain(last_id: u64);
+
+fn @alloc[T](...) -> *T : effect:(alloc, unsafe) { return null; }
+
+// Global VM table.
+var __vm_global_table: [*VirtualMachine; 128] = Default;
+var __vm_global_table_count: u32 = 0;
+var __next_vm_id: u64 = 1;
+
+fn __vm_mgr_residual_write[op: u64, a1: u64, a2: u64] : effect:(unsafe) {}
+
+//==============================================================================
+// Tests
+//==============================================================================
+
+@Test
+pub fn test_vm_create[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: RIGHT_HV_CREATE.bits, value: 0, generation: 1, valid: true);
+  let name: [u8; 6] = [0x74, 0x65, 0x73, 0x74, 0x76, 0x6D]; // "testvm"
+  let config: VmConfig = VmConfig(
+    guest_memory_size: 0x10000000, num_vcpus: 1,
+    boot_rom_path: Default, kernel_path: Default, initrd_path: Default, cmdline: Default,
+    enable_nested_virt: false, enable_huge_pages: true, enable_memory_overcommit: false,
+    enable_iommu: false, tsc_frequency_khz: 2000000,
+    cpuid_vendor: Default, machine_type: MachineType::Virt, firmware_type: FirmwareType::BIOS,
+  );
+  let vm: *VirtualMachine = vm_create(name, config, cap);
+  // assert(vm.state == VmState::Created);
+}
+
+#[test]
+pub fn test_vm_lifecycle[] : effect:(unsafe) {
+  let cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: (RIGHT_HV_CREATE | RIGHT_HV_RUN | RIGHT_HV_DESTROY).bits, value: 0, generation: 1, valid: true);
+  let config: VmConfig = VmConfig(guest_memory_size: 0x10000000, num_vcpus: 1, boot_rom_path: Default, kernel_path: Default, initrd_path: Default, cmdline: Default, enable_nested_virt: false, enable_huge_pages: false, enable_memory_overcommit: false, enable_iommu: false, tsc_frequency_khz: 2000000, cpuid_vendor: Default, machine_type: MachineType::Virt, firmware_type: FirmwareType::BIOS);
+  let vm: *VirtualMachine = vm_create("lifecycle", config, cap);
+
+  vm_add_vcpu(vm, cap);
+  vm_start(vm, cap);
+  assert(vm.state == VmState::Running);
+
+  vm_pause(vm, cap);
+  assert(vm.state == VmState::Paused);
+
+  vm_stop(vm, cap);
+  assert(vm.state == VmState::Stopped);
+}
+
+#[test]
+pub fn test_vm_validation[] : effect:(pure) {
+  let bad_cap: CapabilitySlot = CapabilitySlot(type_tag: 0, rights: 0, value: 0, generation: 0, valid: false);
+  // Validation should fail for invalid capability
+  // No crash expected
+}

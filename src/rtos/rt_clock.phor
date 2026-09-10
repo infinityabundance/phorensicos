@@ -1,0 +1,1079 @@
+// file: rt_clock.phor
+// purpose: Real-time clocks with monotonic clock, wall clock,
+//          execution time clock, clock resolution management,
+//          and clock drift compensation.
+// evidence: RTCLOCK-ARCH-001 through RTCLOCK-ARCH-210
+// residual: All clock reads, compensation events, and drift
+//           adjustments are recorded for forensic verifiability.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Clock Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_RT_CLOCK_BASE : Word64 = DIAG_RTOS_BASE | 0x0600
+
+const CLOCK_SOURCE_CAP       : u32 = 8
+const CLOCK_DRIFT_SAMPLES    : u32 = 64
+const CLOCK_RESIDUAL_LOG     : u32 = 32
+const CLOCK_NAME_CAP         : u32 = 32
+const CLOCK_CALIBRATION_CAP  : u32 = 128
+const CLOCK_SYNC_HISTORY     : u32 = 16
+const CLOCK_OFFSET_CAP       : u32 = 8
+
+// ──────────────────────────────────────────────
+// Clock ID Type
+// ──────────────────────────────────────────────
+pub type ClockId : u32 = struct {
+    value: Word32,
+}
+
+impl ClockId {
+    pub fn new(val: Word32) -> ClockId
+        effects: [deterministic]
+    {
+        ClockId { value: val }
+    }
+
+    pub fn from_u32(val: u32) -> ClockId
+        effects: [deterministic]
+    {
+        ClockId { value: Word32::from_u32(val) }
+    }
+
+    pub fn value(self) -> u32
+        effects: [deterministic]
+    {
+        self.value.to_u32()
+    }
+
+    pub fn eq(self, other: ClockId) -> bool
+        effects: [deterministic]
+    {
+        self.value.eq(other.value)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Type Enum
+// ──────────────────────────────────────────────
+pub type ClockType : u8 = enum {
+    ClockType_Monotonic  = 0x00,
+    ClockType_Wall       = 0x01,
+    ClockType_Execution  = 0x02,
+    ClockType_Virtual    = 0x03,
+    ClockType_Calibrated = 0x04,
+}
+
+// ──────────────────────────────────────────────
+// Clock State Enum
+// ──────────────────────────────────────────────
+pub type ClockState : u8 = enum {
+    ClockState_Stopped = 0x00,
+    ClockState_Running = 0x01,
+    ClockState_Paused  = 0x02,
+    ClockState_Error   = 0x03,
+}
+
+// ──────────────────────────────────────────────
+// Timestamp Structure
+// ──────────────────────────────────────────────
+pub type Timestamp : struct {
+    seconds: Word64,
+    nanoseconds: Word32,
+}
+
+impl Timestamp {
+    pub fn new() -> Timestamp
+        effects: [deterministic]
+    {
+        Timestamp {
+            seconds: Word64::zero(),
+            nanoseconds: Word32::zero(),
+        }
+    }
+
+    pub fn now() -> Timestamp
+        effects: [deterministic]
+    {
+        // In production, this would read from hardware clock
+        Timestamp {
+            seconds: Word64::zero(),
+            nanoseconds: Word32::zero(),
+        }
+    }
+
+    pub fn from_ns(ns: Word64) -> Timestamp
+        effects: [deterministic]
+    {
+        let sec: Word64 = ns.div(Word64::from_u64(1_000_000_000))
+        let rem: Word64 = ns.modulus(Word64::from_u64(1_000_000_000))
+        Timestamp {
+            seconds: sec,
+            nanoseconds: Word32::from_u64(rem.to_u64()),
+        }
+    }
+
+    pub fn to_ns(self) -> Word64
+        effects: [deterministic]
+    {
+        let sec_ns: Word64 = self.seconds.mul(Word64::from_u64(1_000_000_000))
+        sec_ns.add(Word64::from_u64(self.nanoseconds.to_u64()))
+    }
+
+    pub fn add(self, other: Timestamp) -> Timestamp
+        effects: [deterministic]
+    {
+        let total_ns: Word64 = self.to_ns().add(other.to_ns())
+        Timestamp::from_ns(total_ns)
+    }
+
+    pub fn sub(self, other: Timestamp) -> Timestamp
+        effects: [deterministic]
+    {
+        let total_ns: Word64 = self.to_ns().sub(other.to_ns())
+        Timestamp::from_ns(total_ns)
+    }
+
+    pub fn elapsed_since(self, earlier: Timestamp) -> Timestamp
+        effects: [deterministic]
+    {
+        if earlier.to_ns().gt(self.to_ns()) {
+            return Timestamp::new()
+        }
+        self.sub(earlier)
+    }
+
+    pub fn lt(self, other: Timestamp) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().lt(other.to_ns())
+    }
+
+    pub fn gt(self, other: Timestamp) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().gt(other.to_ns())
+    }
+
+    pub fn lte(self, other: Timestamp) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().lte(other.to_ns())
+    }
+
+    pub fn gte(self, other: Timestamp) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().gte(other.to_ns())
+    }
+
+    pub fn eq(self, other: Timestamp) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().eq(other.to_ns())
+    }
+
+    pub fn is_zero(self) -> bool
+        effects: [deterministic]
+    {
+        self.to_ns().is_zero()
+    }
+
+    pub fn seconds_part(self) -> Word64
+        effects: [deterministic]
+    {
+        self.seconds
+    }
+
+    pub fn nanos_part(self) -> u32
+        effects: [deterministic]
+    {
+        self.nanoseconds.to_u32()
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Source (abstract interface for hardware clocks)
+// ──────────────────────────────────────────────
+pub type ClockSource : struct {
+    id: ClockId,
+    clock_type: ClockType,
+    name: FixedString[CLOCK_NAME_CAP],
+    frequency: Word64,
+    resolution_ns: Word64,
+    is_initialized: bool,
+    state: ClockState,
+    drift_ppm: Word64,
+    calibration_value: Word64,
+}
+
+impl ClockSource {
+    pub fn new(cid: ClockId, ctype: ClockType, freq: Word64, res_ns: Word64) -> ClockSource
+        effects: [deterministic]
+    {
+        ClockSource {
+            id: cid,
+            clock_type: ctype,
+            name: FixedString::new(),
+            frequency: freq,
+            resolution_ns: res_ns,
+            is_initialized: false,
+            state: ClockState::ClockState_Stopped,
+            drift_ppm: Word64::zero(),
+            calibration_value: Word64::zero(),
+        }
+    }
+
+    pub fn init(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_initialized = true
+        self.state = ClockState::ClockState_Running
+    }
+
+    pub fn read(self) -> Word64
+        effects: [deterministic]
+    {
+        // Read raw counter value (placeholder)
+        Word64::zero()
+    }
+
+    pub fn to_nanos(self, raw_value: Word64) -> Word64
+        effects: [deterministic]
+    {
+        if self.frequency.is_zero() {
+            return Word64::zero()
+        }
+        raw_value.mul(Word64::from_u64(1_000_000_000)).div(self.frequency)
+    }
+
+    pub fn set_drift(self: ref mut, drift_ppm_val: Word64)
+        effects: [deterministic]
+    {
+        self.drift_ppm = drift_ppm_val
+    }
+
+    pub fn compensate_drift(self, raw_value: Word64, elapsed_ns: Word64) -> Word64
+        effects: [deterministic]
+    {
+        if self.drift_ppm.is_zero() {
+            return self.to_nanos(raw_value)
+        }
+        let drift_ns: Word64 = elapsed_ns.mul(self.drift_ppm).div(Word64::from_u64(1_000_000))
+        self.to_nanos(raw_value).add(drift_ns)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Monotonic Clock
+// ──────────────────────────────────────────────
+pub type MonotonicClock : struct {
+    source: ClockSource,
+    base_value: Word64,
+    last_value: Word64,
+    total_elapsed: Word64,
+    overrun_count: Word64,
+    max_interval: Word64,
+}
+
+impl MonotonicClock {
+    pub fn new(id: ClockId, freq: Word64, res_ns: Word64) -> MonotonicClock
+        effects: [deterministic]
+    {
+        MonotonicClock {
+            source: ClockSource::new(id, ClockType::ClockType_Monotonic, freq, res_ns),
+            base_value: Word64::zero(),
+            last_value: Word64::zero(),
+            total_elapsed: Word64::zero(),
+            overrun_count: Word64::zero(),
+            max_interval: Word64::zero(),
+        }
+    }
+
+    pub fn init(self: ref mut)
+        effects: [deterministic]
+    {
+        self.source.init()
+        self.base_value = self.source.read()
+        self.last_value = self.base_value
+    }
+
+    pub fn read_ns(self) -> Word64
+        effects: [deterministic]
+    {
+        let current: Word64 = self.source.read()
+        let delta: Word64 = current.sub(self.last_value)
+        self.source.to_nanos(delta)
+    }
+
+    pub fn read_monotonic(self: ref mut) -> Word64
+        effects: [deterministic]
+    {
+        let current: Word64 = self.source.read()
+        if current.lt(self.last_value) {
+            // Counter wrapped
+            let before_wrap: Word64 = Word64::max_value().sub(self.last_value)
+            let after_wrap: Word64 = current
+            let delta: Word64 = before_wrap.add(after_wrap)
+            self.overrun_count = self.overrun_count.increment_or_max()
+        }
+        let delta: Word64 = current.sub(self.last_value)
+        if delta.gt(self.max_interval) {
+            self.max_interval = delta
+        }
+        self.total_elapsed = self.total_elapsed.add(delta)
+        self.last_value = current
+        self.source.to_nanos(self.total_elapsed)
+    }
+
+    pub fn elapsed_since(self, since_ns: Word64) -> Word64
+        effects: [deterministic]
+    {
+        self.total_elapsed.sub(since_ns)
+    }
+
+    pub fn resolution_ns(self) -> Word64
+        effects: [deterministic]
+    {
+        self.source.resolution_ns
+    }
+
+    pub fn frequency(self) -> Word64
+        effects: [deterministic]
+    {
+        self.source.frequency
+    }
+}
+
+// ──────────────────────────────────────────────
+// Wall Clock (POSIX-like Unix time)
+// ──────────────────────────────────────────────
+pub type WallClock : struct {
+    source: ClockSource,
+    epoch_offset: Word64,
+    last_reading: Word64,
+    drift_compensation: Word64,
+    is_set: bool,
+}
+
+impl WallClock {
+    pub fn new(id: ClockId, res_ns: Word64) -> WallClock
+        effects: [deterministic]
+    {
+        WallClock {
+            source: ClockSource::new(id, ClockType::ClockType_Wall,
+                Word64::from_u64(1_000_000_000), res_ns),
+            epoch_offset: Word64::zero(),
+            last_reading: Word64::zero(),
+            drift_compensation: Word64::zero(),
+            is_set: false,
+        }
+    }
+
+    pub fn set_epoch(self: ref mut, epoch_ns: Word64)
+        effects: [deterministic]
+    {
+        self.epoch_offset = epoch_ns
+        self.is_set = true
+    }
+
+    pub fn read_wall(self) -> Timestamp
+        effects: [deterministic]
+    {
+        let raw_ns: Word64 = self.source.read()
+        let adjusted: Word64 = raw_ns.add(self.drift_compensation)
+        let wall_ns: Word64 = self.epoch_offset.add(adjusted)
+        Timestamp::from_ns(wall_ns)
+    }
+
+    pub fn adjust_drift(self: ref mut, measured_error_ns: Word64, elapsed_ns: Word64)
+        effects: [deterministic]
+    {
+        if elapsed_ns.is_zero() {
+            return
+        }
+        let ppm: Word64 = measured_error_ns.mul(Word64::from_u64(1_000_000)).div(elapsed_ns)
+        self.source.set_drift(ppm)
+        self.drift_compensation = measured_error_ns
+    }
+
+    pub fn is_set(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_set
+    }
+
+    pub fn to_unix_secs(self) -> Word64
+        effects: [deterministic]
+    {
+        self.read_wall().seconds
+    }
+}
+
+// ──────────────────────────────────────────────
+// Execution Time Clock (measures CPU time for a task)
+// ──────────────────────────────────────────────
+pub type ExecTimeClock : struct {
+    source: ClockSource,
+    task_accum: Word64,
+    current_start: Word64,
+    is_running: bool,
+    total_preemptions: Word64,
+    max_slice: Word64,
+}
+
+impl ExecTimeClock {
+    pub fn new(id: ClockId, freq: Word64) -> ExecTimeClock
+        effects: [deterministic]
+    {
+        ExecTimeClock {
+            source: ClockSource::new(id, ClockType::ClockType_Execution, freq,
+                Word64::from_u64(1)),
+            task_accum: Word64::zero(),
+            current_start: Word64::zero(),
+            is_running: false,
+            total_preemptions: Word64::zero(),
+            max_slice: Word64::zero(),
+        }
+    }
+
+    pub fn start(self: ref mut)
+        effects: [deterministic]
+    {
+        if !self.is_running {
+            self.current_start = self.source.read()
+            self.is_running = true
+        }
+    }
+
+    pub fn stop(self: ref mut) -> Word64
+        effects: [deterministic]
+    {
+        if !self.is_running {
+            return self.task_accum
+        }
+        let now: Word64 = self.source.read()
+        let slice: Word64 = now.sub(self.current_start)
+        let slice_ns: Word64 = self.source.to_nanos(slice)
+        self.task_accum = self.task_accum.add(slice_ns)
+        if slice_ns.gt(self.max_slice) {
+            self.max_slice = slice_ns
+        }
+        self.is_running = false
+        self.task_accum
+    }
+
+    pub fn preempt(self: ref mut)
+        effects: [deterministic]
+    {
+        if self.is_running {
+            let now: Word64 = self.source.read()
+            let slice: Word64 = now.sub(self.current_start)
+            let slice_ns: Word64 = self.source.to_nanos(slice)
+            self.task_accum = self.task_accum.add(slice_ns)
+            self.total_preemptions = self.total_preemptions.increment_or_max()
+            self.is_running = false
+        }
+    }
+
+    pub fn resume(self: ref mut)
+        effects: [deterministic]
+    {
+        if !self.is_running {
+            self.current_start = self.source.read()
+            self.is_running = true
+        }
+    }
+
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.task_accum = Word64::zero()
+        self.current_start = Word64::zero()
+        self.is_running = false
+    }
+
+    pub fn total_exec_time(self) -> Word64
+        effects: [deterministic]
+    {
+        self.task_accum
+    }
+
+    pub fn max_slice_time(self) -> Word64
+        effects: [deterministic]
+    {
+        self.max_slice
+    }
+
+    pub fn preemption_count(self) -> Word64
+        effects: [deterministic]
+    {
+        self.total_preemptions
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Drift Compensation
+// ──────────────────────────────────────────────
+pub type DriftCompensator : struct {
+    samples: FixedArray[Word64, CLOCK_DRIFT_SAMPLES],
+    sample_count: u32,
+    sample_times: FixedArray[Word64, CLOCK_DRIFT_SAMPLES],
+    estimated_drift_ppm: Word64,
+    accumulated_error: Word64,
+    last_correction: Word64,
+    compensation_active: bool,
+    max_drift_ppm: Word64,
+    min_drift_ppm: Word64,
+}
+
+impl DriftCompensator {
+    pub fn new() -> DriftCompensator
+        effects: [deterministic]
+    {
+        DriftCompensator {
+            samples: FixedArray::new(),
+            sample_count: 0,
+            sample_times: FixedArray::new(),
+            estimated_drift_ppm: Word64::zero(),
+            accumulated_error: Word64::zero(),
+            last_correction: Word64::zero(),
+            compensation_active: false,
+            max_drift_ppm: Word64::zero(),
+            min_drift_ppm: Word64::from_u64(0xFFFF_FFFF_FFFF_FFFF),
+        }
+    }
+
+    pub fn record_sample(self: ref mut, local_time: Word64, reference_time: Word64)
+        effects: [deterministic]
+    {
+        let error: Word64 = reference_time.sub(local_time)
+        let elapsed: Word64 = if self.sample_count > 0 {
+            let last_time: Word64 = match self.sample_times.get(self.sample_count - 1) {
+                Result::Ok(t) => t,
+                Result::Err(_) => Word64::zero(),
+            }
+            local_time.sub(last_time)
+        } else {
+            Word64::zero()
+        }
+
+        if self.sample_count < CLOCK_DRIFT_SAMPLES {
+            let _ = self.samples.set(self.sample_count, error)
+            let _ = self.sample_times.set(self.sample_count, local_time)
+            self.sample_count = self.sample_count + 1
+        } else {
+            // Shift samples
+            for i in 0..(CLOCK_DRIFT_SAMPLES - 1) {
+                let s: Word64 = match self.samples.get(i + 1) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => Word64::zero(),
+                }
+                let t: Word64 = match self.sample_times.get(i + 1) {
+                    Result::Ok(v) => v,
+                    Result::Err(_) => Word64::zero(),
+                }
+                let _ = self.samples.set(i, s)
+                let _ = self.sample_times.set(i, t)
+            }
+            let _ = self.samples.set(CLOCK_DRIFT_SAMPLES - 1, error)
+            let _ = self.sample_times.set(CLOCK_DRIFT_SAMPLES - 1, local_time)
+        }
+
+        if !elapsed.is_zero() {
+            let instant_ppm: Word64 = error.mul(Word64::from_u64(1_000_000)).div(elapsed)
+            if instant_ppm.gt(self.max_drift_ppm) {
+                self.max_drift_ppm = instant_ppm
+            }
+            if instant_ppm.lt(self.min_drift_ppm) {
+                self.min_drift_ppm = instant_ppm
+            }
+
+            // Weighted moving average
+            let weight: Word64 = Word64::from_u64(900) // 0.9 weight for new sample
+            let old_weight: Word64 = Word64::from_u64(100) // 0.1 for old estimate
+            self.estimated_drift_ppm = self.estimated_drift_ppm
+                .mul(old_weight)
+                .add(instant_ppm.mul(weight))
+                .div(Word64::from_u64(1000))
+        }
+
+        self.accumulated_error = error
+        self.compensation_active = self.sample_count >= 2
+    }
+
+    pub fn compensate(self, raw_time: Word64) -> Word64
+        effects: [deterministic]
+    {
+        if !self.compensation_active {
+            return raw_time
+        }
+        let correction: Word64 = raw_time.mul(self.estimated_drift_ppm)
+            .div(Word64::from_u64(1_000_000))
+        raw_time.add(correction)
+    }
+
+    pub fn drift_estimate(self) -> Word64
+        effects: [deterministic]
+    {
+        self.estimated_drift_ppm
+    }
+
+    pub fn is_stable(self) -> bool
+        effects: [deterministic]
+    {
+        self.sample_count >= 10 && self.compensation_active
+    }
+
+    pub fn confidence(self) -> u8
+        effects: [deterministic]
+    {
+        if self.sample_count >= 30 { 3 }
+        else if self.sample_count >= 10 { 2 }
+        else if self.sample_count >= 3 { 1 }
+        else { 0 }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Resolution Manager
+// ──────────────────────────────────────────────
+pub type ResolutionManager : struct {
+    min_resolution_ns: Word64,
+    max_resolution_ns: Word64,
+    current_resolution_ns: Word64,
+    is_coalesced: bool,
+    coalesce_window_ns: Word64,
+}
+
+impl ResolutionManager {
+    pub fn new() -> ResolutionManager
+        effects: [deterministic]
+    {
+        ResolutionManager {
+            min_resolution_ns: Word64::from_u64(1),
+            max_resolution_ns: Word64::from_u64(1_000_000),
+            current_resolution_ns: Word64::from_u64(1000),
+            is_coalesced: false,
+            coalesce_window_ns: Word64::zero(),
+        }
+    }
+
+    pub fn set_resolution(self: ref mut, resolution_ns: Word64) -> Result<(), AnalysisError>
+        effects: [deterministic]
+    {
+        if resolution_ns.lt(self.min_resolution_ns) || resolution_ns.gt(self.max_resolution_ns) {
+            return Result::Err(analysis_invalid_params(
+                FixedString[128]::from_slice("Resolution out of range")))
+        }
+        self.current_resolution_ns = resolution_ns
+        Result::Ok(())
+    }
+
+    pub fn enable_coalescing(self: ref mut, window_ns: Word64)
+        effects: [deterministic]
+    {
+        self.is_coalesced = true
+        self.coalesce_window_ns = window_ns
+    }
+
+    pub fn disable_coalescing(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_coalesced = false
+        self.coalesce_window_ns = Word64::zero()
+    }
+
+    pub fn current_resolution(self) -> Word64
+        effects: [deterministic]
+    {
+        self.current_resolution_ns
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Manager (Main Clock Subsystem)
+// ──────────────────────────────────────────────
+pub type ClockManager : struct {
+    monotonic: MonotonicClock,
+    wall: WallClock,
+    exec_clocks: FixedArray[ExecTimeClock, CLOCK_SOURCE_CAP],
+    exec_clock_count: u32,
+    drift_compensators: FixedArray[DriftCompensator, CLOCK_SOURCE_CAP],
+    resolution_manager: ResolutionManager,
+    next_clock_id: u32,
+    total_reads: Word64,
+    total_drift_corrections: Word64,
+    residuals: FixedArray[Timestamp, CLOCK_RESIDUAL_LOG],
+    residual_count: u32,
+}
+
+impl ClockManager {
+    pub fn new() -> ClockManager
+        effects: [deterministic]
+    {
+        let mono_id: ClockId = ClockId::from_u32(1)
+        let wall_id: ClockId = ClockId::from_u32(2)
+        ClockManager {
+            monotonic: MonotonicClock::new(mono_id, Word64::from_u64(1_000_000_000),
+                Word64::from_u64(1)),
+            wall: WallClock::new(wall_id, Word64::from_u64(1_000_000)),
+            exec_clocks: FixedArray::new(),
+            exec_clock_count: 0,
+            drift_compensators: FixedArray::new(),
+            resolution_manager: ResolutionManager::new(),
+            next_clock_id: 3,
+            total_reads: Word64::zero(),
+            total_drift_corrections: Word64::zero(),
+            residuals: FixedArray::new(),
+            residual_count: 0,
+        }
+    }
+
+    pub fn init(self: ref mut)
+        effects: [deterministic, residual]
+    {
+        self.monotonic.init()
+        residual emit {
+            clock_op: "clock.init",
+            monotonic_resolution: self.monotonic.resolution_ns().to_u64(),
+            wall_clock_set: if self.wall.is_set() { 1 } else { 0 },
+        }
+    }
+
+    pub fn read_monotonic(self: ref mut) -> Word64
+        effects: [deterministic, residual]
+    {
+        let val: Word64 = self.monotonic.read_monotonic()
+        self.total_reads = self.total_reads.increment_or_max()
+        if self.total_reads.to_u64() % 1000 == 0 {
+            residual emit {
+                clock_op: "monotonic.read",
+                value_ns: val.to_u64(),
+                total_reads: self.total_reads.to_u64(),
+            }
+        }
+        val
+    }
+
+    pub fn read_wall(self) -> Timestamp
+        effects: [deterministic]
+    {
+        self.wall.read_wall()
+    }
+
+    pub fn set_wall_time(self: ref mut, epoch_ns: Word64)
+        effects: [deterministic, residual]
+    {
+        self.wall.set_epoch(epoch_ns)
+        residual emit {
+            clock_op: "wall.set",
+            epoch_ns: epoch_ns.to_u64(),
+        }
+    }
+
+    pub fn create_exec_clock(self: ref mut, freq: Word64) -> Result[ClockId, AnalysisError>
+        effects: [deterministic]
+    {
+        if self.exec_clock_count >= CLOCK_SOURCE_CAP {
+            return Result::Err(analysis_invalid_params(
+                FixedString[128]::from_slice("Exec clock capacity exceeded")))
+        }
+        let id: ClockId = ClockId::from_u32(self.next_clock_id)
+        self.next_clock_id = self.next_clock_id + 1
+        let clock: ExecTimeClock = ExecTimeClock::new(id, freq)
+        let r: Result<(), BoundsError> = self.exec_clocks.set(self.exec_clock_count, clock)
+        if r.is_err() {
+            return Result::Err(analysis_invalid_params(
+                FixedString[128]::from_slice("Failed to create exec clock")))
+        }
+        self.exec_clock_count = self.exec_clock_count + 1
+        Result::Ok(id)
+    }
+
+    pub fn start_exec_clock(self: ref mut, id: ClockId) -> Result<(), AnalysisError>
+        effects: [deterministic]
+    {
+        for i in 0..self.exec_clock_count {
+            let clock: ref mut ExecTimeClock = match self.exec_clocks.ref_at_mut(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            if clock.source.id.eq(id) {
+                clock.start()
+                return Result::Ok(())
+            }
+        }
+        Result::Err(analysis_invalid_params(FixedString[128]::from_slice("Exec clock not found")))
+    }
+
+    pub fn stop_exec_clock(self: ref mut, id: ClockId) -> Result<Word64, AnalysisError>
+        effects: [deterministic]
+    {
+        for i in 0..self.exec_clock_count {
+            let clock: ref mut ExecTimeClock = match self.exec_clocks.ref_at_mut(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            if clock.source.id.eq(id) {
+                let val: Word64 = clock.stop()
+                return Result::Ok(val)
+            }
+        }
+        Result::Err(analysis_invalid_params(FixedString[128]::from_slice("Exec clock not found")))
+    }
+
+    pub fn get_exec_time(self, id: ClockId) -> Result<Word64, AnalysisError>
+        effects: [deterministic]
+    {
+        for i in 0..self.exec_clock_count {
+            let clock: ExecTimeClock = match self.exec_clocks.get(i) {
+                Result::Ok(c) => c,
+                Result::Err(_) => continue,
+            }
+            if clock.source.id.eq(id) {
+                return Result::Ok(clock.total_exec_time())
+            }
+        }
+        Result::Err(analysis_invalid_params(FixedString[128]::from_slice("Exec clock not found")))
+    }
+
+    pub fn record_drift_sample(self: ref mut, clock_idx: u32, local_time: Word64, reference_time: Word64)
+        effects: [deterministic]
+    {
+        if clock_idx < CLOCK_SOURCE_CAP {
+            let comp: ref mut DriftCompensator = match self.drift_compensators.ref_at_mut(clock_idx) {
+                Result::Ok(c) => c,
+                Result::Err(_) => return,
+            }
+            let old_drift: Word64 = comp.drift_estimate()
+            comp.record_sample(local_time, reference_time)
+            let new_drift: Word64 = comp.drift_estimate()
+            if !new_drift.eq(old_drift) {
+                self.total_drift_corrections = self.total_drift_corrections.increment_or_max()
+            }
+        }
+    }
+
+    pub fn compensate_time(self, raw_time: Word64, clock_idx: u32) -> Word64
+        effects: [deterministic]
+    {
+        if clock_idx < CLOCK_SOURCE_CAP {
+            let comp: DriftCompensator = match self.drift_compensators.get(clock_idx) {
+                Result::Ok(c) => c,
+                Result::Err(_) => return raw_time,
+            }
+            return comp.compensate(raw_time)
+        }
+        raw_time
+    }
+
+    pub fn set_resolution(self: ref mut, resolution_ns: Word64) -> Result<(), AnalysisError>
+        effects: [deterministic]
+    {
+        self.resolution_manager.set_resolution(resolution_ns)
+    }
+
+    pub fn get_resolution(self) -> Word64
+        effects: [deterministic]
+    {
+        self.resolution_manager.current_resolution()
+    }
+
+    pub fn enable_clock_coalescing(self: ref mut, window_ns: Word64)
+        effects: [deterministic]
+    {
+        self.resolution_manager.enable_coalescing(window_ns)
+    }
+
+    pub fn disable_clock_coalescing(self: ref mut)
+        effects: [deterministic]
+    {
+        self.resolution_manager.disable_coalescing()
+    }
+
+    pub fn drift_estimate(self) -> Word64
+        effects: [deterministic]
+    {
+        if CLOCK_SOURCE_CAP > 0 {
+            let comp: DriftCompensator = match self.drift_compensators.get(0) {
+                Result::Ok(c) => c,
+                Result::Err(_) => return Word64::zero(),
+            }
+            return comp.drift_estimate()
+        }
+        Word64::zero()
+    }
+
+    pub fn is_drift_stable(self) -> bool
+        effects: [deterministic]
+    {
+        if CLOCK_SOURCE_CAP > 0 {
+            let comp: DriftCompensator = match self.drift_compensators.get(0) {
+                Result::Ok(c) => c,
+                Result::Err(_) => return false,
+            }
+            return comp.is_stable()
+        }
+        false
+    }
+
+    pub fn clock_report(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[512] = FixedString::new()
+        report.append(FixedString[32]::from_slice("Clock Report:\n"))
+        report.append(FixedString[32]::from_slice("  Monotonic: "))
+        report.append_u64(self.monotonic.total_elapsed.to_u64())
+        report.append(FixedString[16]::from_slice(" ns (res: "))
+        report.append_u64(self.monotonic.resolution_ns().to_u64())
+        report.append(FixedString[2]::from_slice(")\n"))
+
+        report.append(FixedString[32]::from_slice("  Wall: "))
+        report.append(if self.wall.is_set() {
+            FixedString[3]::from_slice("set")
+        } else {
+            FixedString[6]::from_slice("unset")
+        })
+        report.append(FixedString[16]::from_slice("\n  Resolution: "))
+        report.append_u64(self.resolution_manager.current_resolution().to_u64())
+        report.append(FixedString[4]::from_slice(" ns\n"))
+
+        report.append(FixedString[32]::from_slice("  Drift PPM: "))
+        report.append_u64(self.drift_estimate().to_u64())
+        report.append(FixedString[16]::from_slice("\n  Corrections: "))
+        report.append_u64(self.total_drift_corrections.to_u64())
+        report.append(FixedString[16]::from_slice("\n  Exec clocks: "))
+        report.append_u64(self.exec_clock_count as u64)
+        report
+    }
+
+    pub fn flush_residuals(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            clock_op: "clock.residuals.flushed",
+            total_reads: self.total_reads.to_u64(),
+            total_drift_corrections: self.total_drift_corrections.to_u64(),
+            exec_clock_count: self.exec_clock_count as u64,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Clock Utility Functions
+// ──────────────────────────────────────────────
+pub fn sleep_until(manager: ref mut ClockManager, target_ns: Word64)
+    effects: [deterministic]
+{
+    let mut now: Word64 = manager.read_monotonic()
+    let max_spin: u32 = 1_000_000
+    let mut iter: u32 = 0
+    while now.lt(target_ns) && iter < max_spin proven {
+        now = manager.read_monotonic()
+        iter = iter + 1
+    }
+}
+
+pub fn sleep_for(manager: ref mut ClockManager, duration_ns: Word64)
+    effects: [deterministic]
+{
+    let now: Word64 = manager.read_monotonic()
+    let target: Word64 = now.add(duration_ns)
+    sleep_until(manager, target)
+}
+
+pub fn measure_execution(manager: ref mut ClockManager, clock_id: ClockId, fn_to_measure: fn() -> void) -> Word64
+    effects: [deterministic]
+{
+    let _ = manager.start_exec_clock(clock_id)
+    fn_to_measure()
+    let exec_time: Word64 = match manager.stop_exec_clock(clock_id) {
+        Result::Ok(t) => t,
+        Result::Err(_) => Word64::zero(),
+    }
+    exec_time
+}
+
+pub fn calibrate_clock(manager: ref mut ClockManager, reference_ns: Word64, iterations: u32) -> Word64
+    effects: [deterministic, residual]
+{
+    let mut total_error: Word64 = Word64::zero()
+    for i in 0..iterations {
+        let before: Word64 = manager.read_monotonic()
+        let target: Word64 = before.add(reference_ns)
+        sleep_until(manager, target)
+        let after: Word64 = manager.read_monotonic()
+        let actual_delta: Word64 = after.sub(before)
+        let error: Word64 = if actual_delta.gt(reference_ns) {
+            actual_delta.sub(reference_ns)
+        } else {
+            reference_ns.sub(actual_delta)
+        }
+        total_error = total_error.add(error)
+        manager.record_drift_sample(0, actual_delta, reference_ns)
+    }
+
+    let avg_error: Word64 = if iterations > 0 {
+        total_error.div(Word64::from_u64(iterations as u64))
+    } else {
+        Word64::zero()
+    }
+
+    residual emit {
+        clock_op: "calibration.complete",
+        iterations: iterations as u64,
+        avg_error_ns: avg_error.to_u64(),
+    }
+    avg_error
+}
+
+pub fn verify_clock_consistency(manager: ref ClockManager) -> bool
+    effects: [deterministic]
+{
+    // Monotonic clock must be running
+    if manager.monotonic.last_value.is_zero() && manager.monotonic.base_value.is_zero() {
+        return false
+    }
+    // Exec clocks must have valid IDs
+    for i in 0..manager.exec_clock_count {
+        let clock: ExecTimeClock = match manager.exec_clocks.get(i) {
+            Result::Ok(c) => c,
+            Result::Err(_) => return false,
+        }
+        if clock.source.id.value() == 0 {
+            return false
+        }
+    }
+    true
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_clock_manager() -> ClockManager
+    effects: [deterministic, residual]
+{
+    let mut manager: ClockManager = ClockManager::new()
+    manager.init()
+    // Initialize drift compensators
+    for i in 0..CLOCK_SOURCE_CAP {
+        let comp: DriftCompensator = DriftCompensator::new()
+        let _ = manager.drift_compensators.set(i, comp)
+    }
+    residual emit {
+        clock_op: "clock.subsystem.init",
+        clock_sources: CLOCK_SOURCE_CAP as u64,
+        drift_samples: CLOCK_DRIFT_SAMPLES as u64,
+        min_resolution: manager.resolution_manager.min_resolution_ns.to_u64(),
+        max_resolution: manager.resolution_manager.max_resolution_ns.to_u64(),
+    }
+    manager
+}

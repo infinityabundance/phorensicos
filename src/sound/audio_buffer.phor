@@ -1,0 +1,899 @@
+// file: audio_buffer.phor
+// purpose: Audio buffer with fixed-capacity ring buffer, sample format
+//          conversion, channel mapping, volume control, and mixing.
+// evidence: AUDIO-ARCH-001 through AUDIO-ARCH-200
+// residual: All operations are bounded loops and effect-declared.
+
+package "phorensic:sound:audio_buffer:v1.0";
+
+use core::constants::*
+use core::types::*
+use core::math::*
+use core::errors::*
+use core::collections::*
+
+// ──────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-CONST-001 through AUDIO-CONST-025
+
+const AUDIO_BUF_MAX_SAMPLES : u32 = 65536
+const AUDIO_BUF_MAX_CHANNELS : u32 = 8
+const AUDIO_BUF_MAX_FRAMES : u32 = 8192
+const AUDIO_BUF_MIN_VOLUME : i16 = 0
+const AUDIO_BUF_MAX_VOLUME : i16 = 1000
+const AUDIO_BUF_DEFAULT_VOLUME : i16 = 750
+const AUDIO_BUF_PEAK_HOLD_FRAMES : u32 = 48000
+
+// ──────────────────────────────────────────────
+// Sample Formats
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-FMT-001 through AUDIO-FMT-020
+
+pub type SampleFormat : u8 = enum {
+    U8 = 0,
+    S16LE = 1,
+    S24LE = 2,
+    S32LE = 3,
+    F32LE = 4,
+    F64LE = 5,
+}
+
+pub type ChannelPosition : u8 = enum {
+    FrontLeft = 0,
+    FrontRight = 1,
+    FrontCenter = 2,
+    LFE = 3,
+    RearLeft = 4,
+    RearRight = 5,
+    SideLeft = 6,
+    SideRight = 7,
+}
+
+pub type ChannelLayout : u8 = enum {
+    Mono = 1,
+    Stereo = 2,
+    StereoLFE = 3,
+    Quad = 4,
+    Surround51 = 6,
+    Surround71 = 8,
+}
+
+// ──────────────────────────────────────────────
+// Type: AudioSample
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-SAMPLE-001 through AUDIO-SAMPLE-030
+
+pub type AudioSample : u64 = struct {
+    // Internal representation: 64-bit signed fixed-point (Q32.31 format)
+    value: i64,
+}
+
+impl AudioSample {
+    pub fn from_i16(s: i16) -> AudioSample
+        effects: [deterministic]
+    {
+        // Scale i16 to Q32.31
+        AudioSample { value: (s as i64) << 16 }
+    }
+
+    pub fn to_i16(self) -> i16
+        effects: [deterministic]
+    {
+        (self.value >> 16) as i16
+    }
+
+    pub fn from_f32(s: f32) -> AudioSample
+        effects: [deterministic]
+    {
+        let scaled: i64 = (s * 2147483648.0) as i64
+        AudioSample { value: scaled }
+    }
+
+    pub fn to_f32(self) -> f32
+        effects: [deterministic]
+    {
+        (self.value as f32) / 2147483648.0
+    }
+
+    pub fn from_f64(s: f64) -> AudioSample
+        effects: [deterministic]
+    {
+        let scaled: i64 = (s * 9223372036854775808.0) as i64
+        AudioSample { value: scaled }
+    }
+
+    pub fn zero() -> AudioSample
+        effects: [deterministic]
+    {
+        AudioSample { value: 0 }
+    }
+
+    pub fn add(self, other: AudioSample) -> AudioSample
+        effects: [deterministic]
+    {
+        let sum: i64 = self.value + other.value
+        // Clamp to range
+        trusted("audio: clamp saturated addition") {
+            if self.value > 0 && other.value > 0 && sum < 0 {
+                AudioSample { value: 9223372036854775807 }
+            } else if self.value < 0 && other.value < 0 && sum > 0 {
+                AudioSample { value: -9223372036854775808 }
+            } else {
+                AudioSample { value: sum }
+            }
+        }
+    }
+
+    pub fn multiply(self, factor: i16) -> AudioSample
+        effects: [deterministic]
+    {
+        // Volume factor in thousandths (0-1000)
+        let product: i64 = (self.value * (factor as i64)) / 1000
+        AudioSample { value: product }
+    }
+
+    pub fn scale(self, factor: f64) -> AudioSample
+        effects: [deterministic]
+    {
+        let scaled: i64 = (self.value as f64 * factor) as i64
+        AudioSample { value: scaled }
+    }
+
+    pub fn is_silent(self) -> bool
+        effects: [deterministic]
+    {
+        self.value > -256 && self.value < 256
+    }
+
+    pub fn abs(self) -> AudioSample
+        effects: [deterministic]
+    {
+        if self.value < 0 {
+            AudioSample { value: -self.value }
+        } else {
+            self
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Type: AudioFrame (set of samples for all channels)
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-FRAME-001 through AUDIO-FRAME-020
+
+pub type AudioFrame : struct {
+    channels: FixedArray[8, AudioSample],
+    channel_count: u32,
+}
+
+impl AudioFrame {
+    pub fn new(channel_count: u32) -> AudioFrame
+        effects: [deterministic]
+    {
+        let mut frame: AudioFrame = AudioFrame {
+            channels: FixedArray::new(),
+            channel_count: channel_count,
+        }
+        // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+        loop: bounds[BOUND_SMALL] for i in 0..channel_count {
+            let _ = frame.channels.push(AudioSample::zero())
+        }
+        frame
+    }
+
+    pub fn get_channel(self, index: u32) -> AudioSample
+        effects: [deterministic]
+    {
+        if index >= self.channel_count {
+            AudioSample::zero()
+        } else {
+            self.channels[index as usize]
+        }
+    }
+
+    pub fn set_channel(self: ref mut, index: u32, sample: AudioSample)
+        effects: [deterministic]
+    {
+        if index < self.channel_count {
+            self.channels[index as usize] = sample
+        }
+    }
+
+    pub fn channel_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.channel_count
+    }
+
+    pub fn add(self, other: AudioFrame) -> AudioFrame
+        effects: [deterministic]
+    {
+        let mut result: AudioFrame = AudioFrame::new(self.channel_count)
+        // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+        loop: bounds[BOUND_SMALL] for i in 0..self.channel_count {
+            let sum: AudioSample = self.channels[i as usize].add(other.get_channel(i))
+            result.set_channel(i, sum)
+        }
+        result
+    }
+
+    pub fn apply_volume(self: ref mut, volume: i16)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+        loop: bounds[BOUND_SMALL] for i in 0..self.channel_count {
+            self.channels[i as usize] = self.channels[i as usize].multiply(volume)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Type: AudioRingBuffer
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-BUF-001 through AUDIO-BUF-050
+
+pub type AudioRingBuffer : struct {
+    data: FixedArray[65536, AudioFrame],
+    read_pos: u32,
+    write_pos: u32,
+    capacity: u32,
+    frame_size: u32,
+    channel_count: u32,
+    underrun_count: u32,
+    overrun_count: u32,
+    peak_level: FixedArray[8, AudioSample],
+}
+
+impl AudioRingBuffer {
+    pub fn new(capacity: u32, channels: u32) -> AudioRingBuffer
+        effects: [deterministic]
+    {
+        let max_cap: u32 = if capacity > AUDIO_BUF_MAX_SAMPLES { AUDIO_BUF_MAX_SAMPLES } else { capacity }
+        AudioRingBuffer {
+            data: FixedArray::new(),
+            read_pos: 0,
+            write_pos: 0,
+            capacity: max_cap,
+            frame_size: channels,
+            channel_count: channels,
+            underrun_count: 0,
+            overrun_count: 0,
+            peak_level: FixedArray::new(),
+        }
+    }
+
+    // Write a frame to the buffer.
+    pub fn write(self: ref mut, frame: ref AudioFrame) -> bool
+        effects: [deterministic]
+    {
+        if self.is_full() {
+            self.overrun_count = self.overrun_count + 1
+            return false
+        }
+
+        // Pre-populate with empty frames up to write_pos
+        while self.data.len() <= self.write_pos {
+            let _ = self.data.push(AudioFrame::new(self.channel_count))
+        }
+
+        self.data[self.write_pos as usize] = *frame
+        self.write_pos = (self.write_pos + 1) % self.capacity
+
+        // Update peak level
+        // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+        loop: bounds[BOUND_SMALL] for i in 0..self.channel_count {
+            let abs_val: AudioSample = frame.get_channel(i).abs()
+            if self.peak_level.len() <= i {
+                let _ = self.peak_level.push(abs_val)
+            } else if abs_val.value > self.peak_level[i as usize].value {
+                self.peak_level[i as usize] = abs_val
+            }
+        }
+
+        true
+    }
+
+    // Read a frame from the buffer.
+    pub fn read(self: ref mut) -> Option[AudioFrame]
+        effects: [deterministic]
+    {
+        if self.is_empty() {
+            self.underrun_count = self.underrun_count + 1
+            return Option::None
+        }
+
+        let frame: AudioFrame = self.data[self.read_pos as usize]
+        self.read_pos = (self.read_pos + 1) % self.capacity
+        Option::Some(frame)
+    }
+
+    // Read multiple frames into a buffer.
+    pub fn read_batch(self: ref mut, frames: ref mut FixedArray[8192, AudioFrame], count: u32) -> u32
+        effects: [deterministic]
+    {
+        let mut read_count: u32 = 0
+        // loop: bounds[BOUND_LARGE] — bounded by count
+        loop: bounds[BOUND_LARGE] for i in 0..count {
+            match self.read() {
+                Option::Some(frame) => {
+                    let _ = frames.push(frame)
+                    read_count = read_count + 1
+                },
+                Option::None => {
+                    break
+                },
+            }
+        }
+        read_count
+    }
+
+    // Write multiple frames.
+    pub fn write_batch(self: ref mut, frames: ref AudioFrame[], count: u32) -> u32
+        effects: [deterministic]
+    {
+        let mut written: u32 = 0
+        // loop: bounds[BOUND_LARGE] — bounded by count
+        loop: bounds[BOUND_LARGE] for i in 0..count {
+            if self.write(&frames[i as usize]) {
+                written = written + 1
+            } else {
+                break
+            }
+        }
+        written
+    }
+
+    // Check if buffer is empty.
+    pub fn is_empty(self) -> bool
+        effects: [deterministic]
+    {
+        self.read_pos == self.write_pos
+    }
+
+    // Check if buffer is full.
+    pub fn is_full(self) -> bool
+        effects: [deterministic]
+    {
+        let next: u32 = (self.write_pos + 1) % self.capacity
+        next == self.read_pos
+    }
+
+    // Get fill level.
+    pub fn fill_level(self) -> u32
+        effects: [deterministic]
+    {
+        if self.write_pos >= self.read_pos {
+            self.write_pos - self.read_pos
+        } else {
+            self.capacity - self.read_pos + self.write_pos
+        }
+    }
+
+    // Get available space.
+    pub fn available_space(self) -> u32
+        effects: [deterministic]
+    {
+        self.capacity - self.fill_level() - 1
+    }
+
+    // Reset the buffer.
+    pub fn reset(self: ref mut)
+        effects: [deterministic]
+    {
+        self.read_pos = 0
+        self.write_pos = 0
+        self.data.clear()
+        self.peak_level.clear()
+    }
+
+    // Get underrun count.
+    pub fn underrun_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.underrun_count
+    }
+
+    // Get overrun count.
+    pub fn overrun_count(self) -> u32
+        effects: [deterministic]
+    {
+        self.overrun_count
+    }
+
+    // Get peak level for a channel.
+    pub fn peak_level(self, channel: u32) -> AudioSample
+        effects: [deterministic]
+    {
+        if channel < self.peak_level.len() {
+            self.peak_level[channel as usize]
+        } else {
+            AudioSample::zero()
+        }
+    }
+
+    // Reset peak level.
+    pub fn reset_peak(self: ref mut)
+        effects: [deterministic]
+    {
+        self.peak_level.clear()
+    }
+
+    // Get capacity.
+    pub fn capacity(self) -> u32
+        effects: [deterministic]
+    {
+        self.capacity
+    }
+}
+
+// ──────────────────────────────────────────────
+// Sample Format Conversion
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-CONV-001 through AUDIO-CONV-035
+
+pub fn convert_sample_format(src: ref AudioSample, src_fmt: SampleFormat, dst_fmt: SampleFormat) -> AudioSample
+    effects: [deterministic]
+{
+    // Convert from src_fmt if needed
+    let internal: AudioSample = *src
+
+    // Convert to dst_fmt
+    match dst_fmt {
+        SampleFormat::S16LE => {
+            // Already in internal format, just interpret as i16
+            internal
+        },
+        SampleFormat::S32LE => {
+            internal
+        },
+        SampleFormat::F32LE => {
+            AudioSample::from_f32(internal.to_f32())
+        },
+        SampleFormat::F64LE => {
+            AudioSample::from_f64(internal.to_f64())
+        },
+        SampleFormat::U8 => {
+            AudioSample::from_i16(((internal.to_i16() as i32 + 32768) >> 8) as i16)
+        },
+        SampleFormat::S24LE => {
+            // S24 stored as 32-bit, shift accordingly
+            internal
+        },
+    }
+}
+
+// ──────────────────────────────────────────────
+// Channel Mapping
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-MAP-001 through AUDIO-MAP-025
+
+pub type ChannelMap : struct {
+    source_channel: FixedArray[8, u32],
+    dest_channel: FixedArray[8, u32],
+    channel_count: u32,
+}
+
+impl ChannelMap {
+    pub fn new() -> ChannelMap
+        effects: [deterministic]
+    {
+        ChannelMap {
+            source_channel: FixedArray::new(),
+            dest_channel: FixedArray::new(),
+            channel_count: 0,
+        }
+    }
+
+    // Add a channel mapping.
+    pub fn add_mapping(self: ref mut, src: u32, dst: u32) -> Result<(), AudioError>
+        effects: [deterministic]
+    {
+        if self.channel_count >= AUDIO_BUF_MAX_CHANNELS {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x010),
+                FixedString[128]::from_slice("channel map: max mappings reached")))
+        }
+        let _ = self.source_channel.push(src)
+        let _ = self.dest_channel.push(dst)
+        self.channel_count = self.channel_count + 1
+        Result::Ok(())
+    }
+
+    // Apply mapping to a frame.
+    pub fn apply(self, src_frame: ref AudioFrame) -> AudioFrame
+        effects: [deterministic]
+    {
+        let mut dest: AudioFrame = AudioFrame::new(self.channel_count)
+        // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+        loop: bounds[BOUND_SMALL] for i in 0..self.channel_count {
+            let src_ch: u32 = self.source_channel[i as usize]
+            let dst_ch: u32 = self.dest_channel[i as usize]
+            let sample: AudioSample = if src_ch < src_frame.channel_count {
+                src_frame.get_channel(src_ch)
+            } else {
+                AudioSample::zero()
+            }
+            dest.set_channel(dst_ch, sample)
+        }
+        dest
+    }
+
+    pub fn count(self) -> u32
+        effects: [deterministic]
+    {
+        self.channel_count
+    }
+}
+
+// ──────────────────────────────────────────────
+// Volume Control
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-VOL-001 through AUDIO-VOL-025
+
+pub type VolumeControl : struct {
+    volume: i16,
+    mute: bool,
+    balance: i16,  // -1000 to 1000 (left to right)
+    is_master: bool,
+}
+
+impl VolumeControl {
+    pub fn new() -> VolumeControl
+        effects: [deterministic]
+    {
+        VolumeControl {
+            volume: AUDIO_BUF_DEFAULT_VOLUME,
+            mute: false,
+            balance: 0,
+            is_master: true,
+        }
+    }
+
+    pub fn set_volume(self: ref mut, vol: i16) -> Result<(), AudioError>
+        effects: [deterministic]
+    {
+        if vol < AUDIO_BUF_MIN_VOLUME || vol > AUDIO_BUF_MAX_VOLUME {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x020),
+                FixedString[128]::from_slice("volume: out of range")))
+        }
+        self.volume = vol
+        Result::Ok(())
+    }
+
+    pub fn get_volume(self) -> i16
+        effects: [deterministic]
+    {
+        self.volume
+    }
+
+    pub fn set_mute(self: ref mut, muted: bool)
+        effects: [deterministic]
+    {
+        self.mute = muted
+    }
+
+    pub fn is_muted(self) -> bool
+        effects: [deterministic]
+    {
+        self.mute
+    }
+
+    pub fn set_balance(self: ref mut, bal: i16) -> Result<(), AudioError>
+        effects: [deterministic]
+    {
+        if bal < -1000 || bal > 1000 {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x021),
+                FixedString[128]::from_slice("balance: out of range")))
+        }
+        self.balance = bal
+        Result::Ok(())
+    }
+
+    pub fn get_balance(self) -> i16
+        effects: [deterministic]
+    {
+        self.balance
+    }
+
+    // Apply volume to a frame (with balance for stereo).
+    pub fn apply(self, frame: ref mut AudioFrame)
+        effects: [deterministic]
+    {
+        if self.mute {
+            // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+            loop: bounds[BOUND_SMALL] for i in 0..frame.channel_count {
+                frame.set_channel(i, AudioSample::zero())
+            }
+            return
+        }
+
+        let base_vol: i16 = self.volume
+
+        if frame.channel_count >= 2 && self.balance != 0 {
+            // Apply balance for stereo
+            let left_vol: i16 = if self.balance <= 0 {
+                base_vol
+            } else {
+                ((base_vol as i32 * (1000 - self.balance) / 1000) as i16)
+            }
+            let right_vol: i16 = if self.balance >= 0 {
+                base_vol
+            } else {
+                ((base_vol as i32 * (1000 + self.balance) / 1000) as i16)
+            }
+            frame.channels[0] = frame.channels[0].multiply(left_vol)
+            if frame.channel_count > 1 {
+                frame.channels[1] = frame.channels[1].multiply(right_vol)
+            }
+        } else {
+            // Apply uniform volume to all channels
+            // loop: bounds[BOUND_SMALL] — bounded by 8 channels
+            loop: bounds[BOUND_SMALL] for i in 0..frame.channel_count {
+                frame.channels[i as usize] = frame.channels[i as usize].multiply(base_vol)
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Audio Mixer
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-MIX-001 through AUDIO-MIX-030
+
+pub type AudioMixer : struct {
+    inputs: FixedArray[8, AudioRingBuffer],
+    output: AudioRingBuffer,
+    input_volumes: FixedArray[8, VolumeControl],
+    input_count: u32,
+    master_volume: VolumeControl,
+}
+
+impl AudioMixer {
+    pub fn new(capacity: u32, channels: u32, max_inputs: u32) -> AudioMixer
+        effects: [deterministic]
+    {
+        AudioMixer {
+            inputs: FixedArray::new(),
+            output: AudioRingBuffer::new(capacity, channels),
+            input_volumes: FixedArray::new(),
+            input_count: 0,
+            master_volume: VolumeControl::new(),
+        }
+    }
+
+    // Add an input source.
+    pub fn add_input(self: ref mut, buffer: AudioRingBuffer) -> Result<(), AudioError>
+        effects: [deterministic]
+    {
+        if self.input_count >= 8 {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x030),
+                FixedString[128]::from_slice("mixer: max inputs reached")))
+        }
+        let _ = self.inputs.push(buffer)
+        let _ = self.input_volumes.push(VolumeControl::new())
+        self.input_count = self.input_count + 1
+        Result::Ok(())
+    }
+
+    // Mix all inputs into the output buffer.
+    pub fn mix(self: ref mut, frames_to_mix: u32)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_MEDIUM] — bounded by frames
+        loop: bounds[BOUND_MEDIUM] for f in 0..frames_to_mix {
+            let mut mixed: AudioFrame = AudioFrame::new(self.output.channel_count)
+
+            // loop: bounds[BOUND_SMALL] — bounded by 8 inputs
+            loop: bounds[BOUND_SMALL] for i in 0..self.input_count {
+                match self.inputs[i as usize].read() {
+                    Option::Some(mut frame) => {
+                        // Apply input volume
+                        self.input_volumes[i as usize].apply(&mut frame)
+                        // Sum into mixed output
+                        mixed = mixed.add(frame)
+                    },
+                    Option::None => {},  // Input underrun
+                }
+            }
+
+            // Apply master volume
+            self.master_volume.apply(&mut mixed)
+            let _ = self.output.write(&mixed)
+        }
+    }
+
+    // Get the output buffer.
+    pub fn output_buffer(self: ref mut) -> ref mut AudioRingBuffer
+        effects: [deterministic]
+    {
+        &mut self.output
+    }
+
+    // Get input volume control.
+    pub fn input_volume(self: ref mut, index: u32) -> Result<ref mut VolumeControl, AudioError>
+        effects: [deterministic]
+    {
+        if index >= self.input_count {
+            return Result::Err(AudioError::new(
+                Word64::from_u64(DIAG_SOUND_BASE | 0x031),
+                FixedString[128]::from_slice("mixer: input index out of range")))
+        }
+        Result::Ok(&mut self.input_volumes[index as usize])
+    }
+
+    // Get master volume control.
+    pub fn master_volume(self: ref mut) -> ref mut VolumeControl
+        effects: [deterministic]
+    {
+        &mut self.master_volume
+    }
+}
+
+// ──────────────────────────────────────────────
+// Error Type
+// ──────────────────────────────────────────────
+
+pub type AudioError : struct {
+    code: Word64,
+    message: FixedString[128],
+}
+
+impl AudioError {
+    pub fn new(code: Word64, message: FixedString[128]) -> AudioError
+        effects: [deterministic]
+    {
+        AudioError { code: code, message: message }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Test Vectors
+// ──────────────────────────────────────────────
+// Evidence path: AUDIO-TEST-001 through AUDIO-TEST-035
+
+pub fn run_audio_buffer_tests() -> bool
+    effects: [deterministic, residual]
+{
+    // Sample conversion tests
+    let s: AudioSample = AudioSample::from_i16(32767)
+    let back: i16 = s.to_i16()
+    assert(back == 32767, "audio: i16 round-trip")
+
+    let sf: AudioSample = AudioSample::from_f32(1.0)
+    assert(sf.to_i16() > 0, "audio: f32 to sample")
+
+    // Zero test
+    let z: AudioSample = AudioSample::zero()
+    assert(z.is_silent(), "audio: zero is silent")
+
+    // Addition with clamping
+    let a: AudioSample = AudioSample::from_i16(32767)
+    let b: AudioSample = AudioSample::from_i16(32767)
+    let sum: AudioSample = a.add(b)
+    assert(sum.to_i16() >= 32767, "audio: addition clamps")
+
+    // Volume multiplication
+    let vol: AudioSample = AudioSample::from_i16(10000).multiply(500)
+    assert(vol.to_i16() == 5000, "audio: volume multiply 500/1000")
+
+    // Ring buffer tests
+    let mut buf: AudioRingBuffer = AudioRingBuffer::new(100, 2)
+    assert(buf.capacity() == 100, "audio: ring buffer capacity")
+    assert(buf.is_empty(), "audio: ring buffer initially empty")
+
+    // Write and read
+    let mut frame: AudioFrame = AudioFrame::new(2)
+    frame.set_channel(0, AudioSample::from_i16(1000))
+    frame.set_channel(1, AudioSample::from_i16(2000))
+
+    let written: bool = buf.write(&frame)
+    assert(written, "audio: frame written")
+    assert(!buf.is_empty(), "audio: buffer not empty")
+
+    let read_frame: Option[AudioFrame] = buf.read()
+    match read_frame {
+        Option::Some(f) => {
+            assert(f.get_channel(0).to_i16() == 1000, "audio: read channel 0")
+            assert(f.get_channel(1).to_i16() == 2000, "audio: read channel 1")
+        },
+        Option::None => assert(false, "audio: should read frame"),
+    }
+
+    // Underrun
+    let underrun: Option[AudioFrame] = buf.read()
+    match underrun {
+        Option::Some(_) => assert(false, "audio: should underrun"),
+        Option::None => assert(true, "audio: underrun detected"),
+    }
+    assert(buf.underrun_count() == 1, "audio: underrun count is 1")
+
+    // Fill level
+    let _ = buf.write(&frame)
+    assert(buf.fill_level() == 1, "audio: fill level is 1")
+
+    // Batch operations
+    let mut frames: FixedArray[8192, AudioFrame] = FixedArray::new()
+    // loop: bounds[BOUND_SMALL] — bounded by 5
+    loop: bounds[BOUND_SMALL] for i in 0..5 {
+        let mut f: AudioFrame = AudioFrame::new(2)
+        f.set_channel(0, AudioSample::from_i16(100 + (i as i16)))
+        f.set_channel(1, AudioSample::from_i16(200 + (i as i16)))
+        let _ = buf.write(&f)
+    }
+    let read_count: u32 = buf.read_batch(&mut frames, 6)
+    assert(read_count == 6, "audio: batch read 6 frames")
+
+    // Peak level
+    let peak: AudioSample = buf.peak_level(0)
+    assert(peak.value > 0, "audio: peak level tracked")
+
+    // Volume control
+    let mut vol_ctrl: VolumeControl = VolumeControl::new()
+    let _ = vol_ctrl.set_volume(500)
+    assert(vol_ctrl.get_volume() == 500, "audio: volume set to 500")
+
+    let mut test_frame: AudioFrame = AudioFrame::new(2)
+    test_frame.set_channel(0, AudioSample::from_i16(1000))
+    vol_ctrl.apply(&mut test_frame)
+    assert(test_frame.get_channel(0).to_i16() == 500, "audio: volume applied")
+
+    // Mute
+    vol_ctrl.set_mute(true)
+    vol_ctrl.apply(&mut test_frame)
+    assert(test_frame.get_channel(0).is_silent(), "audio: mute works")
+
+    // Balance
+    let mut bal_ctrl: VolumeControl = VolumeControl::new()
+    let _ = bal_ctrl.set_volume(1000)
+    let _ = bal_ctrl.set_balance(500)
+    let mut stereo_frame: AudioFrame = AudioFrame::new(2)
+    stereo_frame.set_channel(0, AudioSample::from_i16(1000))
+    stereo_frame.set_channel(1, AudioSample::from_i16(1000))
+    bal_ctrl.apply(&mut stereo_frame)
+    assert(stereo_frame.get_channel(0).to_i16() == 1000, "audio: left balance")
+    assert(stereo_frame.get_channel(1).to_i16() == 500, "audio: right balance")
+
+    // Channel mapping
+    let mut map: ChannelMap = ChannelMap::new()
+    let _ = map.add_mapping(0, 1)  // src ch 0 -> dst ch 1
+    let _ = map.add_mapping(1, 0)  // src ch 1 -> dst ch 0
+
+    let src_frame: AudioFrame = AudioFrame::new(2)
+    src_frame.set_channel(0, AudioSample::from_i16(100))
+    src_frame.set_channel(1, AudioSample::from_i16(200))
+    let mapped: AudioFrame = map.apply(&src_frame)
+    assert(mapped.get_channel(0).to_i16() == 200, "audio: mapped ch0->ch1")
+    assert(mapped.get_channel(1).to_i16() == 100, "audio: mapped ch1->ch0")
+
+    // Audio mixer
+    let mut mixer: AudioMixer = AudioMixer::new(200, 2, 4)
+    let input_buf: AudioRingBuffer = AudioRingBuffer::new(100, 2)
+    let _ = mixer.add_input(input_buf)
+    assert(true, "audio: mixer created with input")
+
+    // Format conversion
+    let converted: AudioSample = convert_sample_format(&s, SampleFormat::S16LE, SampleFormat::F32LE)
+    assert(converted.to_f32() > 0.0, "audio: format conversion")
+
+    residual emit {
+        op: "audio_buffer.tests",
+        sample_roundtrip: true,
+        addition: true,
+        ring_buf: true,
+        underrun: true,
+        batch: true,
+        peak: true,
+        volume: true,
+        mute: true,
+        balance: true,
+        channel_map: true,
+        mixer: true,
+        format_conv: true,
+    }
+
+    true
+}

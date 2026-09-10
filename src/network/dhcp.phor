@@ -1,0 +1,1311 @@
+// dhcp.phor — DHCP client: discover/offer/request/ack, lease management, renewal, option parsing, hostname
+// Implements RFC 2131 Dynamic Host Configuration Protocol with residual recording.
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/network/dhcp.phor
+// Court: dhcp:v1
+
+package network.dhcp;
+
+import kernel.nucleus_interface.*;
+import core.types.*;
+import core.errors.*;
+import core.collections.*;
+import core.constants.*;
+import core.traits.*;
+import core.capabilities.*;
+import core.effects.*;
+import core.handles.*;
+import core.math.*;
+import core.serialization.*;
+import network.ethernet.*;
+import network.ipv4.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+// DHCP sub-range: 0xE900 - 0xE9FF
+
+type DhcpError = enum {
+    DhcpMessageTooShort    = 0xE900,  // NE900: DHCP message shorter than 240 bytes
+    DhcpInvalidOpcode      = 0xE901,  // NE901: Invalid DHCP opcode
+    DhcpInvalidHtype       = 0xE902,  // NE902: Invalid hardware type
+    DhcpInvalidCookie      = 0xE903,  // NE903: Invalid DHCP magic cookie
+    DhcpOptionTooLong      = 0xE904,  // NE904: DHCP option exceeds message length
+    DhcpOptionUnknown      = 0xE905,  // NE905: Unknown DHCP option
+    DhcpOfferMismatch      = 0xE906,  // NE906: DHCP offer does not match discover
+    DhcpAckMismatch        = 0xE907,  // NE907: DHCP ACK does not match request
+    DhcpNakReceived        = 0xE908,  // NE908: DHCP NAK received
+    DhcpLeaseExpired       = 0xE909,  // NE909: DHCP lease expired
+    DhcpRenewalFailed      = 0xE90A,  // NE90A: DHCP renewal failed
+    DhcpServerNotFound     = 0xE90B,  // NE90B: No DHCP server responding
+    DhcpTimeout            = 0xE90C,  // NE90C: DHCP transaction timed out
+    DhcpStateError         = 0xE90D,  // NE90D: Invalid state for DHCP operation
+    DhcpCapabilityError    = 0xE90E,  // NE90E: Insufficient capability
+    DhcpMaxRetries         = 0xE90F,  // NE90F: DHCP max retries reached
+    DhcpBufferOverflow     = 0xE910,  // NE910: DHCP buffer overflow
+    DhcpInvalidYiaddr      = 0xE911,  // NE911: Invalid 'your IP' address
+    DhcpHostnameTooLong    = 0xE912,  // NE912: Hostname exceeds max length
+}
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+
+const DHCP_BOOTP_HDR_SIZE : u64 = 236;
+const DHCP_MIN_MSG_SIZE   : u64 = 240;
+const DHCP_MAX_MSG_SIZE   : u64 = 576;
+const DHCP_SERVER_PORT    : u16 = 67;
+const DHCP_CLIENT_PORT    : u16 = 68;
+const DHCP_COOKIE         : u32 = 0x63825363;
+const DHCP_MAX_OPTIONS    : u64 = 64;
+const DHCP_HOSTNAME_MAX   : u64 = 64;
+const DHCP_MAX_RETRIES    : u64 = 4;
+const DHCP_TIMEOUT_INIT_MS: u64 = 4000;
+const DHCP_TIMEOUT_MAX_MS : u64 = 64000;
+const DHCP_LEASE_DEFAULT_S: u64 = 86400;
+const DHCP_RENEWAL_PCT    : u64 = 50;
+const DHCP_REBIND_PCT     : u64 = 87;
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Message Types
+// ─────────────────────────────────────────────────────────────
+
+type DhcpOpcode = enum {
+    BootRequest = 1,
+    BootReply   = 2,
+}
+
+type DhcpHardwareType = enum {
+    HtypeEthernet = 1,
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP State Machine
+// ─────────────────────────────────────────────────────────────
+
+type DhcpClientState = enum {
+    DhcpStateInit        = 0,
+    DhcpStateDiscovering = 1,
+    DhcpStateOffered     = 2,
+    DhcpStateRequesting  = 3,
+    DhcpStateBound       = 4,
+    DhcpStateRenewing    = 5,
+    DhcpStateRebinding   = 6,
+    DhcpStateReleased    = 7,
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Option Codes
+// ─────────────────────────────────────────────────────────────
+
+type DhcpOptionCode = enum {
+    OptSubnetMask      = 1,
+    OptRouter          = 3,
+    OptDnsServer       = 6,
+    OptHostname        = 12,
+    OptDomainName      = 15,
+    OptMtu             = 26,
+    OptBroadcastAddr   = 28,
+    OptNtpServer       = 42,
+    OptRequestedIp     = 50,
+    OptLeaseTime       = 51,
+    OptOptionOverload  = 52,
+    OptDhcpMsgType     = 53,
+    OptServerId        = 54,
+    OptParamRequest    = 55,
+    OptMessage         = 56,
+    OptMaxMsgSize      = 57,
+    OptRenewalTime     = 58,
+    OptRebindTime      = 59,
+    OptClassId         = 60,
+    OptClientId        = 61,
+    OptEnd             = 255,
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Option
+// ─────────────────────────────────────────────────────────────
+
+struct DhcpOption {
+    code: u8,
+    length: u8,
+    data: Array(u8, 256),
+    data_len: u64,
+}
+
+impl DhcpOption {
+    fn new(code: u8, data_src: Array(u8, 256), data_len: u64) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 256 {
+            if i >= data_len {
+                break;
+            };
+            data[i] = data_src[i];
+        };
+        return DhcpOption {
+            code: code,
+            length: data_len as u8,
+            data: data,
+            data_len: data_len,
+        };
+    }
+
+    fn dhcp_msg_type(msg_type: u8) -> DhcpOption
+        effect [deterministic]
+    {
+        let data: Array(u8, 256) = Array::zeroed();
+        data[0] = msg_type;
+        return DhcpOption { code: 53, length: 1, data: data, data_len: 1 };
+    }
+
+    fn requested_ip(ip: Ipv4Address) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 4 {
+            data[i] = ip.octets[i];
+        };
+        return DhcpOption { code: 50, length: 4, data: data, data_len: 4 };
+    }
+
+    fn server_id(ip: Ipv4Address) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 4 {
+            data[i] = ip.octets[i];
+        };
+        return DhcpOption { code: 54, length: 4, data: data, data_len: 4 };
+    }
+
+    fn lease_time(seconds: u32) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        data[0] = ((seconds >> 24) & 0xFF) as u8;
+        data[1] = ((seconds >> 16) & 0xFF) as u8;
+        data[2] = ((seconds >> 8) & 0xFF) as u8;
+        data[3] = (seconds & 0xFF) as u8;
+        return DhcpOption { code: 51, length: 4, data: data, data_len: 4 };
+    }
+
+    fn subnet_mask(mask: Ipv4Address) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 4 {
+            data[i] = mask.octets[i];
+        };
+        return DhcpOption { code: 1, length: 4, data: data, data_len: 4 };
+    }
+
+    fn router(gateway: Ipv4Address) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 4 {
+            data[i] = gateway.octets[i];
+        };
+        return DhcpOption { code: 3, length: 4, data: data, data_len: 4 };
+    }
+
+    fn dns_server(server: Ipv4Address) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 4 {
+            data[i] = server.octets[i];
+        };
+        return DhcpOption { code: 6, length: 4, data: data, data_len: 4 };
+    }
+
+    fn hostname(name: Array(u8, DHCP_HOSTNAME_MAX), name_len: u64) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound DHCP_HOSTNAME_MAX {
+            if i >= name_len {
+                break;
+            };
+            data[i] = name[i];
+        };
+        return DhcpOption { code: 12, length: name_len as u8, data: data, data_len: name_len };
+    }
+
+    fn param_request_list(types: Array(u8, 16), count: u64) -> DhcpOption
+        effect [deterministic]
+    {
+        let mut data: Array(u8, 256) = Array::zeroed();
+        loop bound 16 {
+            if i >= count {
+                break;
+            };
+            data[i] = types[i];
+        };
+        return DhcpOption { code: 55, length: count as u8, data: data, data_len: count };
+    }
+
+    fn parse(data: Array(u8, DHCP_MAX_MSG_SIZE), offset: u64, remaining: u64) -> Result(DhcpOption, DhcpError)
+        effect [deterministic]
+    {
+        if remaining < 1 {
+            return Result::Err(DhcpError::DhcpOptionTooLong);
+        };
+        let code: u8 = data[offset];
+        if code == 0 {
+            return Result::Ok(DhcpOption { code: 0, length: 0, data: Array::zeroed(), data_len: 0 });
+        };
+        if code == 255 {
+            return Result::Ok(DhcpOption { code: 255, length: 0, data: Array::zeroed(), data_len: 0 });
+        };
+        if remaining < 2 {
+            return Result::Err(DhcpError::DhcpOptionTooLong);
+        };
+        let length: u8 = data[offset + 1];
+        if (offset + 2 + (length as u64)) > DHCP_MAX_MSG_SIZE {
+            return Result::Err(DhcpError::DhcpOptionTooLong);
+        };
+        let data_len: u64 = length as u64;
+        let mut opt_data: Array(u8, 256) = Array::zeroed();
+        loop bound 256 {
+            if i >= data_len {
+                break;
+            };
+            opt_data[i] = data[offset + 2 + i];
+        };
+        return Result::Ok(DhcpOption { code: code, length: length, data: opt_data, data_len: data_len });
+    }
+
+    fn serialize(self, buf: ref mut Array(u8, DHCP_MAX_MSG_SIZE), offset: ref mut u64)
+        effect [deterministic]
+    {
+        if self.code == 0 || self.code == 255 {
+            buf[*offset] = self.code;
+            *offset = *offset + 1;
+            return;
+        };
+        buf[*offset] = self.code;
+        buf[*offset + 1] = self.length;
+        loop bound 256 {
+            if i >= self.data_len {
+                break;
+            };
+            if (*offset + 2 + i) < DHCP_MAX_MSG_SIZE {
+                buf[*offset + 2 + i] = self.data[i];
+            };
+        };
+        *offset = *offset + 2 + self.data_len;
+    }
+
+    fn as_ipv4(self) -> Result(Ipv4Address, DhcpError)
+        effect [deterministic]
+    {
+        if self.data_len < 4 {
+            return Result::Err(DhcpError::DhcpInvalidYiaddr);
+        };
+        let mut octets: Array(u8, 4) = Array::zeroed();
+        loop bound 4 {
+            octets[i] = self.data[i];
+        };
+        return Result::Ok(Ipv4Address::from_bytes(octets));
+    }
+
+    fn as_u32(self) -> u32
+        effect [deterministic]
+    {
+        if self.data_len < 4 {
+            return 0;
+        };
+        return ((self.data[0] as u32) << 24) | ((self.data[1] as u32) << 16) |
+               ((self.data[2] as u32) << 8) | (self.data[3] as u32);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Message (BOOTP-based)
+// ─────────────────────────────────────────────────────────────
+
+struct DhcpMessage {
+    op: u8,
+    htype: u8,
+    hlen: u8,
+    hops: u8,
+    xid: u32,
+    secs: u16,
+    flags: u16,
+    ciaddr: Array(u8, 4),
+    yiaddr: Array(u8, 4),
+    siaddr: Array(u8, 4),
+    giaddr: Array(u8, 4),
+    chaddr: Array(u8, 16),
+    sname: Array(u8, 64),
+    file: Array(u8, 128),
+    options: Array(DhcpOption, DHCP_MAX_OPTIONS),
+    option_count: u64,
+}
+
+impl DhcpMessage {
+    fn discover(xid: u32, mac: Array(u8, ETH_ADDR_LEN), hostname: Array(u8, DHCP_HOSTNAME_MAX), hostname_len: u64) -> DhcpMessage
+        effect [deterministic]
+    {
+        let mut chaddr_full: Array(u8, 16) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            chaddr_full[i] = mac[i];
+        };
+        let mut options: Array(DhcpOption, DHCP_MAX_OPTIONS) = Array::zeroed();
+        let mut opt_count: u64 = 0;
+        options[opt_count] = DhcpOption::dhcp_msg_type(1); // DHCPDISCOVER
+        opt_count = opt_count + 1;
+        if hostname_len > 0 {
+            options[opt_count] = DhcpOption::hostname(hostname, hostname_len);
+            opt_count = opt_count + 1;
+        };
+        options[opt_count] = DhcpOption::param_request_list(
+            Array::from_literal([1, 3, 6, 12, 15, 26, 28, 42, 51, 54, 58, 59]),
+            12,
+        );
+        opt_count = opt_count + 1;
+        return DhcpMessage {
+            op: 1,
+            htype: 1,
+            hlen: ETH_ADDR_LEN as u8,
+            hops: 0,
+            xid: xid,
+            secs: 0,
+            flags: 0x8000, // Broadcast flag
+            ciaddr: Array::zeroed(),
+            yiaddr: Array::zeroed(),
+            siaddr: Array::zeroed(),
+            giaddr: Array::zeroed(),
+            chaddr: chaddr_full,
+            sname: Array::zeroed(),
+            file: Array::zeroed(),
+            options: options,
+            option_count: opt_count,
+        };
+    }
+
+    fn request(xid: u32, mac: Array(u8, ETH_ADDR_LEN), requested_ip: Ipv4Address,
+                server_ip: Ipv4Address, hostname: Array(u8, DHCP_HOSTNAME_MAX), hostname_len: u64) -> DhcpMessage
+        effect [deterministic]
+    {
+        let mut chaddr_full: Array(u8, 16) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            chaddr_full[i] = mac[i];
+        };
+        let mut options: Array(DhcpOption, DHCP_MAX_OPTIONS) = Array::zeroed();
+        let mut opt_count: u64 = 0;
+        options[opt_count] = DhcpOption::dhcp_msg_type(3); // DHCPREQUEST
+        opt_count = opt_count + 1;
+        options[opt_count] = DhcpOption::requested_ip(requested_ip);
+        opt_count = opt_count + 1;
+        options[opt_count] = DhcpOption::server_id(server_ip);
+        opt_count = opt_count + 1;
+        if hostname_len > 0 {
+            options[opt_count] = DhcpOption::hostname(hostname, hostname_len);
+            opt_count = opt_count + 1;
+        };
+        options[opt_count] = DhcpOption::param_request_list(
+            Array::from_literal([1, 3, 6, 51, 54, 58, 59]),
+            7,
+        );
+        opt_count = opt_count + 1;
+        return DhcpMessage {
+            op: 1,
+            htype: 1,
+            hlen: ETH_ADDR_LEN as u8,
+            hops: 0,
+            xid: xid,
+            secs: 0,
+            flags: 0x8000,
+            ciaddr: Array::zeroed(),
+            yiaddr: Array::zeroed(),
+            siaddr: Array::zeroed(),
+            giaddr: Array::zeroed(),
+            chaddr: chaddr_full,
+            sname: Array::zeroed(),
+            file: Array::zeroed(),
+            options: options,
+            option_count: opt_count,
+        };
+    }
+
+    fn decline(xid: u32, mac: Array(u8, ETH_ADDR_LEN), declined_ip: Ipv4Address) -> DhcpMessage
+        effect [deterministic]
+    {
+        let mut chaddr_full: Array(u8, 16) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            chaddr_full[i] = mac[i];
+        };
+        let mut options: Array(DhcpOption, DHCP_MAX_OPTIONS) = Array::zeroed();
+        options[0] = DhcpOption::dhcp_msg_type(4);
+        options[1] = DhcpOption::requested_ip(declined_ip);
+        return DhcpMessage {
+            op: 1, htype: 1, hlen: ETH_ADDR_LEN as u8, hops: 0,
+            xid: xid, secs: 0, flags: 0x8000,
+            ciaddr: Array::zeroed(), yiaddr: Array::zeroed(),
+            siaddr: Array::zeroed(), giaddr: Array::zeroed(),
+            chaddr: chaddr_full, sname: Array::zeroed(), file: Array::zeroed(),
+            options: options, option_count: 2,
+        };
+    }
+
+    fn release(xid: u32, client_ip: Ipv4Address, mac: Array(u8, ETH_ADDR_LEN), server_ip: Ipv4Address) -> DhcpMessage
+        effect [deterministic]
+    {
+        let mut chaddr_full: Array(u8, 16) = Array::zeroed();
+        loop bound ETH_ADDR_LEN {
+            chaddr_full[i] = mac[i];
+        };
+        let mut options: Array(DhcpOption, DHCP_MAX_OPTIONS) = Array::zeroed();
+        options[0] = DhcpOption::dhcp_msg_type(7);
+        options[1] = DhcpOption::server_id(server_ip);
+        return DhcpMessage {
+            op: 1, htype: 1, hlen: ETH_ADDR_LEN as u8, hops: 0,
+            xid: xid, secs: 0, flags: 0x8000,
+            ciaddr: client_ip.to_array(),
+            yiaddr: Array::zeroed(), siaddr: Array::zeroed(), giaddr: Array::zeroed(),
+            chaddr: chaddr_full, sname: Array::zeroed(), file: Array::zeroed(),
+            options: options, option_count: 2,
+        };
+    }
+
+    fn parse(raw: Array(u8, DHCP_MAX_MSG_SIZE), len: u64) -> Result(DhcpMessage, DhcpError)
+        effect [deterministic]
+        court "dhcp_message_parse:v1"
+    {
+        if len < DHCP_MIN_MSG_SIZE {
+            return Result::Err(DhcpError::DhcpMessageTooShort);
+        };
+        let op: u8 = raw[0];
+        if op != 1 && op != 2 {
+            return Result::Err(DhcpError::DhcpInvalidOpcode);
+        };
+        let htype: u8 = raw[1];
+        if htype != 1 {
+            return Result::Err(DhcpError::DhcpInvalidHtype);
+        };
+        let hlen: u8 = raw[2];
+        let hops: u8 = raw[3];
+        let xid: u32 = ((raw[4] as u32) << 24) | ((raw[5] as u32) << 16) |
+                       ((raw[6] as u32) << 8) | (raw[7] as u32);
+        let secs: u16 = ((raw[8] as u16) << 8) | (raw[9] as u16);
+        let flags: u16 = ((raw[10] as u16) << 8) | (raw[11] as u16);
+        let mut ciaddr: Array(u8, 4) = Array::zeroed();
+        let mut yiaddr: Array(u8, 4) = Array::zeroed();
+        let mut siaddr: Array(u8, 4) = Array::zeroed();
+        let mut giaddr: Array(u8, 4) = Array::zeroed();
+        loop bound 4 {
+            ciaddr[i] = raw[12 + i];
+            yiaddr[i] = raw[16 + i];
+            siaddr[i] = raw[20 + i];
+            giaddr[i] = raw[24 + i];
+        };
+        let mut chaddr: Array(u8, 16) = Array::zeroed();
+        loop bound 16 {
+            chaddr[i] = raw[28 + i];
+        };
+        let mut sname: Array(u8, 64) = Array::zeroed();
+        loop bound 64 {
+            sname[i] = raw[44 + i];
+        };
+        let mut file: Array(u8, 128) = Array::zeroed();
+        loop bound 128 {
+            file[i] = raw[108 + i];
+        };
+        // Check magic cookie at offset 236
+        let cookie: u32 = ((raw[236] as u32) << 24) | ((raw[237] as u32) << 16) |
+                         ((raw[238] as u32) << 8) | (raw[239] as u32);
+        if cookie != DHCP_COOKIE {
+            return Result::Err(DhcpError::DhcpInvalidCookie);
+        };
+        // Parse options starting at offset 240
+        let mut options: Array(DhcpOption, DHCP_MAX_OPTIONS) = Array::zeroed();
+        let mut opt_count: u64 = 0;
+        let mut opt_offset: u64 = 240;
+        loop bound DHCP_MAX_OPTIONS {
+            if opt_offset >= len {
+                break;
+            };
+            let opt_res: Result(DhcpOption, DhcpError) = DhcpOption::parse(raw, opt_offset, len - opt_offset);
+            if opt_res.is_err() {
+                break;
+            };
+            let opt: DhcpOption = opt_res.unwrap();
+            if opt.code == 0 {
+                opt_offset = opt_offset + 1;
+                continue;
+            };
+            if opt.code == 255 {
+                break;
+            };
+            if opt_count < DHCP_MAX_OPTIONS {
+                options[opt_count] = opt;
+                opt_count = opt_count + 1;
+            };
+            opt_offset = opt_offset + 2 + (opt.length as u64);
+        };
+        return Result::Ok(DhcpMessage {
+            op: op, htype: htype, hlen: hlen, hops: hops,
+            xid: xid, secs: secs, flags: flags,
+            ciaddr: ciaddr, yiaddr: yiaddr, siaddr: siaddr, giaddr: giaddr,
+            chaddr: chaddr, sname: sname, file: file,
+            options: options, option_count: opt_count,
+        });
+    }
+
+    fn serialize(self) -> Result(Array(u8, DHCP_MAX_MSG_SIZE), DhcpError)
+        effect [deterministic]
+    {
+        let mut buf: Array(u8, DHCP_MAX_MSG_SIZE) = Array::zeroed();
+        buf[0] = self.op;
+        buf[1] = self.htype;
+        buf[2] = self.hlen;
+        buf[3] = self.hops;
+        buf[4] = ((self.xid >> 24) & 0xFF) as u8;
+        buf[5] = ((self.xid >> 16) & 0xFF) as u8;
+        buf[6] = ((self.xid >> 8) & 0xFF) as u8;
+        buf[7] = (self.xid & 0xFF) as u8;
+        buf[8] = ((self.secs >> 8) & 0xFF) as u8;
+        buf[9] = (self.secs & 0xFF) as u8;
+        buf[10] = ((self.flags >> 8) & 0xFF) as u8;
+        buf[11] = (self.flags & 0xFF) as u8;
+        loop bound 4 {
+            buf[12 + i] = self.ciaddr[i];
+            buf[16 + i] = self.yiaddr[i];
+            buf[20 + i] = self.siaddr[i];
+            buf[24 + i] = self.giaddr[i];
+        };
+        loop bound 16 {
+            buf[28 + i] = self.chaddr[i];
+        };
+        loop bound 64 {
+            buf[44 + i] = self.sname[i];
+        };
+        loop bound 128 {
+            buf[108 + i] = self.file[i];
+        };
+        // Magic cookie
+        buf[236] = ((DHCP_COOKIE >> 24) & 0xFF) as u8;
+        buf[237] = ((DHCP_COOKIE >> 16) & 0xFF) as u8;
+        buf[238] = ((DHCP_COOKIE >> 8) & 0xFF) as u8;
+        buf[239] = (DHCP_COOKIE & 0xFF) as u8;
+        let mut offset: u64 = 240;
+        loop bound DHCP_MAX_OPTIONS {
+            if i >= self.option_count {
+                break;
+            };
+            self.options[i].serialize(buf, offset);
+            offset = offset + 2 + (self.options[i].length as u64);
+        };
+        // End option
+        if offset < DHCP_MAX_MSG_SIZE {
+            buf[offset] = 255;
+        };
+        return Result::Ok(buf);
+    }
+
+    fn get_msg_type(self) -> Option(u8)
+        effect [deterministic]
+    {
+        loop bound DHCP_MAX_OPTIONS {
+            if i >= self.option_count {
+                break;
+            };
+            if self.options[i].code == 53 {
+                return Option::Some(self.options[i].data[0]);
+            };
+        };
+        return Option::None;
+    }
+
+    fn get_server_id(self) -> Result(Ipv4Address, DhcpError)
+        effect [deterministic]
+    {
+        loop bound DHCP_MAX_OPTIONS {
+            if i >= self.option_count {
+                break;
+            };
+            if self.options[i].code == 54 {
+                return self.options[i].as_ipv4();
+            };
+        };
+        return Result::Err(DhcpError::DhcpOptionUnknown);
+    }
+
+    fn get_lease_time(self) -> u32
+        effect [deterministic]
+    {
+        loop bound DHCP_MAX_OPTIONS {
+            if i >= self.option_count {
+                break;
+            };
+            if self.options[i].code == 51 {
+                return self.options[i].as_u32();
+            };
+        };
+        return DHCP_LEASE_DEFAULT_S as u32;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Lease
+// ─────────────────────────────────────────────────────────────
+
+struct DhcpLease {
+    state: DhcpClientState,
+    xid: u32,
+    server_id: Ipv4Address,
+    offered_addr: Ipv4Address,
+    subnet_mask: Ipv4Address,
+    gateway: Ipv4Address,
+    dns_server: Ipv4Address,
+    lease_time_s: u32,
+    renewal_time_s: u32,
+    rebind_time_s: u32,
+    acquired_timestamp: u64,
+    renew_timestamp: u64,
+    rebind_timestamp: u64,
+    expiry_timestamp: u64,
+    retry_count: u64,
+    timeout_ms: u64,
+    hostname: Array(u8, DHCP_HOSTNAME_MAX),
+    hostname_len: u64,
+}
+
+impl DhcpLease {
+    fn new() -> DhcpLease
+        effect [deterministic]
+    {
+        return DhcpLease {
+            state: DhcpClientState::DhcpStateInit,
+            xid: 0,
+            server_id: Ipv4Address::any(),
+            offered_addr: Ipv4Address::any(),
+            subnet_mask: Ipv4Address::any(),
+            gateway: Ipv4Address::any(),
+            dns_server: Ipv4Address::any(),
+            lease_time_s: DHCP_LEASE_DEFAULT_S as u32,
+            renewal_time_s: (DHCP_LEASE_DEFAULT_S as u32) / 2,
+            rebind_time_s: ((DHCP_LEASE_DEFAULT_S as u32) * 87) / 100,
+            acquired_timestamp: 0,
+            renew_timestamp: 0,
+            rebind_timestamp: 0,
+            expiry_timestamp: 0,
+            retry_count: 0,
+            timeout_ms: DHCP_TIMEOUT_INIT_MS,
+            hostname: Array::zeroed(),
+            hostname_len: 0,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Client State Machine
+// ─────────────────────────────────────────────────────────────
+
+struct DhcpClient {
+    state: DhcpClientState,
+    lease: DhcpLease,
+    xid_counter: u32,
+    mac_address: Array(u8, ETH_ADDR_LEN),
+    hostname: Array(u8, DHCP_HOSTNAME_MAX),
+    hostname_len: u64,
+    discover_sent: u64,
+    offers_received: u64,
+    requests_sent: u64,
+    acks_received: u64,
+    naks_received: u64,
+    renewals: u64,
+    releases: u64,
+    total_timeouts: u64,
+    generation: u64,
+}
+
+impl DhcpClient {
+    fn new(mac: Array(u8, ETH_ADDR_LEN), hostname_str: Array(u8, DHCP_HOSTNAME_MAX), hlen: u64) -> DhcpClient
+        effect [deterministic]
+    {
+        return DhcpClient {
+            state: DhcpClientState::DhcpStateInit,
+            lease: DhcpLease::new(),
+            xid_counter: 1,
+            mac_address: mac,
+            hostname: hostname_str,
+            hostname_len: hlen,
+            discover_sent: 0,
+            offers_received: 0,
+            requests_sent: 0,
+            acks_received: 0,
+            naks_received: 0,
+            renewals: 0,
+            releases: 0,
+            total_timeouts: 0,
+            generation: 1,
+        };
+    }
+
+    fn next_xid(self: ref mut) -> u32
+        effect [deterministic]
+    {
+        let xid: u32 = self.xid_counter;
+        self.xid_counter = self.xid_counter + 1;
+        return xid;
+    }
+
+    fn start_discover(self: ref mut) -> Result(DhcpMessage, DhcpError)
+        effect [deterministic]
+        court "dhcp_start_discover:v1"
+    {
+        self.lease.xid = self.next_xid();
+        self.lease.state = DhcpClientState::DhcpStateDiscovering;
+        self.lease.retry_count = 0;
+        self.lease.timeout_ms = DHCP_TIMEOUT_INIT_MS;
+        self.discover_sent = self.discover_sent + 1;
+
+        residual emit {
+            op: "dhcp.discover",
+            xid: self.lease.xid,
+            mac: self.mac_address,
+        };
+
+        return Result::Ok(DhcpMessage::discover(
+            self.lease.xid,
+            self.mac_address,
+            self.hostname,
+            self.hostname_len,
+        ));
+    }
+
+    fn process_offer(self: ref mut, offer: DhcpMessage) -> Result(DhcpMessage, DhcpError)
+        effect [deterministic]
+        court "dhcp_process_offer:v1"
+    {
+        if self.state != DhcpClientState::DhcpStateDiscovering {
+            return Result::Err(DhcpError::DhcpStateError);
+        };
+        if offer.xid != self.lease.xid {
+            return Result::Err(DhcpError::DhcpOfferMismatch);
+        };
+        let yiaddr: Ipv4Address = Ipv4Address::from_bytes(offer.yiaddr);
+        if yiaddr.is_unspecified() {
+            return Result::Err(DhcpError::DhcpInvalidYiaddr);
+        };
+        let server_id_res: Result(Ipv4Address, DhcpError) = offer.get_server_id();
+        if server_id_res.is_err() {
+            return Result::Err(server_id_res.unwrap_err());
+        };
+        self.lease.offered_addr = yiaddr;
+        self.lease.server_id = server_id_res.unwrap();
+        self.lease.lease_time_s = offer.get_lease_time();
+        self.lease.renewal_time_s = self.lease.lease_time_s / 2;
+        self.lease.rebind_time_s = (self.lease.lease_time_s * 87) / 100;
+        self.state = DhcpClientState::DhcpStateOffered;
+        self.offers_received = self.offers_received + 1;
+
+        residual emit {
+            op: "dhcp.offer_received",
+            xid: offer.xid,
+            offered_ip: yiaddr.to_array(),
+            server: self.lease.server_id.to_array(),
+        };
+
+        // Send REQUEST
+        let request: DhcpMessage = DhcpMessage::request(
+            self.lease.xid,
+            self.mac_address,
+            yiaddr,
+            self.lease.server_id,
+            self.hostname,
+            self.hostname_len,
+        );
+        self.state = DhcpClientState::DhcpStateRequesting;
+        self.requests_sent = self.requests_sent + 1;
+        return Result::Ok(request);
+    }
+
+    fn process_ack(self: ref mut, ack: DhcpMessage, now: u64) -> Result(void, DhcpError)
+        effect [deterministic]
+        court "dhcp_process_ack:v1"
+    {
+        if self.state != DhcpClientState::DhcpStateRequesting {
+            return Result::Err(DhcpError::DhcpStateError);
+        };
+        if ack.xid != self.lease.xid {
+            return Result::Err(DhcpError::DhcpAckMismatch);
+        };
+        let yiaddr: Ipv4Address = Ipv4Address::from_bytes(ack.yiaddr);
+        if yiaddr.is_unspecified() {
+            return Result::Err(DhcpError::DhcpInvalidYiaddr);
+        };
+        self.lease.offered_addr = yiaddr;
+        self.lease.acquired_timestamp = now;
+        self.lease.renew_timestamp = now + ((self.lease.lease_time_s as u64) * DHCP_RENEWAL_PCT / 100);
+        self.lease.rebind_timestamp = now + ((self.lease.lease_time_s as u64) * DHCP_REBIND_PCT / 100);
+        self.lease.expiry_timestamp = now + (self.lease.lease_time_s as u64);
+        self.state = DhcpClientState::DhcpStateBound;
+        self.acks_received = self.acks_received + 1;
+
+        residual emit {
+            op: "dhcp.ack_received",
+            xid: ack.xid,
+            assigned_ip: yiaddr.to_array(),
+            lease_time: self.lease.lease_time_s,
+            server: self.lease.server_id.to_array(),
+        };
+
+        return Result::Ok(void);
+    }
+
+    fn process_nak(self: ref mut, nak: DhcpMessage) -> Result(void, DhcpError)
+        effect [deterministic]
+    {
+        if self.state != DhcpClientState::DhcpStateRequesting &&
+           self.state != DhcpClientState::DhcpStateRenewing {
+            return Result::Err(DhcpError::DhcpStateError);
+        };
+        self.naks_received = self.naks_received + 1;
+        self.state = DhcpClientState::DhcpStateInit;
+
+        residual emit {
+            op: "dhcp.nak_received",
+            xid: nak.xid,
+        };
+
+        return Result::Err(DhcpError::DhcpNakReceived);
+    }
+
+    fn start_renew(self: ref mut, now: u64) -> Result(Option(DhcpMessage), DhcpError)
+        effect [deterministic]
+    {
+        if self.state != DhcpClientState::DhcpStateBound {
+            return Result::Err(DhcpError::DhcpStateError);
+        };
+        if now >= self.lease.renew_timestamp {
+            self.state = DhcpClientState::DhcpStateRenewing;
+            self.renewals = self.renewals + 1;
+            let request: DhcpMessage = DhcpMessage::request(
+                self.lease.xid,
+                self.mac_address,
+                self.lease.offered_addr,
+                self.lease.server_id,
+                self.hostname,
+                self.hostname_len,
+            );
+
+            residual emit {
+                op: "dhcp.renew",
+                xid: self.lease.xid,
+                ip: self.lease.offered_addr.to_array(),
+            };
+
+            return Result::Ok(Option::Some(request));
+        };
+        return Result::Ok(Option::None);
+    }
+
+    fn check_rebind(self: ref mut, now: u64) -> bool
+        effect [deterministic]
+    {
+        if self.state == DhcpClientState::DhcpStateRenewing && now >= self.lease.rebind_timestamp {
+            self.state = DhcpClientState::DhcpStateRebinding;
+            return true;
+        };
+        if self.state == DhcpClientState::DhcpStateBound && now >= self.lease.rebind_timestamp {
+            self.state = DhcpClientState::DhcpStateRebinding;
+            return true;
+        };
+        return false;
+    }
+
+    fn check_lease_expiry(self: ref mut, now: u64) -> bool
+        effect [deterministic]
+    {
+        if self.state == DhcpClientState::DhcpStateBound ||
+           self.state == DhcpClientState::DhcpStateRenewing ||
+           self.state == DhcpClientState::DhcpStateRebinding {
+            if now >= self.lease.expiry_timestamp {
+                self.state = DhcpClientState::DhcpStateInit;
+                return true;
+            };
+        };
+        return false;
+    }
+
+    fn release(self: ref mut) -> Result(DhcpMessage, DhcpError)
+        effect [deterministic]
+    {
+        if self.state != DhcpClientState::DhcpStateBound {
+            return Result::Err(DhcpError::DhcpStateError);
+        };
+        self.state = DhcpClientState::DhcpStateReleased;
+        self.releases = self.releases + 1;
+
+        residual emit {
+            op: "dhcp.release",
+            ip: self.lease.offered_addr.to_array(),
+        };
+
+        return Result::Ok(DhcpMessage::release(
+            self.lease.xid,
+            self.lease.offered_addr,
+            self.mac_address,
+            self.lease.server_id,
+        ));
+    }
+
+    fn handle_timeout(self: ref mut) -> Result(Option(DhcpMessage), DhcpError)
+        effect [deterministic]
+    {
+        self.total_timeouts = self.total_timeouts + 1;
+        self.lease.retry_count = self.lease.retry_count + 1;
+        if self.lease.retry_count > DHCP_MAX_RETRIES {
+            self.state = DhcpClientState::DhcpStateInit;
+            return Result::Err(DhcpError::DhcpMaxRetries);
+        };
+        self.lease.timeout_ms = self.lease.timeout_ms * 2;
+        if self.lease.timeout_ms > DHCP_TIMEOUT_MAX_MS {
+            self.lease.timeout_ms = DHCP_TIMEOUT_MAX_MS;
+        };
+        if self.state == DhcpClientState::DhcpStateDiscovering ||
+           self.state == DhcpClientState::DhcpStateInit {
+            return Result::Ok(Option::Some(self.start_discover().unwrap()));
+        };
+        return Result::Ok(Option::None);
+    }
+
+    fn get_leases(self) -> (Ipv4Address, Ipv4Address, Ipv4Address, u32, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.lease.offered_addr,
+            self.lease.subnet_mask,
+            self.lease.gateway,
+            self.lease.lease_time_s,
+            self.lease.acquired_timestamp,
+            self.lease.expiry_timestamp,
+        );
+    }
+
+    fn get_statistics(self) -> (u64, u64, u64, u64, u64, u64, u64)
+        effect [deterministic]
+    {
+        return (
+            self.discover_sent,
+            self.offers_received,
+            self.requests_sent,
+            self.acks_received,
+            self.naks_received,
+            self.renewals,
+            self.total_timeouts,
+        );
+    }
+
+    fn current_state(self) -> DhcpClientState
+        effect [deterministic]
+    {
+        return self.state;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn dhcp_init(mac: Array(u8, ETH_ADDR_LEN), hostname: Array(u8, DHCP_HOSTNAME_MAX),
+             hostname_len: u64) -> Result(DhcpClient, DhcpError)
+    effect [deterministic]
+    court "dhcp_init:v1"
+{
+    residual emit {
+        op: "dhcp.init",
+        status: "ready",
+        mac: mac,
+    };
+    return Result::Ok(DhcpClient::new(mac, hostname, hostname_len));
+}
+
+fn dhcp_state_to_string(state: DhcpClientState) -> Array(u8, 16)
+    effect [deterministic]
+{
+    if state == DhcpClientState::DhcpStateInit {
+        return Array::from_literal("INIT");
+    };
+    if state == DhcpClientState::DhcpStateDiscovering {
+        return Array::from_literal("DISCOVERING");
+    };
+    if state == DhcpClientState::DhcpStateOffered {
+        return Array::from_literal("OFFERED");
+    };
+    if state == DhcpClientState::DhcpStateRequesting {
+        return Array::from_literal("REQUESTING");
+    };
+    if state == DhcpClientState::DhcpStateBound {
+        return Array::from_literal("BOUND");
+    };
+    if state == DhcpClientState::DhcpStateRenewing {
+        return Array::from_literal("RENEWING");
+    };
+    if state == DhcpClientState::DhcpStateRebinding {
+        return Array::from_literal("REBINDING");
+    };
+    if state == DhcpClientState::DhcpStateReleased {
+        return Array::from_literal("RELEASED");
+    };
+    return Array::from_literal("UNKNOWN");
+}
+
+fn dhcp_msg_type_name(msg_type: u8) -> Array(u8, 20)
+    effect [deterministic]
+{
+    if msg_type == 1 { return Array::from_literal("DISCOVER"); };
+    if msg_type == 2 { return Array::from_literal("OFFER"); };
+    if msg_type == 3 { return Array::from_literal("REQUEST"); };
+    if msg_type == 4 { return Array::from_literal("DECLINE"); };
+    if msg_type == 5 { return Array::from_literal("ACK"); };
+    if msg_type == 6 { return Array::from_literal("NAK"); };
+    if msg_type == 7 { return Array::from_literal("RELEASE"); };
+    if msg_type == 8 { return Array::from_literal("INFORM"); };
+    return Array::from_literal("UNKNOWN");
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Renewal and Lease Management Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn dhcp_calculate_renewal_time(lease_time_s: u32) -> u64
+    effect [deterministic]
+{
+    let renewal_s: u64 = (lease_time_s as u64) * DHCP_RENEWAL_PCT / 100;
+    if renewal_s < 60 {
+        return 60;
+    };
+    return renewal_s;
+}
+
+fn dhcp_calculate_rebind_time(lease_time_s: u32) -> u64
+    effect [deterministic]
+{
+    let rebind_s: u64 = (lease_time_s as u64) * DHCP_REBIND_PCT / 100;
+    if rebind_s < 60 {
+        return 60;
+    };
+    return rebind_s;
+}
+
+fn dhcp_calculate_expiry_time(lease_time_s: u32) -> u64
+    effect [deterministic]
+{
+    return lease_time_s as u64;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Option Parsing Utilities
+// ─────────────────────────────────────────────────────────────
+
+fn dhcp_extract_ipv4_from_options(options: Array(DhcpOption, DHCP_MAX_OPTIONS), count: u64, code: u8) -> Option(Ipv4Address)
+    effect [deterministic]
+{
+    loop bound DHCP_MAX_OPTIONS {
+        if i >= count {
+            break;
+        };
+        if options[i].code == code && options[i].data_len >= 4 {
+            let mut octets: Array(u8, 4) = Array::zeroed();
+            loop bound 4 {
+                octets[j] = options[i].data[j];
+            };
+            return Option::Some(Ipv4Address::from_bytes(octets));
+        };
+    };
+    return Option::None;
+}
+
+fn dhcp_extract_u32_from_options(options: Array(DhcpOption, DHCP_MAX_OPTIONS), count: u64, code: u8) -> u32
+    effect [deterministic]
+{
+    loop bound DHCP_MAX_OPTIONS {
+        if i >= count {
+            break;
+        };
+        if options[i].code == code && options[i].data_len >= 4 {
+            return options[i].as_u32();
+        };
+    };
+    return 0;
+}
+
+fn dhcp_extract_string_option(options: Array(DhcpOption, DHCP_MAX_OPTIONS), count: u64, code: u8) -> Array(u8, 256)
+    effect [deterministic]
+{
+    let mut result: Array(u8, 256) = Array::zeroed();
+    loop bound DHCP_MAX_OPTIONS {
+        if i >= count {
+            break;
+        };
+        if options[i].code == code {
+            loop bound 256 {
+                if j >= options[i].data_len {
+                    break;
+                };
+                result[j] = options[i].data[j];
+            };
+            break;
+        };
+    };
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Vendor Extensions
+// ─────────────────────────────────────────────────────────────
+
+struct DhcpVendorOptions {
+    vendor_class_id: Array(u8, 64),
+    vendor_class_len: u64,
+    vendor_specific: Array(u8, 256),
+    vendor_specific_len: u64,
+    client_id_type: u8,
+    client_id: Array(u8, 32),
+    client_id_len: u64,
+}
+
+impl DhcpVendorOptions {
+    fn new() -> DhcpVendorOptions
+        effect [deterministic]
+    {
+        return DhcpVendorOptions {
+            vendor_class_id: Array::zeroed(),
+            vendor_class_len: 0,
+            vendor_specific: Array::zeroed(),
+            vendor_specific_len: 0,
+            client_id_type: 1, // Ethernet MAC
+            client_id: Array::zeroed(),
+            client_id_len: 6,
+        };
+    }
+
+    fn parse(self: ref mut, options: Array(DhcpOption, DHCP_MAX_OPTIONS), count: u64)
+        effect [deterministic]
+    {
+        loop bound DHCP_MAX_OPTIONS {
+            if i >= count {
+                break;
+            };
+            if options[i].code == 60 {
+                let copy_len: u64 = if options[i].data_len > 64 { 64 } else { options[i].data_len };
+                loop bound 64 {
+                    if j >= copy_len { break; };
+                    self.vendor_class_id[j] = options[i].data[j];
+                };
+                self.vendor_class_len = copy_len;
+            } else if options[i].code == 43 {
+                let copy_len: u64 = if options[i].data_len > 256 { 256 } else { options[i].data_len };
+                loop bound 256 {
+                    if j >= copy_len { break; };
+                    self.vendor_specific[j] = options[i].data[j];
+                };
+                self.vendor_specific_len = copy_len;
+            } else if options[i].code == 61 {
+                let copy_len: u64 = if options[i].data_len > 32 { 32 } else { options[i].data_len };
+                if options[i].data_len >= 1 {
+                    self.client_id_type = options[i].data[0];
+                };
+                loop bound 32 {
+                    if j >= copy_len - 1 { break; };
+                    self.client_id[j] = options[i].data[1 + j];
+                };
+                self.client_id_len = copy_len - 1;
+            };
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DHCP Server Configuration Cache
+// ─────────────────────────────────────────────────────────────
+
+const DHCP_SERVER_CACHE_SIZE: u64 = 8;
+
+struct DhcpServerEntry {
+    server_id: Ipv4Address,
+    offered_addr: Ipv4Address,
+    lease_time_s: u32,
+    timestamp: u64,
+}
+
+impl DhcpServerEntry {
+    fn new(srv: Ipv4Address, offered: Ipv4Address, lease: u32, ts: u64) -> DhcpServerEntry
+        effect [deterministic]
+    {
+        return DhcpServerEntry {
+            server_id: srv,
+            offered_addr: offered,
+            lease_time_s: lease,
+            timestamp: ts,
+        };
+    }
+}
+
+struct DhcpServerCache {
+    servers: Array(DhcpServerEntry, DHCP_SERVER_CACHE_SIZE),
+    count: u64,
+}
+
+impl DhcpServerCache {
+    fn new() -> DhcpServerCache
+        effect [deterministic]
+    {
+        return DhcpServerCache {
+            servers: Array::zeroed(),
+            count: 0,
+        };
+    }
+
+    fn add_or_update(self: ref mut, server: DhcpServerEntry)
+        effect [deterministic]
+    {
+        loop bound DHCP_SERVER_CACHE_SIZE {
+            if i >= self.count {
+                break;
+            };
+            if self.servers[i].server_id.eq(server.server_id) {
+                self.servers[i] = server;
+                return;
+            };
+        };
+        if self.count < DHCP_SERVER_CACHE_SIZE {
+            self.servers[self.count] = server;
+            self.count = self.count + 1;
+        };
+    }
+
+    fn lookup(self, server_id: Ipv4Address) -> Option(DhcpServerEntry)
+        effect [deterministic]
+    {
+        loop bound DHCP_SERVER_CACHE_SIZE {
+            if i >= self.count {
+                break;
+            };
+            if self.servers[i].server_id.eq(server_id) {
+                return Option::Some(self.servers[i]);
+            };
+        };
+        return Option::None;
+    }
+
+    fn clear(self: ref mut)
+        effect [deterministic]
+    {
+        self.count = 0;
+    }
+
+    fn count_servers(self) -> u64
+        effect [deterministic]
+    {
+        return self.count;
+    }
+}

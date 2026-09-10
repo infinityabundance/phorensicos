@@ -1,0 +1,1002 @@
+// framebuffer.phor — Linear framebuffer display driver
+// MMIO-based framebuffer with pixel operations and simple mode setting
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/framebuffer.phor
+// Court: framebuffer_driver:v2
+
+package drivers.framebuffer;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type FramebufferError = enum {
+    FramebufferNotInitialized = 0xD0,  // E00D0: framebuffer not initialized
+    InvalidMode               = 0xD1,  // E00D1: invalid display mode
+    InvalidCoordinates        = 0xD2,  // E00D2: pixel coordinates out of range
+    InvalidPixelFormat        = 0xD3,  // E00D3: unsupported pixel format
+    FramebufferCapabilityError = 0xD4, // E00D4: insufficient capability
+    PresentInProgress         = 0xD5,  // E00D5: present operation already in progress
+    PresentTimeout            = 0xD6,  // E00D6: present operation timed out
+    ModeSetFailed             = 0xD7,  // E00D7: mode set failed
+    DoubleBufferConflict      = 0xD8,  // E00D8: double buffer configuration conflict
+    MmioMappingError          = 0xD9,  // E00D9: MMIO mapping failed
+    DisplayNotConnected       = 0xDA,  // E00DA: no display connected
+    CursorNotSupported        = 0xDB,  // E00DB: hardware cursor not supported
+    BlitOperationFailed       = 0xDC,  // E00DC: blit operation failed
+    RectOutOfBounds           = 0xDD,  // E00DD: rectangle exceeds framebuffer bounds
+    InvalidStride             = 0xDE,  // E00DE: invalid stride value
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pixel Formats
+// ─────────────────────────────────────────────────────────────
+
+type PixelFormat = enum {
+    Unknown          = 0,
+    Rgb332           = 1,  // 8-bit: 3R 3G 2B
+    Rgb565           = 2,  // 16-bit: 5R 6G 5B
+    Rgb888           = 3,  // 24-bit: 8R 8G 8B (packed)
+    Xrgb8888         = 4,  // 32-bit: 8R 8G 8B 8X
+    Argb8888         = 5,  // 32-bit: 8A 8R 8G 8B
+    Rgba8888         = 6,  // 32-bit: 8R 8G 8B 8A
+    Bgr888           = 7,  // 24-bit: 8B 8G 8R
+    Xbgr8888         = 8,  // 32-bit: 8B 8G 8R 8X
+    Abgr8888         = 9,  // 32-bit: 8A 8B 8G 8R
+    Monochrome       = 10, // 1-bit monochrome
+    Grayscale8       = 11, // 8-bit grayscale
+}
+
+// ─────────────────────────────────────────────────────────────
+// Display Mode
+// ─────────────────────────────────────────────────────────────
+
+struct DisplayMode {
+    width: u64,
+    height: u64,
+    pitch: u64,          // bytes per row (stride)
+    format: PixelFormat,
+    bpp: u8,              // bits per pixel
+    refresh_rate_hz: u64,
+    flags: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rectangle
+// ─────────────────────────────────────────────────────────────
+
+struct Rect {
+    x: u64,
+    y: u64,
+    width: u64,
+    height: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Pixel Color (ARGB)
+// ─────────────────────────────────────────────────────────────
+
+struct Color {
+    a: u8,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl Color {
+    fn rgb(r: u8, g: u8, b: u8) -> Color
+        effect []
+    {
+        return Color { a: 255, r: r, g: g, b: b };
+    }
+
+    fn argb(a: u8, r: u8, g: u8, b: u8) -> Color
+        effect []
+    {
+        return Color { a: a, r: r, g: g, b: b };
+    }
+
+    fn black() -> Color { return Color { a: 255, r: 0, g: 0, b: 0 }; }
+    fn white() -> Color { return Color { a: 255, r: 255, g: 255, b: 255 }; }
+    fn red() -> Color { return Color { a: 255, r: 255, g: 0, b: 0 }; }
+    fn green() -> Color { return Color { a: 255, r: 0, g: 255, b: 0 }; }
+    fn blue() -> Color { return Color { a: 255, r: 0, g: 0, b: 255 }; }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer State
+// ─────────────────────────────────────────────────────────────
+
+struct FramebufferState {
+    driver_identity: Identity,
+    fb_physical_base: u64,
+    fb_virtual_base: u64,
+    fb_size: u64,
+    current_mode: DisplayMode,
+    available_modes: Array(DisplayMode, 16),
+    mode_count: u64,
+    back_buffer_base: u64,
+    back_buffer_size: u64,
+    double_buffered: bool,
+    front_buffer_index: u64,
+    cursor_position: CursorPosition,
+    cursor_visible: bool,
+    dirty_rect: Rect,
+    hardware_cursor_supported: bool,
+    capability: Cap(FramebufferCapability),
+    residual_log: RingBuf(ResidualRecord, 128),
+    initialized: bool,
+    initialization_timestamp: u64,
+    present_count: u64,
+    pixel_write_count: u64,
+    error_count: u64,
+    trust_state: TrustState,
+    generation: u64,
+}
+
+struct FramebufferCapability {
+    object_id: Identity,
+    generation: u64,
+    can_write: bool,
+    can_present: bool,
+    can_set_mode: bool,
+    can_cursor: bool,
+    max_resolution_x: u64,
+    max_resolution_y: u64,
+}
+
+struct CursorPosition {
+    x: u64,
+    y: u64,
+    visible: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_init(
+    driver_identity: Identity,
+    fb_phys_base: u64,
+    fb_size: u64,
+    initial_mode: DisplayMode,
+    caps: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> FramebufferState
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_init:v2"
+{
+    let modes: Array(DisplayMode, 16) = Array(DisplayMode, 16) {
+        data: [
+            DisplayMode { width: 640, height: 480, pitch: 2560, format: PixelFormat::Xrgb8888, bpp: 32, refresh_rate_hz: 60, flags: 0 },
+            DisplayMode { width: 800, height: 600, pitch: 3200, format: PixelFormat::Xrgb8888, bpp: 32, refresh_rate_hz: 60, flags: 0 },
+            DisplayMode { width: 1024, height: 768, pitch: 4096, format: PixelFormat::Xrgb8888, bpp: 32, refresh_rate_hz: 60, flags: 0 },
+            DisplayMode { width: 1280, height: 720, pitch: 5120, format: PixelFormat::Xrgb8888, bpp: 32, refresh_rate_hz: 60, flags: 0 },
+            DisplayMode { width: 1280, height: 1024, pitch: 5120, format: PixelFormat::Xrgb8888, bpp: 32, refresh_rate_hz: 60, flags: 0 },
+            DisplayMode { width: 1920, height: 1080, pitch: 7680, format: PixelFormat::Xrgb8888, bpp: 32, refresh_rate_hz: 60, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+            DisplayMode { width: 0, height: 0, pitch: 0, format: PixelFormat::Unknown, bpp: 0, refresh_rate_hz: 0, flags: 0 },
+        ],
+    };
+
+    // Compute virtual address (identity mapping for early boot)
+    let fb_virt: u64 = fb_phys_base;
+
+    let state: FramebufferState = FramebufferState {
+        driver_identity: driver_identity,
+        fb_physical_base: fb_phys_base,
+        fb_virtual_base: fb_virt,
+        fb_size: fb_size,
+        current_mode: initial_mode,
+        available_modes: modes,
+        mode_count: 6,
+        back_buffer_base: 0,
+        back_buffer_size: 0,
+        double_buffered: false,
+        front_buffer_index: 0,
+        cursor_position: CursorPosition { x: 0, y: 0, visible: false },
+        cursor_visible: false,
+        dirty_rect: Rect { x: 0, y: 0, width: initial_mode.width, height: initial_mode.height },
+        hardware_cursor_supported: false,
+        capability: caps,
+        residual_log: RingBuf::new(),
+        initialized: true,
+        initialization_timestamp: timestamp,
+        present_count: 0,
+        pixel_write_count: 0,
+        error_count: 0,
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    // Clear the framebuffer
+    framebuffer_clear_screen(state, Color::black());
+
+    residual emit {
+        op: "framebuffer.init",
+        fb_phys_base: fb_phys_base,
+        fb_size: fb_size,
+        width: initial_mode.width,
+        height: initial_mode.height,
+        format: initial_mode.format as u64,
+        bpp: initial_mode.bpp as u64,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Write Pixel
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_write_pixel(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    color: Color,
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_pixel:v2"
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if !state.capability.can_write {
+        return Result::Err(FramebufferError::FramebufferCapabilityError);
+    };
+
+    if x >= state.current_mode.width || y >= state.current_mode.height {
+        return Result::Err(FramebufferError::InvalidCoordinates);
+    };
+
+    let mode: DisplayMode = state.current_mode;
+    let offset: u64 = y * mode.pitch + x * (mode.bpp as u64 / 8);
+    let fb_ptr: *(u8) = (state.fb_virtual_base + offset) as *(u8);
+
+    match mode.format {
+        PixelFormat::Xrgb8888 | PixelFormat::Argb8888 => {
+            // 4 bytes per pixel: B, G, R, A/X
+            trusted reason "framebuffer write at verified MMIO address, bounds-checked" {
+                *(fb_ptr) = color.b;
+                *(fb_ptr + 1) = color.g;
+                *(fb_ptr + 2) = color.r;
+                *(fb_ptr + 3) = color.a;
+            };
+        },
+        PixelFormat::Rgb565 => {
+            let pixel: u16 = ((color.r as u16 >> 3) << 11)
+                           | ((color.g as u16 >> 2) << 5)
+                           | (color.b as u16 >> 3);
+            trusted reason "RGB565 packed pixel write" {
+                *(fb_ptr as *(u16)) = pixel;
+            };
+        },
+        PixelFormat::Rgb888 => {
+            trusted reason "RGB888 packed pixel write at verified offset" {
+                *(fb_ptr) = color.b;
+                *(fb_ptr + 1) = color.g;
+                *(fb_ptr + 2) = color.r;
+            };
+        },
+        _ => {
+            // Fallback: write raw grayscale
+            let gray: u8 = ((color.r as u16 + color.g as u16 + color.b as u16) / 3) as u8;
+            trusted reason "fallback pixel write" {
+                *(fb_ptr) = gray;
+            };
+        },
+    };
+
+    state.pixel_write_count = state.pixel_write_count + 1;
+
+    residual emit {
+        op: "framebuffer.write_pixel",
+        x: x,
+        y: y,
+        r: color.r as u64,
+        g: color.g as u64,
+        b: color.b as u64,
+        total_writes: state.pixel_write_count,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Fill Rectangle
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_fill_rect(
+    state: Handle(FramebufferState),
+    rect: Rect,
+    color: Color,
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_fill:v1"
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if !state.capability.can_write {
+        return Result::Err(FramebufferError::FramebufferCapabilityError);
+    };
+
+    // Bounds check
+    if rect.x + rect.width > state.current_mode.width
+        || rect.y + rect.height > state.current_mode.height
+    {
+        return Result::Err(FramebufferError::RectOutOfBounds);
+    };
+
+    let mode: DisplayMode = state.current_mode;
+    let bpp_bytes: u64 = (mode.bpp as u64) / 8;
+
+    match mode.format {
+        PixelFormat::Xrgb8888 | PixelFormat::Argb8888 => {
+            for row in 0..rect.height {
+                let y_pos: u64 = rect.y + row;
+                let row_offset: u64 = y_pos * mode.pitch + rect.x * bpp_bytes;
+                let row_ptr: *(u8) = (state.fb_virtual_base + row_offset) as *(u8);
+
+                for col in 0..rect.width {
+                    let pixel_offset: u64 = col * 4;
+                    trusted reason "fill rect row scan, bounded by rect width" {
+                        *(row_ptr + pixel_offset) = color.b;
+                        *(row_ptr + pixel_offset + 1) = color.g;
+                        *(row_ptr + pixel_offset + 2) = color.r;
+                        *(row_ptr + pixel_offset + 3) = color.a;
+                    };
+                };
+            };
+        },
+        _ => {
+            // Generic pixel-by-pixel fill
+            for row in 0..rect.height {
+                for col in 0..rect.width {
+                    framebuffer_write_pixel(state, rect.x + col, rect.y + row, color, writer_cap, timestamp);
+                };
+            };
+        },
+    };
+
+    state.pixel_write_count = state.pixel_write_count + (rect.width * rect.height);
+    state.dirty_rect = rect;
+
+    residual emit {
+        op: "framebuffer.fill_rect",
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        total_writes: state.pixel_write_count,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Clear Screen
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_clear_screen(
+    state: Handle(FramebufferState),
+    color: Color,
+) -> void
+    effect [memory:mmio, deterministic, residual]
+{
+    let rect: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: state.current_mode.width,
+        height: state.current_mode.height,
+    };
+
+    framebuffer_fill_rect(state, rect, color, state.capability, state.initialization_timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Blit Rectangle (copy within framebuffer)
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_blit(
+    state: Handle(FramebufferState),
+    src: Rect,
+    dest_x: u64,
+    dest_y: u64,
+    blitter_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_blit:v1"
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if !state.capability.can_write {
+        return Result::Err(FramebufferError::FramebufferCapabilityError);
+    };
+
+    let mode: DisplayMode = state.current_mode;
+    let bpp_bytes: u64 = (mode.bpp as u64) / 8;
+
+    if dest_x + src.width > mode.width || dest_y + src.height > mode.height {
+        return Result::Err(FramebufferError::RectOutOfBounds);
+    };
+
+    for row in 0..src.height {
+        let src_y: u64 = src.y + row;
+        let dst_y: u64 = dest_y + row;
+
+        let src_offset: u64 = src_y * mode.pitch + src.x * bpp_bytes;
+        let dst_offset: u64 = dst_y * mode.pitch + dest_x * bpp_bytes;
+
+        let src_ptr: *(u8) = (state.fb_virtual_base + src_offset) as *(u8);
+        let dst_ptr: *(u8) = (state.fb_virtual_base + dst_offset) as *(u8);
+
+        let copy_bytes: u64 = src.width * bpp_bytes;
+        for byte in 0..copy_bytes {
+            trusted reason "blit copy between framebuffer regions" {
+                *(dst_ptr + byte) = *(src_ptr + byte);
+            };
+        };
+    };
+
+    residual emit {
+        op: "framebuffer.blit",
+        src_x: src.x, src_y: src.y,
+        width: src.width, height: src.height,
+        dst_x: dest_x, dst_y: dest_y,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Present Frame (flip or memcpy)
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_present(
+    state: Handle(FramebufferState),
+    presenter_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_present:v2"
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if !state.capability.can_present {
+        return Result::Err(FramebufferError::FramebufferCapabilityError);
+    };
+
+    // If double-buffered, copy back buffer to front
+    if state.double_buffered && state.back_buffer_base != 0 {
+        let fb_size: u64 = state.current_mode.pitch * state.current_mode.height;
+        let front_ptr: *(u8) = state.fb_virtual_base as *(u8);
+        let back_ptr: *(u8) = state.back_buffer_base as *(u8);
+
+        for i in 0..fb_size {
+            trusted reason "back-to-front buffer copy for double buffering" {
+                *(front_ptr + i) = *(back_ptr + i);
+            };
+        };
+    };
+
+    state.present_count = state.present_count + 1;
+
+    // Reset dirty rect
+    state.dirty_rect = Rect { x: 0, y: 0, width: 0, height: 0 };
+
+    residual emit {
+        op: "framebuffer.present",
+        present_count: state.present_count,
+        double_buffered: if state.double_buffered { 1 } else { 0 },
+        width: state.current_mode.width,
+        height: state.current_mode.height,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Display Mode
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_set_mode(
+    state: Handle(FramebufferState),
+    mode_index: u64,
+    setter_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(DisplayMode, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_set_mode:v1"
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if !state.capability.can_set_mode {
+        return Result::Err(FramebufferError::FramebufferCapabilityError);
+    };
+
+    if mode_index >= state.mode_count {
+        return Result::Err(FramebufferError::InvalidMode);
+    };
+
+    let new_mode: DisplayMode = state.available_modes[mode_index];
+
+    // In a real driver, this would program the display controller
+    // For now, just update the mode structure
+    state.current_mode = new_mode;
+
+    // Clear with new mode dimensions
+    framebuffer_clear_screen(state, Color::black());
+
+    residual emit {
+        op: "framebuffer.set_mode",
+        mode_index: mode_index,
+        width: new_mode.width,
+        height: new_mode.height,
+        format: new_mode.format as u64,
+    };
+
+    return Result::Ok(new_mode);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Cursor Position
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_set_cursor(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    visible: bool,
+    cursor_cap: Cap(FramebufferCapability),
+) -> Result(void, FramebufferError)
+    effect [deterministic, residual]
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if !state.capability.can_cursor {
+        return Result::Err(FramebufferError::CursorNotSupported);
+    };
+
+    state.cursor_position = CursorPosition { x: x, y: y, visible: visible };
+    state.cursor_visible = visible;
+
+    residual emit {
+        op: "framebuffer.set_cursor",
+        x: x,
+        y: y,
+        visible: if visible { 1 } else { 0 },
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enable Double Buffering
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_enable_double_buffer(
+    state: Handle(FramebufferState),
+    back_buffer_phys: u64,
+    back_buffer_size: u64,
+    config_cap: Cap(FramebufferCapability),
+) -> Result(void, FramebufferError)
+    effect [deterministic, residual]
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    // Verify buffer is large enough for the current mode
+    let needed: u64 = state.current_mode.pitch * state.current_mode.height;
+    if back_buffer_size < needed {
+        return Result::Err(FramebufferError::InvalidMode);
+    };
+
+    state.back_buffer_base = back_buffer_phys;
+    state.back_buffer_size = back_buffer_size;
+    state.double_buffered = true;
+
+    residual emit {
+        op: "framebuffer.enable_double_buffer",
+        back_buffer: back_buffer_phys,
+        size: back_buffer_size,
+        needed: needed,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Query Display Mode
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_query_mode(
+    state: Handle(FramebufferState),
+    querier_cap: Cap(FramebufferCapability),
+) -> DisplayMode
+    effect [deterministic]
+{
+    return state.current_mode;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enumerate Available Modes
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_enumerate_modes(
+    state: Handle(FramebufferState),
+    querier_cap: Cap(FramebufferCapability),
+) -> Array(DisplayMode, 16)
+    effect [deterministic]
+{
+    return state.available_modes;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Draw Horizontal Line (optimized)
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_draw_hline(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    width: u64,
+    color: Color,
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+{
+    let rect: Rect = Rect { x: x, y: y, width: width, height: 1 };
+    return framebuffer_fill_rect(state, rect, color, writer_cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Draw Vertical Line (optimized)
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_draw_vline(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    height: u64,
+    color: Color,
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+{
+    let rect: Rect = Rect { x: x, y: y, width: 1, height: height };
+    return framebuffer_fill_rect(state, rect, color, writer_cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Draw Character (8x8 bitmap font)
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_draw_char(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    char_code: u8,
+    fg: Color,
+    bg: Color,
+    font_data: Slice(u8),
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    let char_index: u64 = char_code as u64;
+    let font_start: u64 = char_index * 8;  // 8 bytes per character (8x8)
+
+    if font_start + 8 > font_data.len() {
+        return Result::Err(FramebufferError::InvalidCoordinates);
+    };
+
+    for row in 0..8 {
+        let glyph_byte: u8 = font_data[font_start + row];
+        for col in 0..8 {
+            let pixel_set: bool = (glyph_byte & (0x80 >> col)) != 0;
+            let pixel_color: Color = if pixel_set { fg } else { bg };
+
+            let px: u64 = x + col;
+            let py: u64 = y + row;
+
+            if px < state.current_mode.width && py < state.current_mode.height {
+                framebuffer_write_pixel(state, px, py, pixel_color, writer_cap, timestamp);
+            };
+        };
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Draw String
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_draw_string(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    text: Slice(u8),
+    fg: Color,
+    bg: Color,
+    font_data: Slice(u8),
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(u64, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+{
+    let mut cursor_x: u64 = x;
+
+    for i in 0..text.len() {
+        let char_code: u8 = text[i];
+        framebuffer_draw_char(state, cursor_x, y, char_code, fg, bg, font_data, writer_cap, timestamp);
+        cursor_x = cursor_x + 8;  // Advance 8 pixels per character
+
+        if cursor_x + 8 > state.current_mode.width {
+            break;  // No more room on this line
+        };
+    };
+
+    return Result::Ok(cursor_x - x);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_self_test(
+    state: Handle(FramebufferState),
+) -> Result(u64, FramebufferError)
+    effect [memory:mmio, deterministic]
+    court "framebuffer_self_test:v1"
+{
+    let mut checks: u64 = 0;
+
+    if state.initialized {
+        checks = checks + 1;
+    };
+
+    if state.fb_physical_base != 0 && state.fb_size > 0 {
+        checks = checks + 1;
+    };
+
+    if state.current_mode.width > 0 && state.current_mode.height > 0 {
+        checks = checks + 1;
+    };
+
+    if state.mode_count > 0 {
+        checks = checks + 1;
+    };
+
+    // Test write to first pixel
+    let test_color: Color = Color::rgb(0x12, 0x34, 0x56);
+    let write_result: Result(void, FramebufferError) = framebuffer_write_pixel(
+        state, 0, 0, test_color, state.capability, 0,
+    );
+    if write_result.is_ok() {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "framebuffer.self_test",
+        checks_passed: checks,
+        mode_width: state.current_mode.width,
+        mode_height: state.current_mode.height,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer Scroll — Scroll the display up by N lines
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_scroll(
+    state: Handle(FramebufferState),
+    lines: u64,
+    fill_color: Color,
+    scroller_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+    court "framebuffer_scroll:v1"
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    let mode: DisplayMode = state.current_mode;
+    let bpp_bytes: u64 = (mode.bpp as u64) / 8;
+    let row_bytes: u64 = mode.pitch;
+    let scroll_bytes: u64 = lines * row_bytes;
+    let total_bytes: u64 = mode.height * row_bytes;
+    let copy_bytes: u64 = total_bytes - scroll_bytes;
+
+    let fb: *(u8) = state.fb_virtual_base as *(u8);
+
+    trusted reason "framebuffer scroll via memmove — bounded by screen dimensions" {
+        for i in 0..copy_bytes {
+            *(fb + i) = *(fb + i + scroll_bytes);
+        };
+        // Fill vacated lines with fill_color
+        for i in copy_bytes..total_bytes {
+            let line_offset: u64 = i - copy_bytes;
+            let col_offset: u64 = line_offset % row_bytes;
+            match state.current_mode.format {
+                PixelFormat::Xrgb8888 | PixelFormat::Argb8888 => {
+                    if col_offset % 4 == 0 { *(fb + i) = fill_color.b; }
+                    else if col_offset % 4 == 1 { *(fb + i) = fill_color.g; }
+                    else if col_offset % 4 == 2 { *(fb + i) = fill_color.r; }
+                    else { *(fb + i) = fill_color.a; };
+                },
+                _ => {
+                    *(fb + i) = ((fill_color.r as u16 + fill_color.g as u16 + fill_color.b as u16) / 3) as u8;
+                },
+            };
+        };
+    };
+
+    residual emit {
+        op: "framebuffer.scroll",
+        lines: lines,
+        width: mode.width,
+        height: mode.height,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer Get Pixel — Read pixel color at coordinates
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_get_pixel(
+    state: Handle(FramebufferState),
+    x: u64,
+    y: u64,
+    reader_cap: Cap(FramebufferCapability),
+) -> Result(Color, FramebufferError)
+    effect [memory:mmio, deterministic]
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    if x >= state.current_mode.width || y >= state.current_mode.height {
+        return Result::Err(FramebufferError::InvalidCoordinates);
+    };
+
+    let mode: DisplayMode = state.current_mode;
+    let offset: u64 = y * mode.pitch + x * (mode.bpp as u64 / 8);
+
+    let color: Color = match mode.format {
+        PixelFormat::Xrgb8888 | PixelFormat::Argb8888 => {
+            let b: u8 = *(state.fb_virtual_base as *(u8) + offset);
+            let g: u8 = *(state.fb_virtual_base as *(u8) + offset + 1);
+            let r: u8 = *(state.fb_virtual_base as *(u8) + offset + 2);
+            let a: u8 = *(state.fb_virtual_base as *(u8) + offset + 3);
+            Color { a: a, r: r, g: g, b: b }
+        },
+        PixelFormat::Rgb565 => {
+            let pixel: u16 = *(state.fb_virtual_base as *(u16) + (offset / 2));
+            let r: u8 = ((pixel >> 11) & 0x1F) as u8;
+            let g: u8 = ((pixel >> 5) & 0x3F) as u8;
+            let b: u8 = (pixel & 0x1F) as u8;
+            Color { a: 255, r: r << 3, g: g << 2, b: b << 3 }
+        },
+        _ => Color::black(),
+    };
+
+    return Result::Ok(color);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer Draw Border — Draw a rectangular border
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_draw_border(
+    state: Handle(FramebufferState),
+    rect: Rect,
+    border_width: u64,
+    color: Color,
+    writer_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    let top: Rect = Rect { x: rect.x, y: rect.y, width: rect.width, height: border_width };
+    let bottom: Rect = Rect { x: rect.x, y: rect.y + rect.height - border_width, width: rect.width, height: border_width };
+    let left: Rect = Rect { x: rect.x, y: rect.y, width: border_width, height: rect.height };
+    let right: Rect = Rect { x: rect.x + rect.width - border_width, y: rect.y, width: border_width, height: rect.height };
+
+    framebuffer_fill_rect(state, top, color, writer_cap, timestamp);
+    framebuffer_fill_rect(state, bottom, color, writer_cap, timestamp);
+    framebuffer_fill_rect(state, left, color, writer_cap, timestamp);
+    framebuffer_fill_rect(state, right, color, writer_cap, timestamp);
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Framebuffer Invert Region
+// ─────────────────────────────────────────────────────────────
+
+fn framebuffer_invert_rect(
+    state: Handle(FramebufferState),
+    rect: Rect,
+    inverter_cap: Cap(FramebufferCapability),
+    timestamp: u64,
+) -> Result(void, FramebufferError)
+    effect [memory:mmio, deterministic, residual]
+{
+    if !state.initialized {
+        return Result::Err(FramebufferError::FramebufferNotInitialized);
+    };
+
+    let mode: DisplayMode = state.current_mode;
+    let bpp_bytes: u64 = (mode.bpp as u64) / 8;
+
+    for row in 0..rect.height {
+        for col in 0..rect.width {
+            let x: u64 = rect.x + col;
+            let y: u64 = rect.y + row;
+
+            if x >= mode.width || y >= mode.height { continue; };
+
+            let offset: u64 = y * mode.pitch + x * bpp_bytes;
+            match mode.format {
+                PixelFormat::Xrgb8888 | PixelFormat::Argb8888 => {
+                    let ptr: *(u8) = (state.fb_virtual_base + offset) as *(u8);
+                    trusted reason "pixel invert at verified offset" {
+                        *(ptr) = 255 - *(ptr);
+                        *(ptr + 1) = 255 - *(ptr + 1);
+                        *(ptr + 2) = 255 - *(ptr + 2);
+                    };
+                },
+                _ => {},
+            };
+        };
+    };
+
+    return Result::Ok(void);
+}

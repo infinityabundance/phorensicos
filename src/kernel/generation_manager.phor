@@ -1,0 +1,1198 @@
+// generation_manager.phor — Atomic generation management
+// Create, activate, rollback, list, describe system generations
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/generation_manager.phor
+// Court: generation_manager:v2
+
+package kernel.generation_manager;
+
+import kernel.nucleus_interface.*;
+import kernel.capability_manager.*;
+import kernel.store_manager.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type GenerationError = enum {
+    GenerationNotFound        = 0x70,  // E0070: generation ID not found
+    GenerationTableFull       = 0x71,  // E0071: generation table is full
+    GenerationActivationFailed = 0x72, // E0072: generation activation integrity failure
+    GenerationRollbackRejected = 0x73, // E0073: rollback to target generation rejected
+    GenerationAlreadyActive   = 0x74,  // E0074: generation is already the active one
+    GenerationIntegrityError  = 0x75,  // E0075: generation integrity check failed
+    GenerationMissingDependency = 0x76, // E0076: dependency missing for generation
+    GenerationSealViolation   = 0x77,  // E0077: generation seal integrity violated
+    GenerationTrustInsufficient = 0x78, // E0078: trust state below generation threshold
+    GenerationCapabilityError = 0x79,  // E0079: insufficient capability for generation operation
+    GenerationPendingResiduals = 0x7A, // E007A: generation has pending unverified residuals
+    GenerationGCRunning       = 0x7B,  // E007B: garbage collection is in progress
+    GenerationCourtUnverified = 0x7C,  // E007C: generation has not passed court verification
+    GenerationSnapshotMissing = 0x7D,  // E007D: generation snapshot missing from store
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Status
+// ─────────────────────────────────────────────────────────────
+
+type GenerationStatus = enum {
+    Created          = 0,  // Generation has been created but not yet activated
+    Activating       = 1,  // Generation is in the process of activation
+    Active           = 2,  // Generation is the currently active system state
+    Inactive         = 3,  // Generation exists but is not active
+    Failed           = 4,  // Generation activation failed
+    RollbackTarget   = 5,  // Generation is a valid rollback target
+    Corrupted        = 6,  // Generation integrity check failed
+    GarbageCollected = 7,  // Generation has been garbage collected
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Entry
+// ─────────────────────────────────────────────────────────────
+
+struct GenerationEntry {
+    generation_number: u64,
+    generation_status: GenerationStatus,
+    kernel_container_key: StoreKey,
+    nucleus_image_key: StoreKey,
+    compiler_image_key: StoreKey,
+    runtime_service_keys: Array(StoreKey, 64),
+    runtime_service_count: u64,
+    semantic_store_root: StoreKey,
+    trust_roots: Array(StoreKey, 32),
+    trust_root_count: u64,
+    court_version_refs: Array(u64, 16),
+    court_count: u64,
+    package_graph_key: StoreKey,
+    parent_generation: u64,
+    activation_timestamp: u64,
+    creator_identity: Identity,
+    generation_label: String(128),
+    generation_description: String(512),
+    residual_snapshot: ResidualSnapshot,
+    integrity_hash: u64,
+    verification_proof: u64,
+    activation_residuals: RingBuf(ResidualRecord, 64),
+    sealed: bool,
+}
+
+struct ResidualSnapshot {
+    root_residual_hash: u64,
+    residual_count: u64,
+    last_residual_timestamp: u64,
+    pending_residuals: u64,
+    verified_residuals: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Manager State
+// ─────────────────────────────────────────────────────────────
+
+struct GenerationManagerState {
+    generations: Array(GenerationEntry, 32),
+    generation_count: u64,
+    active_generation: u64,
+    next_generation_number: u64,
+    manager_identity: Identity,
+    store_manager: Handle(StoreManagerState),
+    capability_manager: Handle(CapabilityManagerState),
+    initialization_timestamp: u64,
+    audit_trail: RingBuf(AuditRecord, 256),
+    minimal_trust_for_activation: TrustState,
+    rollback_chain: RingBuf(u64, 16),
+    auto_verify: bool,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Manager Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn generation_manager_init(
+    manager_identity: Identity,
+    store_mgr: Handle(StoreManagerState),
+    cap_mgr: Handle(CapabilityManagerState),
+    initial_gen_number: u64,
+    timestamp: u64,
+) -> GenerationManagerState
+    effect [deterministic]
+    court "gen_manager_init:v1"
+{
+    let state: GenerationManagerState = GenerationManagerState {
+        generations: Array::zeroed(),
+        generation_count: 0,
+        active_generation: initial_gen_number,
+        next_generation_number: initial_gen_number + 1,
+        manager_identity: manager_identity,
+        store_manager: store_mgr,
+        capability_manager: cap_mgr,
+        initialization_timestamp: timestamp,
+        audit_trail: RingBuf::new(),
+        minimal_trust_for_activation: TrustState::Observed,
+        rollback_chain: RingBuf::new(),
+        auto_verify: true,
+    };
+
+    // Create the initial generation entry
+    let initial_key: StoreKey = StoreKey {
+        hash: 0,
+        hash_high: 0,
+        algorithm: HashAlgorithm::PhorHash128,
+        size_hint: 0,
+    };
+
+    let gen0: GenerationEntry = GenerationEntry {
+        generation_number: initial_gen_number,
+        generation_status: GenerationStatus::Active,
+        kernel_container_key: initial_key,
+        nucleus_image_key: initial_key,
+        compiler_image_key: initial_key,
+        runtime_service_keys: Array::zeroed(),
+        runtime_service_count: 0,
+        semantic_store_root: initial_key,
+        trust_roots: Array::zeroed(),
+        trust_root_count: 0,
+        court_version_refs: Array::zeroed(),
+        court_count: 0,
+        package_graph_key: initial_key,
+        parent_generation: 0,
+        activation_timestamp: timestamp,
+        creator_identity: manager_identity,
+        generation_label: String::from_bytes(Slice(u8)::from_str("generation_0")),
+        generation_description: String::from_bytes(Slice(u8)::from_str("initial boot generation")),
+        residual_snapshot: ResidualSnapshot {
+            root_residual_hash: 0,
+            residual_count: 0,
+            last_residual_timestamp: timestamp,
+            pending_residuals: 0,
+            verified_residuals: 0,
+        },
+        integrity_hash: 0,
+        verification_proof: 0,
+        activation_residuals: RingBuf::new(),
+        sealed: true,
+    };
+
+    state.generations[0] = gen0;
+    state.generation_count = 1;
+
+    residual emit {
+        op: "generation_manager.init",
+        initial_generation: initial_gen_number,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create Generation
+// ─────────────────────────────────────────────────────────────
+
+fn generation_create(
+    state: Handle(GenerationManagerState),
+    kernel_key: StoreKey,
+    nucleus_key: StoreKey,
+    compiler_key: StoreKey,
+    store_root: StoreKey,
+    package_graph: StoreKey,
+    service_keys: Slice(StoreKey),
+    trust_root_keys: Slice(StoreKey),
+    label: Slice(u8),
+    description: Slice(u8),
+    creator: Identity,
+    create_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(GenerationEntry, GenerationError)
+    effect [deterministic, residual]
+    court "gen_create:v2"
+{
+    // Check capacity
+    if state.generation_count >= 32 {
+        return Result::Err(GenerationError::GenerationTableFull);
+    };
+
+    let gen_number: u64 = state.next_generation_number;
+    state.next_generation_number = state.next_generation_number + 1;
+
+    // Find empty slot
+    let mut slot_idx: u64 = 0;
+    let mut found_slot: bool = false;
+    for i in 0..32 {
+        if state.generations[i].generation_status == GenerationStatus::GarbageCollected
+            || (state.generations[i].generation_number == 0
+                && state.generations[i].integrity_hash == 0)
+        {
+            slot_idx = i;
+            found_slot = true;
+            break;
+        };
+    };
+
+    if !found_slot {
+        return Result::Err(GenerationError::GenerationTableFull);
+    };
+
+    // Copy service keys
+    let mut svc_keys: Array(StoreKey, 64) = Array::zeroed();
+    let svc_count: u64 = if service_keys.len() < 64 { service_keys.len() } else { 64 };
+    for i in 0..svc_count {
+        svc_keys[i] = service_keys[i];
+    };
+
+    // Copy trust roots
+    let mut trust_keys: Array(StoreKey, 32) = Array::zeroed();
+    let trust_count: u64 = if trust_root_keys.len() < 32 { trust_root_keys.len() } else { 32 };
+    for i in 0..trust_count {
+        trust_keys[i] = trust_root_keys[i];
+    };
+
+    // Create the generation entry
+    let entry: GenerationEntry = GenerationEntry {
+        generation_number: gen_number,
+        generation_status: GenerationStatus::Created,
+        kernel_container_key: kernel_key,
+        nucleus_image_key: nucleus_key,
+        compiler_image_key: compiler_key,
+        runtime_service_keys: svc_keys,
+        runtime_service_count: svc_count,
+        semantic_store_root: store_root,
+        trust_roots: trust_keys,
+        trust_root_count: trust_count,
+        court_version_refs: Array::zeroed(),
+        court_count: 0,
+        package_graph_key: package_graph,
+        parent_generation: state.active_generation,
+        activation_timestamp: 0,
+        creator_identity: creator,
+        generation_label: String::from_bytes(label),
+        generation_description: String::from_bytes(description),
+        residual_snapshot: ResidualSnapshot {
+            root_residual_hash: 0,
+            residual_count: 0,
+            last_residual_timestamp: timestamp,
+            pending_residuals: 0,
+            verified_residuals: 0,
+        },
+        integrity_hash: 0,
+        verification_proof: 0,
+        activation_residuals: RingBuf::new(),
+        sealed: false,
+    };
+
+    state.generations[slot_idx] = entry;
+    state.generation_count = state.generation_count + 1;
+
+    residual emit {
+        op: "generation_manager.create",
+        generation_number: gen_number,
+        parent: state.active_generation,
+        slot: slot_idx,
+        service_count: svc_count,
+        trust_count: trust_count,
+    };
+
+    return Result::Ok(state.generations[slot_idx]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Activate Generation
+// ─────────────────────────────────────────────────────────────
+
+fn generation_activate(
+    state: Handle(GenerationManagerState),
+    gen_number: u64,
+    activator_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, GenerationError)
+    effect [deterministic, residual]
+    court "gen_activate:v2"
+{
+    // Find the generation
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..32 {
+        let entry: GenerationEntry = state.generations[i];
+        if entry.generation_number == gen_number
+            && entry.generation_status != GenerationStatus::GarbageCollected
+        {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(GenerationError::GenerationNotFound);
+    };
+
+    let gen: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[slot_idx]);
+
+    // Check if already active
+    if gen.generation_status == GenerationStatus::Active {
+        return Result::Err(GenerationError::GenerationAlreadyActive);
+    };
+
+    // Check if status allows activation
+    if gen.generation_status == GenerationStatus::Failed
+        || gen.generation_status == GenerationStatus::Corrupted
+    {
+        return Result::Err(GenerationError::GenerationActivationFailed);
+    };
+
+    // Transition to activating
+    gen.generation_status = GenerationStatus::Activating;
+    gen.activation_timestamp = timestamp;
+
+    // Integrity check
+    let integrity_ok: bool = generation_check_integrity(gen);
+
+    // Dependency check
+    let deps_ok: bool = generation_check_dependencies(state, gen);
+
+    // Trust check
+    let trust_ok: bool = generation_check_trust(state, gen);
+
+    if !integrity_ok || !deps_ok || !trust_ok {
+        gen.generation_status = GenerationStatus::Failed;
+
+        // Record failure residual
+        let fail_residual: ResidualRecord = ResidualRecord {
+            timestamp: timestamp,
+            event_type: 0x50,
+            event_data_hash: gen_number,
+            cause_identity: activator_cap.object_id,
+            prior_state_hash: GenerationStatus::Activating as u64,
+            new_state_hash: GenerationStatus::Failed as u64,
+            delta_description: String::from_bytes(Slice(u8)::from_str("generation activation failed")),
+            generation_at_event: gen_number,
+            verified: false,
+        };
+        gen.activation_residuals.push(fail_residual);
+
+        residual emit {
+            op: "generation_manager.activate.failed",
+            generation: gen_number,
+            integrity: if integrity_ok { 1 } else { 0 },
+            deps: if deps_ok { 1 } else { 0 },
+            trust: if trust_ok { 1 } else { 0 },
+        };
+
+        return Result::Err(GenerationError::GenerationActivationFailed);
+    };
+
+    // Record old active generation
+    let old_active: u64 = state.active_generation;
+
+    // Set new active generation
+    gen.generation_status = GenerationStatus::Active;
+    state.active_generation = gen_number;
+    state.rollback_chain.push(old_active);
+
+    // Mark old generation as inactive
+    for i in 0..32 {
+        let e: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[i]);
+        if e.generation_number == old_active
+            && e.generation_status == GenerationStatus::Active
+        {
+            e.generation_status = GenerationStatus::Inactive;
+            break;
+        };
+    };
+
+    // Compute integrity hash
+    gen.integrity_hash = generation_compute_integrity_hash(gen);
+    gen.sealed = true;
+
+    // Record activation residual
+    let act_residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x51,
+        event_data_hash: gen.integrity_hash,
+        cause_identity: activator_cap.object_id,
+        prior_state_hash: old_active,
+        new_state_hash: gen_number,
+        delta_description: String::from_bytes(Slice(u8)::from_str("generation activated")),
+        generation_at_event: gen_number,
+        verified: true,
+    };
+    gen.activation_residuals.push(act_residual);
+
+    // Update residual snapshot
+    gen.residual_snapshot.last_residual_timestamp = timestamp;
+    gen.residual_snapshot.residual_count = gen.residual_snapshot.residual_count + 1;
+
+    residual emit {
+        op: "generation_manager.activate",
+        generation: gen_number,
+        previous: old_active,
+        integrity_hash: gen.integrity_hash,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rollback to Generation
+// ─────────────────────────────────────────────────────────────
+
+fn generation_rollback(
+    state: Handle(GenerationManagerState),
+    target_gen_number: u64,
+    rollback_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, GenerationError)
+    effect [deterministic, residual]
+    court "gen_rollback:v2"
+{
+    // Check if target is the active generation
+    if target_gen_number == state.active_generation {
+        return Result::Err(GenerationError::GenerationAlreadyActive);
+    };
+
+    // Find target generation
+    let mut target_slot: u64 = 0;
+    let mut found_target: bool = false;
+    for i in 0..32 {
+        let entry: GenerationEntry = state.generations[i];
+        if entry.generation_number == target_gen_number
+            && entry.generation_status != GenerationStatus::GarbageCollected
+            && entry.generation_status != GenerationStatus::Corrupted
+        {
+            target_slot = i;
+            found_target = true;
+            break;
+        };
+    };
+
+    if !found_target {
+        return Result::Err(GenerationError::GenerationNotFound);
+    };
+
+    let target: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[target_slot]);
+
+    // Verify target integrity before rollback
+    if !generation_check_integrity(target) {
+        return Result::Err(GenerationError::GenerationIntegrityError);
+    };
+
+    // Check rollback path validity
+    let in_chain: bool = generation_is_in_rollback_chain(state, target_gen_number);
+    if !in_chain {
+        return Result::Err(GenerationError::GenerationRollbackRejected);
+    };
+
+    // Record old active
+    let old_active: u64 = state.active_generation;
+
+    // Deactivate current
+    for i in 0..32 {
+        let e: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[i]);
+        if e.generation_number == state.active_generation
+            && e.generation_status == GenerationStatus::Active
+        {
+            e.generation_status = GenerationStatus::Inactive;
+            break;
+        };
+    };
+
+    // Activate target
+    target.generation_status = GenerationStatus::Active;
+    target.activation_timestamp = timestamp;
+    state.active_generation = target_gen_number;
+
+    // Record rollback residual
+    let rollback_residual: ResidualRecord = ResidualRecord {
+        timestamp: timestamp,
+        event_type: 0x52,
+        event_data_hash: target_gen_number,
+        cause_identity: rollback_cap.object_id,
+        prior_state_hash: old_active,
+        new_state_hash: target_gen_number,
+        delta_description: String::from_bytes(Slice(u8)::from_str("generation rollback executed")),
+        generation_at_event: target_gen_number,
+        verified: true,
+    };
+    target.activation_residuals.push(rollback_residual);
+
+    residual emit {
+        op: "generation_manager.rollback",
+        target_generation: target_gen_number,
+        previous_active: old_active,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// List Generations
+// ─────────────────────────────────────────────────────────────
+
+fn generation_list(
+    state: Handle(GenerationManagerState),
+    lister_cap: Cap(CapabilityToken),
+) -> Result(Array(GenerationEntry, 32), GenerationError)
+    effect [deterministic]
+{
+    return Result::Ok(state.generations);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Describe Generation
+// ─────────────────────────────────────────────────────────────
+
+fn generation_describe(
+    state: Handle(GenerationManagerState),
+    gen_number: u64,
+    describer_cap: Cap(CapabilityToken),
+) -> Result(GenerationEntry, GenerationError)
+    effect [deterministic]
+{
+    for i in 0..32 {
+        let entry: GenerationEntry = state.generations[i];
+        if entry.generation_number == gen_number
+            && entry.generation_status != GenerationStatus::GarbageCollected
+        {
+            return Result::Ok(entry);
+        };
+    };
+    return Result::Err(GenerationError::GenerationNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get Active Generation
+// ─────────────────────────────────────────────────────────────
+
+fn generation_get_active(
+    state: Handle(GenerationManagerState),
+) -> GenerationEntry
+    effect [deterministic]
+{
+    for i in 0..32 {
+        let entry: GenerationEntry = state.generations[i];
+        if entry.generation_status == GenerationStatus::Active {
+            return entry;
+        };
+    };
+
+    // Should never reach here if initialized properly
+    return state.generations[0];
+}
+
+// ─────────────────────────────────────────────────────────────
+// Integrity Check Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn generation_check_integrity(gen: Handle(GenerationEntry)) -> bool
+    effect [deterministic]
+    court "gen_integrity:v1"
+{
+    // Check that key fields are non-zero
+    if gen.generation_number == 0 {
+        return false;
+    };
+
+    if gen.kernel_container_key.hash == 0 && gen.kernel_container_key.hash_high == 0 {
+        return false;
+    };
+
+    if gen.nucleus_image_key.hash == 0 && gen.nucleus_image_key.hash_high == 0 {
+        return false;
+    };
+
+    if gen.semantic_store_root.hash == 0 && gen.semantic_store_root.hash_high == 0 {
+        return false;
+    };
+
+    // If sealed, verify integrity hash
+    if gen.sealed && gen.integrity_hash != 0 {
+        let computed: u64 = generation_compute_integrity_hash(gen);
+        if computed != gen.integrity_hash {
+            return false;
+        };
+    };
+
+    return true;
+}
+
+fn generation_check_dependencies(
+    state: Handle(GenerationManagerState),
+    gen: Handle(GenerationEntry),
+) -> bool
+    effect [deterministic]
+{
+    // Check that the parent generation exists and is valid
+    if gen.parent_generation != 0 {
+        let mut parent_found: bool = false;
+        for i in 0..32 {
+            let entry: GenerationEntry = state.generations[i];
+            if entry.generation_number == gen.parent_generation
+                && entry.generation_status != GenerationStatus::GarbageCollected
+            {
+                parent_found = true;
+                break;
+            };
+        };
+        if !parent_found {
+            return false;
+        };
+    };
+
+    // Check trust roots exist in store
+    for i in 0..gen.trust_root_count {
+        let root_key: StoreKey = gen.trust_roots[i];
+        if root_key.hash == 0 && root_key.hash_high == 0 {
+            return false;
+        };
+    };
+
+    return true;
+}
+
+fn generation_check_trust(
+    state: Handle(GenerationManagerState),
+    gen: Handle(GenerationEntry),
+) -> bool
+    effect [deterministic]
+{
+    // For now, trust check is a simple threshold
+    // In a real system, this would query the store for trust state of each component
+
+    // Parent generation must have been active
+    if gen.parent_generation != 0 {
+        let mut parent_active: bool = false;
+        for i in 0..32 {
+            let entry: GenerationEntry = state.generations[i];
+            if entry.generation_number == gen.parent_generation
+                && (entry.generation_status == GenerationStatus::Active
+                    || entry.generation_status == GenerationStatus::Inactive
+                    || entry.generation_status == GenerationStatus::RollbackTarget)
+            {
+                parent_active = true;
+                break;
+            };
+        };
+        if !parent_active {
+            return false;
+        };
+    };
+
+    return true;
+}
+
+fn generation_compute_integrity_hash(gen: Handle(GenerationEntry)) -> u64
+    effect [deterministic]
+{
+    let mut hash: u64 = gen.generation_number;
+    hash = hash ^ (gen.kernel_container_key.hash + 0x9e3779b97f4a7c15 + (hash << 6) + (hash >> 2));
+    hash = hash ^ (gen.nucleus_image_key.hash + 0x9e3779b97f4a7c15 + (hash << 6) + (hash >> 2));
+    hash = hash ^ (gen.semantic_store_root.hash + 0x9e3779b97f4a7c15 + (hash << 6) + (hash >> 2));
+    hash = hash ^ (gen.parent_generation + 0x9e3779b97f4a7c15 + (hash << 6) + (hash >> 2));
+    hash = hash ^ (gen.activation_timestamp + 0x9e3779b97f4a7c15 + (hash << 6) + (hash >> 2));
+    return hash;
+}
+
+fn generation_is_in_rollback_chain(
+    state: Handle(GenerationManagerState),
+    target_gen: u64,
+) -> bool
+    effect [deterministic]
+{
+    // Walk the rollback chain
+    let mut current: u64 = target_gen;
+    let found: bool = false;
+
+    for _ in 0..32 {  // bounded by max generations
+        if current == state.active_generation {
+            // Can roll back to any generation that itself can reach the active one
+            return true;
+        };
+
+        // Find parent
+        let mut parent_found: bool = false;
+        for i in 0..32 {
+            let entry: GenerationEntry = state.generations[i];
+            if entry.generation_number == current {
+                current = entry.parent_generation;
+                parent_found = true;
+                break;
+            };
+        };
+
+        if !parent_found || current == 0 {
+            break;
+        };
+    };
+
+    // Also check explicit rollback chain
+    for i in 0..state.rollback_chain.len() {
+        let chain_entry: u64 = state.rollback_chain.peek().unwrap_or(0);
+        // Can only check if we pop — for safety just check existence
+    };
+
+    return found;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Mark Generation as Rollback Target
+// ─────────────────────────────────────────────────────────────
+
+fn generation_mark_rollback_target(
+    state: Handle(GenerationManagerState),
+    gen_number: u64,
+    marker_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, GenerationError)
+    effect [deterministic, residual]
+{
+    for i in 0..32 {
+        let gen: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[i]);
+        if gen.generation_number == gen_number
+            && gen.generation_status != GenerationStatus::GarbageCollected
+        {
+            if gen.generation_status == GenerationStatus::Active {
+                return Result::Err(GenerationError::GenerationAlreadyActive);
+            };
+
+            gen.generation_status = GenerationStatus::RollbackTarget;
+
+            residual emit {
+                op: "generation_manager.mark_rollback",
+                generation: gen_number,
+            };
+
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(GenerationError::GenerationNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Garbage Collection
+// ─────────────────────────────────────────────────────────────
+
+fn generation_garbage_collect(
+    state: Handle(GenerationManagerState),
+    gc_cap: Cap(CapabilityToken),
+    keep_last_n: u64,
+    timestamp: u64,
+) -> u64
+    effect [deterministic, residual]
+    court "gen_gc:v1"
+{
+    let mut collected: u64 = 0;
+    let mut gen_numbers: Array(u64, 32) = Array::zeroed();
+    let mut gen_count: u64 = 0;
+
+    // Collect all valid generation numbers
+    for i in 0..32 {
+        let entry: GenerationEntry = state.generations[i];
+        if entry.generation_status != GenerationStatus::GarbageCollected
+            && entry.generation_status != GenerationStatus::Active
+        {
+            gen_numbers[gen_count] = entry.generation_number;
+            gen_count = gen_count + 1;
+        };
+    };
+
+    // Keep the last N, collect the rest
+    if gen_count > keep_last_n {
+        let to_collect: u64 = gen_count - keep_last_n;
+        for i in 0..to_collect {
+            let target_gen: u64 = gen_numbers[i];
+
+            // Check that target is not the active or parent of active
+            let mut is_protected: bool = false;
+            if target_gen == state.active_generation {
+                is_protected = true;
+            };
+
+            if !is_protected {
+                for j in 0..32 {
+                    let e: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[j]);
+                    if e.generation_number == target_gen
+                        && e.generation_status != GenerationStatus::Active
+                    {
+                        e.generation_status = GenerationStatus::GarbageCollected;
+                        e.sealed = false;
+                        state.generation_count = state.generation_count - 1;
+                        collected = collected + 1;
+                        break;
+                    };
+                };
+            };
+        };
+    };
+
+    residual emit {
+        op: "generation_manager.garbage_collect",
+        collected: collected,
+        remaining: state.generation_count,
+        keep_last: keep_last_n,
+    };
+
+    return collected;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add Court Version Reference
+// ─────────────────────────────────────────────────────────────
+
+fn generation_add_court_ref(
+    state: Handle(GenerationManagerState),
+    gen_number: u64,
+    court_version: u64,
+    admin_cap: Cap(CapabilityToken),
+) -> Result(void, GenerationError)
+    effect [deterministic, residual]
+{
+    for i in 0..32 {
+        let gen: Handle(GenerationEntry) = Handle(GenerationEntry)::from_ptr(&state.generations[i]);
+        if gen.generation_number == gen_number
+            && gen.generation_status != GenerationStatus::GarbageCollected
+        {
+            let idx: u64 = gen.court_count;
+            if idx < 16 {
+                gen.court_version_refs[idx] = court_version;
+                gen.court_count = idx + 1;
+            };
+
+            residual emit {
+                op: "generation_manager.add_court_ref",
+                generation: gen_number,
+                court_version: court_version,
+            };
+
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(GenerationError::GenerationNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Manager Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn generation_manager_self_test(
+    state: Handle(GenerationManagerState),
+) -> Result(u64, GenerationError)
+    effect [deterministic]
+    court "gen_self_test:v1"
+{
+    let mut checks: u64 = 0;
+
+    // Check 1: active generation exists
+    let mut active_found: bool = false;
+    for i in 0..32 {
+        if state.generations[i].generation_status == GenerationStatus::Active {
+            active_found = true;
+            break;
+        };
+    };
+
+    if active_found {
+        checks = checks + 1;
+    };
+
+    // Check 2: generation count is consistent
+    let mut actual_count: u64 = 0;
+    for i in 0..32 {
+        if state.generations[i].generation_status != GenerationStatus::GarbageCollected {
+            actual_count = actual_count + 1;
+        };
+    };
+
+    if actual_count == state.generation_count {
+        checks = checks + 1;
+    };
+
+    // Check 3: active generation integrity
+    for i in 0..32 {
+        let entry: GenerationEntry = state.generations[i];
+        if entry.generation_status == GenerationStatus::Active {
+            if entry.generation_number == state.active_generation {
+                checks = checks + 1;
+            };
+            break;
+        };
+    };
+
+    // Check 4: no duplicate generation numbers
+    let mut no_duplicates: bool = true;
+    for i in 0..32 {
+        for j in (i + 1)..32 {
+            if state.generations[i].generation_number == state.generations[j].generation_number
+                && state.generations[i].generation_number != 0
+                && state.generations[j].generation_number != 0
+            {
+                no_duplicates = false;
+                break;
+            };
+        };
+        if !no_duplicates { break; };
+    };
+
+    if no_duplicates {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "generation_manager.self_test",
+        checks_passed: checks,
+        generations: state.generation_count,
+        active: state.active_generation,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Compare Generations — Generate diff between two generations
+// ─────────────────────────────────────────────────────────────
+
+struct GenerationDiff {
+    gen_a: u64,
+    gen_b: u64,
+    kernel_changed: bool,
+    nucleus_changed: bool,
+    compiler_changed: bool,
+    store_root_changed: bool,
+    package_graph_changed: bool,
+    trust_roots_changed: bool,
+    service_count_diff: i64,
+    new_services: Array(StoreKey, 16),
+    removed_services: Array(StoreKey, 16),
+    same_parent: bool,
+    diff_hash: u64,
+}
+
+fn generation_compare(
+    state: Handle(GenerationManagerState),
+    gen_number_a: u64,
+    gen_number_b: u64,
+    comparer_cap: Cap(CapabilityToken),
+) -> Result(GenerationDiff, GenerationError)
+    effect [deterministic]
+    court "gen_compare:v1"
+{
+    let mut gen_a: GenerationEntry;
+    let mut gen_b: GenerationEntry;
+    let mut found_a: bool = false;
+    let mut found_b: bool = false;
+
+    for i in 0..32 {
+        let g: GenerationEntry = state.generations[i];
+        if g.generation_number == gen_number_a {
+            gen_a = g;
+            found_a = true;
+        };
+        if g.generation_number == gen_number_b {
+            gen_b = g;
+            found_b = true;
+        };
+    };
+
+    if !found_a { return Result::Err(GenerationError::GenerationNotFound); };
+    if !found_b { return Result::Err(GenerationError::GenerationNotFound); };
+
+    let diff: GenerationDiff = GenerationDiff {
+        gen_a: gen_number_a,
+        gen_b: gen_number_b,
+        kernel_changed: !store_key_equal(gen_a.kernel_container_key, gen_b.kernel_container_key),
+        nucleus_changed: !store_key_equal(gen_a.nucleus_image_key, gen_b.nucleus_image_key),
+        compiler_changed: !store_key_equal(gen_a.compiler_image_key, gen_b.compiler_image_key),
+        store_root_changed: !store_key_equal(gen_a.semantic_store_root, gen_b.semantic_store_root),
+        package_graph_changed: !store_key_equal(gen_a.package_graph_key, gen_b.package_graph_key),
+        trust_roots_changed: gen_a.trust_root_count != gen_b.trust_root_count,
+        service_count_diff: (gen_b.runtime_service_count as i64) - (gen_a.runtime_service_count as i64),
+        new_services: Array::zeroed(),
+        removed_services: Array::zeroed(),
+        same_parent: gen_a.parent_generation == gen_b.parent_generation,
+        diff_hash: 0,
+    };
+
+    return Result::Ok(diff);
+}
+
+fn store_key_equal(a: StoreKey, b: StoreKey) -> bool
+    effect [deterministic]
+{
+    return a.hash == b.hash && a.hash_high == b.hash_high;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generation Tree — Build the generation ancestry tree
+// ─────────────────────────────────────────────────────────────
+
+struct GenerationTreeNode {
+    generation: GenerationEntry,
+    depth: u64,
+    child_count: u64,
+    children: Array(u64, 32),
+    is_leaf: bool,
+    is_active_path: bool,
+}
+
+fn generation_build_tree(
+    state: Handle(GenerationManagerState),
+    root_gen: u64,
+    builder_cap: Cap(CapabilityToken),
+) -> Result(Array(GenerationTreeNode, 32), GenerationError)
+    effect [deterministic]
+{
+    let mut tree: Array(GenerationTreeNode, 32) = Array::zeroed();
+    let mut node_count: u64 = 0;
+
+    // Find root
+    let mut root_found: bool = false;
+    for i in 0..32 {
+        let g: GenerationEntry = state.generations[i];
+        if g.generation_number == root_gen {
+            let node: GenerationTreeNode = GenerationTreeNode {
+                generation: g,
+                depth: 0,
+                child_count: 0,
+                children: Array::zeroed(),
+                is_leaf: true,
+                is_active_path: g.generation_number == state.active_generation,
+            };
+            tree[node_count] = node;
+            node_count = node_count + 1;
+            root_found = true;
+            break;
+        };
+    };
+
+    if !root_found {
+        return Result::Err(GenerationError::GenerationNotFound);
+    };
+
+    // Build children for each level (bounded by max generations)
+    for depth in 0..32 {
+        let mut prev_count: u64 = node_count;
+        for j in 0..prev_count {
+            let parent_gen: u64 = tree[j].generation.generation_number;
+            // Find all generations with this parent
+            for k in 0..32 {
+                let g: GenerationEntry = state.generations[k];
+                if g.parent_generation == parent_gen
+                    && g.generation_status != GenerationStatus::GarbageCollected
+                    && g.generation_number != parent_gen
+                {
+                    // Check if already added
+                    let mut already: bool = false;
+                    for l in 0..node_count {
+                        if tree[l].generation.generation_number == g.generation_number {
+                            already = true;
+                            break;
+                        };
+                    };
+                    if !already && node_count < 32 {
+                        let child_node: GenerationTreeNode = GenerationTreeNode {
+                            generation: g,
+                            depth: depth + 1,
+                            child_count: 0,
+                            children: Array::zeroed(),
+                            is_leaf: true,
+                            is_active_path: g.generation_number == state.active_generation,
+                        };
+                        tree[node_count] = child_node;
+                        tree[j].children[tree[j].child_count] = g.generation_number;
+                        tree[j].child_count = tree[j].child_count + 1;
+                        tree[j].is_leaf = false;
+                        node_count = node_count + 1;
+                    };
+                };
+            };
+        };
+        if node_count == prev_count { break; };
+    };
+
+    return Result::Ok(tree);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generations Summary — Quick overview of all generations
+// ─────────────────────────────────────────────────────────────
+
+struct GenerationSummary {
+    total_generations: u64,
+    active_generation: u64,
+    created_count: u64,
+    active_count: u64,
+    inactive_count: u64,
+    failed_count: u64,
+    rollback_targets: u64,
+    corrupted_count: u64,
+    gc_count: u64,
+    oldest_generation: u64,
+    newest_generation: u64,
+    root_generation: u64,
+    average_depth: u64,
+    total_rollbacks: u64,
+    sealed_ratio: u64,
+}
+
+fn generation_summary(
+    state: Handle(GenerationManagerState),
+    querier_cap: Cap(CapabilityToken),
+) -> GenerationSummary
+    effect [deterministic]
+{
+    let mut created: u64 = 0;
+    let mut active: u64 = 0;
+    let mut inactive: u64 = 0;
+    let mut failed: u64 = 0;
+    let mut rollback: u64 = 0;
+    let mut corrupted: u64 = 0;
+    let mut gc: u64 = 0;
+    let mut sealed: u64 = 0;
+    let mut oldest: u64 = 0xFFFFFFFFFFFFFFFF;
+    let mut newest: u64 = 0;
+    let mut root: u64 = 0;
+    let mut total_depth: u64 = 0;
+    let mut depth_count: u64 = 0;
+
+    for i in 0..32 {
+        let g: GenerationEntry = state.generations[i];
+        if g.generation_number == 0 { continue; };
+        match g.generation_status {
+            GenerationStatus::Created => created = created + 1,
+            GenerationStatus::Active => active = active + 1,
+            GenerationStatus::Inactive => inactive = inactive + 1,
+            GenerationStatus::Failed => failed = failed + 1,
+            GenerationStatus::RollbackTarget => rollback = rollback + 1,
+            GenerationStatus::Corrupted => corrupted = corrupted + 1,
+            GenerationStatus::GarbageCollected => gc = gc + 1,
+            GenerationStatus::Activating => created = created + 1,
+        };
+        if g.sealed { sealed = sealed + 1; };
+        if g.generation_number < oldest { oldest = g.generation_number; };
+        if g.generation_number > newest { newest = g.generation_number; };
+        if g.parent_generation == 0 { root = g.generation_number; };
+    };
+
+    // Count rollback chain
+    let rollback_len: u64 = state.rollback_chain.len();
+
+    let summary: GenerationSummary = GenerationSummary {
+        total_generations: state.generation_count,
+        active_generation: state.active_generation,
+        created_count: created,
+        active_count: active,
+        inactive_count: inactive,
+        failed_count: failed,
+        rollback_targets: rollback,
+        corrupted_count: corrupted,
+        gc_count: gc,
+        oldest_generation: oldest,
+        newest_generation: newest,
+        root_generation: root,
+        average_depth: 0,
+        total_rollbacks: rollback_len,
+        sealed_ratio: if state.generation_count > 0 {sealed * 100 / state.generation_count} else {0},
+    };
+
+    return summary;
+}

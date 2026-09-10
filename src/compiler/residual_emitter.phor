@@ -1,0 +1,874 @@
+// residual_emitter.phor — Residual Emission Analysis: @emit_residual Annotation Processing,
+//                          Automatic Residual Insertion, Residual Path Tracing,
+//                          Residual Graph Construction, Residual Deduplication,
+//                          Residual Hash Computation
+// Phorensic Compiler Infrastructure — Residual Emission Phase
+//
+// This module implements residual emission analysis for the Phorensic compiler.
+// Residuals are diagnostic payloads that are embedded in the sealed container
+// for downstream analysis. They provide traceability from source code through
+// every compiler phase to the final binary output.
+//
+// Operations performed:
+// 1. @emit_residual annotation processing — processes explicit residual annotations
+// 2. Automatic residual insertion — inserts residuals for implicit compiler decisions
+// 3. Residual path tracing — traces each residual back to its source location
+// 4. Residual graph construction — builds a directed graph of residual dependencies
+// 5. Residual deduplication — merges identical residuals to reduce container size
+// 6. Residual hash computation — computes unique hashes for residual identification
+//
+// Evidence semantics: Each residual is a DiagnosticPayload with severity Residual.
+// The residual graph provides a complete trace of compiler decisions that can be
+// verified by downstream tools.
+//
+// Boundedness: All residual collections are fixed-capacity (256 residuals max,
+// 64 graph nodes max). Loop bounds use BOUND_SMALL and BOUND_MEDIUM.
+//
+// Effect declarations: All functions are [pure] or [diag] as appropriate.
+
+use core::fixed::Array64;
+use core::fixed::Array128;
+use core::fixed::Array256;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::receipts::*;
+
+// ──────────────────────────────────────────────
+// ResidualAnnotation: Represents an @emit_residual annotation
+// ──────────────────────────────────────────────
+// The @emit_residual annotation marks a location in the source where
+// a residual diagnostic should be emitted. It carries a message, an
+// optional diagnostic code, and a path expression for tracing.
+// Evidence path: RESID-ANNOT-001 through RESID-ANNOT-015
+
+pub struct ResidualAnnotation {
+    /// The diagnostic message to emit.
+    pub message : FixedString256,
+    /// The diagnostic code (PHOR-COMP-NNN format).
+    pub code : DiagnosticCode,
+    /// Source location of the annotation.
+    pub location : SourceLocation,
+    /// Optional path expression for residual tracing.
+    pub path_expression : FixedString256,
+    /// Whether the annotation has been processed.
+    pub processed : bool,
+}
+
+impl ResidualAnnotation {
+    pub fn new(
+        message : FixedString256,
+        code : DiagnosticCode,
+        location : SourceLocation,
+    ) -> ResidualAnnotation [pure] {
+        ResidualAnnotation {
+            message: message,
+            code: code,
+            location: location,
+            path_expression: FixedString256::new(),
+            processed: false,
+        }
+    }
+
+    pub fn with_path(
+        message : FixedString256,
+        code : DiagnosticCode,
+        location : SourceLocation,
+        path_expression : FixedString256,
+    ) -> ResidualAnnotation [pure] {
+        ResidualAnnotation {
+            message: message,
+            code: code,
+            location: location,
+            path_expression: path_expression,
+            processed: false,
+        }
+    }
+
+    pub fn mark_processed(mut self) -> ResidualAnnotation [pure] {
+        self.processed = true;
+        self
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualNode: A node in the residual dependency graph
+// ──────────────────────────────────────────────
+// Each residual node represents a single residual diagnostic and its
+// relationships to other residuals in the audit trail.
+// Evidence path: RESID-NODE-001 through RESID-NODE-015
+
+pub struct ResidualNode {
+    /// Unique identifier for this residual.
+    pub residual_id : u64,
+    /// The residual diagnostic payload.
+    pub diagnostic : DiagnosticPayload,
+    /// IDs of residuals that this residual depends on.
+    pub dependency_ids : Array64<u64>,
+    /// IDs of residuals that depend on this residual.
+    pub dependent_ids : Array64<u64>,
+    /// Hash of this residual (for deduplication).
+    pub residual_hash : u64,
+    /// Phase that emitted this residual.
+    pub phase : CompilerPhase,
+    /// Whether this residual has been emitted.
+    pub emitted : bool,
+}
+
+impl ResidualNode {
+    pub fn new(
+        residual_id : u64,
+        diagnostic : DiagnosticPayload,
+        phase : CompilerPhase,
+    ) -> ResidualNode [pure] {
+        let hash : u64 = ResidualNode::compute_hash(diagnostic, residual_id);
+        ResidualNode {
+            residual_id: residual_id,
+            diagnostic: diagnostic,
+            dependency_ids: Array64::new(),
+            dependent_ids: Array64::new(),
+            residual_hash: hash,
+            phase: phase,
+            emitted: false,
+        }
+    }
+
+    pub fn add_dependency(mut self, dep_id : u64) -> ResidualNode [pure] {
+        let _ = self.dependency_ids.push(dep_id);
+        self
+    }
+
+    pub fn add_dependent(mut self, dep_id : u64) -> ResidualNode [pure] {
+        let _ = self.dependent_ids.push(dep_id);
+        self
+    }
+
+    pub fn mark_emitted(mut self) -> ResidualNode [pure] {
+        self.emitted = true;
+        self
+    }
+
+    pub fn compute_hash(diagnostic : DiagnosticPayload, residual_id : u64) -> u64 [pure] {
+        var hash : u64 = 14695981039346656037u64;
+        hash ^= diagnostic.code as u64;
+        hash *= 1099511628211u64;
+        hash ^= residual_id;
+        hash *= 1099511628211u64;
+        // Incorporate message bytes.
+        // loop: bounds[BOUND_SMALL] — bounded by message length.
+        loop: bounds[BOUND_SMALL] for i in 0..diagnostic.message.len() {
+            hash ^= diagnostic.message.get_byte(i) as u64;
+            hash *= 1099511628211u64;
+        }
+        hash
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualEdge: A directed edge in the residual graph
+// ──────────────────────────────────────────────
+// Edges represent dependencies between residuals, forming a directed
+// acyclic graph (DAG) of compiler decision provenance.
+// Evidence path: RESID-EDGE-001 through RESID-EDGE-010
+
+pub struct ResidualEdge {
+    /// Source residual node ID.
+    pub from_id : u64,
+    /// Target residual node ID.
+    pub to_id : u64,
+    /// Label describing the dependency relationship.
+    pub label : FixedString256,
+}
+
+impl ResidualEdge {
+    pub fn new(from_id : u64, to_id : u64, label : FixedString256) -> ResidualEdge [pure] {
+        ResidualEdge {
+            from_id: from_id,
+            to_id: to_id,
+            label: label,
+        }
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_u64(self.from_id);
+        result.push_str(FixedString256::from(" -> "));
+        result.push_u64(self.to_id);
+        result.push_str(FixedString256::from(" ["));
+        result.push_str(self.label);
+        result.push_str(FixedString256::from("]"));
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualGraph: Directed acyclic graph of residual dependencies
+// ──────────────────────────────────────────────
+// The residual graph traces the provenance of each residual back through
+// compiler phases, showing which decisions led to each emission.
+// Evidence path: RESID-GRAPH-001 through RESID-GRAPH-020
+
+pub struct ResidualGraph {
+    /// Nodes in the graph (bounded: 64 max).
+    pub nodes : Array64<ResidualNode>,
+    /// Edges between nodes (bounded: 128 max).
+    pub edges : Array128<ResidualEdge>,
+    /// Next available residual ID.
+    pub next_id : u64,
+    /// Whether the graph has been validated (no cycles).
+    pub validated : bool,
+}
+
+impl ResidualGraph {
+    pub fn new() -> ResidualGraph [pure] {
+        ResidualGraph {
+            nodes: Array64::new(),
+            edges: Array128::new(),
+            next_id: 1u64,
+            validated: false,
+        }
+    }
+
+    pub fn add_node(
+        mut self,
+        diagnostic : DiagnosticPayload,
+        phase : CompilerPhase,
+    ) -> Result<(ResidualGraph, u64), FixedString256> [pure] {
+        if self.nodes.len() >= self.nodes.capacity() {
+            return Result::Err(FixedString256::from("residual graph node capacity exceeded"));
+        }
+        let node_id : u64 = self.next_id;
+        self.next_id = self.next_id + 1u64;
+        let node : ResidualNode = ResidualNode::new(node_id, diagnostic, phase);
+        let _ = self.nodes.push(node);
+        Result::Ok((self, node_id))
+    }
+
+    pub fn add_edge(
+        mut self,
+        from_id : u64,
+        to_id : u64,
+        label : FixedString256,
+    ) -> Result<ResidualGraph, FixedString256> [pure] {
+        if self.edges.len() >= self.edges.capacity() {
+            return Result::Err(FixedString256::from("residual graph edge capacity exceeded"));
+        }
+
+        // Verify both nodes exist.
+        let mut from_found : bool = false;
+        let mut to_found : bool = false;
+        // loop: bounds[BOUND_SMALL] — bounded by 64 nodes.
+        loop: bounds[BOUND_SMALL] for i in 0..self.nodes.len() {
+            let node : ResidualNode = self.nodes.get(i);
+            if node.residual_id == from_id { from_found = true; }
+            if node.residual_id == to_id { to_found = true; }
+        }
+
+        if !from_found {
+            return Result::Err(FixedString256::from("source residual node not found"));
+        }
+        if !to_found {
+            return Result::Err(FixedString256::from("target residual node not found"));
+        }
+
+        let edge : ResidualEdge = ResidualEdge::new(from_id, to_id, label);
+        let _ = self.edges.push(edge);
+
+        // Update node dependency lists.
+        // loop: bounds[BOUND_SMALL] — bounded by 64 nodes.
+        loop: bounds[BOUND_SMALL] for i in 0..self.nodes.len() {
+            let node : ResidualNode = self.nodes.get(i);
+            if node.residual_id == from_id {
+                let updated : ResidualNode = node.add_dependent(to_id);
+                self.nodes.set(i, updated);
+            }
+            if node.residual_id == to_id {
+                let updated : ResidualNode = node.add_dependency(from_id);
+                self.nodes.set(i, updated);
+            }
+        }
+
+        Result::Ok(self)
+    }
+
+    pub fn validate_no_cycles(mut self) -> Result<ResidualGraph, FixedString256> [pure] {
+        // Simple cycle detection: check that no node transitively depends on itself.
+        // loop: bounds[BOUND_SMALL] — bounded by 64 nodes.
+        loop: bounds[BOUND_SMALL] for i in 0..self.nodes.len() {
+            let node : ResidualNode = self.nodes.get(i);
+            // Check reachability from this node back to itself.
+            if self.reaches(node.residual_id, node.residual_id, Array64::new()) {
+                return Result::Err(FixedString256::from("cycle detected in residual graph"));
+            }
+        }
+        self.validated = true;
+        Result::Ok(self)
+    }
+
+    fn reaches(&self, from : u64, target : u64, mut visited : Array64<u64>) -> bool [pure] {
+        // loop: bounds[BOUND_SMALL] — bounded by 64 nodes.
+        loop: bounds[BOUND_SMALL] for i in 0..self.edges.len() {
+            let edge : ResidualEdge = self.edges.get(i);
+            if edge.from_id == from {
+                // Check if already visited.
+                let mut already_visited : bool = false;
+                // loop: bounds[BOUND_SMALL] — bounded by 64 visited.
+                loop: bounds[BOUND_SMALL] for vi in 0..visited.len() {
+                    if visited.get(vi) == edge.to_id {
+                        already_visited = true;
+                    }
+                }
+                if !already_visited {
+                    let _ = visited.push(edge.to_id);
+                    if edge.to_id == target {
+                        return true;
+                    }
+                    if self.reaches(edge.to_id, target, visited) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn format_graph(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("ResidualGraph:\n"));
+        // loop: bounds[BOUND_SMALL] — bounded by 64 nodes.
+        loop: bounds[BOUND_SMALL] for i in 0..self.nodes.len() {
+            let node : ResidualNode = self.nodes.get(i);
+            result.push_str(FixedString256::from("  Node "));
+            result.push_u64(node.residual_id);
+            result.push_str(FixedString256::from(": "));
+            result.push_str(node.diagnostic.message);
+            result.push_str(FixedString256::from("\n"));
+        }
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 edges.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.edges.len() {
+            let edge : ResidualEdge = self.edges.get(i);
+            result.push_str(FixedString256::from("  "));
+            result.push_str(edge.format());
+            result.push_str(FixedString256::from("\n"));
+        }
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualEmitter: Main residual emission state machine
+// ──────────────────────────────────────────────
+// Processes @emit_residual annotations and automatically inserts
+// residuals for implicit compiler decisions.
+// Evidence path: RESID-EMITTER-001 through RESID-EMITTER-040
+
+pub struct ResidualEmitter {
+    /// Residual annotations from source (bounded: 128 max).
+    pub annotations : Array128<ResidualAnnotation>,
+    /// Generated residual diagnostics.
+    pub residuals : Array256<DiagnosticPayload>,
+    /// Residual dependency graph.
+    pub graph : ResidualGraph,
+    /// Emitted residual hashes for deduplication (bounded: 256 max).
+    pub emitted_hashes : Array256<u64>,
+    /// Number of automatically inserted residuals.
+    pub auto_insertion_count : u32,
+    /// Number of duplicates eliminated.
+    pub dedup_count : u32,
+    /// Whether the emitter has completed.
+    pub completed : bool,
+}
+
+impl ResidualEmitter {
+    pub fn new() -> ResidualEmitter [pure] {
+        ResidualEmitter {
+            annotations: Array128::new(),
+            residuals: Array256::new(),
+            graph: ResidualGraph::new(),
+            emitted_hashes: Array256::new(),
+            auto_insertion_count: 0u32,
+            dedup_count: 0u32,
+            completed: false,
+        }
+    }
+
+    // ── Annotation Processing ──
+
+    pub fn register_annotation(
+        mut self,
+        annotation : ResidualAnnotation,
+    ) -> Result<ResidualEmitter, FixedString256> [pure] {
+        if self.annotations.len() >= self.annotations.capacity() {
+            return Result::Err(FixedString256::from("annotation capacity exceeded"));
+        }
+        let _ = self.annotations.push(annotation);
+        Result::Ok(self)
+    }
+
+    pub fn process_annotation(
+        mut self,
+        message : FixedString256,
+    ) -> Result<ResidualEmitter, DiagnosticPayload> [pure, diag] {
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 annotations.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.annotations.len() {
+            let annotation : ResidualAnnotation = self.annotations.get(i);
+            if annotation.message == message && !annotation.processed {
+                // Emit the residual.
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    annotation.code,
+                    annotation.message,
+                    annotation.location,
+                    DiagnosticSeverity::Residual,
+                    CompilerPhase::Lowerer,
+                );
+                let _ = self.residuals.push(diag);
+                self.annotations.set(i, annotation.mark_processed());
+                return Result::Ok(self);
+            }
+        }
+
+        // Annotation not found — auto-insert as a trace residual.
+        self.auto_insertion_count = self.auto_insertion_count + 1u32;
+        let auto_diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerCapabilityViolation,
+            message,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Residual,
+            CompilerPhase::Lowerer,
+        );
+        let _ = self.residuals.push(auto_diag);
+        Result::Ok(self)
+    }
+
+    // ── Automatic Residual Insertion ──
+
+    pub fn auto_insert_residual(
+        mut self,
+        message : FixedString256,
+        phase : CompilerPhase,
+    ) -> Result<ResidualEmitter, FixedString256> [pure] {
+        if self.residuals.len() >= self.residuals.capacity() {
+            return Result::Err(FixedString256::from("residual capacity exceeded"));
+        }
+
+        // Check for duplicates via hash.
+        let temp_diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerCapabilityViolation,
+            message,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Residual,
+            phase,
+        );
+        let temp_hash : u64 = ResidualNode::compute_hash(temp_diag, 0u64);
+
+        // Check dedup set.
+        let mut is_duplicate : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by 256 hashes.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.emitted_hashes.len() {
+            if self.emitted_hashes.get(i) == temp_hash {
+                is_duplicate = true;
+            }
+        }
+
+        if is_duplicate {
+            self.dedup_count = self.dedup_count + 1u32;
+            return Result::Ok(self);
+        }
+
+        let _ = self.emitted_hashes.push(temp_hash);
+        self.auto_insertion_count = self.auto_insertion_count + 1u32;
+        let residual : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LowerCapabilityViolation,
+            message,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Residual,
+            phase,
+        );
+        let _ = self.residuals.push(residual);
+        Result::Ok(self)
+    }
+
+    pub fn auto_insert_compiler_decision(
+        mut self,
+        decision_description : FixedString256,
+        phase : CompilerPhase,
+        code : DiagnosticCode,
+    ) -> Result<ResidualEmitter, FixedString256> [pure] {
+        if self.residuals.len() >= self.residuals.capacity() {
+            return Result::Err(FixedString256::from("residual capacity exceeded"));
+        }
+
+        let temp_diag : DiagnosticPayload = DiagnosticPayload::new(
+            code,
+            decision_description,
+            SourceLocation::new(FixedString256::new(), 0u32, 0u32, 0u64),
+            DiagnosticSeverity::Residual,
+            phase,
+        );
+        let temp_hash : u64 = ResidualNode::compute_hash(temp_diag, 0u64);
+
+        let mut is_duplicate : bool = false;
+        // loop: bounds[BOUND_MEDIUM] — bounded by 256 hashes.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.emitted_hashes.len() {
+            if self.emitted_hashes.get(i) == temp_hash {
+                is_duplicate = true;
+            }
+        }
+
+        if is_duplicate {
+            self.dedup_count = self.dedup_count + 1u32;
+            return Result::Ok(self);
+        }
+
+        let _ = self.emitted_hashes.push(temp_hash);
+        self.auto_insertion_count = self.auto_insertion_count + 1u32;
+        let _ = self.residuals.push(temp_diag);
+        Result::Ok(self)
+    }
+
+    // ── Residual Path Tracing ──
+
+    pub fn trace_residual_path(
+        mut self,
+        start_id : u64,
+        end_id : u64,
+    ) -> Result<Array64<ResidualEdge>, FixedString256> [pure] {
+        let mut path : Array64<ResidualEdge> = Array64::new();
+        let mut current : u64 = start_id;
+        let mut visited : Array64<u64> = Array64::new();
+        let _ = visited.push(start_id);
+
+        // Bounded path finding: at most 128 edges.
+        // loop: bounds[BOUND_MEDIUM] — bounded by 128 edges.
+        loop: bounds[BOUND_MEDIUM] for _step in 0..128u32 {
+            if current == end_id {
+                return Result::Ok(path);
+            }
+
+            let mut found_next : bool = false;
+            // loop: bounds[BOUND_MEDIUM] — bounded by 128 edges.
+            loop: bounds[BOUND_MEDIUM] for ei in 0..self.graph.edges.len() {
+                let edge : ResidualEdge = self.graph.edges.get(ei);
+                if edge.from_id == current {
+                    let mut already_visited : bool = false;
+                    // loop: bounds[BOUND_SMALL] — bounded by 64 visited.
+                    loop: bounds[BOUND_SMALL] for vi in 0..visited.len() {
+                        if visited.get(vi) == edge.to_id {
+                            already_visited = true;
+                        }
+                    }
+                    if !already_visited {
+                        let _ = path.push(edge);
+                        let _ = visited.push(edge.to_id);
+                        current = edge.to_id;
+                        found_next = true;
+                    }
+                }
+            }
+
+            if !found_next {
+                return Result::Err(FixedString256::from("no path found between residual nodes"));
+            }
+        }
+
+        Result::Err(FixedString256::from("path search exceeded maximum steps"))
+    }
+
+    // ── Residual Deduplication ──
+
+    pub fn deduplicate_residuals(mut self) -> ResidualEmitter [pure] {
+        let mut unique : Array256<DiagnosticPayload> = Array256::new();
+        let mut seen_hashes : Array256<u64> = Array256::new();
+
+        // loop: bounds[BOUND_MEDIUM] — bounded by 256 residuals.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.residuals.len() {
+            let diag : DiagnosticPayload = self.residuals.get(i);
+            let hash : u64 = ResidualNode::compute_hash(diag, i as u64);
+
+            let mut is_duplicate : bool = false;
+            // loop: bounds[BOUND_SMALL] — bounded by 256 hashes.
+            loop: bounds[BOUND_SMALL] for hi in 0..seen_hashes.len() {
+                if seen_hashes.get(hi) == hash {
+                    is_duplicate = true;
+                }
+            }
+
+            if !is_duplicate {
+                let _ = seen_hashes.push(hash);
+                let _ = unique.push(diag);
+            } else {
+                self.dedup_count = self.dedup_count + 1u32;
+            }
+        }
+
+        self.residuals = unique;
+        self.emitted_hashes = seen_hashes;
+        self
+    }
+
+    // ── Residual Hash Computation ──
+
+    pub fn compute_residual_hash(&self, index : u32) -> Result<u64, FixedString256> [pure] {
+        if index >= self.residuals.len() {
+            return Result::Err(FixedString256::from("residual index out of range"));
+        }
+        let diag : DiagnosticPayload = self.residuals.get(index);
+        let hash : u64 = ResidualNode::compute_hash(diag, index as u64);
+        Result::Ok(hash)
+    }
+
+    pub fn compute_root_hash(&self) -> u64 [pure] {
+        var root_hash : u64 = 14695981039346656037u64;
+        // loop: bounds[BOUND_MEDIUM] — bounded by 256 residuals.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.residuals.len() {
+            let diag : DiagnosticPayload = self.residuals.get(i);
+            let hash : u64 = ResidualNode::compute_hash(diag, i as u64);
+            root_hash ^= hash;
+            root_hash *= 1099511628211u64;
+        }
+        root_hash
+    }
+
+    // ── Graph Construction ──
+
+    pub fn build_residual_graph(mut self) -> Result<ResidualEmitter, FixedString256> [pure] {
+        // Add all residuals as graph nodes.
+        // loop: bounds[BOUND_MEDIUM] — bounded by 256 residuals.
+        loop: bounds[BOUND_MEDIUM] for i in 0..self.residuals.len() {
+            let diag : DiagnosticPayload = self.residuals.get(i);
+            let (new_graph, _node_id) : (ResidualGraph, u64) = match self.graph.add_node(diag, diag.phase) {
+                Result::Ok(pair) => pair,
+                Result::Err(msg) => {
+                    return Result::Err(msg);
+                }
+            };
+            self.graph = new_graph;
+        }
+
+        // Validate no cycles.
+        match self.graph.validate_no_cycles() {
+            Result::Ok(validated) => {
+                self.graph = validated;
+                Result::Ok(self)
+            }
+            Result::Err(msg) => Result::Err(msg),
+        }
+    }
+
+    // ── Finalization ──
+
+    pub fn finalize(mut self) -> (ResidualEmitter, ResidualEmissionReceipt) [pure] {
+        // Deduplicate before finalizing.
+        self = self.deduplicate_residuals();
+
+        let receipt : ResidualEmissionReceipt = ResidualEmissionReceipt::new(
+            self.residuals.len(),
+            self.auto_insertion_count,
+            self.dedup_count,
+            self.graph.nodes.len(),
+            self.graph.edges.len(),
+            self.compute_root_hash(),
+        );
+        self.completed = true;
+        (self, receipt)
+    }
+
+    pub fn get_residuals(&self) -> Array256<DiagnosticPayload> [pure] {
+        self.residuals
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualEmissionReceipt: Evidence receipt for residual emission
+// ──────────────────────────────────────────────
+// Records all residual emission results for downstream sealing.
+// Evidence path: RESID-RECEIPT-001 through RESID-RECEIPT-010
+
+pub struct ResidualEmissionReceipt {
+    pub evidence : EvidenceReceipt,
+    pub residual_count : u32,
+    pub auto_insertion_count : u32,
+    pub dedup_count : u32,
+    pub graph_node_count : u32,
+    pub graph_edge_count : u32,
+    pub root_hash : u64,
+}
+
+impl ResidualEmissionReceipt {
+    pub fn new(
+        residual_count : u32,
+        auto_insertion_count : u32,
+        dedup_count : u32,
+        graph_node_count : u32,
+        graph_edge_count : u32,
+        root_hash : u64,
+    ) -> ResidualEmissionReceipt [pure] {
+        var payload_hash : u64 = 14695981039346656037u64;
+        payload_hash ^= residual_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= auto_insertion_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= dedup_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= graph_node_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= graph_edge_count as u64;
+        payload_hash *= 1099511628211u64;
+        payload_hash ^= root_hash;
+        payload_hash *= 1099511628211u64;
+
+        ResidualEmissionReceipt {
+            evidence: EvidenceReceipt::new(
+                CompilerPhase::Lowerer,
+                payload_hash,
+                0u64,
+                0u64,
+            ),
+            residual_count: residual_count,
+            auto_insertion_count: auto_insertion_count,
+            dedup_count: dedup_count,
+            graph_node_count: graph_node_count,
+            graph_edge_count: graph_edge_count,
+            root_hash: root_hash,
+        }
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("ResidualEmission: "));
+        result.push_u32(self.residual_count);
+        result.push_str(FixedString256::from(" residuals [auto="));
+        result.push_u32(self.auto_insertion_count);
+        result.push_str(FixedString256::from(", dedup="));
+        result.push_u32(self.dedup_count);
+        result.push_str(FixedString256::from(", graph-nodes="));
+        result.push_u32(self.graph_node_count);
+        result.push_str(FixedString256::from(", graph-edges="));
+        result.push_u32(self.graph_edge_count);
+        result.push_str(FixedString256::from(", root-hash=0x"));
+        result.push_u64(self.root_hash);
+        result.push_str(FixedString256::from("]"));
+        result
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualBatchProcessor: Processes residuals in batch mode
+// ──────────────────────────────────────────────
+// Handles bulk residual operations for compiler phases that produce
+// many residuals at once. Evidence path: RESID-BATCH-001 through RESID-BATCH-020
+
+pub struct ResidualBatchProcessor {
+    /// Batches of residuals (bounded: 64 max).
+    pub batches : Array64<Array256<DiagnosticPayload>>,
+    /// Total residuals processed.
+    pub total_processed : u32,
+    /// Current batch index.
+    pub current_batch : u32,
+}
+
+impl ResidualBatchProcessor {
+    pub fn new() -> ResidualBatchProcessor [pure] {
+        ResidualBatchProcessor {
+            batches: Array64::new(),
+            total_processed: 0u32,
+            current_batch: 0u32,
+        }
+    }
+
+    pub fn begin_batch(mut self) -> Result<ResidualBatchProcessor, FixedString256> [pure] {
+        if self.batches.len() >= self.batches.capacity() {
+            return Result::Err(FixedString256::from("batch capacity exceeded"));
+        }
+        let new_batch : Array256<DiagnosticPayload> = Array256::new();
+        let _ = self.batches.push(new_batch);
+        self.current_batch = self.batches.len() - 1u32;
+        Result::Ok(self)
+    }
+
+    pub fn add_to_batch(mut self, residual : DiagnosticPayload) -> Result<ResidualBatchProcessor, FixedString256> [pure] {
+        if self.current_batch >= self.batches.len() {
+            return Result::Err(FixedString256::from("no active batch"));
+        }
+        let batch : Array256<DiagnosticPayload> = self.batches.get(self.current_batch);
+        if batch.len() >= batch.capacity() {
+            return Result::Err(FixedString256::from("batch residual capacity exceeded"));
+        }
+        let _ = batch.push(residual);
+        self.total_processed = self.total_processed + 1u32;
+        Result::Ok(self)
+    }
+
+    pub fn flush_batch(mut self) -> Result<(ResidualBatchProcessor, Array256<DiagnosticPayload>), FixedString256> [pure] {
+        if self.current_batch >= self.batches.len() {
+            return Result::Err(FixedString256::from("no active batch to flush"));
+        }
+        let batch : Array256<DiagnosticPayload> = self.batches.get(self.current_batch);
+        Result::Ok((self, batch))
+    }
+
+    pub fn total_residuals(&self) -> u32 [pure] {
+        self.total_processed
+    }
+}
+
+// ──────────────────────────────────────────────
+// ResidualPath: Represents a single residual trace path
+// ──────────────────────────────────────────────
+// A path from a source annotation through all intermediate compiler
+// decisions to the final emitted residual.
+// Evidence path: RESID-PATH-001 through RESID-PATH-015
+
+pub struct ResidualPath {
+    /// Starting annotation.
+    pub annotation : ResidualAnnotation,
+    /// Nodes along the path.
+    pub path_nodes : Array64<u64>,
+    /// The final emitted residual ID.
+    pub final_residual_id : u64,
+    /// Whether the path is complete.
+    pub complete : bool,
+}
+
+impl ResidualPath {
+    pub fn new(annotation : ResidualAnnotation) -> ResidualPath [pure] {
+        ResidualPath {
+            annotation: annotation,
+            path_nodes: Array64::new(),
+            final_residual_id: 0u64,
+            complete: false,
+        }
+    }
+
+    pub fn add_node(mut self, node_id : u64) -> ResidualPath [pure] {
+        let _ = self.path_nodes.push(node_id);
+        self
+    }
+
+    pub fn complete(mut self, final_id : u64) -> ResidualPath [pure] {
+        self.final_residual_id = final_id;
+        self.complete = true;
+        self
+    }
+
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(FixedString256::from("Path: "));
+        result.push_str(self.annotation.message);
+        result.push_str(FixedString256::from(" ["));
+        // loop: bounds[BOUND_SMALL] — bounded by 64 nodes.
+        loop: bounds[BOUND_SMALL] for i in 0..self.path_nodes.len() {
+            if i > 0u32 {
+                result.push_str(FixedString256::from(" -> "));
+            }
+            result.push_u64(self.path_nodes.get(i));
+        }
+        result.push_str(FixedString256::from("]"));
+        if self.complete {
+            result.push_str(FixedString256::from(" (complete)"));
+        }
+        result
+    }
+}

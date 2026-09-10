@@ -1,0 +1,1307 @@
+// nvme.phor — NVMe storage driver
+// Queue pair management, submission/completion queues, PRP lists, identify, read/write, DMA
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/nvme.phor
+// Court: nvme_driver:v2
+
+package drivers.nvme;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type NvmeError = enum {
+    NvmeNotInitialized        = 0x500,  // E0500: NVMe driver not initialized
+    NvmeControllerNotFound    = 0x501,  // E0501: NVMe controller not found
+    NvmeQueueFull             = 0x502,  // E0502: submission queue full
+    NvmeCompletionTimeout     = 0x503,  // E0503: completion poll timeout
+    NvmeInvalidQueue          = 0x504,  // E0504: invalid queue identifier
+    NvmeInvalidCommand        = 0x505,  // E0505: invalid command parameters
+    NvmeDmaError              = 0x506,  // E0506: DMA setup error
+    NvmePrpError              = 0x507,  // E0507: PRP list error
+    NvmeIdentifyFailed        = 0x508,  // E0508: identify command failed
+    NvmeNamespaceInvalid      = 0x509,  // E0509: invalid namespace id
+    NvmeReadError             = 0x50A,  // E050A: read command failed
+    NvmeWriteError            = 0x50B,  // E050B: write command failed
+    NvmeCapabilityError       = 0x50C,  // E050C: insufficient capability
+    NvmeDoorbellError         = 0x50D,  // E050D: doorbell register error
+    NvmeFatalControllerStatus = 0x50E,  // E050E: controller fatal status
+    NvmeInvalidBlockCount     = 0x50F,  // E050F: invalid block count
+    NvmeInvalidLbaRange       = 0x510,  // E0510: LBA range exceeds namespace
+    NvmeAdminCmdFailed        = 0x511,  // E0511: admin command resulted in error
+    NvmeNoPrpListSpace        = 0x512,  // E0512: no PRP list entries available
+    NvmeMaxQueuesExceeded     = 0x513,  // E0513: maximum queue count exceeded
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe MMIO Register Offsets
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeMmioRegs {
+    mmio_base: u64,
+}
+
+impl NvmeMmioRegs {
+    fn cap_offset() -> u64 { return 0x0000; }    // Controller Capabilities
+    fn vs_offset() -> u64 { return 0x0008; }      // Version
+    fn intms_offset() -> u64 { return 0x000C; }   // Interrupt Vector Mask Set
+    fn intmc_offset() -> u64 { return 0x0010; }   // Interrupt Vector Mask Clear
+    fn cc_offset() -> u64 { return 0x0014; }      // Controller Config
+    fn csts_offset() -> u64 { return 0x001C; }    // Controller Status
+    fn nss_offset() -> u64 { return 0x0020; }     // NVM Subsystem Shutdown
+    fn aqa_offset() -> u64 { return 0x0024; }     // Admin Queue Attributes
+    fn asq_offset() -> u64 { return 0x0028; }     // Admin Submission Queue Base
+    fn acq_offset() -> u64 { return 0x0030; }     // Admin Completion Queue Base
+    fn sq0_tdb_offset() -> u64 { return 0x1000; } // Submission Queue 0 Tail Doorbell
+    fn cq0_hdb_offset() -> u64 { return 0x1004; } // Completion Queue 0 Head Doorbell
+    fn sq_tdb_offset(qid: u32) -> u64 { return 0x1000 + (qid as u64) * 8; }
+    fn cq_hdb_offset(qid: u32) -> u64 { return 0x1004 + (qid as u64) * 8; }
+
+    fn read32(self, offset: u64) -> u32
+        effect [memory:mmio]
+    {
+        return trusted reason "NVMe MMIO register read at verified offset, NVM Express Spec §3.1" {
+            let ptr: *(u32) = (self.mmio_base + offset) as *(u32);
+            return *ptr;
+        };
+    }
+
+    fn read64(self, offset: u64) -> u64
+        effect [memory:mmio]
+    {
+        return trusted reason "NVMe MMIO 64-bit register read" {
+            let ptr: *(u64) = (self.mmio_base + offset) as *(u64);
+            return *ptr;
+        };
+    }
+
+    fn write32(self, offset: u64, value: u32) -> void
+        effect [memory:mmio]
+    {
+        trusted reason "NVMe MMIO register write at verified offset, NVM Express Spec §3.1" {
+            let ptr: *(u32) = (self.mmio_base + offset) as *(u32);
+            *ptr = value;
+        };
+    }
+
+    fn write64(self, offset: u64, value: u64) -> void
+        effect [memory:mmio]
+    {
+        trusted reason "NVMe MMIO 64-bit register write" {
+            let ptr: *(u64) = (self.mmio_base + offset) as *(u64);
+            *ptr = value;
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Capabilities Register (CAP)
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeCap {
+    mqes: u16,           // Max queue entries (0-based)
+    timeout: u8,         // Timeout in 500ms units
+    css_nvm: bool,       // Supports NVM command set
+    dstrd: u8,           // Doorbell stride
+    to: u8,
+    ams: u8,
+    cqr: bool,
+    css: u8,
+    bins: u8,
+}
+
+fn nvme_parse_cap(reg: u64) -> NvmeCap
+    effect [deterministic]
+{
+    return NvmeCap {
+        mqes: ((reg >> 0) & 0xFFFF) as u16,
+        timeout: ((reg >> 24) & 0xFF) as u8,
+        css_nvm: ((reg >> 37) & 0x01) != 0,
+        dstrd: ((reg >> 32) & 0x0F) as u8,
+        to: ((reg >> 24) & 0xFF) as u8,
+        ams: ((reg >> 36) & 0x03) as u8,
+        cqr: ((reg >> 39) & 0x01) != 0,
+        css: ((reg >> 37) & 0x07) as u8,
+        bins: ((reg >> 48) & 0xFF) as u8,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Submission Queue Entry (SQE / Command)
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeSqe {
+    cdw0: u32,    // DW 0-7: Command Dwords
+    nsid: u32,    // Namespace Identifier
+    cdw2: u32,
+    cdw3: u32,
+    metadata_ptr: u64,
+    data_ptr1: u64,  // PRP or SGL pointer
+    data_ptr2: u64,  // PRP or SGL pointer
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Completion Queue Entry (CQE)
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeCqe {
+    command_id: u16,
+    sq_head_ptr: u16,
+    sq_identifier: u16,
+    status_field: u16,
+    // Status field breakdown
+    status_code: u8,
+    status_code_type: u8,
+    more: bool,
+    phase_tag: bool,
+    result: u32,
+}
+
+fn nvme_parse_cqe(dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> NvmeCqe
+    effect [deterministic]
+{
+    let status_raw: u16 = ((dw3 >> 16) & 0xFFFF) as u16;
+    return NvmeCqe {
+        command_id: (dw2 & 0xFFFF) as u16,
+        sq_head_ptr: ((dw2 >> 16) & 0xFFFF) as u16,
+        sq_identifier: (dw0 & 0xFFFF) as u16,
+        status_field: status_raw,
+        status_code: (status_raw & 0xFF) as u8,
+        status_code_type: ((status_raw >> 8) & 0x07) as u8,
+        more: (dw0 & 0x10000) != 0,
+        phase_tag: (dw3 & 0x01) != 0,
+        result: dw1,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Queue Pair
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeQueuePair {
+    queue_id: u16,
+    submission_queue: Array(NvmeSqe, 256),
+    completion_queue: Array(NvmeCqe, 256),
+    sq_tail: u16,          // Producer index
+    sq_head: u16,          // Consumer index (updated by HW)
+    cq_head: u16,          // Consumer index
+    cq_phase: bool,        // Current phase tag
+    sq_phys_addr: u64,     // Physical address of SQ
+    cq_phys_addr: u64,     // Physical address of CQ
+    sq_size: u16,          // Number of entries (power of 2)
+    cq_size: u16,
+    sq_doorbell: u64,      // Doorbell register address
+    cq_doorbell: u64,
+    doorbell_stride: u8,
+    initialized: bool,
+    is_admin: bool,
+    outstanding_commands: u16,
+}
+
+// ─────────────────────────────────────────────────────────────
+// PRP Entry and PRP List
+// ─────────────────────────────────────────────────────────────
+
+struct PrpEntry {
+    phys_addr: u64,
+}
+
+struct PrpList {
+    entries: Array(PrpEntry, 128),
+    entry_count: u64,
+    list_phys_addr: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Admin Command Opcodes
+// ─────────────────────────────────────────────────────────────
+
+type NvmeAdminOpcode = enum {
+    DeleteIoSubmissionQueue = 0x00,
+    DeleteIoCompletionQueue = 0x01,
+    CreateIoSubmissionQueue = 0x05,
+    CreateIoCompletionQueue = 0x06,
+    Identify                = 0x06,
+    Abort                   = 0x08,
+    SetFeatures             = 0x09,
+    GetFeatures             = 0x0A,
+    AsyncEventRequest       = 0x0C,
+    NamespaceManagement     = 0x0D,
+    FirmwareActivate        = 0x10,
+    FirmwareImageDownload   = 0x11,
+    DeviceSelfTest          = 0x14,
+    NamespaceAttachment     = 0x15,
+    FormatNvm               = 0x80,
+    SecuritySend            = 0x81,
+    SecurityReceive         = 0x82,
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe NVM Command Opcodes
+// ─────────────────────────────────────────────────────────────
+
+type NvmeIoOpcode = enum {
+    Flush           = 0x00,
+    Write           = 0x01,
+    Read            = 0x02,
+    WriteUncorrectable = 0x04,
+    Compare         = 0x05,
+    WriteZeroes     = 0x08,
+    DatasetManagement = 0x09,
+    Verify          = 0x0C,
+    Copy            = 0x19,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identify Data Structures
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeIdentifyControllerData {
+    vid: u16,
+    ssvid: u16,
+    sn: [u8; 20],
+    mn: [u8; 40],
+    fr: [u8; 8],
+    rab: u8,
+    ieee: [u8; 3],
+    cmic: u8,
+    mdts: u8,
+    cntlid: u16,
+    ver: u32,
+    oacs: u16,
+    abd: u16,
+    max_namespaces: u32,
+    sqes: u8,
+    cqes: u8,
+    nn: u32,
+    oncs: u16,
+    fuses: u16,
+    fna: u8,
+    vwc: u8,
+    awun: u16,
+    awupf: u16,
+    acwu: u16,
+    sgls: u32,
+    nvm_sr: u32,
+    power_states: Array(u32, 32),
+    vs_00: u32,
+    vs_01: u32,
+    vs_02: u32,
+    vs_03: u32,
+    vs_04: u32,
+    vs_05: u32,
+}
+
+struct NvmeIdentifyNamespaceData {
+    nsze: u64,
+    ncap: u64,
+    nuse: u64,
+    nsfeat: u8,
+    nlbaf: u8,
+    flbas: u8,
+    mc: u8,
+    dpc: u8,
+    dps: u8,
+    nmic: u8,
+    rescap: u8,
+    fpi: u8,
+    dlfeat: u8,
+    nawun: u16,
+    nawupf: u16,
+    nacwu: u16,
+    nabsn: u16,
+    nabo: u16,
+    nabspf: u16,
+    noiob: u16,
+    nvmcap: u128,
+    nsattr: u8,
+    nvmsetid: u16,
+    anagrpid: u32,
+    endgid: u32,
+    nguid: [u8; 16],
+    eui64: u64,
+    lbaf: Array(NvmeLbaFormat, 16),
+    vs: [u8; 3712],
+}
+
+struct NvmeLbaFormat {
+    lbads: u8,        // LBA data size (2^lbads bytes)
+    rp: u8,           // Relative performance
+    lpsis: bool,
+    ms: u16,          // Metadata size (extension)
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Controller State
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeNamespace {
+    nsid: u32,
+    identify_data: NvmeIdentifyNamespaceData,
+    block_size: u64,
+    block_count: u64,
+    lba_shift: u8,
+    active: bool,
+}
+
+struct NvmeController {
+    controller_identity: Identity,
+    mmio_base: u64,
+    mmio_size: u64,
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    irq_vector: u8,
+    cap: NvmeCap,
+    version: u32,
+    admin_queue: NvmeQueuePair,
+    io_queues: Array(NvmeQueuePair, 16),
+    io_queue_count: u16,
+    namespaces: Array(NvmeNamespace, 32),
+    namespace_count: u32,
+    dma_base: u64,
+    dma_size: u64,
+    prp_pool: PrpList,
+    ready_timeout_ms: u64,
+    initialized: bool,
+    fatal_error: bool,
+    residual_log: RingBuf(ResidualRecord, 64),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct NvmeDriverState {
+    driver_identity: Identity,
+    controllers: Array(NvmeController, 4),
+    controller_count: u64,
+    default_dma_base: u64,
+    default_dma_size: u64,
+    initialized: bool,
+    initialization_timestamp: u64,
+    total_io_operations: u64,
+    total_errors: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+struct NvmeCapability {
+    object_id: Identity,
+    generation: u64,
+    can_admin: bool,
+    can_read: bool,
+    can_write: bool,
+    can_identify: bool,
+    can_dma: bool,
+    can_format: bool,
+    max_io_queues: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Build PRP Entries for a Data Buffer
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_build_prp(
+    controller: Handle(NvmeController),
+    data_phys: u64,
+    data_size: u64,
+    prp1: Handle(u64),
+    prp2: Handle(u64),
+    prp_list: Handle(PrpList),
+) -> Result(void, NvmeError)
+    effect [deterministic]
+    court "nvme_build_prp:v1"
+{
+    if data_size == 0 {
+        prp1.val = 0;
+        prp2.val = 0;
+        return Result::Ok(void);
+    };
+
+    let page_size: u64 = 4096;  // 4K pages
+    let offset_in_page: u64 = data_phys & (page_size - 1);
+    let first_page_remaining: u64 = page_size - offset_in_page;
+
+    prp1.val = data_phys;
+
+    if data_size <= first_page_remaining {
+        prp2.val = 0;
+        return Result::Ok(void);
+    };
+
+    let remaining: u64 = data_size - first_page_remaining;
+    let next_page: u64 = (data_phys + first_page_remaining) & !(page_size - 1);
+
+    if remaining <= page_size {
+        // Can use a single PRP2 with the next physical address
+        prp2.val = next_page;
+        return Result::Ok(void);
+    };
+
+    // Need a PRP list
+    prp2.val = controller.prp_pool.list_phys_addr;
+    let mut list_idx: u64 = 0;
+    let mut current_page: u64 = next_page;
+
+    loop bound 128 {
+        if remaining == 0 || list_idx >= 128 {
+            break;
+        };
+        controller.prp_pool.entries[list_idx] = PrpEntry { phys_addr: current_page };
+        list_idx = list_idx + 1;
+        current_page = current_page + page_size;
+        if remaining >= page_size {
+            remaining = remaining - page_size;
+        } else {
+            remaining = 0;
+        };
+    };
+
+    controller.prp_pool.entry_count = list_idx;
+
+    if remaining > 0 {
+        return Result::Err(NvmeError::NvmePrpError);
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Ring SQ Doorbell
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_ring_sq_doorbell(
+    regs: NvmeMmioRegs,
+    qp: Handle(NvmeQueuePair),
+) -> void
+    effect [memory:mmio]
+    court "nvme_ring_doorbell:v1"
+{
+    let doorbell_val: u32 = qp.sq_tail as u32;
+    trusted reason "NVMe doorbell write to notify controller of new submissions, NVM Express Spec §3.2.5" {
+        let ptr: *(u32) = qp.sq_doorbell as *(u32);
+        *ptr = doorbell_val;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Submit Admin Command
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_submit_admin_cmd(
+    controller: Handle(NvmeController),
+    sqe: NvmeSqe,
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(u16, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_admin_cmd:v1"
+{
+    if !controller.initialized {
+        return Result::Err(NvmeError::NvmeNotInitialized);
+    };
+
+    if !admin_cap.can_admin {
+        return Result::Err(NvmeError::NvmeCapabilityError);
+    };
+
+    let qp: Handle(NvmeQueuePair) = Handle(NvmeQueuePair)::from_ptr(&controller.admin_queue);
+
+    if !qp.initialized {
+        return Result::Err(NvmeError::NvmeInvalidQueue);
+    };
+
+    let tail: u16 = qp.sq_tail;
+    let slot: u64 = tail as u64;
+    let cmd_id: u16 = tail;
+
+    // Place command in submission queue
+    let cmd: NvmeSqe = NvmeSqe {
+        cdw0: sqe.cdw0 | (cmd_id as u32),
+        nsid: sqe.nsid,
+        cdw2: sqe.cdw2,
+        cdw3: sqe.cdw3,
+        metadata_ptr: sqe.metadata_ptr,
+        data_ptr1: sqe.data_ptr1,
+        data_ptr2: sqe.data_ptr2,
+        cdw10: sqe.cdw10,
+        cdw11: sqe.cdw11,
+        cdw12: sqe.cdw12,
+        cdw13: sqe.cdw13,
+        cdw14: sqe.cdw14,
+        cdw15: sqe.cdw15,
+    };
+
+    qp.submission_queue[slot] = cmd;
+
+    // Update tail and ring doorbell
+    let new_tail: u16 = (tail + 1) & (qp.sq_size - 1);
+    qp.sq_tail = new_tail;
+    qp.outstanding_commands = qp.outstanding_commands + 1;
+
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+    nvme_ring_sq_doorbell(regs, qp);
+
+    controller.total_io_operations = controller.total_io_operations + 1;
+
+    residual emit {
+        op: "nvme.submit_admin",
+        cmd_id: cmd_id as u64,
+        nsid: sqe.nsid as u64,
+        opcode: sqe.cdw0 as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(cmd_id);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Poll for Completion
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_poll_completion(
+    qp: Handle(NvmeQueuePair),
+    timeout_ms: u64,
+) -> Result(NvmeCqe, NvmeError)
+    effect [deterministic]
+    court "nvme_poll_cq:v1"
+{
+    loop bound 10000 {
+        if qp.outstanding_commands == 0 {
+            break;
+        };
+
+        let head: u16 = qp.cq_head;
+        let cqe: NvmeCqe = qp.completion_queue[head as u64];
+
+        if cqe.phase_tag == qp.cq_phase {
+            // Check for error
+            if cqe.status_code != 0 {
+                // Update head pointer to acknowledge
+                qp.cq_head = (head + 1) & (qp.cq_size - 1);
+                if qp.cq_head == 0 {
+                    qp.cq_phase = !qp.cq_phase;
+                };
+                qp.outstanding_commands = qp.outstanding_commands - 1;
+                return Result::Err(NvmeError::NvmeAdminCmdFailed);
+            };
+
+            return Result::Ok(cqe);
+        };
+
+        // Spin-wait with bounded loop
+        // In real hw, would use proper polling or interrupt
+    };
+
+    return Result::Err(NvmeError::NvmeCompletionTimeout);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Acknowledge Completion
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_ack_completion(
+    controller: Handle(NvmeController),
+    qp: Handle(NvmeQueuePair),
+    cqe: NvmeCqe,
+) -> void
+    effect [memory:mmio]
+{
+    let new_head: u16 = (qp.cq_head + 1) & (qp.cq_size - 1);
+    qp.cq_head = new_head;
+    qp.outstanding_commands = qp.outstanding_commands - 1;
+
+    if qp.cq_head == 0 {
+        qp.cq_phase = !qp.cq_phase;
+    };
+
+    // Ring CQ head doorbell
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+    trusted reason "NVMe CQ head doorbell write, NVM Express Spec §3.2.5" {
+        let ptr: *(u32) = qp.cq_doorbell as *(u32);
+        *ptr = qp.cq_head as u32;
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialize Admin Queue Pair
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_init_admin_queue(
+    controller: Handle(NvmeController),
+    admin_sq_phys: u64,
+    admin_cq_phys: u64,
+    queue_size: u16,
+) -> Result(void, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_init_admin_q:v1"
+{
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+    let doorbell_stride: u8 = controller.cap.dstrd;
+
+    let sq_doorbell: u64 = controller.mmio_base + NvmeMmioRegs::sq0_tdb_offset();
+    let cq_doorbell: u64 = controller.mmio_base + NvmeMmioRegs::cq0_hdb_offset();
+
+    // Set admin queue attributes
+    let aqa: u32 = ((queue_size as u32) << 16) | (queue_size as u32);  // ACQS ans ASQS both = queue_size-1
+    regs.write32(NvmeMmioRegs::aqa_offset(), aqa);
+
+    // Set admin submission and completion queue base addresses
+    regs.write64(NvmeMmioRegs::asq_offset(), admin_sq_phys);
+    regs.write64(NvmeMmioRegs::acq_offset(), admin_cq_phys);
+
+    controller.admin_queue = NvmeQueuePair {
+        queue_id: 0,
+        submission_queue: Array::zeroed(),
+        completion_queue: Array::zeroed(),
+        sq_tail: 0,
+        sq_head: 0,
+        cq_head: 0,
+        cq_phase: true,
+        sq_phys_addr: admin_sq_phys,
+        cq_phys_addr: admin_cq_phys,
+        sq_size: queue_size,
+        cq_size: queue_size,
+        sq_doorbell: sq_doorbell,
+        cq_doorbell: cq_doorbell,
+        doorbell_stride: doorbell_stride,
+        initialized: true,
+        is_admin: true,
+        outstanding_commands: 0,
+    };
+
+    residual emit {
+        op: "nvme.init_admin_queue",
+        mmio_base: controller.mmio_base,
+        sq_size: queue_size as u64,
+        sq_phys: admin_sq_phys,
+        cq_phys: admin_cq_phys,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create I/O Completion Queue
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_create_io_cq(
+    controller: Handle(NvmeController),
+    qid: u16,
+    cq_size: u16,
+    cq_phys: u64,
+    irq_vector: u16,
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(void, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_create_io_cq:v1"
+{
+    let sqe: NvmeSqe = NvmeSqe {
+        cdw0: (NvmeAdminOpcode::CreateIoCompletionQueue as u32),
+        nsid: 0,
+        cdw2: 0, cdw3: 0,
+        metadata_ptr: 0,
+        data_ptr1: cq_phys,  // PRP1 = CQ physical address
+        data_ptr2: 0,
+        cdw10: (qid as u32) | ((cq_size as u32 - 1) << 16),
+        cdw11: (irq_vector as u32) | (1 << 1),  // Physically contiguous + IRQ enabled
+        cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+
+    return nvme_submit_admin_cmd(controller, sqe, admin_cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create I/O Submission Queue
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_create_io_sq(
+    controller: Handle(NvmeController),
+    qid: u16,
+    sq_size: u16,
+    sq_phys: u64,
+    cq_id: u16,
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(void, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_create_io_sq:v1"
+{
+    let sqe: NvmeSqe = NvmeSqe {
+        cdw0: (NvmeAdminOpcode::CreateIoSubmissionQueue as u32),
+        nsid: 0,
+        cdw2: 0, cdw3: 0,
+        metadata_ptr: 0,
+        data_ptr1: sq_phys,
+        data_ptr2: 0,
+        cdw10: (qid as u32) | ((sq_size as u32 - 1) << 16),
+        cdw11: (cq_id as u32) | (1 << 1),  // Physically contiguous
+        cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+
+    return nvme_submit_admin_cmd(controller, sqe, admin_cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identify Controller
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_identify_controller(
+    controller: Handle(NvmeController),
+    data_buffer: u64,
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(void, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_identify_ctrl:v1"
+{
+    let sqe: NvmeSqe = NvmeSqe {
+        cdw0: (NvmeAdminOpcode::Identify as u32),
+        nsid: 0,
+        cdw2: 0, cdw3: 0,
+        metadata_ptr: 0,
+        data_ptr1: data_buffer,
+        data_ptr2: 0,
+        cdw10: 0x00000001,  // CNS = 1 (Identify Controller)
+        cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+
+    let result: Result(u16, NvmeError) = nvme_submit_admin_cmd(controller, sqe, admin_cap, timestamp);
+    match result {
+        Result::Ok(cmd_id) => {
+            residual emit {
+                op: "nvme.identify_controller",
+                cmd_id: cmd_id as u64,
+                data_buffer: data_buffer,
+                timestamp: timestamp,
+            };
+            return Result::Ok(void);
+        },
+        Result::Err(e) => { return Result::Err(e); },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identify Namespace
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_identify_namespace(
+    controller: Handle(NvmeController),
+    nsid: u32,
+    data_buffer: u64,
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(void, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_identify_ns:v1"
+{
+    let sqe: NvmeSqe = NvmeSqe {
+        cdw0: (NvmeAdminOpcode::Identify as u32),
+        nsid: nsid,
+        cdw2: 0, cdw3: 0,
+        metadata_ptr: 0,
+        data_ptr1: data_buffer,
+        data_ptr2: 0,
+        cdw10: 0x00000000,  // CNS = 0 (Identify Namespace)
+        cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+
+    return nvme_submit_admin_cmd(controller, sqe, admin_cap, timestamp);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Build NVM Read/Write Command
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_build_rw_sqe(
+    opcode: NvmeIoOpcode,
+    nsid: u32,
+    slba: u64,
+    block_count: u16,
+    prp1: u64,
+    prp2: u64,
+) -> NvmeSqe
+    effect [deterministic]
+{
+    let cmd: u32 = (opcode as u32);
+    let bcnt: u32 = (block_count as u32) - 1;  // 0-based
+
+    return NvmeSqe {
+        cdw0: cmd,
+        nsid: nsid,
+        cdw2: 0, cdw3: 0,
+        metadata_ptr: 0,
+        data_ptr1: prp1,
+        data_ptr2: prp2,
+        cdw10: (slba & 0xFFFFFFFF) as u32,       // SLBA low
+        cdw11: ((slba >> 32) & 0xFFFFFFFF) as u32, // SLBA high
+        cdw12: bcnt,
+        cdw13: 0,  // DSM/PRINFO/ILBRT
+        cdw14: 0,  // ELBRT
+        cdw15: 0,  // LR
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Submit I/O Read Command
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_read_blocks(
+    controller: Handle(NvmeController),
+    nsid: u32,
+    slba: u64,
+    block_count: u16,
+    data_phys: u64,
+    data_size: u64,
+    io_queue_idx: u16,
+    io_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(u16, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_read:v2"
+{
+    if !io_cap.can_read {
+        return Result::Err(NvmeError::NvmeCapabilityError);
+    };
+
+    if (io_queue_idx as u64) >= (controller.io_queue_count as u64) {
+        return Result::Err(NvmeError::NvmeInvalidQueue);
+    };
+
+    // Build PRP entries
+    let prp1: u64 = 0;
+    let prp2: u64 = 0;
+    let prp_list_result: Result(void, NvmeError) = nvme_build_prp(
+        controller, data_phys, data_size,
+        Handle(u64)::from_ptr(&prp1),
+        Handle(u64)::from_ptr(&prp2),
+        Handle(PrpList)::from_ptr(&controller.prp_pool),
+    );
+    match prp_list_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    let sqe: NvmeSqe = nvme_build_rw_sqe(NvmeIoOpcode::Read, nsid, slba, block_count, prp1, prp2);
+
+    // Place command in selected I/O submission queue
+    let qp: Handle(NvmeQueuePair) = Handle(NvmeQueuePair)::from_ptr(&controller.io_queues[io_queue_idx as u64]);
+    let tail: u16 = qp.sq_tail;
+    let slot: u64 = tail as u64;
+    let cmd_id: u16 = tail;
+
+    qp.submission_queue[slot] = sqe;
+    qp.submission_queue[slot].cdw0 = sqe.cdw0 | (cmd_id as u32);
+    qp.sq_tail = (tail + 1) & (qp.sq_size - 1);
+    qp.outstanding_commands = qp.outstanding_commands + 1;
+
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+    nvme_ring_sq_doorbell(regs, qp);
+
+    controller.total_io_operations = controller.total_io_operations + 1;
+
+    residual emit {
+        op: "nvme.read",
+        nsid: nsid as u64,
+        slba: slba,
+        block_count: block_count as u64,
+        data_phys: data_phys,
+        qid: io_queue_idx as u64,
+        cmd_id: cmd_id as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(cmd_id);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Submit I/O Write Command
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_write_blocks(
+    controller: Handle(NvmeController),
+    nsid: u32,
+    slba: u64,
+    block_count: u16,
+    data_phys: u64,
+    data_size: u64,
+    io_queue_idx: u16,
+    io_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(u16, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_write:v2"
+{
+    if !io_cap.can_write {
+        return Result::Err(NvmeError::NvmeCapabilityError);
+    };
+
+    if (io_queue_idx as u64) >= (controller.io_queue_count as u64) {
+        return Result::Err(NvmeError::NvmeInvalidQueue);
+    };
+
+    let prp1: u64 = 0;
+    let prp2: u64 = 0;
+    let prp_list_result: Result(void, NvmeError) = nvme_build_prp(
+        controller, data_phys, data_size,
+        Handle(u64)::from_ptr(&prp1),
+        Handle(u64)::from_ptr(&prp2),
+        Handle(PrpList)::from_ptr(&controller.prp_pool),
+    );
+    match prp_list_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    let sqe: NvmeSqe = nvme_build_rw_sqe(NvmeIoOpcode::Write, nsid, slba, block_count, prp1, prp2);
+
+    let qp: Handle(NvmeQueuePair) = Handle(NvmeQueuePair)::from_ptr(&controller.io_queues[io_queue_idx as u64]);
+    let tail: u16 = qp.sq_tail;
+    let slot: u64 = tail as u64;
+    let cmd_id: u16 = tail;
+
+    qp.submission_queue[slot] = sqe;
+    qp.submission_queue[slot].cdw0 = sqe.cdw0 | (cmd_id as u32);
+    qp.sq_tail = (tail + 1) & (qp.sq_size - 1);
+    qp.outstanding_commands = qp.outstanding_commands + 1;
+
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+    nvme_ring_sq_doorbell(regs, qp);
+
+    controller.total_io_operations = controller.total_io_operations + 1;
+
+    residual emit {
+        op: "nvme.write",
+        nsid: nsid as u64,
+        slba: slba,
+        block_count: block_count as u64,
+        data_phys: data_phys,
+        qid: io_queue_idx as u64,
+        cmd_id: cmd_id as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(cmd_id);
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Controller Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_controller_init(
+    controller: Handle(NvmeController),
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(void, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_controller_init:v2"
+{
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+
+    // Read capabilities
+    let cap_raw: u64 = regs.read64(NvmeMmioRegs::cap_offset());
+    controller.cap = nvme_parse_cap(cap_raw);
+
+    // Read version
+    controller.version = regs.read32(NvmeMmioRegs::vs_offset());
+
+    // Read ready timeout
+    let timeout_500ms: u64 = controller.cap.timeout as u64;
+    controller.ready_timeout_ms = timeout_500ms * 500;
+
+    // Disable controller by clearing CC.EN
+    let cc: u32 = regs.read32(NvmeMmioRegs::cc_offset());
+    regs.write32(NvmeMmioRegs::cc_offset(), cc & !0x01);
+
+    // Wait for CSTS.RDY to clear
+    loop bound 200 {
+        let csts: u32 = regs.read32(NvmeMmioRegs::csts_offset());
+        if (csts & 0x01) == 0 {
+            break;
+        };
+    };
+
+    // Set CC: enable, I/O queue set to admin queue size, ARB at 4K pages
+    let arb: u32 = 0;      // Arbitration: round robin
+    let mps: u32 = 0;      // Memory page size: 4K (2^12)
+    let css: u32 = 0;      // NVM command set
+    let new_cc: u32 = (arb << 11) | (mps << 7) | (css << 4) | 0x01;  // Enable
+    regs.write32(NvmeMmioRegs::cc_offset(), new_cc);
+
+    // Wait for CSTS.RDY to set
+    loop bound 200 {
+        let csts: u32 = regs.read32(NvmeMmioRegs::csts_offset());
+        if (csts & 0x01) != 0 {
+            break;
+        };
+    };
+
+    // Initialize admin queue
+    let admin_queue_phys: u64 = controller.dma_base;
+    let admin_cq_phys: u64 = controller.dma_base + 4096;
+    let init_result: Result(void, NvmeError) = nvme_init_admin_queue(
+        controller, admin_queue_phys, admin_cq_phys, 64,
+    );
+    match init_result {
+        Result::Err(e) => { return Result::Err(e); },
+        Result::Ok(_) => {},
+    };
+
+    controller.initialized = true;
+
+    residual emit {
+        op: "nvme.controller_init",
+        mmio_base: controller.mmio_base,
+        version: controller.version as u64,
+        mqes: controller.cap.mqes as u64,
+        timeout: controller.cap.timeout as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// NVMe Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_driver_init(
+    driver_identity: Identity,
+    dma_base: u64,
+    dma_size: u64,
+    cap: NvmeCapability,
+    timestamp: u64,
+) -> NvmeDriverState
+    effect [deterministic, residual]
+    court "nvme_driver_init:v2"
+{
+    let state: NvmeDriverState = NvmeDriverState {
+        driver_identity: driver_identity,
+        controllers: Array::zeroed(),
+        controller_count: 0,
+        default_dma_base: dma_base,
+        default_dma_size: dma_size,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        total_io_operations: 0,
+        total_errors: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    residual emit {
+        op: "nvme_driver.init",
+        driver_identity: driver_identity.id_hash,
+        dma_base: dma_base,
+        dma_size: dma_size,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Add NVMe Controller from PCI Discovery
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_add_controller(
+    state: Handle(NvmeDriverState),
+    mmio_base: u64,
+    mmio_size: u64,
+    pci_bus: u8,
+    pci_device: u8,
+    pci_func: u8,
+    irq_vector: u8,
+    dma_base: u64,
+    dma_size: u64,
+    admin_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(u64, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_add_controller:v1"
+{
+    if state.controller_count >= 4 {
+        return Result::Err(NvmeError::NvmeMaxQueuesExceeded);
+    };
+
+    let idx: u64 = state.controller_count;
+    let ctrl_identity: Identity = identity_new(
+        0x4E564D, timestamp, idx, pci_bus as u64,
+    );
+
+    let prp_pool: PrpList = PrpList {
+        entries: Array::zeroed(),
+        entry_count: 0,
+        list_phys_addr: dma_base + 0x2000,  // PRP list after queues
+    };
+
+    let controller: NvmeController = NvmeController {
+        controller_identity: ctrl_identity,
+        mmio_base: mmio_base,
+        mmio_size: mmio_size,
+        pci_bus: pci_bus,
+        pci_device: pci_device,
+        pci_func: pci_func,
+        irq_vector: irq_vector,
+        cap: NvmeCap { mqes: 0, timeout: 0, css_nvm: false, dstrd: 0, to: 0, ams: 0, cqr: false, css: 0, bins: 0 },
+        version: 0,
+        admin_queue: NvmeQueuePair {
+            queue_id: 0, submission_queue: Array::zeroed(), completion_queue: Array::zeroed(),
+            sq_tail: 0, sq_head: 0, cq_head: 0, cq_phase: true,
+            sq_phys_addr: 0, cq_phys_addr: 0,
+            sq_size: 0, cq_size: 0, sq_doorbell: 0, cq_doorbell: 0,
+            doorbell_stride: 0, initialized: false, is_admin: true, outstanding_commands: 0,
+        },
+        io_queues: Array::zeroed(),
+        io_queue_count: 0,
+        namespaces: Array::zeroed(),
+        namespace_count: 0,
+        dma_base: dma_base,
+        dma_size: dma_size,
+        prp_pool: prp_pool,
+        ready_timeout_ms: 0,
+        initialized: false,
+        fatal_error: false,
+        residual_log: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    state.controllers[idx] = controller;
+
+    let ctrl_handle: Handle(NvmeController) = Handle(NvmeController)::from_ptr(&state.controllers[idx]);
+    let init_result: Result(void, NvmeError) = nvme_controller_init(ctrl_handle, admin_cap, timestamp);
+    match init_result {
+        Result::Err(e) => {
+            state.controllers[idx].fatal_error = true;
+            return Result::Err(e);
+        },
+        Result::Ok(_) => {},
+    };
+
+    state.controller_count = state.controller_count + 1;
+
+    residual emit {
+        op: "nvme.add_controller",
+        idx: idx,
+        mmio_base: mmio_base,
+        pci_bdf: ((pci_bus as u64) << 16) | ((pci_device as u64) << 11) | (pci_func as u64),
+        dma_base: dma_base,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(idx);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get Namespace Block Size
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_get_block_size(
+    controller: Handle(NvmeController),
+    nsid: u32,
+) -> Result(u64, NvmeError)
+    effect [deterministic]
+{
+    loop bound 32 {
+        let i: u64 = 0;
+        loop while i < (controller.namespace_count as u64) {
+            let ns: NvmeNamespace = controller.namespaces[i];
+            if ns.nsid == nsid && ns.active {
+                return Result::Ok(ns.block_size);
+            };
+            if i >= 31 { break; };
+        };
+        break;
+    };
+    return Result::Err(NvmeError::NvmeNamespaceInvalid);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Record All Residuals
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_record_residuals(
+    state: Handle(NvmeDriverState),
+    timestamp: u64,
+) -> void
+    effect [residual]
+    court "nvme_record_residuals:v1"
+{
+    residual emit {
+        op: "nvme_driver.state_summary",
+        initialized: if state.initialized { 1 } else { 0 },
+        controller_count: state.controller_count,
+        total_io: state.total_io_operations,
+        total_errors: state.total_errors,
+        timestamp: timestamp,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Flush Command
+// ─────────────────────────────────────────────────────────────
+
+fn nvme_flush(
+    controller: Handle(NvmeController),
+    nsid: u32,
+    io_queue_idx: u16,
+    io_cap: NvmeCapability,
+    timestamp: u64,
+) -> Result(u16, NvmeError)
+    effect [memory:mmio, deterministic, residual]
+    court "nvme_flush:v1"
+{
+    if !io_cap.can_write {
+        return Result::Err(NvmeError::NvmeCapabilityError);
+    };
+
+    if (io_queue_idx as u64) >= (controller.io_queue_count as u64) {
+        return Result::Err(NvmeError::NvmeInvalidQueue);
+    };
+
+    let sqe: NvmeSqe = NvmeSqe {
+        cdw0: NvmeIoOpcode::Flush as u32,
+        nsid: nsid,
+        cdw2: 0, cdw3: 0,
+        metadata_ptr: 0, data_ptr1: 0, data_ptr2: 0,
+        cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+
+    let qp: Handle(NvmeQueuePair) = Handle(NvmeQueuePair)::from_ptr(&controller.io_queues[io_queue_idx as u64]);
+    let tail: u16 = qp.sq_tail;
+    let slot: u64 = tail as u64;
+    let cmd_id: u16 = tail;
+
+    qp.submission_queue[slot] = sqe;
+    qp.submission_queue[slot].cdw0 = sqe.cdw0 | (cmd_id as u32);
+    qp.sq_tail = (tail + 1) & (qp.sq_size - 1);
+    qp.outstanding_commands = qp.outstanding_commands + 1;
+
+    let regs: NvmeMmioRegs = NvmeMmioRegs { mmio_base: controller.mmio_base };
+    nvme_ring_sq_doorbell(regs, qp);
+
+    residual emit {
+        op: "nvme.flush",
+        nsid: nsid as u64,
+        qid: io_queue_idx as u64,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(cmd_id);
+}

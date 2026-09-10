@@ -1,0 +1,1249 @@
+// scheduler.phor — Capability/effect-aware scheduler
+// Spawn, yield, priority, residual tracking for threads
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/scheduler.phor
+// Court: scheduler:v2
+
+package kernel.scheduler;
+
+import kernel.nucleus_interface.*;
+import kernel.capability_manager.*;
+import kernel.session_manager.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type SchedulerError = enum {
+    ThreadNotFound        = 0x80,  // E0080: thread ID not found
+    ThreadTableFull       = 0x81,  // E0081: thread table full
+    InvalidPriority       = 0x82,  // E0082: priority value out of range
+    ThreadNotRunnable     = 0x83,  // E0083: thread is not in runnable state
+    ThreadAlreadyRunning  = 0x84,  // E0084: thread is already running
+    CapabilityViolation   = 0x85,  // E0085: thread lacks required capability for operation
+    QuantumExhausted      = 0x86,  // E0086: thread's time quantum has been exhausted
+    SchedulerNotInitialized = 0x87, // E0087: scheduler has not been initialized
+    InvalidEffectSet      = 0x88,  // E0088: thread has invalid effect declaration
+    PriorityInheritanceFailed = 0x89, // E0089: priority inheritance failed
+    SpawnDenied           = 0x8A,  // E008A: spawn operation denied by capability policy
+    YieldNotAllowed       = 0x8B,  // E008B: current context cannot yield
+    ResidualLogFull       = 0x8C,  // E008C: scheduler residual log is full
+    IdleThreadFailed      = 0x8D,  // E008D: idle thread encountered unexpected state
+}
+
+// ─────────────────────────────────────────────────────────────
+// Thread Priority
+// ─────────────────────────────────────────────────────────────
+
+type ThreadPriority = enum {
+    Idle       = 0,   // Only runs when nothing else is ready
+    Low        = 1,   // Background tasks
+    Normal     = 2,   // Default priority
+    High       = 3,   // Important user-facing tasks
+    Realtime   = 4,   // Time-sensitive tasks
+    Critical   = 5,   // System-critical (kernel threads)
+    Nucleus    = 6,   // Nucleus-level (trusted)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Thread State
+// ─────────────────────────────────────────────────────────────
+
+type ThreadState = enum {
+    Created      = 0,  // Thread created but not yet started
+    Runnable     = 1,  // Ready to run
+    Running      = 2,  // Currently executing on a CPU
+    Blocked      = 3,  // Blocked on resource/IPC/timer
+    Sleeping     = 4,  // Sleeping for a duration
+    Suspended    = 5,  // Suspended by scheduler/administrator
+    Zombie       = 6,  // Has exited but not yet reaped
+    Terminated   = 7,  // Fully terminated and cleaned up
+}
+
+// ─────────────────────────────────────────────────────────────
+// Effect Declaration
+// ─────────────────────────────────────────────────────────────
+
+struct EffectDeclaration {
+    effects: u64,  // Bitmask of declared effects
+}
+
+impl EffectDeclaration {
+    fn has_io(self) -> bool { return (self.effects & 0x01) != 0; }
+    fn has_deterministic(self) -> bool { return (self.effects & 0x02) != 0; }
+    fn has_non_deterministic(self) -> bool { return (self.effects & 0x04) != 0; }
+    fn has_interrupt(self) -> bool { return (self.effects & 0x08) != 0; }
+    fn has_blocking(self) -> bool { return (self.effects & 0x10) != 0; }
+    fn has_compute(self) -> bool { return (self.effects & 0x20) != 0; }
+    fn has_residual(self) -> bool { return (self.effects & 0x40) != 0; }
+    fn has_machine_io(self) -> bool { return (self.effects & 0x80) != 0; }
+    fn has_mmio(self) -> bool { return (self.effects & 0x100) != 0; }
+    fn has_dma(self) -> bool { return (self.effects & 0x200) != 0; }
+
+    fn none() -> EffectDeclaration { return EffectDeclaration { effects: 0 }; }
+    fn io_only() -> EffectDeclaration { return EffectDeclaration { effects: 0x01 }; }
+    fn compute_only() -> EffectDeclaration { return EffectDeclaration { effects: 0x20 }; }
+    fn all() -> EffectDeclaration { return EffectDeclaration { effects: 0x3FF }; }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduling Policy
+// ─────────────────────────────────────────────────────────────
+
+type SchedulingPolicy = enum {
+    RoundRobin          = 0,  // Classic round-robin
+    Priority            = 1,  // Strict priority-based
+    CapabilityBalanced  = 2,  // Balance capabilities across threads
+    EffectAware         = 3,  // Effect-aware scheduling (IO vs compute)
+    Realtime            = 4,  // Real-time scheduling (deadline-based)
+    FairShare           = 5,  // Fair share scheduling
+}
+
+// ─────────────────────────────────────────────────────────────
+// Thread Control Block
+// ─────────────────────────────────────────────────────────────
+
+struct ThreadControlBlock {
+    thread_id: Identity,
+    thread_state: ThreadState,
+    priority: ThreadPriority,
+    base_priority: ThreadPriority,
+    effective_priority: ThreadPriority,
+    session_identity: Identity,
+    owning_session: Identity,
+    capabilities: Array(Identity, 32),
+    capability_count: u64,
+    effect_declaration: EffectDeclaration,
+    entry_point: u64,
+    stack_pointer: u64,
+    stack_base: u64,
+    stack_size: u64,
+    kernel_stack: u64,
+    registers: CpuRegisterState,
+    cpu_affinity: u64,
+    total_cpu_time: u64,
+    quantum_used: u64,
+    quantum_max: u64,
+    priority_boost: u64,
+    priority_boost_decay: u64,
+    deadline: u64,
+    wakeup_time: u64,
+    blocking_reason: BlockingReason,
+    parent_thread: Option(Identity),
+    children: Array(Identity, 16),
+    child_count: u64,
+    residual_log: RingBuf(ResidualRecord, 64),
+    schedule_residuals: RingBuf(ScheduleResidual, 32),
+    creation_timestamp: u64,
+    last_scheduled_timestamp: u64,
+    context_switch_count: u64,
+    yield_count: u64,
+    preemption_count: u64,
+    trust_state: TrustState,
+    metadata: ThreadMetadata,
+}
+
+struct ThreadMetadata {
+    name: String(64),
+    description: String(256),
+    service_name: String(64),
+    category: ThreadCategory,
+}
+
+type ThreadCategory = enum {
+    KernelThread     = 0,
+    UserThread       = 1,
+    DriverThread     = 2,
+    ServiceThread    = 3,
+    IdleThread       = 4,
+    WorkerThread     = 5,
+    InterruptThread  = 6,
+    RealtimeThread   = 7,
+    AuditThread      = 8,
+}
+
+type BlockingReason = enum {
+    NotBlocked        = 0,
+    WaitingForIpc     = 1,
+    WaitingForPort    = 2,
+    WaitingForTimer   = 3,
+    WaitingForIpcSend = 4,
+    WaitingForIpcRecv = 5,
+    WaitingForCapability = 6,
+    WaitingForMemory  = 7,
+    WaitingForChild   = 8,
+    WaitingForLock    = 9,
+    Sleeping          = 10,
+    SuspendedByAdmin  = 11,
+    BlockedOnResource = 12,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Schedule Residual
+// ─────────────────────────────────────────────────────────────
+
+struct ScheduleResidual {
+    timestamp: u64,
+    decision_type: ScheduleDecisionType,
+    thread_id: Identity,
+    previous_thread: Option(Identity),
+    priority_used: ThreadPriority,
+    quantum_granted: u64,
+    reason: String(64),
+}
+
+type ScheduleDecisionType = enum {
+    ScheduleIn    = 0,  // Thread scheduled onto CPU
+    ScheduleOut   = 1,  // Thread scheduled off CPU
+    Preempted     = 2,  // Thread was preempted
+    Yielded       = 3,  // Thread voluntarily yielded
+    Blocked       = 4,  // Thread blocked on resource
+    Woken         = 5,  // Thread woken from block/sleep
+    Created       = 6,  // Thread was created
+    Terminated    = 7,  // Thread was terminated
+    PriorityBoost = 8,  // Thread received priority boost
+    PriorityDrop  = 9,  // Thread priority was lowered
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler State
+// ─────────────────────────────────────────────────────────────
+
+struct SchedulerState {
+    threads: Array(ThreadControlBlock, 128),
+    thread_count: u64,
+    run_queues: Array(RingBuf(u64, 64), 7),  // One per priority level
+    active_thread: Option(Identity),
+    policy: SchedulingPolicy,
+    default_quantum: u64,
+    capability_manager: Handle(CapabilityManagerState),
+    session_manager: Handle(SessionManagerState),
+    manager_identity: Identity,
+    initialization_timestamp: u64,
+    total_context_switches: u64,
+    total_preemptions: u64,
+    idle_thread: Option(Identity),
+    is_initialized: bool,
+    tick_count: u64,
+    audit_trail: RingBuf(AuditRecord, 256),
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_init(
+    manager_identity: Identity,
+    cap_mgr: Handle(CapabilityManagerState),
+    sess_mgr: Handle(SessionManagerState),
+    policy: SchedulingPolicy,
+    default_quantum: u64,
+    timestamp: u64,
+) -> SchedulerState
+    effect [deterministic]
+    court "scheduler_init:v1"
+{
+    let state: SchedulerState = SchedulerState {
+        threads: Array::zeroed(),
+        thread_count: 0,
+        run_queues: Array::zeroed(),
+        active_thread: Option::None,
+        policy: policy,
+        default_quantum: default_quantum,
+        capability_manager: cap_mgr,
+        session_manager: sess_mgr,
+        manager_identity: manager_identity,
+        initialization_timestamp: timestamp,
+        total_context_switches: 0,
+        total_preemptions: 0,
+        idle_thread: Option::None,
+        is_initialized: true,
+        tick_count: 0,
+        audit_trail: RingBuf::new(),
+    };
+
+    residual emit {
+        op: "scheduler.init",
+        policy: policy as u64,
+        default_quantum: default_quantum,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Spawn Thread
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_spawn(
+    state: Handle(SchedulerState),
+    entry_point: u64,
+    priority: ThreadPriority,
+    stack_base: u64,
+    stack_size: u64,
+    effects: EffectDeclaration,
+    session: Identity,
+    spawn_cap: Cap(CapabilityToken),
+    metadata: ThreadMetadata,
+    timestamp: u64,
+) -> Result(Identity, SchedulerError)
+    effect [deterministic, residual]
+    court "scheduler_spawn:v2"
+{
+    if !state.is_initialized {
+        return Result::Err(SchedulerError::SchedulerNotInitialized);
+    };
+
+    if state.thread_count >= 128 {
+        return Result::Err(SchedulerError::ThreadTableFull);
+    };
+
+    // Find empty slot
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..128 {
+        let t: ThreadControlBlock = state.threads[i];
+        if t.thread_state == ThreadState::Terminated || (t.thread_id.id_hash == 0) {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SchedulerError::ThreadTableFull);
+    };
+
+    // Generate thread identity
+    let thread_id: Identity = identity_new(
+        session.id_hash,
+        timestamp,
+        slot_idx as u64,
+        slot_idx,
+    );
+
+    // Set up initial register state
+    let registers: CpuRegisterState = CpuRegisterState {
+        rax: 0, rbx: 0, rcx: 0, rdx: 0,
+        rsi: 0, rdi: 0, rbp: 0,
+        rsp: stack_base + stack_size - 8,
+        r8: 0, r9: 0, r10: 0, r11: 0,
+        r12: 0, r13: 0, r14: 0, r15: 0,
+        rip: entry_point,
+        rflags: 0x202,
+        cs: 0, ds: 0, es: 0, fs: 0, gs: 0, ss: 0,
+        cr0: 0, cr2: 0, cr3: 0, cr4: 0, efer: 0,
+        gdtr_base: 0, gdtr_limit: 0, idtr_base: 0, idtr_limit: 0,
+        tr_segment: 0, fs_base: 0, gs_base: 0,
+        kernel_stack: 0,
+    };
+
+    let quantum: u64 = match priority {
+        ThreadPriority::Idle => state.default_quantum * 2,
+        ThreadPriority::Low => state.default_quantum,
+        ThreadPriority::Normal => state.default_quantum,
+        ThreadPriority::High => state.default_quantum / 2,
+        ThreadPriority::Realtime => state.default_quantum / 4,
+        ThreadPriority::Critical => state.default_quantum / 2,
+        ThreadPriority::Nucleus => state.default_quantum,
+    };
+
+    let thread: ThreadControlBlock = ThreadControlBlock {
+        thread_id: thread_id,
+        thread_state: ThreadState::Created,
+        priority: priority,
+        base_priority: priority,
+        effective_priority: priority,
+        session_identity: session,
+        owning_session: session,
+        capabilities: Array::zeroed(),
+        capability_count: 0,
+        effect_declaration: effects,
+        entry_point: entry_point,
+        stack_pointer: stack_base + stack_size - 8,
+        stack_base: stack_base,
+        stack_size: stack_size,
+        kernel_stack: 0,
+        registers: registers,
+        cpu_affinity: 0,
+        total_cpu_time: 0,
+        quantum_used: 0,
+        quantum_max: quantum,
+        priority_boost: 0,
+        priority_boost_decay: 0,
+        deadline: 0,
+        wakeup_time: 0,
+        blocking_reason: BlockingReason::NotBlocked,
+        parent_thread: Option::None,
+        children: Array::zeroed(),
+        child_count: 0,
+        residual_log: RingBuf::new(),
+        schedule_residuals: RingBuf::new(),
+        creation_timestamp: timestamp,
+        last_scheduled_timestamp: 0,
+        context_switch_count: 0,
+        yield_count: 0,
+        preemption_count: 0,
+        trust_state: TrustState::Unknown,
+        metadata: metadata,
+    };
+
+    state.threads[slot_idx] = thread;
+    state.thread_count = state.thread_count + 1;
+
+    // Add to run queue if created as runnable
+    let prio_idx: u64 = priority as u64;
+    if prio_idx < 7 {
+        state.run_queues[prio_idx].push(slot_idx);
+    };
+
+    // Record spawn residual
+    let residual: ScheduleResidual = ScheduleResidual {
+        timestamp: timestamp,
+        decision_type: ScheduleDecisionType::Created,
+        thread_id: thread_id,
+        previous_thread: Option::None,
+        priority_used: priority,
+        quantum_granted: quantum,
+        reason: String::from_bytes(Slice(u8)::from_str("thread spawned")),
+    };
+
+    // Find the thread to add the residual
+    let tcb: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[slot_idx]);
+    tcb.schedule_residuals.push(residual);
+
+    residual emit {
+        op: "scheduler.spawn",
+        thread_id: thread_id.id_hash,
+        priority: priority as u64,
+        entry_point: entry_point,
+        quantum: quantum,
+        effects: effects.effects,
+    };
+
+    return Result::Ok(thread_id);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Yield Current Thread
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_yield(
+    state: Handle(SchedulerState),
+    current_thread_id: Identity,
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+    court "scheduler_yield:v1"
+{
+    // Find the current thread
+    let mut slot_idx: u64 = 0;
+    let mut found: bool = false;
+    for i in 0..128 {
+        let t: ThreadControlBlock = state.threads[i];
+        if identity_equal(t.thread_id, current_thread_id)
+            && t.thread_state == ThreadState::Running
+        {
+            slot_idx = i;
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SchedulerError::ThreadNotFound);
+    };
+
+    let thread: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[slot_idx]);
+
+    // Transition to Runnable
+    thread.thread_state = ThreadState::Runnable;
+    thread.quantum_used = thread.quantum_max;  // Force reschedule
+    thread.yield_count = thread.yield_count + 1;
+
+    // Add back to run queue
+    let prio_idx: u64 = thread.effective_priority as u64;
+    if prio_idx < 7 {
+        state.run_queues[prio_idx].push(slot_idx);
+    };
+
+    // Record yield residual
+    let residual: ScheduleResidual = ScheduleResidual {
+        timestamp: timestamp,
+        decision_type: ScheduleDecisionType::Yielded,
+        thread_id: current_thread_id,
+        previous_thread: Option::Some(current_thread_id),
+        priority_used: thread.effective_priority,
+        quantum_granted: 0,
+        reason: String::from_bytes(Slice(u8)::from_str("thread yielded")),
+    };
+    thread.schedule_residuals.push(residual);
+
+    residual emit {
+        op: "scheduler.yield",
+        thread_id: current_thread_id.id_hash,
+        yield_count: thread.yield_count,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set Thread Priority
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_set_priority(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    new_priority: ThreadPriority,
+    setter_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+    court "scheduler_set_priority:v1"
+{
+    // Validate priority
+    if new_priority as u64 > 6 {
+        return Result::Err(SchedulerError::InvalidPriority);
+    };
+
+    let mut found: bool = false;
+    for i in 0..128 {
+        let thread: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(thread.thread_id, thread_id)
+            && thread.thread_state != ThreadState::Terminated
+        {
+            let old_priority: ThreadPriority = thread.effective_priority;
+            thread.base_priority = new_priority;
+            thread.effective_priority = new_priority;
+
+            let residual: ScheduleResidual = ScheduleResidual {
+                timestamp: timestamp,
+                decision_type: ScheduleDecisionType::PriorityBoost,
+                thread_id: thread_id,
+                previous_thread: Option::None,
+                priority_used: new_priority,
+                quantum_granted: 0,
+                reason: String::from_bytes(Slice(u8)::from_str("priority changed")),
+            };
+            thread.schedule_residuals.push(residual);
+
+            found = true;
+            break;
+        };
+    };
+
+    if !found {
+        return Result::Err(SchedulerError::ThreadNotFound);
+    };
+
+    residual emit {
+        op: "scheduler.set_priority",
+        thread_id: thread_id.id_hash,
+        new_priority: new_priority as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Schedule Next Thread (pick from run queues)
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_pick_next(
+    state: Handle(SchedulerState),
+    current_thread: Option(Identity),
+    timestamp: u64,
+) -> Option(u64)
+    effect [deterministic]
+    court "scheduler_pick:v1"
+{
+    // Priority-based selection: check highest priority queues first
+    let mut prio: u64 = 6;  // Start from highest
+    loop bound 7 {
+        let queue: Handle(RingBuf(u64, 64)) = Handle(RingBuf(u64, 64))::from_ptr(&state.run_queues[prio]);
+        if !queue.is_empty() {
+            // Peek at the next candidate
+            let candidate_slot: u64 = queue.peek().unwrap_or(0);
+
+            // Verify the thread is still runnable
+            let thread: ThreadControlBlock = state.threads[candidate_slot];
+            if thread.thread_state == ThreadState::Runnable
+                || thread.thread_state == ThreadState::Created
+            {
+                queue.pop();  // Remove from queue
+                return Option::Some(candidate_slot);
+            } else {
+                // Thread not runnable, remove from queue and continue
+                queue.pop();
+            };
+        };
+
+        if prio == 0 {
+            break;
+        };
+        prio = prio - 1;
+    };
+
+    // No runnable thread found
+    return Option::None;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Context Switch (record transition)
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_context_switch(
+    state: Handle(SchedulerState),
+    prev_thread: Option(Identity),
+    next_thread: Identity,
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+{
+    // Record schedule-out residual for previous thread
+    match prev_thread {
+        Option::Some(prev_id) => {
+            for i in 0..128 {
+                let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+                if identity_equal(t.thread_id, prev_id) {
+                    t.thread_state = ThreadState::Runnable;
+                    t.total_cpu_time = t.total_cpu_time + (timestamp - t.last_scheduled_timestamp);
+                    t.context_switch_count = t.context_switch_count + 1;
+
+                    let out_residual: ScheduleResidual = ScheduleResidual {
+                        timestamp: timestamp,
+                        decision_type: ScheduleDecisionType::ScheduleOut,
+                        thread_id: prev_id,
+                        previous_thread: Option::None,
+                        priority_used: t.effective_priority,
+                        quantum_granted: 0,
+                        reason: String::from_bytes(Slice(u8)::from_str("context switched out")),
+                    };
+                    t.schedule_residuals.push(out_residual);
+                    break;
+                };
+            };
+        },
+        Option::None => {},
+    };
+
+    // Record schedule-in residual for next thread
+    let mut next_found: bool = false;
+    for i in 0..128 {
+        let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(t.thread_id, next_thread) {
+            t.thread_state = ThreadState::Running;
+            t.last_scheduled_timestamp = timestamp;
+            t.quantum_used = 0;
+            t.context_switch_count = t.context_switch_count + 1;
+
+            let in_residual: ScheduleResidual = ScheduleResidual {
+                timestamp: timestamp,
+                decision_type: ScheduleDecisionType::ScheduleIn,
+                thread_id: next_thread,
+                previous_thread: prev_thread,
+                priority_used: t.effective_priority,
+                quantum_granted: t.quantum_max,
+                reason: String::from_bytes(Slice(u8)::from_str("context switched in")),
+            };
+            t.schedule_residuals.push(in_residual);
+
+            next_found = true;
+            break;
+        };
+    };
+
+    if !next_found {
+        return Result::Err(SchedulerError::ThreadNotFound);
+    };
+
+    state.active_thread = Option::Some(next_thread);
+    state.total_context_switches = state.total_context_switches + 1;
+
+    residual emit {
+        op: "scheduler.context_switch",
+        prev_thread: prev_thread.map_or(0, |id| id.id_hash),
+        next_thread: next_thread.id_hash,
+        total_switches: state.total_context_switches,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Tick (time quantum accounting)
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_tick(
+    state: Handle(SchedulerState),
+    timestamp: u64,
+) -> Option(Identity)  // Returns thread to preempt if quantum exhausted
+    effect [deterministic, residual]
+    court "scheduler_tick:v1"
+{
+    state.tick_count = state.tick_count + 1;
+
+    match state.active_thread {
+        Option::Some(active_id) => {
+            for i in 0..128 {
+                let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+                if identity_equal(t.thread_id, active_id) {
+                    t.quantum_used = t.quantum_used + 1;
+
+                    // Apply priority boost decay
+                    if t.priority_boost > 0 && t.priority_boost_decay > 0 {
+                        t.priority_boost_decay = t.priority_boost_decay - 1;
+                        if t.priority_boost_decay == 0 {
+                            t.priority_boost = 0;
+                            t.effective_priority = t.base_priority;
+                        };
+                    };
+
+                    // Check if quantum exhausted
+                    if t.quantum_used >= t.quantum_max {
+                        t.preemption_count = t.preemption_count + 1;
+                        state.total_preemptions = state.total_preemptions + 1;
+
+                        let preempt_residual: ScheduleResidual = ScheduleResidual {
+                            timestamp: timestamp,
+                            decision_type: ScheduleDecisionType::Preempted,
+                            thread_id: active_id,
+                            previous_thread: Option::None,
+                            priority_used: t.effective_priority,
+                            quantum_granted: t.quantum_max,
+                            reason: String::from_bytes(Slice(u8)::from_str("quantum exhausted")),
+                        };
+                        t.schedule_residuals.push(preempt_residual);
+
+                        return Option::Some(active_id);
+                    };
+
+                    break;
+                };
+            };
+        },
+        Option::None => {},
+    };
+
+    return Option::None;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Block Thread
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_block(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    reason: BlockingReason,
+    wakeup_time: u64,
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(t.thread_id, thread_id)
+            && t.thread_state == ThreadState::Running
+        {
+            t.thread_state = ThreadState::Blocked;
+            t.blocking_reason = reason;
+            t.wakeup_time = wakeup_time;
+
+            let residual: ScheduleResidual = ScheduleResidual {
+                timestamp: timestamp,
+                decision_type: ScheduleDecisionType::Blocked,
+                thread_id: thread_id,
+                previous_thread: Option::None,
+                priority_used: t.effective_priority,
+                quantum_granted: 0,
+                reason: String::from_bytes(Slice(u8)::from_str("thread blocked")),
+            };
+            t.schedule_residuals.push(residual);
+
+            return Result::Ok(void);
+        };
+    };
+
+    return Result::Err(SchedulerError::ThreadNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Wake Thread
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_wake(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(t.thread_id, thread_id)
+            && (t.thread_state == ThreadState::Blocked
+                || t.thread_state == ThreadState::Sleeping)
+        {
+            t.thread_state = ThreadState::Runnable;
+            t.blocking_reason = BlockingReason::NotBlocked;
+
+            // Add to run queue
+            let prio_idx: u64 = t.effective_priority as u64;
+            if prio_idx < 7 {
+                state.run_queues[prio_idx].push(i);
+            };
+
+            let residual: ScheduleResidual = ScheduleResidual {
+                timestamp: timestamp,
+                decision_type: ScheduleDecisionType::Woken,
+                thread_id: thread_id,
+                previous_thread: Option::None,
+                priority_used: t.effective_priority,
+                quantum_granted: 0,
+                reason: String::from_bytes(Slice(u8)::from_str("thread woken")),
+            };
+            t.schedule_residuals.push(residual);
+
+            return Result::Ok(void);
+        };
+    };
+
+    return Result::Err(SchedulerError::ThreadNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Terminate Thread
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_terminate(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    terminator_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(t.thread_id, thread_id)
+            && t.thread_state != ThreadState::Terminated
+        {
+            t.thread_state = ThreadState::Zombie;
+
+            let residual: ScheduleResidual = ScheduleResidual {
+                timestamp: timestamp,
+                decision_type: ScheduleDecisionType::Terminated,
+                thread_id: thread_id,
+                previous_thread: Option::None,
+                priority_used: t.effective_priority,
+                quantum_granted: 0,
+                reason: String::from_bytes(Slice(u8)::from_str("thread terminated")),
+            };
+            t.schedule_residuals.push(residual);
+
+            state.thread_count = state.thread_count - 1;
+
+            residual emit {
+                op: "scheduler.terminate",
+                thread_id: thread_id.id_hash,
+                total_cpu_time: t.total_cpu_time,
+            };
+
+            return Result::Ok(void);
+        };
+    };
+
+    return Result::Err(SchedulerError::ThreadNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get Schedule Residuals
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_get_residuals(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    auditor_cap: Cap(CapabilityToken),
+) -> Result(RingBuf(ScheduleResidual, 32), SchedulerError)
+    effect [deterministic]
+{
+    for i in 0..128 {
+        let t: ThreadControlBlock = state.threads[i];
+        if identity_equal(t.thread_id, thread_id) {
+            return Result::Ok(t.schedule_residuals);
+        };
+    };
+    return Result::Err(SchedulerError::ThreadNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reap Zombie Thread (full cleanup)
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_reap(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    reaper_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(t.thread_id, thread_id)
+            && t.thread_state == ThreadState::Zombie
+        {
+            t.thread_state = ThreadState::Terminated;
+            t.thread_id = Identity {
+                id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0,
+            };
+
+            residual emit {
+                op: "scheduler.reap",
+                thread_id: thread_id.id_hash,
+            };
+
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(SchedulerError::ThreadNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_self_test(
+    state: Handle(SchedulerState),
+) -> Result(u64, SchedulerError)
+    effect [deterministic]
+    court "scheduler_self_test:v1"
+{
+    let mut checks: u64 = 0;
+
+    if state.is_initialized {
+        checks = checks + 1;
+    };
+
+    // Check thread count consistency
+    let mut actual: u64 = 0;
+    for i in 0..128 {
+        let t: ThreadControlBlock = state.threads[i];
+        if t.thread_state != ThreadState::Terminated && t.thread_id.id_hash != 0 {
+            actual = actual + 1;
+        };
+    };
+
+    if actual == state.thread_count {
+        checks = checks + 1;
+    };
+
+    // Check run queue consistency
+    let mut queue_total: u64 = 0;
+    for i in 0..7 {
+        queue_total = queue_total + state.run_queues[i].len();
+    };
+
+    // Bounded check
+    if queue_total <= 128 {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "scheduler.self_test",
+        checks_passed: checks,
+        thread_count: state.thread_count,
+        total_switches: state.total_context_switches,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Statistics
+// ─────────────────────────────────────────────────────────────
+
+struct SchedulerStatistics {
+    thread_count: u64,
+    runnable_count: u64,
+    blocked_count: u64,
+    sleeping_count: u64,
+    suspended_count: u64,
+    zombie_count: u64,
+    running_count: u64,
+    created_count: u64,
+    idle_cpu_pct: u64,
+    context_switches_per_sec: u64,
+    avg_queue_depth: u64,
+    preempt_ratio: u64,
+    total_cpu_time: u64,
+    max_cpu_time: u64,
+    priority_distribution: Array(u64, 7),
+}
+
+fn scheduler_statistics(
+    state: Handle(SchedulerState),
+) -> SchedulerStatistics
+    effect [deterministic]
+    court "scheduler_stats:v1"
+{
+    let mut runnable: u64 = 0;
+    let mut blocked: u64 = 0;
+    let mut sleeping: u64 = 0;
+    let mut suspended: u64 = 0;
+    let mut zombie: u64 = 0;
+    let mut running: u64 = 0;
+    let mut created: u64 = 0;
+    let mut priority_dist: Array(u64, 7) = Array::zeroed();
+    let mut total_cpu: u64 = 0;
+    let mut max_cpu: u64 = 0;
+    let mut queue_depth: u64 = 0;
+
+    for i in 0..128 {
+        let t: ThreadControlBlock = state.threads[i];
+        if t.thread_state != ThreadState::Terminated && t.thread_id.id_hash != 0 {
+            match t.thread_state {
+                ThreadState::Runnable => runnable = runnable + 1,
+                ThreadState::Blocked => blocked = blocked + 1,
+                ThreadState::Sleeping => sleeping = sleeping + 1,
+                ThreadState::Suspended => suspended = suspended + 1,
+                ThreadState::Zombie => zombie = zombie + 1,
+                ThreadState::Running => running = running + 1,
+                ThreadState::Created => created = created + 1,
+                _ => {},
+            };
+
+            let prio_idx: u64 = t.base_priority as u64;
+            if prio_idx < 7 { priority_dist[prio_idx] = priority_dist[prio_idx] + 1; };
+
+            total_cpu = total_cpu + t.total_cpu_time;
+            if t.total_cpu_time > max_cpu { max_cpu = t.total_cpu_time; };
+        };
+    };
+
+    for i in 0..7 {
+        queue_depth = queue_depth + state.run_queues[i].len();
+    };
+
+    let preempt_ratio_val: u64 = if state.total_context_switches > 0 {
+        state.total_preemptions * 100 / state.total_context_switches
+    } else {
+        0
+    };
+
+    let stats: SchedulerStatistics = SchedulerStatistics {
+        thread_count: state.thread_count,
+        runnable_count: runnable,
+        blocked_count: blocked,
+        sleeping_count: sleeping,
+        suspended_count: suspended,
+        zombie_count: zombie,
+        running_count: running,
+        created_count: created,
+        idle_cpu_pct: 0,
+        context_switches_per_sec: state.total_context_switches,
+        avg_queue_depth: if 7 > 0 { queue_depth / 7 } else { 0 },
+        preempt_ratio: preempt_ratio_val,
+        total_cpu_time: total_cpu,
+        max_cpu_time: max_cpu,
+        priority_distribution: priority_dist,
+    };
+
+    return stats;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Enqueue — Add thread to run queue
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_enqueue_thread(
+    state: Handle(SchedulerState),
+    slot_idx: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic]
+{
+    if slot_idx >= 128 {
+        return Result::Err(SchedulerError::ThreadNotFound);
+    };
+
+    let thread: ThreadControlBlock = state.threads[slot_idx];
+    let prio_idx: u64 = thread.effective_priority as u64;
+
+    if prio_idx < 7 {
+        state.run_queues[prio_idx].push(slot_idx);
+        thread.thread_state = ThreadState::Runnable;
+        return Result::Ok(void);
+    };
+
+    return Result::Err(SchedulerError::InvalidPriority);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Dequeue — Remove thread from run queue
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_dequeue_thread(
+    state: Handle(SchedulerState),
+    slot_idx: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic]
+{
+    for i in 0..7 {
+        let mut temp_queue: RingBuf(u64, 64) = RingBuf::new();
+        let queue: Handle(RingBuf(u64, 64)) = Handle(RingBuf(u64, 64))::from_ptr(&state.run_queues[i]);
+
+        while !queue.is_empty() {
+            let val: u64 = queue.pop().unwrap_or(0);
+            if val != slot_idx {
+                temp_queue.push(val);
+            };
+        };
+
+        // Copy back
+        while !temp_queue.is_empty() {
+            let val: u64 = temp_queue.pop().unwrap_or(0);
+            queue.push(val);
+        };
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Inherit Priority — Priority inheritance protocol
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_inherit_priority(
+    state: Handle(SchedulerState),
+    thread_id: Identity,
+    inherited_priority: ThreadPriority,
+    timestamp: u64,
+) -> Result(void, SchedulerError)
+    effect [deterministic, residual]
+{
+    for i in 0..128 {
+        let t: Handle(ThreadControlBlock) = Handle(ThreadControlBlock)::from_ptr(&state.threads[i]);
+        if identity_equal(t.thread_id, thread_id) {
+            if inherited_priority as u64 > t.effective_priority as u64 {
+                t.priority_boost = (inherited_priority as u64) - (t.base_priority as u64);
+                t.effective_priority = inherited_priority;
+                t.priority_boost_decay = 10;  // Decay after 10 ticks
+
+                let residual: ScheduleResidual = ScheduleResidual {
+                    timestamp: timestamp,
+                    decision_type: ScheduleDecisionType::PriorityBoost,
+                    thread_id: thread_id,
+                    previous_thread: Option::None,
+                    priority_used: inherited_priority,
+                    quantum_granted: 0,
+                    reason: String::from_bytes(Slice(u8)::from_str("priority inheritance")),
+                };
+                t.schedule_residuals.push(residual);
+            };
+            return Result::Ok(void);
+        };
+    };
+    return Result::Err(SchedulerError::ThreadNotFound);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Choose Thread — Thread selection with policy
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_choose_thread(
+    state: Handle(SchedulerState),
+    policy: SchedulingPolicy,
+) -> Option(u64)
+    effect [deterministic]
+    court "scheduler_choose:v1"
+{
+    match policy {
+        SchedulingPolicy::RoundRobin => {
+            // Round-robin across all priorities
+            for i in 0..7 {
+                let queue: RingBuf(u64, 64) = state.run_queues[i];
+                if !queue.is_empty() {
+                    return Option::Some(queue.peek().unwrap_or(0));
+                };
+            };
+            return Option::None;
+        },
+        SchedulingPolicy::Priority => {
+            // Strict priority: highest first
+            let mut prio: u64 = 6;
+            loop bound 7 {
+                let queue: RingBuf(u64, 64) = state.run_queues[prio];
+                if !queue.is_empty() {
+                    return Option::Some(queue.peek().unwrap_or(0));
+                };
+                if prio == 0 { break; };
+                prio = prio - 1;
+            };
+            return Option::None;
+        },
+        SchedulingPolicy::EffectAware => {
+            // Effect-aware: prefer compute threads when IO-bound threads are blocked
+            let mut compute_prio: u64 = 6;
+            loop bound 7 {
+                let queue: RingBuf(u64, 64) = state.run_queues[compute_prio];
+                if !queue.is_empty() {
+                    let slot: u64 = queue.peek().unwrap_or(0);
+                    let thread: ThreadControlBlock = state.threads[slot];
+                    if thread.effect_declaration.has_compute() {
+                        return Option::Some(slot);
+                    };
+                };
+                if compute_prio == 0 { break; };
+                compute_prio = compute_prio - 1;
+            };
+            // Fallback: any runnable thread
+            return scheduler_pick_next(state, Option::None, 0);
+        },
+        _ => {
+            return scheduler_pick_next(state, Option::None, 0);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler Balance — Load balance across priorities
+// ─────────────────────────────────────────────────────────────
+
+fn scheduler_balance(
+    state: Handle(SchedulerState),
+    timestamp: u64,
+) -> void
+    effect [deterministic, residual]
+{
+    let mut total_runnable: u64 = 0;
+    for i in 0..7 {
+        total_runnable = total_runnable + state.run_queues[i].len();
+    };
+
+    if total_runnable > 64 {
+        // Donate some threads from overloaded priority levels
+        for src_prio in 0..6 {
+            let src_queue: Handle(RingBuf(u64, 64)) = Handle(RingBuf(u64, 64))::from_ptr(&state.run_queues[src_prio]);
+            if src_queue.len() > 8 {
+                let dst_prio: u64 = src_prio + 1;
+                if dst_prio < 7 {
+                    let dst_queue: Handle(RingBuf(u64, 64)) = Handle(RingBuf(u64, 64))::from_ptr(&state.run_queues[dst_prio]);
+                    while !src_queue.is_empty() && !dst_queue.is_full() && src_queue.len() > 8 {
+                        let slot: u64 = src_queue.pop().unwrap_or(0);
+                        dst_queue.push(slot);
+                    };
+                };
+            };
+        };
+    };
+
+    residual emit {
+        op: "scheduler.balance",
+        total_runnable: total_runnable,
+        timestamp: timestamp,
+    };
+}

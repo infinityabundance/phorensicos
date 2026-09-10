@@ -1,0 +1,1029 @@
+// timer.phor — HPET/APIC timer driver
+// Oneshot, periodic, and RTC access with residual tracking
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/drivers/timer.phor
+// Court: timer_driver:v2
+
+package drivers.timer;
+
+import kernel.nucleus_interface.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type TimerError = enum {
+    TimerNotInitialized     = 0x110,  // E0110: timer driver not initialized
+    TimerNotFound           = 0x111,  // E0111: timer device not found
+    TimerInvalidConfig      = 0x112,  // E0112: invalid timer configuration
+    TimerCapabilityError    = 0x113,  // E0113: insufficient capability
+    TimerOneshotError       = 0x114,  // E0114: oneshot programming failed
+    TimerPeriodicError      = 0x115,  // E0115: periodic programming failed
+    TimerInterruptNotRegistered = 0x116, // E0116: timer interrupt not registered
+    TimerRtcError           = 0x117,  // E0117: RTC access error
+    TimerHpetNotAvailable   = 0x118,  // E0118: HPET not available
+    TimerApicNotAvailable   = 0x119,  // E0119: APIC timer not available
+    TimerOverflow           = 0x11A,  // E011A: timer counter overflow
+    TimerStaleValue         = 0x11B,  // E011B: timer value is stale
+    TimerCalibrationError   = 0x11C,  // E011C: timer frequency calibration failed
+    TimerPowerStateError    = 0x11D,  // E011D: timer power state error
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Types
+// ─────────────────────────────────────────────────────────────
+
+type TimerType = enum {
+    Hpet        = 0,  // High Precision Event Timer
+    ApicTimer   = 1,  // Local APIC Timer
+    Pic8254     = 2,  // Legacy PIT (8254)
+    RtcCmos     = 3,  // RTC/CMOS
+    AcpiTimer   = 4,  // ACPI Power Management Timer
+    Tsc         = 5,  // Time Stamp Counter
+    Watchdog    = 6,  // Watchdog Timer
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Configuration
+// ─────────────────────────────────────────────────────────────
+
+struct TimerConfig {
+    timer_type: TimerType,
+    frequency_hz: u64,
+    period_ns: u64,
+    oneshot: bool,
+    periodic: bool,
+    interrupt_enabled: bool,
+    irq_vector: u8,
+    hpet_timer_id: u8,
+    apic_divider: u8,
+    initial_count: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// HPET Registers
+// ─────────────────────────────────────────────────────────────
+
+struct HpetRegisters {
+    mmio_base: u64,
+}
+
+impl HpetRegisters {
+    fn general_capabilities_offset() -> u64 { return 0x000; }
+    fn general_config_offset() -> u64 { return 0x010; }
+    fn general_int_status_offset() -> u64 { return 0x020; }
+    fn main_counter_offset() -> u64 { return 0x0F0; }
+    fn timer_config_offset(timer_id: u8) -> u64 { return 0x100 + (timer_id as u64 * 0x20); }
+    fn timer_comparator_offset(timer_id: u8) -> u64 { return 0x108 + (timer_id as u64 * 0x20); }
+    fn timer_fsb_interrupt_offset(timer_id: u8) -> u64 { return 0x110 + (timer_id as u64 * 0x20); }
+
+    fn read64(self, offset: u64) -> u64
+        effect [memory:mmio]
+    {
+        return trusted reason "HPET MMIO register read at verified address, HPET spec §2.3" {
+            let ptr: *(u64) = (self.mmio_base + offset) as *(u64);
+            return *ptr;
+        };
+    }
+
+    fn write64(self, offset: u64, value: u64) -> void
+        effect [memory:mmio]
+    {
+        trusted reason "HPET MMIO register write at verified address, HPET spec §2.3" {
+            let ptr: *(u64) = (self.mmio_base + offset) as *(u64);
+            *ptr = value;
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC (CMOS) Access
+// ─────────────────────────────────────────────────────────────
+
+struct RtcAccess {
+    cmos_port: u16,
+}
+
+impl RtcAccess {
+    fn cmos_address_port() -> u16 { return 0x70; }
+    fn cmos_data_port() -> u16 { return 0x71; }
+
+    fn read_cmos(self, reg: u8) -> u8
+        effect [machine:ioport]
+    {
+        return trusted reason "CMOS RTC register read at standard ports 0x70/0x71, PC-AT compat §3.4" {
+            // outb(cmos_address_port(), reg)
+            // return inb(cmos_data_port())
+            return 0;
+        };
+    }
+
+    fn write_cmos(self, reg: u8, value: u8) -> void
+        effect [machine:ioport]
+    {
+        trusted reason "CMOS RTC register write at standard ports" {
+            // outb(cmos_address_port(), reg)
+            // outb(cmos_data_port(), value)
+        };
+    }
+
+    fn read_rtc_time(self) -> RtcTime
+        effect [machine:ioport, deterministic]
+        court "rtc_read:v1"
+    {
+        // Wait for RTC update to complete
+        let mut status: u8 = 0;
+        loop bound 100 {
+            status = self.read_cmos(0x0A);  // Status Register A
+            if (status & 0x80) == 0 {  // UIP bit clear
+                break;
+            };
+        };
+
+        let seconds: u8 = self.read_cmos(0x00);  // Seconds
+        let minutes: u8 = self.read_cmos(0x02);  // Minutes
+        let hours: u8 = self.read_cmos(0x04);    // Hours
+        let day: u8 = self.read_cmos(0x07);      // Day of month
+        let month: u8 = self.read_cmos(0x08);    // Month
+        let year: u8 = self.read_cmos(0x09);     // Year
+        let century: u8 = self.read_cmos(0x32);  // Century (if available)
+
+        // Convert BCD to binary (RTC typically returns BCD)
+        let rtc_time: RtcTime = RtcTime {
+            seconds: rtc_bcd_to_bin(seconds),
+            minutes: rtc_bcd_to_bin(minutes),
+            hours: rtc_bcd_to_bin(hours),
+            day: rtc_bcd_to_bin(day),
+            month: rtc_bcd_to_bin(month),
+            year: rtc_bcd_to_bin(year),
+            century: rtc_bcd_to_bin(century),
+        };
+
+        return rtc_time;
+    }
+}
+
+fn rtc_bcd_to_bin(bcd: u8) -> u8
+    effect [deterministic]
+{
+    return ((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F);
+}
+
+fn rtc_bin_to_bcd(bin: u8) -> u8
+    effect [deterministic]
+{
+    return ((bin / 10) << 4) | (bin % 10);
+}
+
+// ─────────────────────────────────────────────────────────────
+// RTC Time Structure
+// ─────────────────────────────────────────────────────────────
+
+struct RtcTime {
+    seconds: u8,
+    minutes: u8,
+    hours: u8,
+    day: u8,
+    month: u8,
+    year: u8,
+    century: u8,
+}
+
+impl RtcTime {
+    fn to_timestamp(self) -> u64
+        effect [deterministic]
+    {
+        let y: u64 = (self.century as u64) * 100 + (self.year as u64);
+        let m: u64 = self.month as u64;
+        let d: u64 = self.day as u64;
+        let hr: u64 = self.hours as u64;
+        let min: u64 = self.minutes as u64;
+        let sec: u64 = self.seconds as u64;
+
+        // Simplified timestamp: seconds since 2000-01-01
+        // In real implementation, use proper date conversion
+        let days_since_2000: u64 = (y - 2000) * 365 + (y - 2000) / 4 + d;
+        let result: u64 = days_since_2000 * 86400 + hr * 3600 + min * 60 + sec;
+        return result;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer State
+// ─────────────────────────────────────────────────────────────
+
+struct TimerDevice {
+    timer_id: Identity,
+    timer_type: TimerType,
+    config: TimerConfig,
+    hpet_regs: HpetRegisters,
+    rtc_access: RtcAccess,
+    apic_base: u64,
+    capability: Cap(TimerCapability),
+    initialized: bool,
+    counter_value: u64,
+    ticks_per_ms: u64,
+    calibration_cycles: u64,
+    interrupt_count: u64,
+    last_interrupt_timestamp: u64,
+    residual_log: RingBuf(ResidualRecord, 64),
+    trust_state: TrustState,
+    generation: u64,
+}
+
+struct TimerCapability {
+    object_id: Identity,
+    generation: u64,
+    can_oneshot: bool,
+    can_periodic: bool,
+    can_read_rtc: bool,
+    can_set_rtc: bool,
+    can_calibrate: bool,
+    max_frequency_hz: u64,
+    min_frequency_hz: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Driver State
+// ─────────────────────────────────────────────────────────────
+
+struct TimerDriverState {
+    timers: Array(TimerDevice, 8),
+    timer_count: u64,
+    active_timer: u64,
+    driver_identity: Identity,
+    default_cap: Cap(TimerCapability),
+    initialized: bool,
+    initialization_timestamp: u64,
+    system_uptime_ms: u64,
+    total_interrupts: u64,
+    driver_residuals: RingBuf(ResidualRecord, 256),
+    trust_state: TrustState,
+    hpet_mmio_base: u64,
+    apic_mmio_base: u64,
+    tsc_frequency_hz: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Driver Initialization
+// ─────────────────────────────────────────────────────────────
+
+fn timer_driver_init(
+    driver_identity: Identity,
+    hpet_base: u64,
+    apic_base: u64,
+    tsc_freq: u64,
+    cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> TimerDriverState
+    effect [memory:mmio, machine:ioport, deterministic, residual]
+    court "timer_driver_init:v2"
+{
+    let state: TimerDriverState = TimerDriverState {
+        timers: Array::zeroed(),
+        timer_count: 0,
+        active_timer: 0,
+        driver_identity: driver_identity,
+        default_cap: cap,
+        initialized: true,
+        initialization_timestamp: timestamp,
+        system_uptime_ms: 0,
+        total_interrupts: 0,
+        driver_residuals: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        hpet_mmio_base: hpet_base,
+        apic_mmio_base: apic_base,
+        tsc_frequency_hz: tsc_freq,
+    };
+
+    residual emit {
+        op: "timer_driver.init",
+        driver_identity: driver_identity.id_hash,
+        hpet_base: hpet_base,
+        apic_base: apic_base,
+        tsc_freq: tsc_freq,
+        timestamp: timestamp,
+    };
+
+    return state;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialize HPET Timer
+// ─────────────────────────────────────────────────────────────
+
+fn timer_init_hpet(
+    state: Handle(TimerDriverState),
+    timer_id_suffix: u64,
+    cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> Result(Identity, TimerError)
+    effect [memory:mmio, deterministic, residual]
+    court "timer_init_hpet:v1"
+{
+    if state.timer_count >= 8 {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let hpet: HpetRegisters = HpetRegisters {
+        mmio_base: state.hpet_mmio_base,
+    };
+
+    // Read HPET capabilities
+    let cap_reg: u64 = hpet.read64(HpetRegisters::general_capabilities_offset());
+    let period_fs: u32 = (cap_reg >> 32) as u32;  // Period in femtoseconds
+    let hpet_freq_hz: u64 = 1000000000000000 / (period_fs as u64);
+
+    // Enable HPET
+    let config_reg: u64 = hpet.read64(HpetRegisters::general_config_offset());
+    hpet.write64(HpetRegisters::general_config_offset(), config_reg | 0x01);
+
+    // Set main counter to 0
+    hpet.write64(HpetRegisters::main_counter_offset(), 0);
+
+    let timer_id: Identity = identity_new(
+        0x544D_52,  // "TMR"
+        timestamp,
+        timer_id_suffix,
+        TimerType::Hpet as u64,
+    );
+
+    let config: TimerConfig = TimerConfig {
+        timer_type: TimerType::Hpet,
+        frequency_hz: hpet_freq_hz,
+        period_ns: period_fs as u64 / 1000000,
+        oneshot: true,
+        periodic: true,
+        interrupt_enabled: true,
+        irq_vector: 0x40,
+        hpet_timer_id: 0,
+        apic_divider: 0,
+        initial_count: hpet_freq_hz / 1000,  // 1ms
+    };
+
+    let device: TimerDevice = TimerDevice {
+        timer_id: timer_id,
+        timer_type: TimerType::Hpet,
+        config: config,
+        hpet_regs: hpet,
+        rtc_access: RtcAccess { cmos_port: 0x70 },
+        apic_base: state.apic_mmio_base,
+        capability: cap,
+        initialized: true,
+        counter_value: 0,
+        ticks_per_ms: hpet_freq_hz / 1000,
+        calibration_cycles: 0,
+        interrupt_count: 0,
+        last_interrupt_timestamp: timestamp,
+        residual_log: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    state.timers[state.timer_count] = device;
+    state.timer_count = state.timer_count + 1;
+    state.active_timer = state.timer_count - 1;
+
+    residual emit {
+        op: "timer_driver.init_hpet",
+        timer_id: timer_id.id_hash,
+        hpet_freq: hpet_freq_hz,
+        period_fs: period_fs as u64,
+    };
+
+    return Result::Ok(timer_id);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Initialize APIC Timer
+// ─────────────────────────────────────────────────────────────
+
+fn timer_init_apic(
+    state: Handle(TimerDriverState),
+    timer_id_suffix: u64,
+    divider: u8,
+    cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> Result(Identity, TimerError)
+    effect [memory:mmio, deterministic, residual]
+{
+    if state.timer_count >= 8 {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let timer_id: Identity = identity_new(
+        0x544D_52,
+        timestamp,
+        timer_id_suffix,
+        TimerType::ApicTimer as u64,
+    );
+
+    // APIC timer configuration
+    let apic_div: u64 = match divider {
+        1 => 0x0B,   // Divide by 1
+        2 => 0x00,   // Divide by 2
+        4 => 0x01,   // Divide by 4
+        8 => 0x02,   // Divide by 8
+        16 => 0x03,  // Divide by 16
+        32 => 0x08,  // Divide by 32
+        64 => 0x09,  // Divide by 64
+        128 => 0x0A, // Divide by 128
+        _ => 0x03,   // Default: divide by 16
+    };
+
+    // Program APIC timer divider (would write to APIC register 0x3E0)
+    // Program APIC LVT timer (would write to APIC register 0x320)
+
+    let config: TimerConfig = TimerConfig {
+        timer_type: TimerType::ApicTimer,
+        frequency_hz: 0,  // Calibrated later
+        period_ns: 0,
+        oneshot: true,
+        periodic: true,
+        interrupt_enabled: true,
+        irq_vector: 0x41,
+        hpet_timer_id: 0,
+        apic_divider: divider,
+        initial_count: 0xFFFFFFFF,
+    };
+
+    let hpet: HpetRegisters = HpetRegisters { mmio_base: state.hpet_mmio_base };
+
+    let device: TimerDevice = TimerDevice {
+        timer_id: timer_id,
+        timer_type: TimerType::ApicTimer,
+        config: config,
+        hpet_regs: hpet,
+        rtc_access: RtcAccess { cmos_port: 0x70 },
+        apic_base: state.apic_mmio_base,
+        capability: cap,
+        initialized: true,
+        counter_value: 0xFFFFFFFF,
+        ticks_per_ms: 0,  // Calibrated later
+        calibration_cycles: 0,
+        interrupt_count: 0,
+        last_interrupt_timestamp: timestamp,
+        residual_log: RingBuf::new(),
+        trust_state: TrustState::Unknown,
+        generation: 1,
+    };
+
+    state.timers[state.timer_count] = device;
+    state.timer_count = state.timer_count + 1;
+
+    residual emit {
+        op: "timer_driver.init_apic",
+        timer_id: timer_id.id_hash,
+        divider: divider as u64,
+    };
+
+    return Result::Ok(timer_id);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Program Oneshot Timer
+// ─────────────────────────────────────────────────────────────
+
+fn timer_oneshot(
+    state: Handle(TimerDriverState),
+    timer_idx: u64,
+    microseconds: u64,
+    setter_cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> Result(void, TimerError)
+    effect [memory:mmio, deterministic, residual]
+    court "timer_oneshot:v2"
+{
+    if timer_idx >= state.timer_count {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let timer: Handle(TimerDevice) = Handle(TimerDevice)::from_ptr(&state.timers[timer_idx]);
+
+    if !timer.initialized {
+        return Result::Err(TimerError::TimerNotInitialized);
+    };
+
+    if !timer.capability.can_oneshot {
+        return Result::Err(TimerError::TimerCapabilityError);
+    };
+
+    match timer.timer_type {
+        TimerType::Hpet => {
+            let ticks: u64 = microseconds * timer.ticks_per_ms / 1000;
+
+            // Read current counter
+            let current: u64 = timer.hpet_regs.read64(HpetRegisters::main_counter_offset());
+            let target: u64 = current + ticks;
+
+            // Program comparator
+            let timer_cfg_offset: u64 = HpetRegisters::timer_config_offset(timer.config.hpet_timer_id);
+            let timer_comp_offset: u64 = HpetRegisters::timer_comparator_offset(timer.config.hpet_timer_id);
+
+            // Configure timer for oneshot (non-periodic, enable interrupt)
+            let cfg: u64 = timer.hpet_regs.read64(timer_cfg_offset);
+            let cfg_oneshot: u64 = cfg & !(0x010);  // Clear periodic bit (bit 4)
+            timer.hpet_regs.write64(timer_cfg_offset, cfg_oneshot | 0x004);  // Enable interrupt
+
+            // Set comparator
+            timer.hpet_regs.write64(timer_comp_offset, target);
+            timer.counter_value = target;
+        },
+        TimerType::ApicTimer => {
+            // APIC oneshot: set initial count register
+            let apic_initial_count_reg: u64 = timer.apic_base + 0x380;
+            let apic_count: u64 = microseconds * (timer.ticks_per_ms / 1000);
+
+            trusted reason "APIC timer initial count register write, Intel SDM Vol 3 §10.5" {
+                let ptr: *(u32) = apic_initial_count_reg as *(u32);
+                *ptr = apic_count as u32;
+            };
+
+            timer.counter_value = apic_count;
+        },
+        _ => {
+            return Result::Err(TimerError::TimerOneshotError);
+        },
+    };
+
+    residual emit {
+        op: "timer_driver.oneshot",
+        timer_idx: timer_idx,
+        microseconds: microseconds,
+        timer_type: timer.timer_type as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Program Periodic Timer
+// ─────────────────────────────────────────────────────────────
+
+fn timer_periodic(
+    state: Handle(TimerDriverState),
+    timer_idx: u64,
+    microseconds: u64,
+    setter_cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> Result(void, TimerError)
+    effect [memory:mmio, deterministic, residual]
+    court "timer_periodic:v2"
+{
+    if timer_idx >= state.timer_count {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let timer: Handle(TimerDevice) = Handle(TimerDevice)::from_ptr(&state.timers[timer_idx]);
+
+    if !timer.initialized {
+        return Result::Err(TimerError::TimerNotInitialized);
+    };
+
+    if !timer.capability.can_periodic {
+        return Result::Err(TimerError::TimerCapabilityError);
+    };
+
+    match timer.timer_type {
+        TimerType::Hpet => {
+            let ticks: u64 = microseconds * timer.ticks_per_ms / 1000;
+            let timer_cfg_offset: u64 = HpetRegisters::timer_config_offset(timer.config.hpet_timer_id);
+            let timer_comp_offset: u64 = HpetRegisters::timer_comparator_offset(timer.config.hpet_timer_id);
+
+            let current: u64 = timer.hpet_regs.read64(HpetRegisters::main_counter_offset());
+            let target: u64 = current + ticks;
+
+            // Configure for periodic
+            let cfg: u64 = timer.hpet_regs.read64(timer_cfg_offset);
+            timer.hpet_regs.write64(timer_cfg_offset, cfg | 0x014);  // Set periodic (bit 4) and enable (bit 2)
+
+            // Set comparator (for periodic, the comparator value is the period)
+            timer.hpet_regs.write64(timer_comp_offset, ticks);
+
+            // Also set the accumulator or FSB register
+            timer.hpet_regs.write64(HpetRegisters::timer_fsb_interrupt_offset(timer.config.hpet_timer_id), 0);
+
+            timer.counter_value = ticks;
+        },
+        TimerType::ApicTimer => {
+            // APIC periodic: set initial count with timer mode = periodic
+            let apic_lvt_timer_reg: u64 = timer.apic_base + 0x320;
+            let apic_initial_count_reg: u64 = timer.apic_base + 0x380;
+
+            // Set timer mode to periodic (bit 17)
+            trusted reason "APIC LVT timer register write, Intel SDM Vol 3 §10.5.2" {
+                let lvt_ptr: *(u32) = apic_lvt_timer_reg as *(u32);
+                let lvt_val: u32 = timer.config.irq_vector as u32 | 0x20000;  // Vector | Periodic
+                *lvt_ptr = lvt_val;
+            };
+
+            let apic_count: u64 = microseconds * (timer.ticks_per_ms / 1000);
+            trusted reason "APIC initial count for periodic mode" {
+                let ptr: *(u32) = apic_initial_count_reg as *(u32);
+                *ptr = apic_count as u32;
+            };
+
+            timer.counter_value = apic_count;
+        },
+        _ => {
+            return Result::Err(TimerError::TimerPeriodicError);
+        },
+    };
+
+    residual emit {
+        op: "timer_driver.periodic",
+        timer_idx: timer_idx,
+        microseconds: microseconds,
+        timer_type: timer.timer_type as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read HPET Main Counter
+// ─────────────────────────────────────────────────────────────
+
+fn timer_read_counter(
+    state: Handle(TimerDriverState),
+    timer_idx: u64,
+    reader_cap: Cap(TimerCapability),
+) -> Result(u64, TimerError)
+    effect [memory:mmio, deterministic]
+{
+    if timer_idx >= state.timer_count {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let timer: TimerDevice = state.timers[timer_idx];
+
+    match timer.timer_type {
+        TimerType::Hpet => {
+            let value: u64 = timer.hpet_regs.read64(HpetRegisters::main_counter_offset());
+            return Result::Ok(value);
+        },
+        TimerType::ApicTimer => {
+            // Read APIC current count register
+            let apic_current_count_reg: u64 = timer.apic_base + 0x390;
+            let value: u32 = trusted reason "APIC current count read" {
+                let ptr: *(u32) = apic_current_count_reg as *(u32);
+                return *ptr;
+            };
+            return Result::Ok(value as u64);
+        },
+        _ => {
+            return Result::Err(TimerError::TimerNotFound);
+        },
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Stop Timer
+// ─────────────────────────────────────────────────────────────
+
+fn timer_stop(
+    state: Handle(TimerDriverState),
+    timer_idx: u64,
+    stopper_cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> Result(void, TimerError)
+    effect [memory:mmio, deterministic, residual]
+{
+    if timer_idx >= state.timer_count {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let timer: Handle(TimerDevice) = Handle(TimerDevice)::from_ptr(&state.timers[timer_idx]);
+
+    match timer.timer_type {
+        TimerType::Hpet => {
+            let timer_cfg_offset: u64 = HpetRegisters::timer_config_offset(timer.config.hpet_timer_id);
+            let cfg: u64 = timer.hpet_regs.read64(timer_cfg_offset);
+            timer.hpet_regs.write64(timer_cfg_offset, cfg & !(0x004));  // Clear enable
+        },
+        TimerType::ApicTimer => {
+            // Mask APIC timer interrupt
+            let apic_lvt_timer_reg: u64 = timer.apic_base + 0x320;
+            trusted reason "APIC LVT timer mask" {
+                let ptr: *(u32) = apic_lvt_timer_reg as *(u32);
+                *ptr = *ptr | 0x10000;  // Set mask bit
+            };
+        },
+        _ => {},
+    };
+
+    residual emit {
+        op: "timer_driver.stop",
+        timer_idx: timer_idx,
+        timer_type: timer.timer_type as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Read RTC Time
+// ─────────────────────────────────────────────────────────────
+
+fn timer_read_rtc(
+    state: Handle(TimerDriverState),
+    reader_cap: Cap(TimerCapability),
+) -> Result(RtcTime, TimerError)
+    effect [machine:ioport, deterministic, residual]
+    court "timer_read_rtc:v1"
+{
+    if !state.initialized {
+        return Result::Err(TimerError::TimerNotInitialized);
+    };
+
+    // Find RTC timer or create temporary access
+    let rtc: RtcAccess = RtcAccess { cmos_port: 0x70 };
+    let time: RtcTime = rtc.read_rtc_time();
+
+    residual emit {
+        op: "timer_driver.read_rtc",
+        hour: time.hours as u64,
+        minute: time.minutes as u64,
+        second: time.seconds as u64,
+    };
+
+    return Result::Ok(time);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Set RTC Time
+// ─────────────────────────────────────────────────────────────
+
+fn timer_set_rtc(
+    state: Handle(TimerDriverState),
+    time: RtcTime,
+    setter_cap: Cap(TimerCapability),
+) -> Result(void, TimerError)
+    effect [machine:ioport, deterministic, residual]
+{
+    if !state.initialized {
+        return Result::Err(TimerError::TimerNotInitialized);
+    };
+
+    let rtc: RtcAccess = RtcAccess { cmos_port: 0x70 };
+
+    // Disable NMI and set index
+    rtc.write_cmos(0x0B, 0x06);  // Status Register B: enable binary, 24h mode
+
+    // Write time fields
+    rtc.write_cmos(0x00, rtc_bin_to_bcd(time.seconds));
+    rtc.write_cmos(0x02, rtc_bin_to_bcd(time.minutes));
+    rtc.write_cmos(0x04, rtc_bin_to_bcd(time.hours));
+    rtc.write_cmos(0x07, rtc_bin_to_bcd(time.day));
+    rtc.write_cmos(0x08, rtc_bin_to_bcd(time.month));
+    rtc.write_cmos(0x09, rtc_bin_to_bcd(time.year));
+
+    residual emit {
+        op: "timer_driver.set_rtc",
+        hour: time.hours as u64,
+        minute: time.minutes as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Handle Timer Interrupt
+// ─────────────────────────────────────────────────────────────
+
+fn timer_interrupt_handler(
+    state: Handle(TimerDriverState),
+    timer_idx: u64,
+    timestamp: u64,
+) -> void
+    effect [memory:mmio, deterministic, interrupt, residual]
+    court "timer_interrupt:v1"
+{
+    if timer_idx >= state.timer_count {
+        return;
+    };
+
+    let timer: Handle(TimerDevice) = Handle(TimerDevice)::from_ptr(&state.timers[timer_idx]);
+
+    timer.interrupt_count = timer.interrupt_count + 1;
+    timer.last_interrupt_timestamp = timestamp;
+    state.system_uptime_ms = state.system_uptime_ms + (timer.config.period_ns / 1000000);
+    state.total_interrupts = state.total_interrupts + 1;
+
+    // Clear HPET interrupt status
+    match timer.timer_type {
+        TimerType::Hpet => {
+            let int_status_offset: u64 = HpetRegisters::general_int_status_offset();
+            timer.hpet_regs.write64(int_status_offset, 1 << timer.config.hpet_timer_id);
+        },
+        TimerType::ApicTimer => {
+            // APIC EOI would be written to the local APIC EOI register
+            let apic_eoi_reg: u64 = timer.apic_base + 0x0B0;
+            trusted reason "APIC EOI write" {
+                let ptr: *(u32) = apic_eoi_reg as *(u32);
+                *ptr = 0;
+            };
+        },
+        _ => {},
+    };
+
+    residual emit {
+        op: "timer_driver.interrupt",
+        timer_idx: timer_idx,
+        timer_type: timer.timer_type as u64,
+        interrupt_count: timer.interrupt_count,
+        uptime_ms: state.system_uptime_ms,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Get System Uptime
+// ─────────────────────────────────────────────────────────────
+
+fn timer_uptime(
+    state: Handle(TimerDriverState),
+    querier_cap: Cap(TimerCapability),
+) -> u64
+    effect [deterministic]
+{
+    return state.system_uptime_ms;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Calibrate APIC Timer against HPET
+// ─────────────────────────────────────────────────────────────
+
+fn timer_calibrate_apic(
+    state: Handle(TimerDriverState),
+    apic_idx: u64,
+    hpet_idx: u64,
+    calibrator_cap: Cap(TimerCapability),
+    timestamp: u64,
+) -> Result(u64, TimerError)
+    effect [memory:mmio, deterministic, residual]
+{
+    if apic_idx >= state.timer_count || hpet_idx >= state.timer_count {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let apic_timer: Handle(TimerDevice) = Handle(TimerDevice)::from_ptr(&state.timers[apic_idx]);
+    let hpet_timer: TimerDevice = state.timers[hpet_idx];
+
+    // Read HPET counter before
+    let hpet_before: u64 = hpet_timer.hpet_regs.read64(HpetRegisters::main_counter_offset());
+
+    // Set APIC timer to a large initial count
+    let apic_initial_count_reg: u64 = apic_timer.apic_base + 0x380;
+    trusted reason "APIC initial count for calibration" {
+        let ptr: *(u32) = apic_initial_count_reg as *(u32);
+        *ptr = 0xFFFFFFFF;
+    };
+
+    // Wait for APIC timer to count down (simplified)
+    // In real implementation, wait for it to reach 0 or a known value
+
+    let apic_current: u32 = trusted reason "APIC current count read for calibration" {
+        let ptr: *(u32) = (apic_timer.apic_base + 0x390) as *(u32);
+        return *ptr;
+    };
+
+    let hpet_after: u64 = hpet_timer.hpet_regs.read64(HpetRegisters::main_counter_offset());
+
+    let hpet_elapsed: u64 = hpet_after - hpet_before;
+    let apic_elapsed: u64 = 0xFFFFFFFF - (apic_current as u64);
+
+    if hpet_elapsed > 0 {
+        let apic_ticks_per_ms: u64 = (apic_elapsed * hpet_timer.ticks_per_ms) / hpet_elapsed;
+        apic_timer.ticks_per_ms = apic_ticks_per_ms;
+        apic_timer.calibration_cycles = apic_elapsed;
+
+        residual emit {
+            op: "timer_driver.calibrate_apic",
+            apic_ticks_per_ms: apic_ticks_per_ms,
+            hpet_elapsed: hpet_elapsed,
+            apic_elapsed: apic_elapsed,
+        };
+
+        return Result::Ok(apic_ticks_per_ms);
+    };
+
+    return Result::Err(TimerError::TimerCalibrationError);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn timer_self_test(
+    state: Handle(TimerDriverState),
+) -> Result(u64, TimerError)
+    effect [memory:mmio, machine:ioport, deterministic]
+    court "timer_self_test:v1"
+{
+    let mut checks: u64 = 0;
+
+    if state.initialized {
+        checks = checks + 1;
+    };
+
+    if state.timer_count > 0 {
+        checks = checks + 1;
+    };
+
+    // Test that at least one timer has frequency > 0
+    let mut valid_freq: bool = false;
+    for i in 0..state.timer_count {
+        if state.timers[i].config.frequency_hz > 0 {
+            valid_freq = true;
+            break;
+        };
+    };
+
+    if valid_freq {
+        checks = checks + 1;
+    };
+
+    // Test HPET counter increment
+    for i in 0..state.timer_count {
+        let t: TimerDevice = state.timers[i];
+        if t.timer_type == TimerType::Hpet && t.initialized {
+            let before: u64 = t.hpet_regs.read64(HpetRegisters::main_counter_offset());
+            // Read again (counter should have incremented)
+            let after: u64 = t.hpet_regs.read64(HpetRegisters::main_counter_offset());
+            if after >= before {
+                checks = checks + 1;
+            };
+            break;
+        };
+    };
+
+    residual emit {
+        op: "timer_driver.self_test",
+        checks_passed: checks,
+        timer_count: state.timer_count,
+        uptime_ms: state.system_uptime_ms,
+    };
+
+    return Result::Ok(checks);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Diagnostics — Read detailed timer status
+// ─────────────────────────────────────────────────────────────
+
+struct TimerDiagnostics {
+    timer_idx: u64,
+    timer_type: TimerType,
+    initialized: bool,
+    frequency_hz: u64,
+    period_ns: u64,
+    interrupt_count: u64,
+    counter_value: u64,
+    ticks_per_ms: u64,
+    system_uptime_ms: u64,
+    calibration_cycles: u64,
+    hpet_enabled: bool,
+    apic_configured: bool,
+    rtc_accessible: bool,
+    trust_state: TrustState,
+    generation: u64,
+}
+
+fn timer_diagnostics(
+    state: Handle(TimerDriverState),
+    timer_idx: u64,
+    diag_cap: Cap(TimerCapability),
+) -> Result(TimerDiagnostics, TimerError)
+    effect [memory:mmio, deterministic]
+{
+    if timer_idx >= state.timer_count {
+        return Result::Err(TimerError::TimerNotFound);
+    };
+
+    let t: TimerDevice = state.timers[timer_idx];
+    let counter: u64 = match t.timer_type {
+        TimerType::Hpet => t.hpet_regs.read64(HpetRegisters::main_counter_offset()),
+        _ => t.counter_value,
+    };
+
+    let diag: TimerDiagnostics = TimerDiagnostics {
+        timer_idx: timer_idx,
+        timer_type: t.timer_type,
+        initialized: t.initialized,
+        frequency_hz: t.config.frequency_hz,
+        period_ns: t.config.period_ns,
+        interrupt_count: t.interrupt_count,
+        counter_value: counter,
+        ticks_per_ms: t.ticks_per_ms,
+        system_uptime_ms: state.system_uptime_ms,
+        calibration_cycles: t.calibration_cycles,
+        hpet_enabled: t.timer_type == TimerType::Hpet && t.initialized,
+        apic_configured: t.timer_type == TimerType::ApicTimer && t.initialized,
+        rtc_accessible: true,
+        trust_state: t.trust_state,
+        generation: t.generation,
+    };
+
+    return Result::Ok(diag);
+}

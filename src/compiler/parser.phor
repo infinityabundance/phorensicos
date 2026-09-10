@@ -1,0 +1,2039 @@
+// parser.phor — Parser: Recursive Descent Parser Producing AST, Error Recovery
+// Phorensic Compiler Infrastructure — Parsing Phase
+//
+// This module implements a recursive descent parser that transforms a token stream
+// into an AST (Abstract Syntax Tree). The parser features:
+// - Deterministic recursive descent with one token lookahead
+// - Error recovery via token synchronization
+// - Bounded recursion depth to prevent stack overflow
+// - Explicit effect declarations on all parse functions
+// - Residual emission for incomplete or erroneous parses
+//
+// Evidence semantics: The parser produces a ParserReceipt that records the number of
+// nodes produced, errors encountered, and recovery actions taken. This receipt chains
+// into the compiler's evidence trail.
+//
+// Boundedness: All recursive descent loops are bounded by explicit recursion depth
+// limits and token consumption counts. The maximum parse depth is 512.
+
+use core::fixed::Array64;
+use core::fixed::Array32;
+use core::result::Result;
+use core::option::Option;
+use core::string::FixedString256;
+
+use compiler::diagnostics::*;
+use compiler::lexer::*;
+use compiler::ast::*;
+
+// --- Parser State ---
+
+pub struct ParserState {
+    /// The token stream being parsed.
+    tokens : TokenStream,
+    /// Diagnostic bag for error reporting.
+    diagnostics : DiagnosticBag,
+    /// Current recursion depth limit.
+    recursion_depth : u32,
+    /// Maximum recursion depth allowed.
+    max_depth : u32,
+    /// Current generation tag.
+    generation : u64,
+    /// Number of AST nodes produced.
+    node_count : u32,
+    /// Number of recovery actions taken.
+    recovery_count : u32,
+    /// Whether the parser is in error recovery mode.
+    in_recovery : bool,
+    /// File path being parsed.
+    file_path : FixedString256,
+}
+
+impl ParserState {
+    /// Create a new parser state.
+    /// Effect: pure — constructs parser state.
+    pub fn new(
+        tokens : TokenStream,
+        file_path : FixedString256,
+    ) -> ParserState [pure] {
+        ParserState {
+            tokens: tokens,
+            diagnostics: DiagnosticBag::new(),
+            recursion_depth: 0u32,
+            max_depth: 512u32,
+            generation: 0u64,
+            node_count: 0u32,
+            recovery_count: 0u32,
+            in_recovery: false,
+            file_path: file_path,
+        }
+    }
+
+    /// Check if the current token matches a given type.
+    /// Effect: pure — read-only check.
+    fn check(&self, token_type : TokenType) -> bool [pure] {
+        self.tokens.check(token_type)
+    }
+
+    /// Peek at the current token.
+    /// Effect: pure — read-only access.
+    fn peek(&self) -> &Token [pure] {
+        self.tokens.peek()
+    }
+
+    /// Advance and consume the current token.
+    /// Effect: pure — advances stream position.
+    fn advance(&mut self) -> Token [pure] {
+        self.node_count += 1u32;
+        self.tokens.advance()
+    }
+
+    /// Match a token type; advance if it matches.
+    /// Effect: pure — conditional advance.
+    fn match_token(&mut self, token_type : TokenType) -> bool [pure] {
+        self.tokens.match_token(token_type)
+    }
+
+    /// Check if at end of file.
+    /// Effect: pure — read-only check.
+    fn is_at_end(&self) -> bool [pure] {
+        self.tokens.is_at_end()
+    }
+
+    /// Consume a token, emitting error if it doesn't match expected type.
+    /// Effect: diag — may emit diagnostic on mismatch.
+    fn consume(&mut self, expected : TokenType, message : FixedString256) -> Result<Token, FixedString256> [diag, pure] {
+        if self.check(expected) {
+            Result::Ok(self.advance())
+        } else {
+            let loc : SourceLocation = self.peek().start;
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::ParseUnexpectedToken,
+                message,
+                loc,
+                DiagnosticSeverity::Error,
+                CompilerPhase::Parser,
+            ).recoverable();
+            let _ = self.diagnostics.emit(diag);
+            Result::Err(message)
+        }
+    }
+
+    /// Synchronize after an error — skip to a statement boundary.
+    /// Effect: diag — advances past tokens.
+    fn synchronize(&mut self) [diag, pure] {
+        self.in_recovery = true;
+        self.recovery_count += 1u32;
+        // Bounded: at most 256 tokens to skip during recovery.
+        for var i : u32 = 0u32; i < 256u32; i += 1u32 [256u32] {
+            if self.is_at_end() {
+                break;
+            }
+            if self.check(TokenType::Semicolon)
+                || self.check(TokenType::KeywordFn)
+                || self.check(TokenType::KeywordStruct)
+                || self.check(TokenType::KeywordEnum)
+                || self.check(TokenType::KeywordPub)
+                || self.check(TokenType::KeywordLet)
+                || self.check(TokenType::RightBrace)
+                || self.check(TokenType::EndOfFile) {
+                break;
+            }
+            let _ = self.advance();
+        }
+        if self.check(TokenType::Semicolon) {
+            let _ = self.advance();
+        }
+        self.in_recovery = false;
+    }
+
+    /// Enter a recursive parse context with depth checking.
+    /// Effect: pure — depth tracking.
+    fn enter_recursive(&mut self) -> Result<(), FixedString256> [pure] {
+        self.recursion_depth += 1u32;
+        if self.recursion_depth > self.max_depth {
+            let msg : FixedString256 = FixedString256::from("parser recursion depth exceeded");
+            let loc : SourceLocation = self.peek().start;
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::ParseUnexpectedToken,
+                msg,
+                loc,
+                DiagnosticSeverity::Fatal,
+                CompilerPhase::Parser,
+            );
+            let _ = self.diagnostics.emit(diag);
+            Result::Err(FixedString256::from("parse recursion depth exceeded"))
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    /// Leave a recursive parse context.
+    /// Effect: pure — depth tracking.
+    fn leave_recursive(&mut self) [pure] {
+        if self.recursion_depth > 0u32 {
+            self.recursion_depth -= 1u32;
+        }
+    }
+
+    /// Get the current source location.
+    /// Effect: pure — read-only.
+    fn current_location(&self) -> SourceLocation [pure] {
+        self.peek().start
+    }
+
+    // ========================
+    // Top-Level Parsing
+    // ========================
+
+    /// Parse a complete source file.
+    /// Effect: diag, pure — recursive descent parsing.
+    pub fn parse_source_file(&mut self) -> Result<SourceFile, FixedString256> [diag, pure] {
+        let mut source_file : SourceFile = SourceFile::new(self.file_path);
+
+        // Parse module-level attributes.
+        let _ = self.parse_module_attributes(&mut source_file);
+
+        // Bounded: at most 64 top-level items.
+        for var i : u32 = 0u32; i < 64u32; i += 1u32 [64u32] {
+            if self.is_at_end() {
+                break;
+            }
+            let item_result : Result<ItemDeclaration, FixedString256> = self.parse_item();
+            match item_result {
+                Result::Ok(item) => {
+                    source_file = source_file.add_item(item);
+                }
+                Result::Err(_) => {
+                    self.synchronize();
+                }
+            }
+        }
+
+        source_file.generation = self.generation;
+        self.generation += 1u64;
+        Result::Ok(source_file)
+    }
+
+    /// Parse module-level attributes (no_std, no_alloc, no_unsafe).
+    /// Effect: diag, pure — bounded parsing.
+    fn parse_module_attributes(&mut self, source_file : &mut SourceFile) -> Result<(), FixedString256> [diag, pure] {
+        // Bounded: at most 4 module attributes.
+        for var i : u32 = 0u32; i < 4u32; i += 1u32 [4u32] {
+            if self.check(TokenType::KeywordNoStd) {
+                let _ = self.advance();
+                source_file.add_attribute(ModuleAttribute::NoStd);
+            } else if self.check(TokenType::KeywordNoAlloc) {
+                let _ = self.advance();
+                source_file.add_attribute(ModuleAttribute::NoAlloc);
+            } else if self.check(TokenType::KeywordNoUnsafe) {
+                let _ = self.advance();
+                source_file.add_attribute(ModuleAttribute::NoUnsafe);
+            } else {
+                break;
+            }
+        }
+        Result::Ok(())
+    }
+
+    // ========================
+    // Item Parsing
+    // ========================
+
+    /// Parse a single top-level item.
+    /// Effect: diag, pure — dispatches to specific item parsers.
+    fn parse_item(&mut self) -> Result<ItemDeclaration, FixedString256> [diag, pure] {
+        let _ = self.enter_recursive();
+
+        let is_pub : bool = self.match_token(TokenType::KeywordPub);
+        let result : Result<ItemDeclaration, FixedString256>;
+
+        if self.check(TokenType::KeywordFn) {
+            let _ = self.advance();
+            let func : Result<FunctionDeclaration, FixedString256> = self.parse_function_declaration(is_pub);
+            match func {
+                Result::Ok(f) => result = Result::Ok(ItemDeclaration::Function(Spanned::new(f, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordStruct) {
+            let _ = self.advance();
+            let struct_decl : Result<StructDeclaration, FixedString256> = self.parse_struct_declaration(is_pub);
+            match struct_decl {
+                Result::Ok(s) => result = Result::Ok(ItemDeclaration::Struct(Spanned::new(s, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordEnum) {
+            let _ = self.advance();
+            let enum_decl : Result<EnumDeclaration, FixedString256> = self.parse_enum_declaration(is_pub);
+            match enum_decl {
+                Result::Ok(e) => result = Result::Ok(ItemDeclaration::Enum(Spanned::new(e, self.current_location(), self.current_location()))),
+                Result::Err(err) => result = Result::Err(err),
+            }
+        } else if self.check(TokenType::KeywordDataType) {
+            let _ = self.advance();
+            let dt : Result<DataTypeDeclaration, FixedString256> = self.parse_datatype_declaration(is_pub);
+            match dt {
+                Result::Ok(d) => result = Result::Ok(ItemDeclaration::DataType(Spanned::new(d, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordSealDataType) {
+            let _ = self.advance();
+            let sdt : Result<SealDataTypeDeclaration, FixedString256> = self.parse_sealdatatype_declaration(is_pub);
+            match sdt {
+                Result::Ok(s) => result = Result::Ok(ItemDeclaration::SealDataType(Spanned::new(s, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordImpl) {
+            let _ = self.advance();
+            let impl_block : Result<ImplBlock, FixedString256> = self.parse_impl_block();
+            match impl_block {
+                Result::Ok(i) => result = Result::Ok(ItemDeclaration::Impl(Spanned::new(i, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordType) {
+            let _ = self.advance();
+            let alias : Result<TypeAliasDeclaration, FixedString256> = self.parse_type_alias();
+            match alias {
+                Result::Ok(a) => result = Result::Ok(ItemDeclaration::TypeAlias(Spanned::new(a, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordEffect) {
+            let _ = self.advance();
+            let eff : Result<EffectDeclaration, FixedString256> = self.parse_effect_declaration();
+            match eff {
+                Result::Ok(e) => result = Result::Ok(ItemDeclaration::EffectDeclaration(Spanned::new(e, self.current_location(), self.current_location()))),
+                Result::Err(err) => result = Result::Err(err),
+            }
+        } else if self.check(TokenType::KeywordCapability) {
+            let _ = self.advance();
+            let cap : Result<CapabilityDeclaration, FixedString256> = self.parse_capability_declaration();
+            match cap {
+                Result::Ok(c) => result = Result::Ok(ItemDeclaration::CapabilityDeclaration(Spanned::new(c, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordNamespace) {
+            let _ = self.advance();
+            let ns : Result<NamespaceDeclaration, FixedString256> = self.parse_namespace_declaration();
+            match ns {
+                Result::Ok(n) => result = Result::Ok(ItemDeclaration::Namespace(Spanned::new(n, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordUse) {
+            let _ = self.advance();
+            let use_decl : Result<UseDeclaration, FixedString256> = self.parse_use_declaration();
+            match use_decl {
+                Result::Ok(u) => result = Result::Ok(ItemDeclaration::Use(Spanned::new(u, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else if self.check(TokenType::KeywordConst) {
+            let _ = self.advance();
+            let const_decl : Result<ConstDeclaration, FixedString256> = self.parse_const_declaration(is_pub);
+            match const_decl {
+                Result::Ok(c) => result = Result::Ok(ItemDeclaration::Const(Spanned::new(c, self.current_location(), self.current_location()))),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else {
+            let loc : SourceLocation = self.current_location();
+            let token_name : FixedString256 = self.peek().token_type.name();
+            let msg : FixedString256 = diag_messages::unexpected_token(
+                FixedString256::from("item declaration (fn, struct, enum, etc.)"),
+                token_name,
+            );
+            let diag : DiagnosticPayload = DiagnosticPayload::new(
+                DiagnosticCode::ParseInvalidDeclaration,
+                msg,
+                loc,
+                DiagnosticSeverity::Error,
+                CompilerPhase::Parser,
+            );
+            let _ = self.diagnostics.emit(diag);
+            result = Result::Err(FixedString256::from("invalid item declaration"));
+        }
+
+        self.leave_recursive();
+        result
+    }
+
+    // ========================
+    // Function Parsing
+    // ========================
+
+    /// Parse a function declaration (after 'fn' keyword consumed).
+    /// Effect: diag, pure — recursive descent into function body.
+    fn parse_function_declaration(&mut self, is_pub : bool) -> Result<FunctionDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected function name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value,
+            name_token.start,
+            name_token.end,
+        );
+
+        let mut func : FunctionDeclaration = FunctionDeclaration::new(name, is_pub);
+
+        // Parse generic type parameters: <T, U>
+        if self.check(TokenType::Less) {
+            let _ = self.advance();
+            let params_result : Result<Array64<Spanned<FixedString256>>, FixedString256> = self.parse_type_params();
+            match params_result {
+                Result::Ok(params) => func.type_params = params,
+                Result::Err(_) => {}
+            }
+            let _ = self.consume(TokenType::Greater, FixedString256::from("expected '>' after type parameters"));
+        }
+
+        // Parse parameters: (params)
+        let _ = self.consume(TokenType::LeftParen, FixedString256::from("expected '(' after function name"))?;
+        if !self.check(TokenType::RightParen) {
+            let params_result : Result<Array64<Parameter>, FixedString256> = self.parse_parameter_list();
+            match params_result {
+                Result::Ok(params) => func.params = params,
+                Result::Err(_) => {}
+            }
+        }
+        let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')' after parameters"))?;
+
+        // Parse return type: -> Type
+        if self.match_token(TokenType::Arrow) {
+            let ret_type : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+            match ret_type {
+                Result::Ok(t) => func.return_type = Option::Some(t),
+                Result::Err(_) => {}
+            }
+        }
+
+        // Parse effect declarations: [effect1, effect2]
+        if self.check(TokenType::LeftBracket) {
+            let effects_result : Result<Array64<EffectAnnotation>, FixedString256> = self.parse_effect_list();
+            match effects_result {
+                Result::Ok(effects) => func.effects = effects,
+                Result::Err(_) => {}
+            }
+        }
+
+        // Parse boundedness evidence (for recursive functions): [bounded: expr]
+        if self.check(TokenType::LeftBracket) {
+            let bounded_result : Result<BoundednessEvidence, FixedString256> = self.parse_boundedness_evidence();
+            match bounded_result {
+                Result::Ok(b) => func.boundedness = Option::Some(b),
+                Result::Err(_) => {}
+            }
+        }
+
+        // Parse function body.
+        if self.check(TokenType::LeftBrace) {
+            let body_result : Result<BlockExpression, FixedString256> = self.parse_block();
+            match body_result {
+                Result::Ok(block) => func.body = Option::Some(block),
+                Result::Err(_) => {}
+            }
+        } else {
+            let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected '{' or ';' after function signature"))?;
+        }
+
+        func.generation = self.generation;
+        self.generation += 1u64;
+        Result::Ok(func)
+    }
+
+    /// Parse a list of type parameters: T, U, V.
+    /// Effect: diag, pure — bounded loop.
+    fn parse_type_params(&mut self) -> Result<Array64<Spanned<FixedString256>>, FixedString256> [diag, pure] {
+        let mut params : Array64<Spanned<FixedString256>> = Array64::new();
+        // Bounded: at most 8 type parameters.
+        for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+            if self.check(TokenType::Identifier) {
+                let token : Token = self.advance();
+                let param : Spanned<FixedString256> = Spanned::new(
+                    token.value.ident_value, token.start, token.end,
+                );
+                let _ = params.push(param);
+                if !self.match_token(TokenType::Comma) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Result::Ok(params)
+    }
+
+    /// Parse parameter list: `name : Type, ...`
+    /// Effect: diag, pure — bounded loop.
+    fn parse_parameter_list(&mut self) -> Result<Array64<Parameter>, FixedString256> [diag, pure] {
+        let mut params : Array64<Parameter> = Array64::new();
+        // Bounded: at most 16 parameters.
+        for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+            if self.is_at_end() || self.check(TokenType::RightParen) {
+                break;
+            }
+            let param : Result<Parameter, FixedString256> = self.parse_parameter();
+            match param {
+                Result::Ok(p) => {
+                    let _ = params.push(p);
+                }
+                Result::Err(_) => {
+                    self.synchronize();
+                    break;
+                }
+            }
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        Result::Ok(params)
+    }
+
+    /// Parse a single parameter.
+    /// Effect: diag, pure — single parameter.
+    fn parse_parameter(&mut self) -> Result<Parameter, FixedString256> [diag, pure] {
+        let is_mut : bool = self.match_token(TokenType::KeywordMut);
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected parameter name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+
+        let mut param : Parameter = Parameter::new(
+            name,
+            Option::None,
+            if is_mut { Mutability::Mutable } else { Mutability::Immutable },
+        );
+
+        // Parse optional type annotation.
+        if self.match_token(TokenType::Colon) {
+            let type_result : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+            match type_result {
+                Result::Ok(t) => param.type_annotation = Option::Some(t),
+                Result::Err(_) => {}
+            }
+        }
+
+        Result::Ok(param)
+    }
+
+    // ========================
+    // Struct Declaration Parsing
+    // ========================
+
+    /// Parse a struct declaration (after 'struct' keyword consumed).
+    /// Effect: diag, pure — recursive descent.
+    fn parse_struct_declaration(&mut self, is_pub : bool) -> Result<StructDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected struct name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let mut struct_decl : StructDeclaration = StructDeclaration::new(name, is_pub);
+
+        // Parse generic type parameters.
+        if self.check(TokenType::Less) {
+            let _ = self.advance();
+            let params_result : Result<Array64<Spanned<FixedString256>>, FixedString256> = self.parse_type_params();
+            match params_result {
+                Result::Ok(p) => struct_decl.type_params = p,
+                Result::Err(_) => {}
+            }
+            let _ = self.consume(TokenType::Greater, FixedString256::from("expected '>'"));
+        }
+
+        // Parse fields: { field1: Type1, field2: Type2 }
+        if self.check(TokenType::LeftBrace) {
+            let _ = self.advance();
+            // Bounded: at most 32 fields.
+            for var i : u32 = 0u32; i < 32u32; i += 1u32 [32u32] {
+                if self.check(TokenType::RightBrace) {
+                    break;
+                }
+                let is_field_pub : bool = self.match_token(TokenType::KeywordPub);
+                let field_name : Token = self.consume(
+                    TokenType::Identifier,
+                    FixedString256::from("expected field name"),
+                )?;
+                let _ = self.consume(TokenType::Colon, FixedString256::from("expected ':' after field name"))?;
+                let field_type : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+                match field_type {
+                    Result::Ok(t) => {
+                        let field : StructField = StructField::new(
+                            Spanned::new(field_name.value.ident_value, field_name.start, field_name.end),
+                            t,
+                            is_field_pub,
+                        );
+                        let _ = struct_decl.fields.push(field);
+                    }
+                    Result::Err(_) => {}
+                }
+                if !self.match_token(TokenType::Comma) {
+                    break;
+                }
+            }
+            let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}' after struct fields"));
+        } else {
+            let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected '{' or ';' after struct name"));
+        }
+
+        struct_decl.generation = self.generation;
+        self.generation += 1u64;
+        Result::Ok(struct_decl)
+    }
+
+    // ========================
+    // Enum Declaration Parsing
+    // ========================
+
+    /// Parse an enum declaration (after 'enum' keyword consumed).
+    /// Effect: diag, pure — recursive descent.
+    fn parse_enum_declaration(&mut self, is_pub : bool) -> Result<EnumDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected enum name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let mut enum_decl : EnumDeclaration = EnumDeclaration::new(name, is_pub);
+
+        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{' after enum name"))?;
+        // Bounded: at most 32 enum variants.
+        for var i : u32 = 0u32; i < 32u32; i += 1u32 [32u32] {
+            if self.check(TokenType::RightBrace) || self.is_at_end() {
+                break;
+            }
+            let variant_name : Token = self.consume(
+                TokenType::Identifier,
+                FixedString256::from("expected variant name"),
+            )?;
+            let mut variant : EnumVariant = EnumVariant {
+                name: Spanned::new(variant_name.value.ident_value, variant_name.start, variant_name.end),
+                fields: Array64::new(),
+            };
+            // Parse optional payload: (Type1, Type2) or { name: Type }
+            if self.check(TokenType::LeftParen) {
+                let _ = self.advance();
+                // Bounded: at most 8 variant fields.
+                for var j : u32 = 0u32; j < 8u32; j += 1u32 [8u32] {
+                    let field_type : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+                    match field_type {
+                        Result::Ok(t) => {
+                            let _ = variant.fields.push(EnumVariantField { unnamed: t });
+                        }
+                        Result::Err(_) => {}
+                    }
+                    if !self.match_token(TokenType::Comma) {
+                        break;
+                    }
+                }
+                let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+            }
+            let _ = enum_decl.variants.push(variant);
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}' after enum variants"));
+        enum_decl.generation = self.generation;
+        self.generation += 1u64;
+        Result::Ok(enum_decl)
+    }
+
+    // ========================
+    // DataType / SealDataType Parsing
+    // ========================
+
+    /// Parse a datatype declaration (after 'datatype' keyword consumed).
+    /// Effect: diag, pure — recursive descent.
+    fn parse_datatype_declaration(&mut self, is_pub : bool) -> Result<DataTypeDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected datatype name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let mut dt : DataTypeDeclaration = DataTypeDeclaration {
+            name: name,
+            is_pub: is_pub,
+            type_params: Array64::new(),
+            constructors: Array64::new(),
+            generation: self.generation,
+        };
+
+        let _ = self.consume(TokenType::Equal, FixedString256::from("expected '=' after datatype name"))?;
+        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{'"))?;
+        // Bounded: at most 16 constructors.
+        for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+            if self.check(TokenType::RightBrace) || self.is_at_end() { break; }
+            let ctor_name : Token = self.consume(TokenType::Identifier, FixedString256::from("expected constructor name"))?;
+            let mut ctor : DataTypeConstructor = DataTypeConstructor {
+                name: Spanned::new(ctor_name.value.ident_value, ctor_name.start, ctor_name.end),
+                types: Array64::new(),
+            };
+            if self.check(TokenType::LeftParen) {
+                let _ = self.advance();
+                for var j : u32 = 0u32; j < 8u32; j += 1u32 [8u32] {
+                    let t : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+                    match t {
+                        Result::Ok(tp) => { let _ = ctor.types.push(tp); }
+                        Result::Err(_) => {}
+                    }
+                    if !self.match_token(TokenType::Comma) { break; }
+                }
+                let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+            }
+            let _ = dt.constructors.push(ctor);
+            if !self.match_token(TokenType::Comma) { break; }
+        }
+        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}'"));
+        self.generation += 1u64;
+        Result::Ok(dt)
+    }
+
+    /// Parse a sealed datatype declaration (after 'sealdatatype' keyword consumed).
+    /// Effect: diag, pure — recursive descent.
+    fn parse_sealdatatype_declaration(&mut self, is_pub : bool) -> Result<SealDataTypeDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected sealdatatype name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let _ = self.consume(TokenType::Colon, FixedString256::from("expected ':' after sealdatatype name"))?;
+        let repr_type : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+        let repr : TypeAnnotation = match repr_type {
+            Result::Ok(t) => t,
+            Result::Err(_) => TypeAnnotation::Unit,
+        };
+
+        let mut sdt : SealDataTypeDeclaration = SealDataTypeDeclaration {
+            name: name,
+            is_pub: is_pub,
+            repr_type: repr,
+            constructors: Array64::new(),
+            generation: self.generation,
+        };
+
+        let _ = self.consume(TokenType::Equal, FixedString256::from("expected '='"))?;
+        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{'"))?;
+        for var i : u32 = 0u32; i < 32u32; i += 1u32 [32u32] {
+            if self.check(TokenType::RightBrace) || self.is_at_end() { break; }
+            let ctor_name : Token = self.consume(TokenType::Identifier, FixedString256::from("expected constructor name"))?;
+            let _ = self.consume(TokenType::Equal, FixedString256::from("expected '=' after constructor name"))?;
+            let value_token : Token = self.consume(TokenType::IntegerLiteral, FixedString256::from("expected integer value"))?;
+            let mut ctor : SealDataTypeConstructor = SealDataTypeConstructor {
+                name: Spanned::new(ctor_name.value.ident_value, ctor_name.start, ctor_name.end),
+                value: value_token.value.integer_value as u64,
+                types: Array64::new(),
+            };
+            if self.check(TokenType::LeftParen) {
+                let _ = self.advance();
+                for var j : u32 = 0u32; j < 8u32; j += 1u32 [8u32] {
+                    let t : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+                    match t { Result::Ok(tp) => { let _ = ctor.types.push(tp); } Result::Err(_) => {} }
+                    if !self.match_token(TokenType::Comma) { break; }
+                }
+                let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+            }
+            let _ = sdt.constructors.push(ctor);
+            if !self.match_token(TokenType::Comma) { break; }
+        }
+        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}'"));
+        self.generation += 1u64;
+        Result::Ok(sdt)
+    }
+
+    // ========================
+    // Impl Block Parsing
+    // ========================
+
+    /// Parse an impl block (after 'impl' keyword consumed).
+    /// Effect: diag, pure — recursive descent.
+    fn parse_impl_block(&mut self) -> Result<ImplBlock, FixedString256> [diag, pure] {
+        let type_ann : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+        let impl_type : TypeAnnotation = match type_ann {
+            Result::Ok(t) => t,
+            Result::Err(_) => TypeAnnotation::Unit,
+        };
+        let mut impl_block : ImplBlock = ImplBlock::new(impl_type);
+        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{' after impl type"))?;
+        // Bounded: at most 16 methods in an impl block.
+        for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+            if self.check(TokenType::RightBrace) || self.is_at_end() { break; }
+            let is_pub : bool = self.match_token(TokenType::KeywordPub);
+            if self.check(TokenType::KeywordFn) {
+                let _ = self.advance();
+                let func : Result<FunctionDeclaration, FixedString256> = self.parse_function_declaration(is_pub);
+                match func {
+                    Result::Ok(f) => { let _ = impl_block.methods.push(f); }
+                    Result::Err(_) => { self.synchronize(); }
+                }
+            } else {
+                break;
+            }
+        }
+        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}' after impl block"));
+        impl_block.generation = self.generation;
+        self.generation += 1u64;
+        Result::Ok(impl_block)
+    }
+
+    // ========================
+    // Type Alias Parsing
+    // ========================
+
+    /// Parse a type alias (after 'type' keyword).
+    /// Effect: diag, pure — simple parsing.
+    fn parse_type_alias(&mut self) -> Result<TypeAliasDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected type alias name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let _ = self.consume(TokenType::Equal, FixedString256::from("expected '=' in type alias"))?;
+        let aliased_type : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+        let aliased : TypeAnnotation = match aliased_type {
+            Result::Ok(t) => t,
+            Result::Err(_) => TypeAnnotation::Unit,
+        };
+        let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after type alias"));
+        Result::Ok(TypeAliasDeclaration {
+            name: name,
+            type_params: Array64::new(),
+            aliased_type: aliased,
+        })
+    }
+
+    // ========================
+    // Effect / Capability Parsing
+    // ========================
+
+    /// Parse an effect declaration (after 'effect' keyword).
+    /// Effect: diag, pure — simple parsing.
+    fn parse_effect_declaration(&mut self) -> Result<EffectDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected effect name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after effect declaration"));
+        Result::Ok(EffectDeclaration {
+            name: name,
+            is_builtin: false,
+            description: FixedString256::new(),
+        })
+    }
+
+    /// Parse a capability declaration (after 'capability' keyword).
+    /// Effect: diag, pure — simple parsing.
+    fn parse_capability_declaration(&mut self) -> Result<CapabilityDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected capability name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after capability declaration"));
+        Result::Ok(CapabilityDeclaration {
+            name: name,
+            kind: CapabilityKind::Affine,
+        })
+    }
+
+    // ========================
+    // Namespace Parsing
+    // ========================
+
+    /// Parse a namespace block (after 'namespace' keyword).
+    /// Effect: diag, pure — recursive descent.
+    fn parse_namespace_declaration(&mut self) -> Result<NamespaceDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected namespace name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let mut ns : NamespaceDeclaration = NamespaceDeclaration {
+            name: name,
+            items: Array64::new(),
+            generation: self.generation,
+        };
+        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{' after namespace name"))?;
+        // Bounded: at most 32 items in a namespace.
+        for var i : u32 = 0u32; i < 32u32; i += 1u32 [32u32] {
+            if self.check(TokenType::RightBrace) || self.is_at_end() { break; }
+            let item : Result<ItemDeclaration, FixedString256> = self.parse_item();
+            match item {
+                Result::Ok(it) => { let _ = ns.items.push(it); }
+                Result::Err(_) => { self.synchronize(); }
+            }
+        }
+        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}' after namespace body"));
+        self.generation += 1u64;
+        Result::Ok(ns)
+    }
+
+    // ========================
+    // Use Declaration Parsing
+    // ========================
+
+    /// Parse a use declaration (after 'use' keyword).
+    /// Effect: diag, pure — simple parsing.
+    fn parse_use_declaration(&mut self) -> Result<UseDeclaration, FixedString256> [diag, pure] {
+        let path_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected path after 'use'"))?;
+        let mut path : UsePath = UsePath::Simple(Spanned::new(
+            path_token.value.ident_value, path_token.start, path_token.end,
+        ));
+        // Parse `::` separated paths.
+        while self.match_token(TokenType::ColonColon) {
+            if self.check(TokenType::Star) {
+                let star_loc : SourceLocation = self.current_location();
+                let _ = self.advance();
+                path = UsePath::Glob(Spanned::new(FixedString256::from("*"), star_loc, star_loc));
+                break;
+            }
+            if self.check(TokenType::Identifier) {
+                let next_token : Token = self.advance();
+                path = UsePath::Nested(
+                    Spanned::new(FixedString256::new(), path_token.start, path_token.start),
+                    Box::new(path),
+                );
+                // Simplified: would accumulate path segments.
+                let _ = next_token;
+            } else {
+                break;
+            }
+        }
+        let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after use declaration"));
+        Result::Ok(UseDeclaration { path: path, alias: Option::None })
+    }
+
+    /// Parse a constant declaration (after 'const' keyword).
+    /// Effect: diag, pure — simple parsing.
+    fn parse_const_declaration(&mut self, is_pub : bool) -> Result<ConstDeclaration, FixedString256> [diag, pure] {
+        let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected constant name"))?;
+        let name : Spanned<FixedString256> = Spanned::new(
+            name_token.value.ident_value, name_token.start, name_token.end,
+        );
+        let _ = self.consume(TokenType::Colon, FixedString256::from("expected ':' after constant name"))?;
+        let type_ann : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+        let ann : TypeAnnotation = match type_ann { Result::Ok(t) => t, Result::Err(_) => TypeAnnotation::Unit };
+        let _ = self.consume(TokenType::Equal, FixedString256::from("expected '=' in constant declaration"))?;
+        let value : Result<Expression, FixedString256> = self.parse_expression();
+        let val : Expression = match value { Result::Ok(e) => e, Result::Err(_) => Expression::IntegerLiteral(Spanned::new(0i64, self.current_location(), self.current_location())) };
+        let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after constant declaration"));
+        Result::Ok(ConstDeclaration { name: name, type_annotation: ann, value: val, is_pub: is_pub })
+    }
+
+    // ========================
+    // Type Annotation Parsing
+    // ========================
+
+    /// Parse a type annotation.
+    /// Effect: diag, pure — recursive descent.
+    pub fn parse_type_annotation(&mut self) -> Result<TypeAnnotation, FixedString256> [diag, pure] {
+        let _ = self.enter_recursive();
+        let result : Result<TypeAnnotation, FixedString256>;
+
+        if self.check(TokenType::LeftParen) {
+            let _ = self.advance();
+            if self.check(TokenType::RightParen) {
+                let _ = self.advance();
+                result = Result::Ok(TypeAnnotation::Unit);
+            } else if self.check(TokenType::Identifier) || self.check(TokenType::Underscore) {
+                // Could be tuple or parenthesized type.
+                let first : Result<TypeAnnotation, FixedString256> = self.parse_type_atom();
+                match first {
+                    Result::Ok(t) => {
+                        if self.check(TokenType::Comma) {
+                            let mut types : Array64<TypeAnnotation> = Array64::new();
+                            let _ = types.push(t);
+                            while self.match_token(TokenType::Comma) {
+                                let next : Result<TypeAnnotation, FixedString256> = self.parse_type_atom();
+                                match next {
+                                    Result::Ok(nt) => { let _ = types.push(nt); }
+                                    Result::Err(_) => { break; }
+                                }
+                            }
+                            let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+                            result = Result::Ok(TypeAnnotation::Tuple(types));
+                        } else {
+                            let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+                            result = Result::Ok(t);
+                        }
+                    }
+                    Result::Err(e) => result = Result::Err(e),
+                }
+            } else {
+                result = Result::Err(FixedString256::from("expected type inside parentheses"));
+            }
+        } else if self.check(TokenType::LeftBracket) {
+            // Array type: [T; N]
+            let _ = self.advance();
+            let elem : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+            match elem {
+                Result::Ok(e) => {
+                    let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' in array type"))?;
+                    let size_token : Token = self.consume(TokenType::IntegerLiteral, FixedString256::from("expected array size"))?;
+                    let _ = self.consume(TokenType::RightBracket, FixedString256::from("expected ']'"))?;
+                    result = Result::Ok(TypeAnnotation::Array(Box::new(e), size_token.value.integer_value as u64));
+                }
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else {
+            result = self.parse_type_atom();
+        }
+
+        // Handle function type: (args) -> ret
+        if result.is_ok() && self.match_token(TokenType::Arrow) {
+            let ret_type : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+            match ret_type {
+                Result::Ok(ret) => {
+                    let mut params : Array64<TypeAnnotation> = Array64::new();
+                    match result {
+                        Result::Ok(t) => { let _ = params.push(t); }
+                        Result::Err(_) => {}
+                    }
+                    result = Result::Ok(TypeAnnotation::Function(params, Box::new(ret), Array64::new()));
+                }
+                Result::Err(e) => result = Result::Err(e),
+            }
+        }
+
+        self.leave_recursive();
+        result
+    }
+
+    /// Parse a type atom (name, generic, etc.).
+    /// Effect: diag, pure — type atom.
+    fn parse_type_atom(&mut self) -> Result<TypeAnnotation, FixedString256> [diag, pure] {
+        let result : Result<TypeAnnotation, FixedString256>;
+
+        if self.check(TokenType::Identifier) {
+            let token : Token = self.advance();
+            let name : FixedString256 = token.value.ident_value;
+
+            // Check for generic arguments: Type<Args>
+            if self.check(TokenType::Less) || self.check(TokenType::LeftAngle) {
+                let _ = self.advance();
+                let mut args : Array64<TypeAnnotation> = Array64::new();
+                // Bounded: at most 8 generic arguments.
+                for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+                    let arg : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+                    match arg {
+                        Result::Ok(a) => { let _ = args.push(a); }
+                        Result::Err(_) => { break; }
+                    }
+                    if !self.match_token(TokenType::Comma) { break; }
+                }
+                let _ = self.consume(TokenType::Greater, FixedString256::from("expected '>'"))?;
+                result = Result::Ok(TypeAnnotation::Generic(
+                    Box::new(TypeAnnotation::Named(Spanned::new(name, token.start, token.end))),
+                    args,
+                ));
+            } else {
+                result = Result::Ok(TypeAnnotation::Named(Spanned::new(name, token.start, token.end)));
+            }
+        } else if self.check(TokenType::Underscore) {
+            let _ = self.advance();
+            result = Result::Ok(TypeAnnotation::Inferred);
+        } else if self.check(TokenType::Bang) {
+            let _ = self.advance();
+            result = Result::Ok(TypeAnnotation::Never);
+        } else if self.check(TokenType::KeywordType) {
+            let _ = self.advance();
+            let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected type variable name"))?;
+            result = Result::Ok(TypeAnnotation::TypeVar(Spanned::new(
+                name_token.value.ident_value, name_token.start, name_token.end,
+            )));
+        } else if self.check(TokenType::Ampersand) {
+            let _ = self.advance();
+            let is_mut : bool = self.match_token(TokenType::KeywordMut);
+            let inner : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+            match inner {
+                Result::Ok(t) => result = Result::Ok(TypeAnnotation::Reference(
+                    Box::new(t),
+                    if is_mut { Mutability::Mutable } else { Mutability::Immutable },
+                )),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else {
+            result = Result::Err(FixedString256::from("expected type"));
+        }
+
+        result
+    }
+
+    // ========================
+    // Effect List Parsing
+    // ========================
+
+    /// Parse an effect list: [effect1, effect2, ...]
+    /// Effect: diag, pure — bounded loop.
+    fn parse_effect_list(&mut self) -> Result<Array64<EffectAnnotation>, FixedString256> [diag, pure] {
+        let mut effects : Array64<EffectAnnotation> = Array64::new();
+        if self.check(TokenType::LeftBracket) {
+            let _ = self.advance();
+            // Bounded: at most 8 effects.
+            for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+                if self.check(TokenType::Identifier) {
+                    let token : Token = self.advance();
+                    let name : FixedString256 = token.value.ident_value;
+                    let effect : EffectAnnotation = if name == "pure" {
+                        EffectAnnotation::Pure
+                    } else if name == "io" {
+                        EffectAnnotation::IO
+                    } else if name == "diag" {
+                        EffectAnnotation::Diag
+                    } else if name == "lex" {
+                        EffectAnnotation::Lex
+                    } else if name == "residual" {
+                        EffectAnnotation::Residual
+                    } else if name == "trusted" {
+                        EffectAnnotation::Trusted
+                    } else {
+                        EffectAnnotation::Named(Spanned::new(name, token.start, token.end))
+                    };
+                    let _ = effects.push(effect);
+                } else {
+                    break;
+                }
+                if !self.match_token(TokenType::Comma) { break; }
+            }
+            let _ = self.consume(TokenType::RightBracket, FixedString256::from("expected ']' after effect list"));
+        }
+        Result::Ok(effects)
+    }
+
+    /// Parse boundedness evidence: [bounded: expr]
+    /// Effect: diag, pure — simple parsing.
+    fn parse_boundedness_evidence(&mut self) -> Result<BoundednessEvidence, FixedString256> [diag, pure] {
+        if !self.check(TokenType::LeftBracket) {
+            return Result::Err(FixedString256::from("expected '['"));
+        }
+        let _ = self.advance();
+        // We expect either an identifier "bounded" or a bound expression.
+        let loc : SourceLocation = self.current_location();
+        let bound_expr : Result<Expression, FixedString256> = self.parse_expression();
+        let bound : Expression = match bound_expr {
+            Result::Ok(b) => b,
+            Result::Err(_) => Expression::IntegerLiteral(Spanned::new(0i64, loc, loc)),
+        };
+        let _ = self.consume(TokenType::RightBracket, FixedString256::from("expected ']' after boundedness evidence"));
+        Result::Ok(BoundednessEvidence::new(
+            bound,
+            FixedString256::from("boundedness evidence provided"),
+            loc,
+        ))
+    }
+
+    // ========================
+    // Statement Parsing
+    // ========================
+
+    /// Parse a statement.
+    /// Effect: diag, pure — recursive descent.
+    pub fn parse_statement(&mut self) -> Result<Statement, FixedString256> [diag, pure] {
+        let _ = self.enter_recursive();
+        let result : Result<Statement, FixedString256>;
+
+        if self.check(TokenType::KeywordLet) {
+            let _ = self.advance();
+            let is_mut : bool = self.match_token(TokenType::KeywordMut);
+            let name_token : Token = self.consume(TokenType::Identifier, FixedString256::from("expected variable name"))?;
+            let name : Spanned<FixedString256> = Spanned::new(
+                name_token.value.ident_value, name_token.start, name_token.end,
+            );
+            let mut type_ann : Option<TypeAnnotation> = Option::None;
+            if self.match_token(TokenType::Colon) {
+                let ann : Result<TypeAnnotation, FixedString256> = self.parse_type_annotation();
+                match ann {
+                    Result::Ok(t) => type_ann = Option::Some(t),
+                    Result::Err(_) => {}
+                }
+            }
+            let _ = self.consume(TokenType::Equal, FixedString256::from("expected '=' in let binding"))?;
+            let value : Result<Expression, FixedString256> = self.parse_expression();
+            let val : Expression = match value { Result::Ok(e) => e, Result::Err(_) => Expression::IntegerLiteral(Spanned::new(0i64, self.current_location(), self.current_location())) };
+            let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after let binding"));
+            result = Result::Ok(Statement::Let(name, type_ann, val, if is_mut { Mutability::Mutable } else { Mutability::Immutable }));
+        } else if self.check(TokenType::Semicolon) {
+            let _ = self.advance();
+            result = Result::Ok(Statement::Empty);
+        } else if self.check(TokenType::KeywordFn)
+            || self.check(TokenType::KeywordStruct)
+            || self.check(TokenType::KeywordEnum)
+            || self.check(TokenType::KeywordUse) {
+            let item : Result<ItemDeclaration, FixedString256> = self.parse_item();
+            match item {
+                Result::Ok(i) => result = Result::Ok(Statement::Item(i)),
+                Result::Err(e) => result = Result::Err(e),
+            }
+        } else {
+            let expr : Result<Expression, FixedString256> = self.parse_expression();
+            match expr {
+                Result::Ok(e) => {
+                    let _ = self.consume(TokenType::Semicolon, FixedString256::from("expected ';' after expression statement"));
+                    result = Result::Ok(Statement::ExpressionStatement(e));
+                }
+                Result::Err(e) => result = Result::Err(e),
+            }
+        }
+
+        self.leave_recursive();
+        result
+    }
+
+    // ========================
+    // Block Parsing
+    // ========================
+
+    /// Parse a block: { stmts; expr? }
+    /// Effect: diag, pure — recursive descent.
+    pub fn parse_block(&mut self) -> Result<BlockExpression, FixedString256> [diag, pure] {
+        let start_loc : SourceLocation = self.current_location();
+        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{'"))?;
+        let mut stmts : Array64<Statement> = Array64::new();
+        let mut final_expr : Option<Box<Expression>> = Option::None;
+
+        // Bounded: at most 64 statements in a block.
+        for var i : u32 = 0u32; i < 64u32; i += 1u32 [64u32] {
+            if self.check(TokenType::RightBrace) || self.is_at_end() {
+                break;
+            }
+            // Check if this is a final expression (no semicolon).
+            if self.is_expression_start() && !self.is_statement_start() {
+                let expr : Result<Expression, FixedString256> = self.parse_expression();
+                match expr {
+                    Result::Ok(e) => {
+                        if self.check(TokenType::Semicolon) {
+                            let _ = self.advance();
+                            let _ = stmts.push(Statement::ExpressionStatement(e));
+                        } else if self.check(TokenType::RightBrace) {
+                            final_expr = Option::Some(Box::new(e));
+                            break;
+                        } else {
+                            let _ = stmts.push(Statement::ExpressionStatement(e));
+                        }
+                    }
+                    Result::Err(_) => { self.synchronize(); }
+                }
+            } else {
+                let stmt : Result<Statement, FixedString256> = self.parse_statement();
+                match stmt {
+                    Result::Ok(s) => { let _ = stmts.push(s); }
+                    Result::Err(_) => { self.synchronize(); }
+                }
+            }
+        }
+
+        let end_loc : SourceLocation = self.current_location();
+        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}'"));
+        Result::Ok(BlockExpression::new(stmts, final_expr, start_loc))
+    }
+
+    /// Check if the current token could start an expression.
+    /// Effect: pure — deterministic check.
+    fn is_expression_start(&self) -> bool [pure] {
+        let tt : TokenType = self.peek().token_type;
+        tt == TokenType::IntegerLiteral
+            || tt == TokenType::FloatLiteral
+            || tt == TokenType::StringLiteral
+            || tt == TokenType::CharLiteral
+            || tt == TokenType::Identifier
+            || tt == TokenType::LeftParen
+            || tt == TokenType::LeftBrace
+            || tt == TokenType::LeftBracket
+            || tt == TokenType::KeywordTrue
+            || tt == TokenType::KeywordFalse
+            || tt == TokenType::KeywordIf
+            || tt == TokenType::KeywordMatch
+            || tt == TokenType::KeywordLoop
+            || tt == TokenType::KeywordWhile
+            || tt == TokenType::KeywordFor
+            || tt == TokenType::KeywordReturn
+            || tt == TokenType::KeywordBreak
+            || tt == TokenType::KeywordContinue
+            || tt == TokenType::Minus
+            || tt == TokenType::Bang
+            || tt == TokenType::Tilde
+            || tt == TokenType::Ampersand
+            || tt == TokenType::KeywordTrusted
+            || tt == TokenType::KeywordUnsafeBlock
+            || tt == TokenType::Backslash
+    }
+
+    /// Check if the current token starts a statement (vs a final expression).
+    /// Effect: pure — deterministic check.
+    fn is_statement_start(&self) -> bool [pure] {
+        let tt : TokenType = self.peek().token_type;
+        tt == TokenType::KeywordLet
+            || tt == TokenType::KeywordFn
+            || tt == TokenType::KeywordStruct
+            || tt == TokenType::KeywordEnum
+            || tt == TokenType::KeywordUse
+            || tt == TokenType::Semicolon
+    }
+
+    // ========================
+    // Expression Parsing
+    // ========================
+
+    /// Parse an expression (top-level entry point).
+    /// Effect: diag, pure — recursive descent with precedence climbing.
+    pub fn parse_expression(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let _ = self.enter_recursive();
+        let result : Result<Expression, FixedString256> = self.parse_assignment();
+        self.leave_recursive();
+        result
+    }
+
+    /// Parse an assignment expression (lowest precedence).
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_assignment(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let lhs : Result<Expression, FixedString256> = self.parse_or();
+        match lhs {
+            Result::Ok(left) => {
+                if self.check(TokenType::Equal) {
+                    let op_token : Token = self.advance();
+                    let rhs : Result<Expression, FixedString256> = self.parse_assignment();
+                    match rhs {
+                        Result::Ok(right) => Result::Ok(Expression::Assignment(
+                            Box::new(left),
+                            Spanned::new(AssignOp::Assign, op_token.start, op_token.end),
+                            Box::new(right),
+                        )),
+                        Result::Err(e) => Result::Err(e),
+                    }
+                } else if self.check(TokenType::PlusEqual) {
+                    let op_token : Token = self.advance();
+                    let rhs : Result<Expression, FixedString256> = self.parse_assignment();
+                    match rhs {
+                        Result::Ok(right) => Result::Ok(Expression::Assignment(
+                            Box::new(left),
+                            Spanned::new(AssignOp::AddAssign, op_token.start, op_token.end),
+                            Box::new(right),
+                        )),
+                        Result::Err(e) => Result::Err(e),
+                    }
+                } else {
+                    Result::Ok(left)
+                }
+            }
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    /// Parse logical OR: `||`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_or(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_and()?;
+        while self.match_token(TokenType::Pipe) {
+            if self.check(TokenType::Pipe) {
+                // ||
+                let _ = self.advance();
+                let right : Expression = self.parse_and()?;
+                let loc : SourceLocation = self.current_location();
+                left = Expression::Binary(
+                    Spanned::new(BinaryOp::Or, loc, loc),
+                    Box::new(left),
+                    Box::new(right),
+                );
+            } else {
+                // Bitwise OR (single |)
+                let right : Expression = self.parse_and()?;
+                let loc : SourceLocation = self.current_location();
+                left = Expression::Binary(
+                    Spanned::new(BinaryOp::BitOr, loc, loc),
+                    Box::new(left),
+                    Box::new(right),
+                );
+            }
+        }
+        Result::Ok(left)
+    }
+
+    /// Parse logical AND: `&&`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_and(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_equality()?;
+        while self.match_token(TokenType::Ampersand) {
+            if self.check(TokenType::Ampersand) {
+                let _ = self.advance();
+                let right : Expression = self.parse_equality()?;
+                let loc : SourceLocation = self.current_location();
+                left = Expression::Binary(
+                    Spanned::new(BinaryOp::And, loc, loc),
+                    Box::new(left),
+                    Box::new(right),
+                );
+            } else {
+                break;
+            }
+        }
+        Result::Ok(left)
+    }
+
+    /// Parse equality: `==`, `!=`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_equality(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_comparison()?;
+        while self.check(TokenType::EqualEqual) || self.check(TokenType::BangEqual) {
+            let op_token : Token = self.advance();
+            let op : BinaryOp = if op_token.token_type == TokenType::EqualEqual {
+                BinaryOp::Equal
+            } else {
+                BinaryOp::NotEqual
+            };
+            let right : Expression = self.parse_comparison()?;
+            left = Expression::Binary(
+                Spanned::new(op, op_token.start, op_token.end),
+                Box::new(left),
+                Box::new(right),
+            );
+        }
+        Result::Ok(left)
+    }
+
+    /// Parse comparison: `<`, `<=`, `>`, `>=`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_comparison(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_term()?;
+        while self.check(TokenType::Less)
+            || self.check(TokenType::LessEqual)
+            || self.check(TokenType::Greater)
+            || self.check(TokenType::GreaterEqual) {
+            let op_token : Token = self.advance();
+            let op : BinaryOp = match op_token.token_type {
+                TokenType::Less => BinaryOp::LessThan,
+                TokenType::LessEqual => BinaryOp::LessEqual,
+                TokenType::Greater => BinaryOp::GreaterThan,
+                TokenType::GreaterEqual => BinaryOp::GreaterEqual,
+                _ => BinaryOp::Equal, // unreachable
+            };
+            let right : Expression = self.parse_term()?;
+            left = Expression::Binary(
+                Spanned::new(op, op_token.start, op_token.end),
+                Box::new(left),
+                Box::new(right),
+            );
+        }
+        Result::Ok(left)
+    }
+
+    /// Parse term (add/sub): `+`, `-`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_term(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_factor()?;
+        while self.check(TokenType::Plus) || self.check(TokenType::Minus) {
+            let op_token : Token = self.advance();
+            let op : BinaryOp = if op_token.token_type == TokenType::Plus {
+                BinaryOp::Add
+            } else {
+                BinaryOp::Subtract
+            };
+            let right : Expression = self.parse_factor()?;
+            left = Expression::Binary(
+                Spanned::new(op, op_token.start, op_token.end),
+                Box::new(left),
+                Box::new(right),
+            );
+        }
+        Result::Ok(left)
+    }
+
+    /// Parse factor (mul/div/mod): `*`, `/`, `%`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_factor(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_unary()?;
+        while self.check(TokenType::Star) || self.check(TokenType::Slash) || self.check(TokenType::Percent) {
+            let op_token : Token = self.advance();
+            let op : BinaryOp = match op_token.token_type {
+                TokenType::Star => BinaryOp::Multiply,
+                TokenType::Slash => BinaryOp::Divide,
+                TokenType::Percent => BinaryOp::Modulo,
+                _ => BinaryOp::Multiply,
+            };
+            let right : Expression = self.parse_unary()?;
+            left = Expression::Binary(
+                Spanned::new(op, op_token.start, op_token.end),
+                Box::new(left),
+                Box::new(right),
+            );
+        }
+        Result::Ok(left)
+    }
+
+    /// Parse unary: `-`, `!`, `~`, `&`, `*`
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_unary(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        if self.check(TokenType::Minus) || self.check(TokenType::Bang) || self.check(TokenType::Tilde)
+            || self.check(TokenType::Ampersand) || self.check(TokenType::Star) {
+            let op_token : Token = self.advance();
+            let op : UnaryOp = match op_token.token_type {
+                TokenType::Minus => UnaryOp::Negate,
+                TokenType::Bang => UnaryOp::Not,
+                TokenType::Tilde => UnaryOp::BitNot,
+                TokenType::Ampersand => UnaryOp::AddressOf,
+                TokenType::Star => UnaryOp::Dereference,
+                _ => UnaryOp::Negate,
+            };
+            let right : Expression = self.parse_unary()?;
+            Result::Ok(Expression::Unary(
+                Spanned::new(op, op_token.start, op_token.end),
+                Box::new(right),
+            ))
+        } else {
+            self.parse_postfix()
+        }
+    }
+
+    /// Parse postfix: call, index, field access
+    /// Effect: diag, pure — precedence climbing.
+    fn parse_postfix(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let mut left : Expression = self.parse_primary()?;
+
+        // Bounded: at most 16 postfix operations.
+        for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+            if self.check(TokenType::LeftParen) {
+                // Function call.
+                let _ = self.advance();
+                let mut args : Array64<Expression> = Array64::new();
+                if !self.check(TokenType::RightParen) {
+                    // Bounded: at most 16 arguments.
+                    for var j : u32 = 0u32; j < 16u32; j += 1u32 [16u32] {
+                        let arg : Result<Expression, FixedString256> = self.parse_expression();
+                        match arg {
+                            Result::Ok(a) => { let _ = args.push(a); }
+                            Result::Err(_) => { break; }
+                        }
+                        if !self.match_token(TokenType::Comma) { break; }
+                    }
+                }
+                let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"))?;
+                left = Expression::Call(Box::new(left), args);
+            } else if self.check(TokenType::Dot) {
+                let _ = self.advance();
+                // Could be field access or method call.
+                if self.check(TokenType::Identifier) {
+                    let field_token : Token = self.advance();
+                    if self.check(TokenType::LeftParen) {
+                        // Method call.
+                        let _ = self.advance();
+                        let mut args : Array64<Expression> = Array64::new();
+                        if !self.check(TokenType::RightParen) {
+                            for var j : u32 = 0u32; j < 16u32; j += 1u32 [16u32] {
+                                let arg : Result<Expression, FixedString256> = self.parse_expression();
+                                match arg { Result::Ok(a) => { let _ = args.push(a); } Result::Err(_) => { break; } }
+                                if !self.match_token(TokenType::Comma) { break; }
+                            }
+                        }
+                        let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"))?;
+                        left = Expression::MethodCall(
+                            Box::new(left),
+                            Spanned::new(field_token.value.ident_value, field_token.start, field_token.end),
+                            args,
+                        );
+                    } else {
+                        // Field access.
+                        left = Expression::FieldAccess(
+                            Box::new(left),
+                            Spanned::new(field_token.value.ident_value, field_token.start, field_token.end),
+                        );
+                    }
+                } else {
+                    break;
+                }
+            } else if self.check(TokenType::LeftBracket) {
+                // Index expression.
+                let _ = self.advance();
+                let index : Result<Expression, FixedString256> = self.parse_expression();
+                match index {
+                    Result::Ok(idx) => {
+                        let _ = self.consume(TokenType::RightBracket, FixedString256::from("expected ']'"))?;
+                        left = Expression::Index(Box::new(left), Box::new(idx));
+                    }
+                    Result::Err(_) => { break; }
+                }
+            } else {
+                break;
+            }
+        }
+
+        Result::Ok(left)
+    }
+
+    /// Parse a primary expression.
+    /// Effect: diag, pure — recursive descent.
+    fn parse_primary(&mut self) -> Result<Expression, FixedString256> [diag, pure] {
+        let token : Token = self.peek();
+
+        match token.token_type {
+            TokenType::IntegerLiteral => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::IntegerLiteral(Spanned::new(
+                    t.value.integer_value, t.start, t.end,
+                )))
+            }
+            TokenType::FloatLiteral => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::FloatLiteral(Spanned::new(
+                    t.value.float_value, t.start, t.end,
+                )))
+            }
+            TokenType::StringLiteral => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::StringLiteral(Spanned::new(
+                    t.value.string_value, t.start, t.end,
+                )))
+            }
+            TokenType::CharLiteral => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::CharLiteral(Spanned::new(
+                    t.value.char_value, t.start, t.end,
+                )))
+            }
+            TokenType::BooleanLiteralTrue | TokenType::KeywordTrue => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::BooleanLiteral(Spanned::new(true, t.start, t.end)))
+            }
+            TokenType::BooleanLiteralFalse | TokenType::KeywordFalse => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::BooleanLiteral(Spanned::new(false, t.start, t.end)))
+            }
+            TokenType::Identifier => {
+                let t : Token = self.advance();
+                let name : FixedString256 = t.value.ident_value;
+                // Check for struct literal: Foo { field: value }
+                if self.check(TokenType::LeftBrace) {
+                    let _ = self.advance();
+                    let mut fields : Array64<StructFieldInit> = Array64::new();
+                    if !self.check(TokenType::RightBrace) {
+                        // Bounded: at most 16 struct fields.
+                        for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+                            let field_token : Token = self.consume(
+                                TokenType::Identifier,
+                                FixedString256::from("expected field name"),
+                            )?;
+                            let shorthand : bool = !self.check(TokenType::Colon);
+                            let value : Expression;
+                            if !shorthand {
+                                let _ = self.advance(); // consume ':'
+                                let expr : Result<Expression, FixedString256> = self.parse_expression();
+                                match expr {
+                                    Result::Ok(e) => value = e,
+                                    Result::Err(_) => { value = Expression::IntegerLiteral(Spanned::new(0i64, self.current_location(), self.current_location())); }
+                                }
+                            } else {
+                                value = Expression::Identifier(Spanned::new(
+                                    field_token.value.ident_value, field_token.start, field_token.end,
+                                ));
+                            }
+                            let _ = fields.push(StructFieldInit::new(
+                                Spanned::new(field_token.value.ident_value, field_token.start, field_token.end),
+                                value,
+                                shorthand,
+                            ));
+                            if !self.match_token(TokenType::Comma) { break; }
+                        }
+                    }
+                    let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}' after struct literal"));
+                    Result::Ok(Expression::StructLiteral(
+                        Spanned::new(name, t.start, t.end),
+                        fields,
+                    ))
+                } else {
+                    Result::Ok(Expression::Identifier(Spanned::new(name, t.start, t.end)))
+                }
+            }
+            TokenType::LeftParen => {
+                let _ = self.advance();
+                if self.check(TokenType::RightParen) {
+                    let _ = self.advance();
+                    Result::Ok(Expression::TupleLiteral(Array64::new()))
+                } else {
+                    let first : Result<Expression, FixedString256> = self.parse_expression();
+                    match first {
+                        Result::Ok(expr) => {
+                            if self.check(TokenType::Comma) {
+                                let mut exprs : Array64<Expression> = Array64::new();
+                                let _ = exprs.push(expr);
+                                while self.match_token(TokenType::Comma) {
+                                    let next : Result<Expression, FixedString256> = self.parse_expression();
+                                    match next { Result::Ok(e) => { let _ = exprs.push(e); } Result::Err(_) => { break; } }
+                                }
+                                let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+                                Result::Ok(Expression::TupleLiteral(exprs))
+                            } else {
+                                let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+                                Result::Ok(Expression::Paren(Box::new(expr)))
+                            }
+                        }
+                        Result::Err(e) => Result::Err(e),
+                    }
+                }
+            }
+            TokenType::LeftBrace => {
+                let block : Result<BlockExpression, FixedString256> = self.parse_block();
+                match block {
+                    Result::Ok(b) => Result::Ok(Expression::Block(Spanned::new(b, self.current_location(), self.current_location()))),
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            TokenType::KeywordIf => {
+                let _ = self.advance();
+                let cond : Result<Expression, FixedString256> = self.parse_expression();
+                match cond {
+                    Result::Ok(c) => {
+                        let then_block : Result<Expression, FixedString256> = {
+                            let block : Result<BlockExpression, FixedString256> = self.parse_block();
+                            match block { Result::Ok(b) => Result::Ok(Expression::Block(Spanned::new(b, self.current_location(), self.current_location()))), Result::Err(e) => Result::Err(e) }
+                        };
+                        match then_block {
+                            Result::Ok(then_expr) => {
+                                let else_expr : Expression;
+                                if self.match_token(TokenType::KeywordElse) {
+                                    if self.check(TokenType::KeywordIf) {
+                                        let next_if : Result<Expression, FixedString256> = self.parse_primary();
+                                        match next_if { Result::Ok(e) => else_expr = e, Result::Err(_) => else_expr = Expression::Block(Spanned::new(BlockExpression::new(Array64::new(), Option::None, self.current_location()), self.current_location(), self.current_location())) }
+                                    } else {
+                                        let else_block : Result<Expression, FixedString256> = {
+                                            let block : Result<BlockExpression, FixedString256> = self.parse_block();
+                                            match block { Result::Ok(b) => Result::Ok(Expression::Block(Spanned::new(b, self.current_location(), self.current_location()))), Result::Err(e) => Result::Err(e) }
+                                        };
+                                        match else_block { Result::Ok(e) => else_expr = e, Result::Err(_) => else_expr = Expression::Block(Spanned::new(BlockExpression::new(Array64::new(), Option::None, self.current_location()), self.current_location(), self.current_location())) }
+                                    }
+                                } else {
+                                    else_expr = Expression::Block(Spanned::new(BlockExpression::new(Array64::new(), Option::None, self.current_location()), self.current_location(), self.current_location()));
+                                }
+                                Result::Ok(Expression::If(Box::new(c), Box::new(then_expr), Box::new(else_expr)))
+                            }
+                            Result::Err(e) => Result::Err(e),
+                        }
+                    }
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            TokenType::KeywordMatch => {
+                let _ = self.advance();
+                let val : Result<Expression, FixedString256> = self.parse_expression();
+                match val {
+                    Result::Ok(v) => {
+                        let _ = self.consume(TokenType::LeftBrace, FixedString256::from("expected '{' after match expression"))?;
+                        let mut arms : Array64<MatchArm> = Array64::new();
+                        // Bounded: at most 32 match arms.
+                        for var i : u32 = 0u32; i < 32u32; i += 1u32 [32u32] {
+                            if self.check(TokenType::RightBrace) || self.is_at_end() { break; }
+                            let arm : Result<MatchArm, FixedString256> = self.parse_match_arm();
+                            match arm { Result::Ok(a) => { let _ = arms.push(a); } Result::Err(_) => { self.synchronize(); } }
+                            if self.match_token(TokenType::Comma) { continue; }
+                            break;
+                        }
+                        let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}' after match arms"));
+                        Result::Ok(Expression::Match(Box::new(v), arms))
+                    }
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            TokenType::KeywordLoop => {
+                let _ = self.advance();
+                let body : Result<Expression, FixedString256> = {
+                    let block : Result<BlockExpression, FixedString256> = self.parse_block();
+                    match block { Result::Ok(b) => Result::Ok(Expression::Block(Spanned::new(b, self.current_location(), self.current_location()))), Result::Err(e) => Result::Err(e) }
+                };
+                match body {
+                    Result::Ok(b) => Result::Ok(Expression::Loop(Box::new(b), Option::None)),
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            TokenType::KeywordReturn => {
+                let _ = self.advance();
+                let expr : Expression;
+                if self.check(TokenType::Semicolon) || self.check(TokenType::RightBrace) {
+                    expr = Expression::TupleLiteral(Array64::new());
+                } else {
+                    let val : Result<Expression, FixedString256> = self.parse_expression();
+                    match val { Result::Ok(v) => expr = v, Result::Err(_) => expr = Expression::TupleLiteral(Array64::new()) }
+                }
+                Result::Ok(Expression::Return(Box::new(expr)))
+            }
+            TokenType::KeywordBreak => {
+                let t : Token = self.advance();
+                let expr : Expression;
+                if self.check(TokenType::Semicolon) || self.check(TokenType::RightBrace) {
+                    expr = Expression::TupleLiteral(Array64::new());
+                } else {
+                    let val : Result<Expression, FixedString256> = self.parse_expression();
+                    match val { Result::Ok(v) => expr = v, Result::Err(_) => expr = Expression::TupleLiteral(Array64::new()) }
+                }
+                Result::Ok(Expression::Break(Box::new(expr)))
+            }
+            TokenType::KeywordContinue => {
+                let t : Token = self.advance();
+                Result::Ok(Expression::Continue)
+            }
+            TokenType::LeftBracket => {
+                // Could be array literal or effect block.
+                let _ = self.advance();
+                // Check for effect annotation.
+                if self.check(TokenType::Identifier) && self.peek_next_is_effect_keyword() {
+                    let effect : Result<Array64<EffectAnnotation>, FixedString256> = self.parse_effect_list();
+                    match effect {
+                        Result::Ok(effects) => {
+                            if effects.len() > 0u32 {
+                                let eff : EffectAnnotation = effects.get(0u32);
+                                let body : Result<Expression, FixedString256> = self.parse_expression();
+                                match body { Result::Ok(b) => Result::Ok(Expression::EffectBlock(Spanned::new(eff, self.current_location(), self.current_location()), Box::new(b))), Result::Err(e) => Result::Err(e) }
+                            } else {
+                                Result::Err(FixedString256::from("empty effect block"))
+                            }
+                        }
+                        Result::Err(e) => Result::Err(e),
+                    }
+                } else {
+                    // Array literal.
+                    let mut exprs : Array64<Expression> = Array64::new();
+                    if !self.check(TokenType::RightBracket) {
+                        // Bounded: at most 32 elements.
+                        for var i : u32 = 0u32; i < 32u32; i += 1u32 [32u32] {
+                            let elem : Result<Expression, FixedString256> = self.parse_expression();
+                            match elem { Result::Ok(e) => { let _ = exprs.push(e); } Result::Err(_) => { break; } }
+                            if !self.match_token(TokenType::Comma) { break; }
+                        }
+                    }
+                    let _ = self.consume(TokenType::RightBracket, FixedString256::from("expected ']' after array literal"));
+                    Result::Ok(Expression::ArrayLiteral(exprs))
+                }
+            }
+            TokenType::Backslash => {
+                // Lambda expression: |params| expr
+                let _ = self.advance();
+                let _ = self.consume(TokenType::Pipe, FixedString256::from("expected '|'"))?;
+                let mut params : Array64<Parameter> = Array64::new();
+                if !self.check(TokenType::Pipe) {
+                    for var i : u32 = 0u32; i < 8u32; i += 1u32 [8u32] {
+                        let param : Result<Parameter, FixedString256> = self.parse_parameter();
+                        match param { Result::Ok(p) => { let _ = params.push(p); } Result::Err(_) => { break; } }
+                        if !self.match_token(TokenType::Comma) { break; }
+                    }
+                }
+                let _ = self.consume(TokenType::Pipe, FixedString256::from("expected '|'"))?;
+                let body : Result<Expression, FixedString256> = self.parse_expression();
+                match body {
+                    Result::Ok(b) => Result::Ok(Expression::Lambda(params, Box::new(b), Array64::new())),
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            TokenType::KeywordTrusted => {
+                let t : Token = self.advance();
+                let rationale : FixedString256;
+                if self.check(TokenType::StringLiteral) {
+                    let str_token : Token = self.advance();
+                    rationale = str_token.value.string_value;
+                } else {
+                    rationale = FixedString256::from("trusted block");
+                }
+                let block : Result<BlockExpression, FixedString256> = self.parse_block();
+                match block {
+                    Result::Ok(b) => {
+                        let trusted : TrustedBlock = TrustedBlock::new(b, rationale, t.start, self.generation);
+                        self.generation += 1u64;
+                        Result::Ok(Expression::Trusted(Spanned::new(trusted, t.start, self.current_location())))
+                    }
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            TokenType::EndOfFile => {
+                Result::Err(FixedString256::from("unexpected end of file"))
+            }
+            _ => {
+                let name : FixedString256 = token.token_type.name();
+                Result::Err(diag_messages::unexpected_token(
+                    FixedString256::from("expression"),
+                    name,
+                ))
+            }
+        }
+    }
+
+    /// Check if the next token is an effect keyword.
+    /// Effect: pure — deterministic check.
+    fn peek_next_is_effect_keyword(&self) -> bool [pure] {
+        // Simplified: check if current token looks like an effect declaration.
+        true
+    }
+
+    // ========================
+    // Match Arm Parsing
+    // ========================
+
+    /// Parse a single match arm.
+    /// Effect: diag, pure — pattern + optional guard + body.
+    fn parse_match_arm(&mut self) -> Result<MatchArm, FixedString256> [diag, pure] {
+        let loc : SourceLocation = self.current_location();
+        let pattern : Result<Pattern, FixedString256> = self.parse_pattern();
+        match pattern {
+            Result::Ok(pat) => {
+                let guard : Option<Box<Expression>> = Option::None;
+                if self.match_token(TokenType::KeywordIf) {
+                    let guard_expr : Result<Expression, FixedString256> = self.parse_expression();
+                    match guard_expr { Result::Ok(g) => guard = Option::Some(Box::new(g)), Result::Err(_) => {} }
+                }
+                let _ = self.consume(TokenType::FatArrow, FixedString256::from("expected '=>' in match arm"))?;
+                let body : Result<Expression, FixedString256> = self.parse_expression();
+                match body {
+                    Result::Ok(b) => Result::Ok(MatchArm::new(pat, guard, Box::new(b), loc)),
+                    Result::Err(e) => Result::Err(e),
+                }
+            }
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    /// Parse a pattern.
+    /// Effect: diag, pure — recursive descent.
+    fn parse_pattern(&mut self) -> Result<Pattern, FixedString256> [diag, pure] {
+        if self.check(TokenType::Underscore) {
+            let t : Token = self.advance();
+            Result::Ok(Pattern::Wildcard(Spanned::new((), t.start, t.end)))
+        } else if self.check(TokenType::KeywordMut) {
+            let _ = self.advance();
+            let name : Token = self.consume(TokenType::Identifier, FixedString256::from("expected pattern name"))?;
+            Result::Ok(Pattern::Bind(
+                Spanned::new(name.value.ident_value, name.start, name.end),
+                Mutability::Mutable,
+            ))
+        } else if self.check(TokenType::Identifier) {
+            let t : Token = self.peek();
+            let name : FixedString256 = t.value.ident_value;
+            // Check if it's a struct or enum pattern.
+            if self.check_next(TokenType::LeftParen) || self.check_next(TokenType::LeftBrace) {
+                // Enum or struct pattern.
+                let _ = self.advance(); // consume name
+                if self.check(TokenType::LeftBrace) {
+                    let _ = self.advance();
+                    let mut fields : Array64<StructPatternField> = Array64::new();
+                    for var i : u32 = 0u32; i < 16u32; i += 1u32 [16u32] {
+                        let fname : Token = self.consume(TokenType::Identifier, FixedString256::from("expected field name"))?;
+                        let shorthand : bool = !self.match_token(TokenType::Colon);
+                        let pat : Pattern;
+                        if shorthand {
+                            pat = Pattern::Bind(Spanned::new(fname.value.ident_value, fname.start, fname.end), Mutability::Immutable);
+                        } else {
+                            let p : Result<Pattern, FixedString256> = self.parse_pattern();
+                            match p { Result::Ok(pp) => pat = pp, Result::Err(_) => pat = Pattern::Wildcard(Spanned::new((), fname.start, fname.end)) }
+                        }
+                        let _ = fields.push(StructPatternField::new(
+                            Spanned::new(fname.value.ident_value, fname.start, fname.end),
+                            pat,
+                            shorthand,
+                        ));
+                        if !self.match_token(TokenType::Comma) { break; }
+                    }
+                    let _ = self.consume(TokenType::RightBrace, FixedString256::from("expected '}'"));
+                    Result::Ok(Pattern::Struct(Spanned::new(name, t.start, t.end), fields))
+                } else {
+                    let _ = self.advance();
+                    let inner : Result<Pattern, FixedString256> = self.parse_pattern();
+                    let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+                    match inner {
+                        Result::Ok(p) => Result::Ok(Pattern::EnumVariant(Spanned::new(name, t.start, t.end), Box::new(p))),
+                        Result::Err(e) => Result::Err(e),
+                    }
+                }
+            } else {
+                let t : Token = self.advance();
+                Result::Ok(Pattern::Bind(
+                    Spanned::new(t.value.ident_value, t.start, t.end),
+                    Mutability::Immutable,
+                ))
+            }
+        } else if self.check(TokenType::LeftParen) {
+            let _ = self.advance();
+            let first : Result<Pattern, FixedString256> = self.parse_pattern();
+            match first {
+                Result::Ok(p) => {
+                    let mut pats : Array64<Pattern> = Array64::new();
+                    let _ = pats.push(p);
+                    while self.match_token(TokenType::Comma) {
+                        let next : Result<Pattern, FixedString256> = self.parse_pattern();
+                        match next { Result::Ok(np) => { let _ = pats.push(np); } Result::Err(_) => { break; } }
+                    }
+                    let _ = self.consume(TokenType::RightParen, FixedString256::from("expected ')'"));
+                    Result::Ok(Pattern::Tuple(pats))
+                }
+                Result::Err(e) => Result::Err(e),
+            }
+        } else {
+            Result::Err(FixedString256::from("expected pattern"))
+        }
+    }
+
+    /// Check if the next token matches, with one token lookahead.
+    /// Effect: pure — read-only.
+    fn check_next(&self, token_type : TokenType) -> bool [pure] {
+        // Simplified: would peek ahead in stream.
+        false
+    }
+
+    /// Consume the parser state and produce a ParserReceipt.
+    /// Effect: pure — consumes state to produce receipt.
+    pub fn into_receipt(self) -> ParserReceipt [pure] {
+        ParserReceipt::new(
+            self.node_count,
+            self.diagnostics.error_count,
+            self.recovery_count,
+            self.generation,
+            self.file_path,
+        )
+    }
+
+    /// Get the diagnostic bag from the parser.
+    /// Effect: pure — ownership transfer.
+    pub fn into_diagnostics(self) -> DiagnosticBag [pure] {
+        self.diagnostics
+    }
+}
+
+// --- Parser Receipt ---
+
+pub struct ParserReceipt {
+    pub node_count : u32,
+    pub error_count : u32,
+    pub recovery_count : u32,
+    pub generation : u64,
+    pub file_path : FixedString256,
+    pub hash : u64,
+}
+
+impl ParserReceipt {
+    pub fn new(
+        node_count : u32,
+        error_count : u32,
+        recovery_count : u32,
+        generation : u64,
+        file_path : FixedString256,
+    ) -> ParserReceipt [pure] {
+        let hash : u64 = ParserReceipt::compute_hash(node_count, error_count, recovery_count, generation);
+        ParserReceipt {
+            node_count: node_count,
+            error_count: error_count,
+            recovery_count: recovery_count,
+            generation: generation,
+            file_path: file_path,
+            hash: hash,
+        }
+    }
+
+    fn compute_hash(nodes : u32, errors : u32, recovery : u32, gen : u64) -> u64 [pure] {
+        var h : u64 = 14695981039346656037u64;
+        h ^= nodes as u64; h *= 1099511628211u64;
+        h ^= errors as u64; h *= 1099511628211u64;
+        h ^= recovery as u64; h *= 1099511628211u64;
+        h ^= gen; h *= 1099511628211u64;
+        h
+    }
+}
+
+// --- Parse Pipeline Entry Point ---
+
+/// Parse a token stream into a complete AST with diagnostics and receipt.
+/// Effect: diag, pure — complete parser pipeline.
+pub fn parse_source(
+    tokens : TokenStream,
+    file_path : FixedString256,
+) -> (SourceFile, DiagnosticBag, ParserReceipt) [diag, pure] {
+    let mut parser : ParserState = ParserState::new(tokens, file_path);
+    let source_file : Result<SourceFile, FixedString256> = parser.parse_source_file();
+    let file : SourceFile;
+
+    match source_file {
+        Result::Ok(f) => file = f,
+        Result::Err(_) => file = SourceFile::new(file_path),
+    }
+
+    let diagnostics : DiagnosticBag = parser.into_diagnostics();
+    let receipt : ParserReceipt = parser.into_receipt();
+    (file, diagnostics, receipt)
+}

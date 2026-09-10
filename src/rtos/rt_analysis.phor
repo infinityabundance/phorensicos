@@ -1,0 +1,1252 @@
+// file: rt_analysis.phor
+// purpose: Real-time analysis engine for worst-case execution time (WCET)
+//          estimation, response time analysis, schedulability testing,
+//          utilization bound computation, and feasibility analysis.
+//          All analysis is fully deterministic and court-verifiable.
+// evidence: RTANALYSIS-ARCH-001 through RTANALYSIS-ARCH-240
+// residual: Every analysis result is recorded for forensic traceability.
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::effects::*
+use core::collections::*
+use core::math::*
+use core::traits::*
+
+// ──────────────────────────────────────────────
+// Analysis Diagnostic Ranges
+// ──────────────────────────────────────────────
+const DIAG_RT_ANALYSIS_BASE : Word64 = DIAG_RTOS_BASE | 0x0500
+
+const ANALYSIS_MAX_TASKS          : u32 = 64
+const ANALYSIS_MAX_PRECISION      : u32 = 32
+const ANALYSIS_RTA_ITERATIONS     : u32 = 256
+const ANALYSIS_WCET_SAMPLES       : u32 = 1024
+const ANALYSIS_FEASIBILITY_DEPTH  : u32 = 64
+const ANALYSIS_RESIDUAL_LOG       : u32 = 64
+const ANALYSIS_BOUND_SMALL        : u32 = 32
+const ANALYSIS_HYPERPERIOD_CAP    : u32 = 128
+
+// ──────────────────────────────────────────────
+// Analysis Error Types
+// ──────────────────────────────────────────────
+pub type AnalysisError : struct {
+    code: Word64,
+    msg: FixedString[128],
+}
+
+impl AnalysisError {
+    pub fn new(c: Word64, m: FixedString[128]) -> AnalysisError
+        effects: [deterministic]
+    {
+        AnalysisError { code: c, msg: m }
+    }
+
+    pub fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+
+    pub fn msg(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+}
+
+pub fn analysis_task_table_full() -> AnalysisError
+    effects: [deterministic]
+{
+    AnalysisError::new(Word64::from_u64(DIAG_RT_ANALYSIS_BASE | 0x001),
+        FixedString[128]::from_slice("Task table capacity exceeded"))
+}
+
+pub fn analysis_invalid_params(msg: FixedString[128]) -> AnalysisError
+    effects: [deterministic]
+{
+    AnalysisError::new(Word64::from_u64(DIAG_RT_ANALYSIS_BASE | 0x002), msg)
+}
+
+pub fn analysis_unschedulable() -> AnalysisError
+    effects: [deterministic]
+{
+    AnalysisError::new(Word64::from_u64(DIAG_RT_ANALYSIS_BASE | 0x003),
+        FixedString[128]::from_slice("Task set is unschedulable"))
+}
+
+pub fn analysis_inconclusive() -> AnalysisError
+    effects: [deterministic]
+{
+    AnalysisError::new(Word64::from_u64(DIAG_RT_ANALYSIS_BASE | 0x004),
+        FixedString[128]::from_slice("Analysis result is inconclusive"))
+}
+
+// ──────────────────────────────────────────────
+// Analysis Task Model
+// ──────────────────────────────────────────────
+pub type AnalysisTask : struct {
+    id: u8,
+    name: FixedString[32],
+    period: Word64,
+    deadline: Word64,
+    wcet: Word64,
+    bcet: Word64,
+    priority: u8,
+    phase: Word64,
+    jitter: Word64,
+    blocking_time: Word64,
+    preemption_cost: Word64,
+    cache_impact: Word64,
+    is_periodic: bool,
+    is_critical: bool,
+}
+
+impl AnalysisTask {
+    pub fn new(tid: u8, period_us: Word64, deadline_us: Word64, wcet_us: Word64) -> AnalysisTask
+        effects: [deterministic]
+    {
+        AnalysisTask {
+            id: tid,
+            name: FixedString::new(),
+            period: period_us,
+            deadline: deadline_us,
+            wcet: wcet_us,
+            bcet: wcet_us,
+            priority: 0,
+            phase: Word64::zero(),
+            jitter: Word64::zero(),
+            blocking_time: Word64::zero(),
+            preemption_cost: Word64::zero(),
+            cache_impact: Word64::zero(),
+            is_periodic: true,
+            is_critical: false,
+        }
+    }
+
+    pub fn with_name(tid: u8, period_us: Word64, deadline_us: Word64, wcet_us: Word64, tname: FixedString[32]) -> AnalysisTask
+        effects: [deterministic]
+    {
+        let mut task: AnalysisTask = AnalysisTask::new(tid, period_us, deadline_us, wcet_us)
+        task.name = tname
+        task
+    }
+
+    pub fn utilization(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.period.is_zero() {
+            return Word64::zero()
+        }
+        // Return utilization in millipercent (1000 = 100%)
+        self.wcet.mul(Word64::from_u64(1000)).div(self.deadline)
+    }
+
+    pub fn density(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.period.is_zero() {
+            return Word64::zero()
+        }
+        self.wcet.mul(Word64::from_u64(1000)).div(self.period)
+    }
+
+    pub fn slack(self) -> Word64
+        effects: [deterministic]
+    {
+        if self.deadline.gt(self.wcet) {
+            self.deadline.sub(self.wcet)
+        } else {
+            Word64::zero()
+        }
+    }
+
+    pub fn set_bcet(self: ref mut, bcet_val: Word64)
+        effects: [deterministic]
+    {
+        self.bcet = bcet_val
+    }
+
+    pub fn set_jitter(self: ref mut, jitter_val: Word64)
+        effects: [deterministic]
+    {
+        self.jitter = jitter_val
+    }
+
+    pub fn set_blocking(self: ref mut, block_val: Word64)
+        effects: [deterministic]
+    {
+        self.blocking_time = block_val
+    }
+
+    pub fn set_critical(self: ref mut)
+        effects: [deterministic]
+    {
+        self.is_critical = true
+    }
+
+    pub fn set_priority(self: ref mut, prio: u8)
+        effects: [deterministic]
+    {
+        self.priority = prio
+    }
+}
+
+// ──────────────────────────────────────────────
+// WCET Estimation
+// ──────────────────────────────────────────────
+pub type WcetEstimate : struct {
+    task_id: u8,
+    min_observed: Word64,
+    max_observed: Word64,
+    mean_exec: Word64,
+    median_exec: Word64,
+    std_dev: Word64,
+    sample_count: u32,
+    confidence_level: Word64,
+    wcet_estimate: Word64,
+    bcet_estimate: Word64,
+    variant: Word64,
+    p99_value: Word64,
+    p95_value: Word64,
+}
+
+impl WcetEstimate {
+    pub fn new(tid: u8) -> WcetEstimate
+        effects: [deterministic]
+    {
+        WcetEstimate {
+            task_id: tid,
+            min_observed: Word64::max_value(),
+            max_observed: Word64::zero(),
+            mean_exec: Word64::zero(),
+            median_exec: Word64::zero(),
+            std_dev: Word64::zero(),
+            sample_count: 0,
+            confidence_level: Word64::zero(),
+            wcet_estimate: Word64::zero(),
+            bcet_estimate: Word64::max_value(),
+            variant: Word64::zero(),
+            p99_value: Word64::zero(),
+            p95_value: Word64::zero(),
+        }
+    }
+
+    pub fn add_sample(self: ref mut, exec_time: Word64)
+        effects: [deterministic]
+    {
+        if exec_time.gt(self.max_observed) {
+            self.max_observed = exec_time
+        }
+        if exec_time.lt(self.min_observed) {
+            self.min_observed = exec_time
+        }
+        if exec_time.lt(self.bcet_estimate) {
+            self.bcet_estimate = exec_time
+        }
+
+        let old_mean: Word64 = self.mean_exec
+        let n: Word64 = Word64::from_u64(self.sample_count as u64)
+        self.mean_exec = old_mean.mul(n).add(exec_time).div(n.increment_or_max())
+        self.sample_count = self.sample_count + 1
+
+        // Update running variance approximation
+        let diff: Word64 = exec_time.sub(old_mean)
+        self.variant = self.variant.add(
+            diff.mul(diff).div(Word64::from_u64(self.sample_count as u64)))
+    }
+
+    pub fn finalize(self: ref mut) -> Word64
+        effects: [deterministic]
+    {
+        // Compute WCET with statistical margin
+        let margin: Word64 = self.variant.div(Word64::from_u64(100)).mul(Word64::from_u64(200))
+        self.wcet_estimate = self.max_observed.add(margin)
+        self.bcet_estimate = self.min_observed
+
+        // Compute confidence level (0-1000 scale)
+        if self.sample_count > 30 {
+            self.confidence_level = Word64::from_u64(950)
+        } else if self.sample_count > 10 {
+            self.confidence_level = Word64::from_u64(800)
+        } else if self.sample_count > 3 {
+            self.confidence_level = Word64::from_u64(500)
+        } else {
+            self.confidence_level = Word64::from_u64(100)
+        }
+
+        self.std_dev = self.variant.sqrt()
+
+        // P95 and P99 estimates based on normal approximation
+        let std_u64: u64 = self.std_dev.to_u64()
+        let mean_u64: u64 = self.mean_exec.to_u64()
+        self.p95_value = Word64::from_u64(mean_u64 + std_u64 * 2)
+        self.p99_value = Word64::from_u64(mean_u64 + std_u64 * 3)
+
+        self.wcet_estimate
+    }
+
+    pub fn confidence(self) -> u8
+        effects: [deterministic]
+    {
+        let conf: u64 = self.confidence_level.to_u64()
+        if conf > 900 { 3 }
+        else if conf > 700 { 2 }
+        else if conf > 300 { 1 }
+        else { 0 }
+    }
+
+    pub fn is_reliable(self) -> bool
+        effects: [deterministic]
+    {
+        self.sample_count >= 10
+    }
+}
+
+// ──────────────────────────────────────────────
+// Response Time Analysis (RTA) Calculator
+// ──────────────────────────────────────────────
+pub type ResponseTimeAnalysis : struct {
+    tasks: FixedArray[AnalysisTask, ANALYSIS_MAX_TASKS],
+    task_count: u32,
+    response_times: FixedArray[Word64, ANALYSIS_MAX_TASKS],
+    iterations: FixedArray[u32, ANALYSIS_MAX_TASKS],
+    converged: FixedArray[bool, ANALYSIS_MAX_TASKS],
+    total_iterations: u32,
+    analysis_complete: bool,
+    is_schedulable: bool,
+    critical_instant: Word64,
+    max_response_time: Word64,
+    worst_case_interference: Word64,
+}
+
+impl ResponseTimeAnalysis {
+    pub fn new() -> ResponseTimeAnalysis
+        effects: [deterministic]
+    {
+        ResponseTimeAnalysis {
+            tasks: FixedArray::new(),
+            task_count: 0,
+            response_times: FixedArray::new(),
+            iterations: FixedArray::new(),
+            converged: FixedArray::new(),
+            total_iterations: 0,
+            analysis_complete: false,
+            is_schedulable: false,
+            critical_instant: Word64::zero(),
+            max_response_time: Word64::zero(),
+            worst_case_interference: Word64::zero(),
+        }
+    }
+
+    pub fn add_task(self: ref mut, task: AnalysisTask) -> Result<(), AnalysisError>
+        effects: [deterministic]
+    {
+        if self.task_count >= ANALYSIS_MAX_TASKS {
+            return Result::Err(analysis_task_table_full())
+        }
+        let r: Result<(), BoundsError> = self.tasks.set(self.task_count, task)
+        if r.is_ok() {
+            self.task_count = self.task_count + 1
+        }
+        Result::Ok(())
+    }
+
+    pub fn sort_by_priority(self: ref mut)
+        effects: [deterministic]
+    {
+        // Simple insertion sort by priority (ascending = higher priority first)
+        for i in 1..self.task_count {
+            let key: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            let mut j: u32 = i
+            while j > 0 proven {
+                let prev: AnalysisTask = match self.tasks.get(j - 1) {
+                    Result::Ok(t) => t,
+                    Result::Err(_) => AnalysisTask::new(0, Word64::zero(), Word64::zero(), Word64::zero()),
+                }
+                if key.priority < prev.priority {
+                    let r: Result<(), BoundsError> = self.tasks.set(j, prev)
+                    j = j - 1
+                } else {
+                    break
+                }
+            }
+            let r: Result<(), BoundsError> = self.tasks.set(j, key)
+        }
+    }
+
+    pub fn sort_by_period(self: ref mut)
+        effects: [deterministic]
+    {
+        // Sort by period ascending (for rate-monotonic ordering)
+        for i in 1..self.task_count {
+            let key: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            let mut j: u32 = i
+            while j > 0 proven {
+                let prev: AnalysisTask = match self.tasks.get(j - 1) {
+                    Result::Ok(t) => t,
+                    Result::Err(_) => AnalysisTask::new(0, Word64::zero(), Word64::zero(), Word64::zero()),
+                }
+                if key.period.lt(prev.period) {
+                    let r: Result<(), BoundsError> = self.tasks.set(j, prev)
+                    j = j - 1
+                } else {
+                    break
+                }
+            }
+            let r: Result<(), BoundsError> = self.tasks.set(j, key)
+        }
+    }
+
+    pub fn compute_response_times(self: ref mut) -> Result<bool, AnalysisError>
+        effects: [deterministic]
+    {
+        self.total_iterations = 0
+        self.max_response_time = Word64::zero()
+        self.is_schedulable = true
+
+        for i in 0..self.task_count {
+            let task: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+
+            // Initial response time = WCET
+            let mut r_prev: Word64 = task.wcet
+            let mut r_curr: Word64 = task.wcet
+            let mut iter: u32 = 0
+            let mut has_converged: bool = false
+
+            while iter < ANALYSIS_RTA_ITERATIONS proven {
+                // Compute interference from higher-priority tasks
+                let mut interference: Word64 = Word64::zero()
+                for j in 0..i {
+                    let higher: AnalysisTask = match self.tasks.get(j) {
+                        Result::Ok(t) => t,
+                        Result::Err(_) => continue,
+                    }
+                    if higher.priority < task.priority {
+                        let releases: Word64 = (r_prev.add(higher.period).sub(Word64::from_u64(1))).div(higher.period)
+                        interference = interference.add(higher.wcet.mul(releases))
+                    }
+                }
+
+                r_curr = task.wcet.add(interference).add(task.blocking_time)
+                iter = iter + 1
+
+                if r_curr.eq(r_prev) {
+                    has_converged = true
+                    break
+                }
+                r_prev = r_curr
+
+                // Check deadline miss
+                if r_curr.gt(task.deadline) {
+                    break
+                }
+            }
+
+            let r_idx: u32 = i
+            let _ = self.response_times.set(r_idx, r_curr)
+            let _ = self.iterations.set(r_idx, iter)
+            let _ = self.converged.set(r_idx, has_converged)
+            self.total_iterations = self.total_iterations + iter
+
+            if r_curr.gt(self.max_response_time) {
+                self.max_response_time = r_curr
+            }
+
+            // Check schedulability
+            if r_curr.gt(task.deadline) || !has_converged {
+                self.is_schedulable = false
+            }
+        }
+
+        self.analysis_complete = true
+        Result::Ok(self.is_schedulable)
+    }
+
+    pub fn get_response_time(self, task_index: u32) -> Result[Word64, AnalysisError>
+        effects: [deterministic]
+    {
+        if task_index >= self.task_count {
+            return Result::Err(analysis_invalid_params(FixedString[128]::from_slice("Task index out of range")))
+        }
+        self.response_times.get(task_index)
+    }
+
+    pub fn is_schedulable_result(self) -> bool
+        effects: [deterministic]
+    {
+        self.is_schedulable && self.analysis_complete
+    }
+
+    pub fn worst_case_response(self) -> Word64
+        effects: [deterministic]
+    {
+        self.max_response_time
+    }
+
+    pub fn total_interference(self) -> Word64
+        effects: [deterministic]
+    {
+        let mut total: Word64 = Word64::zero()
+        for i in 0..self.task_count {
+            let rt: Word64 = match self.response_times.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::zero(),
+            }
+            let task: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            let interference: Word64 = rt.sub(task.wcet)
+            if interference.gt(Word64::zero()) {
+                total = total.add(interference)
+            }
+        }
+        total
+    }
+}
+
+// ──────────────────────────────────────────────
+// Utilization Bound Analysis
+// ──────────────────────────────────────────────
+pub type UtilizationBound : struct {
+    task_count: u32,
+    total_utilization: Word64,
+    bound_value: Word64,
+    bound_type: u8,
+    exceeds_bound: bool,
+    margin: Word64,
+    critical_task: u8,
+}
+
+impl UtilizationBound {
+    pub fn new() -> UtilizationBound
+        effects: [deterministic]
+    {
+        UtilizationBound {
+            task_count: 0,
+            total_utilization: Word64::zero(),
+            bound_value: Word64::zero(),
+            bound_type: 0,
+            exceeds_bound: false,
+            margin: Word64::zero(),
+            critical_task: 0,
+        }
+    }
+
+    pub fn compute_rm_bound(self: ref mut, n: u32)
+        effects: [deterministic]
+    {
+        self.task_count = n
+        self.bound_type = 0 // RMS bound
+        // RMS bound: n * (2^(1/n) - 1) approximated in millipercent
+        let bound_table: FixedArray[Word64, ANALYSIS_BOUND_SMALL] = FixedArray::from_raw([
+            Word64::from_u64(1000), Word64::from_u64(828), Word64::from_u64(779),
+            Word64::from_u64(756), Word64::from_u64(743), Word64::from_u64(734),
+            Word64::from_u64(728), Word64::from_u64(724), Word64::from_u64(720),
+            Word64::from_u64(717), Word64::from_u64(714), Word64::from_u64(712),
+            Word64::from_u64(710), Word64::from_u64(708), Word64::from_u64(706),
+            Word64::from_u64(705), Word64::from_u64(703), Word64::from_u64(702),
+            Word64::from_u64(701), Word64::from_u64(700), Word64::from_u64(699),
+            Word64::from_u64(698), Word64::from_u64(697), Word64::from_u64(696),
+            Word64::from_u64(695), Word64::from_u64(694), Word64::from_u64(693),
+            Word64::from_u64(692), Word64::from_u64(691), Word64::from_u64(690),
+            Word64::from_u64(689), Word64::from_u64(688),
+        ], 32)
+        if n == 0 {
+            self.bound_value = Word64::from_u64(1000)
+        } else if n >= 32 {
+            self.bound_value = Word64::from_u64(688)
+        } else {
+            let bound: Word64 = match bound_table.get(n - 1) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::from_u64(688),
+            }
+            self.bound_value = bound
+        }
+    }
+
+    pub fn compute_edf_bound(self: ref mut)
+        effects: [deterministic]
+    {
+        self.bound_type = 1 // EDF bound
+        // EDF: bound is 100% utilization = 1000 millipercent
+        self.bound_value = Word64::from_u64(1000)
+    }
+
+    pub fn evaluate(self, total_util: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.total_utilization = total_util
+        self.exceeds_bound = total_util.gt(self.bound_value)
+        if self.exceeds_bound {
+            self.margin = Word64::zero()
+        } else {
+            self.margin = self.bound_value.sub(total_util)
+        }
+        !self.exceeds_bound
+    }
+
+    pub fn margin_percent(self) -> u32
+        effects: [deterministic]
+    {
+        self.margin.div(Word64::from_u64(10)).to_u64() as u32
+    }
+}
+
+// ──────────────────────────────────────────────
+// Feasibility Analysis
+// ──────────────────────────────────────────────
+pub type FeasibilityResult : struct {
+    feasible: bool,
+    test_name: FixedString[48],
+    utilization: Word64,
+    bound: Word64,
+    critical_task: u8,
+    max_response_time: Word64,
+    hyperperiod: Word64,
+    tested_tasks: u32,
+    details: FixedString[256],
+}
+
+impl FeasibilityResult {
+    pub fn new() -> FeasibilityResult
+        effects: [deterministic]
+    {
+        FeasibilityResult {
+            feasible: false,
+            test_name: FixedString::new(),
+            utilization: Word64::zero(),
+            bound: Word64::zero(),
+            critical_task: 0,
+            max_response_time: Word64::zero(),
+            hyperperiod: Word64::zero(),
+            tested_tasks: 0,
+            details: FixedString::new(),
+        }
+    }
+
+    pub fn set_result(self: ref mut, feasible: bool, name: FixedString[48])
+        effects: [deterministic]
+    {
+        self.feasible = feasible
+        self.test_name = name
+    }
+
+    pub fn is_feasible(self) -> bool
+        effects: [deterministic]
+    {
+        self.feasible
+    }
+}
+
+pub type FeasibilityAnalysis : struct {
+    tasks: FixedArray[AnalysisTask, ANALYSIS_FEASIBILITY_DEPTH],
+    task_count: u32,
+    results: FixedArray[FeasibilityResult, ANALYSIS_FEASIBILITY_DEPTH],
+    result_count: u32,
+    overall_feasible: bool,
+}
+
+impl FeasibilityAnalysis {
+    pub fn new() -> FeasibilityAnalysis
+        effects: [deterministic]
+    {
+        FeasibilityAnalysis {
+            tasks: FixedArray::new(),
+            task_count: 0,
+            results: FixedArray::new(),
+            result_count: 0,
+            overall_feasible: false,
+        }
+    }
+
+    pub fn add_task(self: ref mut, task: AnalysisTask) -> Result<(), AnalysisError>
+        effects: [deterministic]
+    {
+        if self.task_count >= ANALYSIS_FEASIBILITY_DEPTH {
+            return Result::Err(analysis_task_table_full())
+        }
+        let r: Result<(), BoundsError> = self.tasks.set(self.task_count, task)
+        if r.is_ok() {
+            self.task_count = self.task_count + 1
+        }
+        Result::Ok(())
+    }
+
+    pub fn run_all_tests(self: ref mut) -> FeasibilityResult
+        effects: [deterministic]
+    {
+        let mut overall: bool = true
+        let main_result: FeasibilityResult = FeasibilityResult::new()
+
+        // Test 1: Utilization bound test (RMS)
+        let ub_result: FeasibilityResult = self.utilization_bound_test()
+        let r_idx: u32 = self.result_count
+        let _ = self.results.set(r_idx, ub_result)
+        self.result_count = self.result_count + 1
+        if !ub_result.is_feasible() {
+            overall = false
+        }
+
+        // Test 2: Response time analysis
+        let rta_result: FeasibilityResult = self.response_time_test()
+        let r_idx2: u32 = self.result_count
+        let _ = self.results.set(r_idx2, rta_result)
+        self.result_count = self.result_count + 1
+        if !rta_result.is_feasible() {
+            overall = false
+        }
+
+        // Test 3: Critical instant analysis
+        let ci_result: FeasibilityResult = self.critical_instant_test()
+        let r_idx3: u32 = self.result_count
+        let _ = self.results.set(r_idx3, ci_result)
+        self.result_count = self.result_count + 1
+        if !ci_result.is_feasible() {
+            overall = false
+        }
+
+        // Test 4: Hyperperiod feasibility
+        let hp_result: FeasibilityResult = self.hyperperiod_test()
+        let r_idx4: u32 = self.result_count
+        let _ = self.results.set(r_idx4, hp_result)
+        self.result_count = self.result_count + 1
+        if !hp_result.is_feasible() {
+            overall = false
+        }
+
+        self.overall_feasible = overall
+        main_result.feasible = overall
+        main_result.tested_tasks = self.task_count
+        main_result
+    }
+
+    fn utilization_bound_test(self) -> FeasibilityResult
+        effects: [deterministic]
+    {
+        let mut result: FeasibilityResult = FeasibilityResult::new()
+        let mut total_util: Word64 = Word64::zero()
+        let mut max_util: Word64 = Word64::zero()
+        let mut max_util_task: u8 = 0
+
+        for i in 0..self.task_count {
+            let task: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            let u: Word64 = task.utilization()
+            total_util = total_util.add(u)
+            if u.gt(max_util) {
+                max_util = u
+                max_util_task = task.id
+            }
+        }
+
+        let n: u32 = self.task_count
+        let bound_val: Word64 = if n == 0 {
+            Word64::from_u64(1000)
+        } else if n >= 32 {
+            Word64::from_u64(688)
+        } else {
+            let offset: u32 = n - 1
+            let table: FixedArray[Word64, 32] = FixedArray::from_raw([
+                Word64::from_u64(1000), Word64::from_u64(828), Word64::from_u64(779),
+                Word64::from_u64(756), Word64::from_u64(743), Word64::from_u64(734),
+                Word64::from_u64(728), Word64::from_u64(724), Word64::from_u64(720),
+                Word64::from_u64(717), Word64::from_u64(714), Word64::from_u64(712),
+                Word64::from_u64(710), Word64::from_u64(708), Word64::from_u64(706),
+                Word64::from_u64(705), Word64::from_u64(703), Word64::from_u64(702),
+                Word64::from_u64(701), Word64::from_u64(700), Word64::from_u64(699),
+                Word64::from_u64(698), Word64::from_u64(697), Word64::from_u64(696),
+                Word64::from_u64(695), Word64::from_u64(694), Word64::from_u64(693),
+                Word64::from_u64(692), Word64::from_u64(691), Word64::from_u64(690),
+                Word64::from_u64(689), Word64::from_u64(688),
+            ], 32)
+            match table.get(offset) {
+                Result::Ok(v) => v,
+                Result::Err(_) => Word64::from_u64(688),
+            }
+        }
+
+        let feasible: bool = total_util.lte(bound_val)
+        result.set_result(feasible, FixedString[48]::from_slice("Utilization Bound Test"))
+        result.utilization = total_util
+        result.bound = bound_val
+        result.critical_task = max_util_task
+        result.tested_tasks = self.task_count
+        result
+    }
+
+    fn response_time_test(self) -> FeasibilityResult
+        effects: [deterministic]
+    {
+        let mut result: FeasibilityResult = FeasibilityResult::new()
+        let mut rta: ResponseTimeAnalysis = ResponseTimeAnalysis::new()
+        for i in 0..self.task_count {
+            let task: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            let _ = rta.add_task(task)
+        }
+        rta.sort_by_priority()
+
+        let sched_result: Result<bool, AnalysisError> = rta.compute_response_times()
+        let feasible: bool = match sched_result {
+            Result::Ok(s) => s,
+            Result::Err(_) => false,
+        }
+
+        result.set_result(feasible, FixedString[48]::from_slice("Response Time Analysis"))
+        result.max_response_time = rta.max_response_time
+        result.tested_tasks = self.task_count
+        result
+    }
+
+    fn critical_instant_test(self) -> FeasibilityResult
+        effects: [deterministic]
+    {
+        let mut result: FeasibilityResult = FeasibilityResult::new()
+        let mut feasible: bool = true
+        let mut worst_response: Word64 = Word64::zero()
+
+        for i in 0..self.task_count {
+            let task: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            // Critical instant: all higher-priority tasks release simultaneously
+            let mut interference: Word64 = Word64::zero()
+            for j in 0..i {
+                let higher: AnalysisTask = match self.tasks.get(j) {
+                    Result::Ok(t) => t,
+                    Result::Err(_) => continue,
+                }
+                if higher.priority < task.priority {
+                    interference = interference.add(higher.wcet)
+                }
+            }
+            let response: Word64 = task.wcet.add(interference).add(task.blocking_time)
+            if response.gt(worst_response) {
+                worst_response = response
+            }
+            if response.gt(task.deadline) {
+                feasible = false
+            }
+        }
+
+        result.set_result(feasible, FixedString[48]::from_slice("Critical Instant Test"))
+        result.max_response_time = worst_response
+        result.tested_tasks = self.task_count
+        result
+    }
+
+    fn hyperperiod_test(self) -> FeasibilityResult
+        effects: [deterministic]
+    {
+        let mut result: FeasibilityResult = FeasibilityResult::new()
+        if self.task_count == 0 {
+            result.set_result(true, FixedString[48]::from_slice("Hyperperiod Test"))
+            return result
+        }
+
+        // Compute hyperperiod = LCM of all periods (bounded)
+        let mut hp: Word64 = Word64::from_u64(1)
+        for i in 0..self.task_count {
+            let task: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(t) => t,
+                Result::Err(_) => continue,
+            }
+            let p: Word64 = task.period
+            if p.is_zero() {
+                continue
+            }
+            // LCM = a * b / GCD(a, b)
+            let g: Word64 = hp.gcd(p)
+            hp = hp.mul(p).div(g)
+            if hp.gt(Word64::from_u64(1_000_000_000_000)) {
+                hp = Word64::from_u64(1_000_000_000_000)
+            }
+        }
+
+        result.hyperperiod = hp
+        result.set_result(true, FixedString[48]::from_slice("Hyperperiod Test"))
+        result.tested_tasks = self.task_count
+        result
+    }
+
+    pub fn get_summary(self) -> FixedString[512]
+        effects: [deterministic]
+    {
+        let mut summary: FixedString[512] = FixedString::new()
+        summary.append(FixedString[32]::from_slice("Feasibility Analysis:\n"))
+        summary.append(FixedString[32]::from_slice("  Overall: "))
+        summary.append(if self.overall_feasible {
+            FixedString[8]::from_slice("FEASIBLE")
+        } else {
+            FixedString[12]::from_slice("INFEASIBLE")
+        })
+        summary.append(FixedString[32]::from_slice("\n  Tests run: "))
+        summary.append_u64(self.result_count as u64)
+        summary.append(FixedString[32]::from_slice("\n  Tasks: "))
+        summary.append_u64(self.task_count as u64)
+
+        for i in 0..self.result_count {
+            let r: FeasibilityResult = match self.results.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            summary.append(FixedString[2]::from_slice("\n  - "))
+            summary.append(r.test_name)
+            summary.append(FixedString[2]::from_slice(": "))
+            summary.append(if r.is_feasible() {
+                FixedString[6]::from_slice("PASS  ")
+            } else {
+                FixedString[6]::from_slice("FAIL  ")
+            })
+            summary.append_u64(r.utilization.to_u64())
+            summary.append(FixedString[1]::from_slice("/"))
+            summary.append_u64(r.bound.to_u64())
+        }
+        summary
+    }
+}
+
+// ──────────────────────────────────────────────
+// Schedulability Test Orchestrator
+// ──────────────────────────────────────────────
+pub type SchedulabilityTest : struct {
+    name: FixedString[48],
+    passed: bool,
+    utilization: Word64,
+    bound: Word64,
+    response_time: Word64,
+    deadline: Word64,
+    details: FixedString[256],
+}
+
+impl SchedulabilityTest {
+    pub fn new(test_name: FixedString[48]) -> SchedulabilityTest
+        effects: [deterministic]
+    {
+        SchedulabilityTest {
+            name: test_name,
+            passed: false,
+            utilization: Word64::zero(),
+            bound: Word64::zero(),
+            response_time: Word64::zero(),
+            deadline: Word64::zero(),
+            details: FixedString::new(),
+        }
+    }
+
+    pub fn record(self: ref mut)
+        effects: [residual]
+    {
+        residual emit {
+            analysis_op: "schedulability.test",
+            test_name: self.name,
+            passed: if self.passed { 1 } else { 0 },
+            utilization: self.utilization.to_u64(),
+            bound: self.bound.to_u64(),
+            response_time: self.response_time.to_u64(),
+            deadline: self.deadline.to_u64(),
+        }
+    }
+}
+
+pub fn run_full_schedulability_analysis(tasks: ref FixedArray[AnalysisTask, ANALYSIS_MAX_TASKS], count: u32) -> FixedArray[SchedulabilityTest, ANALYSIS_BOUND_SMALL]
+    effects: [deterministic, residual]
+{
+    let mut results: FixedArray[SchedulabilityTest, ANALYSIS_BOUND_SMALL] = FixedArray::new()
+    let mut result_count: u32 = 0
+
+    // Test 1: Utilization bound
+    let mut ub_test: SchedulabilityTest = SchedulabilityTest::new(
+        FixedString[48]::from_slice("Utilization Bound Test"))
+    let mut total_util: Word64 = Word64::zero()
+    for i in 0..count {
+        let t: AnalysisTask = match tasks.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        total_util = total_util.add(t.utilization())
+    }
+    let bound: Word64 = rate_monotonic_utilization_bound(count)
+    ub_test.utilization = total_util
+    ub_test.bound = bound
+    ub_test.passed = total_util.lte(bound)
+    let _ = results.set(result_count, ub_test)
+    result_count = result_count + 1
+    ub_test.record()
+
+    // Test 2: Individual deadline check
+    for i in 0..count {
+        let t: AnalysisTask = match tasks.get(i) {
+            Result::Ok(v) => v,
+            Result::Err(_) => continue,
+        }
+        let mut dl_test: SchedulabilityTest = SchedulabilityTest::new(
+            FixedString[48]::from_slice("Deadline Check"))
+        dl_test.deadline = t.deadline
+        dl_test.response_time = t.wcet.add(t.blocking_time)
+        dl_test.passed = dl_test.response_time.lte(t.deadline)
+        if result_count < ANALYSIS_BOUND_SMALL {
+            let _ = results.set(result_count, dl_test)
+            result_count = result_count + 1
+        }
+    }
+
+    residual emit {
+        analysis_op: "schedulability.analysis.complete",
+        tasks_analyzed: count as u64,
+        total_utilization: total_util.to_u64(),
+        bound: bound.to_u64(),
+        passed: if total_util.lte(bound) { 1 } else { 0 },
+        tests_run: result_count as u64,
+    }
+
+    results
+}
+
+fn rate_monotonic_utilization_bound(n: u32) -> Word64
+    effects: [deterministic]
+{
+    if n == 0 { return Word64::from_u64(1000) }
+    if n == 1 { return Word64::from_u64(1000) }
+    if n >= 32 { return Word64::from_u64(688) }
+    let table: FixedArray[Word64, 32] = FixedArray::from_raw([
+        Word64::from_u64(1000), Word64::from_u64(828), Word64::from_u64(779),
+        Word64::from_u64(756), Word64::from_u64(743), Word64::from_u64(734),
+        Word64::from_u64(728), Word64::from_u64(724), Word64::from_u64(720),
+        Word64::from_u64(717), Word64::from_u64(714), Word64::from_u64(712),
+        Word64::from_u64(710), Word64::from_u64(708), Word64::from_u64(706),
+        Word64::from_u64(705), Word64::from_u64(703), Word64::from_u64(702),
+        Word64::from_u64(701), Word64::from_u64(700), Word64::from_u64(699),
+        Word64::from_u64(698), Word64::from_u64(697), Word64::from_u64(696),
+        Word64::from_u64(695), Word64::from_u64(694), Word64::from_u64(693),
+        Word64::from_u64(692), Word64::from_u64(691), Word64::from_u64(690),
+        Word64::from_u64(689), Word64::from_u64(688),
+    ], 32)
+    let idx: u32 = if n > 32 { 31 } else { n - 1 }
+    match table.get(idx) {
+        Result::Ok(v) => v,
+        Result::Err(_) => Word64::from_u64(688),
+    }
+}
+
+// ──────────────────────────────────────────────
+// WCET Analysis Engine
+// ──────────────────────────────────────────────
+pub type WcetAnalyzer : struct {
+    estimates: FixedArray[WcetEstimate, ANALYSIS_MAX_TASKS],
+    estimate_count: u32,
+}
+
+impl WcetAnalyzer {
+    pub fn new() -> WcetAnalyzer
+        effects: [deterministic]
+    {
+        WcetAnalyzer {
+            estimates: FixedArray::new(),
+            estimate_count: 0,
+        }
+    }
+
+    pub fn estimate_for_task(self: ref mut, tid: u8) -> Result<ref mut WcetEstimate, AnalysisError>
+        effects: [deterministic]
+    {
+        for i in 0..self.estimate_count {
+            let est: ref mut WcetEstimate = match self.estimates.ref_at_mut(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if est.task_id == tid {
+                return Result::Ok(est)
+            }
+        }
+        // Create new estimate
+        if self.estimate_count >= ANALYSIS_MAX_TASKS {
+            return Result::Err(analysis_task_table_full())
+        }
+        let new_est: WcetEstimate = WcetEstimate::new(tid)
+        let r: Result<(), BoundsError> = self.estimates.set(self.estimate_count, new_est)
+        if r.is_err() {
+            return Result::Err(analysis_task_table_full())
+        }
+        self.estimate_count = self.estimate_count + 1
+        self.estimates.ref_at_mut(self.estimate_count - 1)
+    }
+
+    pub fn record_execution(self: ref mut, tid: u8, exec_time: Word64)
+        effects: [deterministic]
+    {
+        let est: ref mut WcetEstimate = match self.estimate_for_task(tid) {
+            Result::Ok(e) => e,
+            Result::Err(_) => return,
+        }
+        est.add_sample(exec_time)
+    }
+
+    pub fn get_wcet(self, tid: u8) -> Result[Word64, AnalysisError>
+        effects: [deterministic]
+    {
+        for i in 0..self.estimate_count {
+            let est: WcetEstimate = match self.estimates.get(i) {
+                Result::Ok(e) => e,
+                Result::Err(_) => continue,
+            }
+            if est.task_id == tid {
+                return Result::Ok(est.wcet_estimate)
+            }
+        }
+        Result::Err(analysis_invalid_params(FixedString[128]::from_slice("Task ID not found")))
+    }
+}
+
+// ──────────────────────────────────────────────
+// Master Analysis Engine
+// ──────────────────────────────────────────────
+pub type AnalysisEngine : struct {
+    rta: ResponseTimeAnalysis,
+    feasibility: FeasibilityAnalysis,
+    wcet_analyzer: WcetAnalyzer,
+    tasks: FixedArray[AnalysisTask, ANALYSIS_MAX_TASKS],
+    task_count: u32,
+}
+
+impl AnalysisEngine {
+    pub fn new() -> AnalysisEngine
+        effects: [deterministic]
+    {
+        AnalysisEngine {
+            rta: ResponseTimeAnalysis::new(),
+            feasibility: FeasibilityAnalysis::new(),
+            wcet_analyzer: WcetAnalyzer::new(),
+            tasks: FixedArray::new(),
+            task_count: 0,
+        }
+    }
+
+    pub fn add_task(self: ref mut, task: AnalysisTask) -> Result<(), AnalysisError>
+        effects: [deterministic]
+    {
+        if self.task_count >= ANALYSIS_MAX_TASKS {
+            return Result::Err(analysis_task_table_full())
+        }
+        let r: Result<(), BoundsError> = self.tasks.set(self.task_count, task)
+        if r.is_ok() {
+            let _ = self.rta.add_task(task)
+            let _ = self.feasibility.add_task(task)
+            self.task_count = self.task_count + 1
+        }
+        Result::Ok(())
+    }
+
+    pub fn run_feasibility(self: ref mut) -> FeasibilityResult
+        effects: [deterministic, residual]
+    {
+        let result: FeasibilityResult = self.feasibility.run_all_tests()
+        residual emit {
+            analysis_op: "feasibility.analysis",
+            task_count: self.task_count as u64,
+            feasible: if result.is_feasible() { 1 } else { 0 },
+            utilization: result.utilization.to_u64(),
+            bound: result.bound.to_u64(),
+        }
+        result
+    }
+
+    pub fn run_rta(self: ref mut) -> Result<bool, AnalysisError>
+        effects: [deterministic, residual]
+    {
+        self.rta.sort_by_priority()
+        let result: Result<bool, AnalysisError> = self.rta.compute_response_times()
+        match result {
+            Result::Ok(sched) => {
+                residual emit {
+                    analysis_op: "rta.complete",
+                    schedulable: if sched { 1 } else { 0 },
+                    worst_response: self.rta.worst_case_response().to_u64(),
+                    iterations: self.rta.total_iterations as u64,
+                }
+                Result::Ok(sched)
+            }
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    pub fn record_wcet_sample(self: ref mut, tid: u8, exec_time: Word64)
+        effects: [deterministic]
+    {
+        self.wcet_analyzer.record_execution(tid, exec_time)
+    }
+
+    pub fn generate_report(self) -> FixedString[1024]
+        effects: [deterministic]
+    {
+        let mut report: FixedString[1024] = FixedString::new()
+        report.append(FixedString[32]::from_slice("RT Analysis Report\n"))
+        report.append(FixedString[32]::from_slice("==================\n"))
+        report.append(FixedString[32]::from_slice("Tasks: "))
+        report.append_u64(self.task_count as u64)
+        report.append(FixedString[16]::from_slice("\n\nTask Details:\n"))
+
+        for i in 0..self.task_count {
+            let t: AnalysisTask = match self.tasks.get(i) {
+                Result::Ok(v) => v,
+                Result::Err(_) => continue,
+            }
+            report.append(FixedString[8]::from_slice("  T"))
+            report.append_u64(t.id as u64)
+            report.append(FixedString[16]::from_slice(": P="))
+            report.append_u64(t.period.to_u64())
+            report.append(FixedString[8]::from_slice(" D="))
+            report.append_u64(t.deadline.to_u64())
+            report.append(FixedString[8]::from_slice(" C="))
+            report.append_u64(t.wcet.to_u64())
+            report.append(FixedString[8]::from_slice(" U="))
+            report.append_u64(t.utilization().to_u64())
+            report.append(FixedString[2]::from_slice("\n"))
+        }
+
+        report.append(FixedString[32]::from_slice("\nUtilization Bound: "))
+        let bound: Word64 = rate_monotonic_utilization_bound(self.task_count)
+        report.append_u64(bound.to_u64())
+
+        report.append(FixedString[32]::from_slice("\nFeasibility: "))
+        report.append(if self.feasibility.overall_feasible {
+            FixedString[8]::from_slice("FEASIBLE")
+        } else {
+            FixedString[12]::from_slice("INFEASIBLE")
+        })
+        report
+    }
+}
+
+// ──────────────────────────────────────────────
+// Module Initialization
+// ──────────────────────────────────────────────
+pub fn init_analysis_engine() -> AnalysisEngine
+    effects: [deterministic, residual]
+{
+    let engine: AnalysisEngine = AnalysisEngine::new()
+    residual emit {
+        analysis_op: "analysis.engine.init",
+        max_tasks: ANALYSIS_MAX_TASKS as u64,
+        rta_iterations: ANALYSIS_RTA_ITERATIONS as u64,
+        wcet_samples: ANALYSIS_WCET_SAMPLES as u64,
+    }
+    engine
+}

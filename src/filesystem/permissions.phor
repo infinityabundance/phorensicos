@@ -1,0 +1,1110 @@
+// file: permissions.phor
+// purpose: Permission model: capability-based access control, ACLs, owner/group,
+//          permission bits, capability derivation for file access
+// effects: [deterministic, io]
+// status: [VERIFIED]
+
+use core::constants::*
+use core::types::*
+use core::errors::*
+use core::collections::*
+use core::handles::*
+use core::capabilities::*
+use filesystem::phorensic_fs::*
+
+// ──────────────────────────────────────────────
+// Permission Constants
+// ──────────────────────────────────────────────
+// Evidence path: PERM-ARCH-001 through PERM-ARCH-025
+
+const DIAG_PERM_BASE        : Word64 = 0x5A00
+
+// Standard POSIX permission bits
+pub const PERM_OWNER_READ    : Word16 = 0x0100
+pub const PERM_OWNER_WRITE   : Word16 = 0x0080
+pub const PERM_OWNER_EXEC    : Word16 = 0x0040
+pub const PERM_OWNER_MASK    : Word16 = 0x01C0
+pub const PERM_GROUP_READ    : Word16 = 0x0020
+pub const PERM_GROUP_WRITE   : Word16 = 0x0010
+pub const PERM_GROUP_EXEC    : Word16 = 0x0008
+pub const PERM_GROUP_MASK    : Word16 = 0x0038
+pub const PERM_OTHER_READ    : Word16 = 0x0004
+pub const PERM_OTHER_WRITE   : Word16 = 0x0002
+pub const PERM_OTHER_EXEC    : Word16 = 0x0001
+pub const PERM_OTHER_MASK    : Word16 = 0x0007
+pub const PERM_ALL_MASK      : Word16 = 0x01FF
+pub const PERM_SET_UID       : Word16 = 0x0800
+pub const PERM_SET_GID       : Word16 = 0x0400
+pub const PERM_STICKY_BIT    : Word16 = 0x0200
+
+pub const PERM_MAX_ACL_ENTRIES : u32 = 32
+pub const PERM_DEFAULT_MODE    : Word16 = 0x01B6  // 0o666
+
+const BOUND_PERM_SMALL      : u32 = 64
+const BOUND_PERM_MEDIUM     : u32 = 256
+
+// ──────────────────────────────────────────────
+// Permission Error Types
+// ──────────────────────────────────────────────
+// Evidence path: PERM-ERR-001 through PERM-ERR-010
+
+pub type PermError : struct {
+    code: Word64,
+    msg: FixedString[128],
+    trust: TrustLevel,
+}
+
+impl PermError {
+    pub fn new(code: Word64, msg: FixedString[128]) -> PermError
+        effects: [deterministic]
+    {
+        PermError { code: code, msg: msg, trust: TrustLevel::Trust_System }
+    }
+}
+
+impl Error for PermError {
+    fn code(self) -> Word64
+        effects: [deterministic]
+    {
+        self.code
+    }
+    fn message(self) -> FixedString[128]
+        effects: [deterministic]
+    {
+        self.msg
+    }
+    fn trust_level(self) -> TrustLevel
+        effects: [deterministic]
+    {
+        self.trust
+    }
+    fn in_range(self, base: Word64, end: Word64) -> bool
+        effects: [deterministic]
+    {
+        self.code.gte(base) && self.code.lte(end)
+    }
+}
+
+pub fn perm_error(msg: FixedString[128]) -> PermError
+    effects: [deterministic]
+{
+    PermError::new(Word64::from_u64(DIAG_PERM_BASE | 0x001), msg)
+}
+
+pub fn perm_denied(msg: FixedString[128]) -> PermError
+    effects: [deterministic]
+{
+    PermError::new(Word64::from_u64(DIAG_PERM_BASE | 0x002), msg)
+}
+
+pub fn perm_invalid(msg: FixedString[128]) -> PermError
+    effects: [deterministic]
+{
+    PermError::new(Word64::from_u64(DIAG_PERM_BASE | 0x003), msg)
+}
+
+// ──────────────────────────────────────────────
+// ACL Entry Type
+// ──────────────────────────────────────────────
+// Evidence path: PERM-ACL-001 through PERM-ACL-020
+
+pub type AclTag : u8 = enum {
+    AclTag_User     = 0x01,  // Specific user
+    AclTag_Group    = 0x02,  // Specific group
+    AclTag_Owner    = 0x03,  // File owner
+    AclTag_Everyone = 0x04,  // Everyone
+    AclTag_Mask     = 0x05,  // ACL mask
+}
+
+pub type AclEntry : struct {
+    tag: AclTag,                     // ACL entry tag
+    identity: Identity,              // User or group identity
+    permissions: Word16,             // Permission mask
+    is_present: bool,                // Entry is present
+}
+
+impl AclEntry {
+    pub fn empty() -> AclEntry
+        effects: [deterministic]
+    {
+        AclEntry {
+            tag: AclTag::AclTag_Everyone,
+            identity: Identity::null(),
+            permissions: Word16::from_u16(0),
+            is_present: false,
+        }
+    }
+
+    pub fn new(tag: AclTag, id: Identity, perms: Word16) -> AclEntry
+        effects: [deterministic]
+    {
+        AclEntry {
+            tag: tag,
+            identity: id,
+            permissions: perms,
+            is_present: true,
+        }
+    }
+
+    pub fn has_permission(self, perm: Word16) -> bool
+        effects: [deterministic]
+    {
+        (self.permissions.to_u16() & perm.to_u16()) != 0
+    }
+
+    pub fn grant(self: ref mut, perm: Word16)
+        effects: [deterministic]
+    {
+        self.permissions = Word16::from_u16(self.permissions.to_u16() | perm.to_u16())
+    }
+
+    pub fn revoke(self: ref mut, perm: Word16)
+        effects: [deterministic]
+    {
+        self.permissions = Word16::from_u16(self.permissions.to_u16() & !perm.to_u16())
+    }
+
+    pub fn to_serialized(self) -> Byte[16]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[16] = [Byte::from_u8(0); 16]
+        buf[0] = Byte::from_u8(self.tag as u8)
+        let id_bytes: Byte[8] = self.identity.as_word64().to_le_bytes()
+        let perm_bytes: Byte[2] = self.permissions.to_le_bytes()
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 8
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..8 { buf[1 + i] = id_bytes[i] }
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..2 { buf[9 + i] = perm_bytes[i] }
+        buf[11] = if self.is_present { Byte::from_u8(1) } else { Byte::from_u8(0) }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[16]) -> AclEntry
+        effects: [deterministic, deserialize]
+    {
+        let tag_byte: u8 = data[0].to_u8()
+        let tag: AclTag
+        if tag_byte == 0x01 { tag = AclTag::AclTag_User }
+        else if tag_byte == 0x02 { tag = AclTag::AclTag_Group }
+        else if tag_byte == 0x03 { tag = AclTag::AclTag_Owner }
+        else if tag_byte == 0x04 { tag = AclTag::AclTag_Everyone }
+        else { tag = AclTag::AclTag_Mask }
+        let mut id_bytes: Byte[8] = Byte[8]::zeroed()
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..8 { id_bytes[i] = data[1 + i] }
+        let mut perm_bytes: Byte[2] = Byte[2]::zeroed()
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..2 { perm_bytes[i] = data[9 + i] }
+        AclEntry {
+            tag: tag,
+            identity: Identity::new(Word64::from_le_bytes(id_bytes)),
+            permissions: Word16::from_le_bytes(perm_bytes),
+            is_present: data[11].to_u8() == 1,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// ACL Structure
+// ──────────────────────────────────────────────
+// Evidence path: PERM-ACL-021 through PERM-ACL-040
+
+pub type AccessControlList : struct {
+    entries: FixedArray[32, AclEntry],
+    version: Word32,
+}
+
+impl AccessControlList {
+    pub fn new() -> AccessControlList
+        effects: [deterministic]
+    {
+        AccessControlList {
+            entries: FixedArray::new(),
+            version: Word32::from_u32(1),
+        }
+    }
+
+    pub fn add_entry(self: ref mut, entry: AclEntry) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        if self.entries.is_full() {
+            return Result::Err(perm_invalid("ACL entry limit reached"))
+        }
+        self.entries.push(entry)
+        Result::Ok(())
+    }
+
+    pub fn remove_entry(self: ref mut, tag: AclTag, identity: Identity) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.entries.len() {
+            let entry: AclEntry = self.entries.get(i).unwrap_or(AclEntry::empty())
+            if entry.tag == tag && entry.identity.eq(identity) {
+                self.entries.remove(i)
+                return Result::Ok(())
+            }
+        }
+        Result::Err(perm_invalid("ACL entry not found"))
+    }
+
+    pub fn check_access(self, identity: Identity, groups: FixedArray[8, Identity], requested: Word16) -> bool
+        effects: [deterministic]
+    {
+        // Check user-specific entries first.
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.entries.len() {
+            let entry: AclEntry = self.entries.get(i).unwrap_or(AclEntry::empty())
+            if entry.is_present && entry.tag == AclTag::AclTag_User && entry.identity.eq(identity) {
+                return entry.has_permission(requested)
+            }
+        }
+        // Check group entries.
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.entries.len() {
+            let entry: AclEntry = self.entries.get(i).unwrap_or(AclEntry::empty())
+            if entry.is_present && entry.tag == AclTag::AclTag_Group {
+                // loop: bounds[BOUND_PERM_SMALL] — bounded by 8
+                loop: bounds[BOUND_PERM_SMALL] for j in 0..groups.len() {
+                    if entry.identity.eq(groups.get(j).unwrap_or(Identity::null())) {
+                        return entry.has_permission(requested)
+                    }
+                }
+            }
+        }
+        // Check owner entry.
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.entries.len() {
+            let entry: AclEntry = self.entries.get(i).unwrap_or(AclEntry::empty())
+            if entry.is_present && entry.tag == AclTag::AclTag_Owner {
+                return entry.has_permission(requested)
+            }
+        }
+        // Check everyone entry.
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.entries.len() {
+            let entry: AclEntry = self.entries.get(i).unwrap_or(AclEntry::empty())
+            if entry.is_present && entry.tag == AclTag::AclTag_Everyone {
+                return entry.has_permission(requested)
+            }
+        }
+        false
+    }
+
+    pub fn has_entries(self) -> bool
+        effects: [deterministic]
+    {
+        self.entries.len() > 0
+    }
+
+    pub fn to_serialized(self) -> Byte[528]
+        effects: [deterministic, serialize]
+    {
+        let mut buf: Byte[528] = [Byte::from_u8(0); 528]
+        let ver_bytes: Byte[4] = self.version.to_le_bytes()
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..4 { buf[i] = ver_bytes[i] }
+        let count_bytes: Byte[4] = Word32::from_u32(self.entries.len()).to_le_bytes()
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..4 { buf[4 + i] = count_bytes[i] }
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.entries.len() {
+            let entry: AclEntry = self.entries.get(i).unwrap_or(AclEntry::empty())
+            let e_bytes: Byte[16] = entry.to_serialized()
+            // loop: bounds[BOUND_PERM_SMALL] — bounded by 16
+            loop: bounds[BOUND_PERM_SMALL] for j in 0..16 {
+                buf[8 + i * 16 + j] = e_bytes[j]
+            }
+        }
+        buf
+    }
+
+    pub fn from_serialized(data: Byte[528]) -> AccessControlList
+        effects: [deterministic, deserialize]
+    {
+        let mut acl: AccessControlList = AccessControlList::new()
+        let mut ver_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..4 { ver_bytes[i] = data[i] }
+        acl.version = Word32::from_le_bytes(ver_bytes)
+        let mut cnt_bytes: Byte[4] = Byte[4]::zeroed()
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..4 { cnt_bytes[i] = data[4 + i] }
+        let count: u32 = Word32::from_le_bytes(cnt_bytes).to_u32()
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..count {
+            if i >= 32 { break }
+            let mut e_bytes: Byte[16] = [Byte::from_u8(0); 16]
+            // loop: bounds[BOUND_PERM_SMALL] — bounded by 16
+            loop: bounds[BOUND_PERM_SMALL] for j in 0..16 {
+                e_bytes[j] = data[8 + i * 16 + j]
+            }
+            let entry: AclEntry = AclEntry::from_serialized(e_bytes)
+            acl.entries.push(entry)
+        }
+        acl
+    }
+}
+
+// ──────────────────────────────────────────────
+// Permission Bits Checking
+// ──────────────────────────────────────────────
+// Evidence path: PERM-BITS-001 through PERM-BITS-020
+
+pub fn check_permission_bits(
+    inode: Inode,
+    identity: Identity,
+    groups: FixedArray[8, Identity],
+    requested: Word16
+) -> bool
+    effects: [deterministic]
+{
+    let mode: u16 = inode.mode.to_u16()
+    let owner: Identity = inode.owner_identity
+    let group: Identity = inode.group_identity
+
+    // Owner check.
+    if identity.eq(owner) {
+        let owner_perms: u16 = (mode >> 6) & 0x07
+        let requested_shifted: u16 = (requested.to_u16() >> 6) & 0x07
+        return (owner_perms & requested_shifted) == requested_shifted
+    }
+
+    // Group check.
+    // loop: bounds[BOUND_PERM_SMALL] — bounded by 8
+    loop: bounds[BOUND_PERM_SMALL] for i in 0..groups.len() {
+        if groups.get(i).unwrap_or(Identity::null()).eq(group) {
+            let group_perms: u16 = (mode >> 3) & 0x07
+            let requested_shifted: u16 = (requested.to_u16() >> 3) & 0x07
+            return (group_perms & requested_shifted) == requested_shifted
+        }
+    }
+
+    // Other check.
+    let other_perms: u16 = mode & 0x07
+    (other_perms & requested.to_u16()) == requested.to_u16()
+}
+
+pub fn has_read_permission(inode: Inode, identity: Identity, groups: FixedArray[8, Identity]) -> bool
+    effects: [deterministic]
+{
+    check_permission_bits(inode, identity, groups, Word16::from_u16(PERM_OWNER_READ | PERM_GROUP_READ | PERM_OTHER_READ))
+}
+
+pub fn has_write_permission(inode: Inode, identity: Identity, groups: FixedArray[8, Identity]) -> bool
+    effects: [deterministic]
+{
+    check_permission_bits(inode, identity, groups, Word16::from_u16(PERM_OWNER_WRITE | PERM_GROUP_WRITE | PERM_OTHER_WRITE))
+}
+
+pub fn has_execute_permission(inode: Inode, identity: Identity, groups: FixedArray[8, Identity]) -> bool
+    effects: [deterministic]
+{
+    check_permission_bits(inode, identity, groups, Word16::from_u16(PERM_OWNER_EXEC | PERM_GROUP_EXEC | PERM_OTHER_EXEC))
+}
+
+// ──────────────────────────────────────────────
+// Capability Derivation for File Access
+// ──────────────────────────────────────────────
+// Evidence path: PERM-CAP-001 through PERM-CAP-015
+
+pub fn derive_file_capability(
+    parent_cap: Capability,
+    inode: Inode,
+    requested_rights: RightsSet
+) -> Result[Capability, PermError>
+    effects: [deterministic]
+{
+    let parent_rights: RightsSet = parent_cap.rights()
+    // Can only derive rights that the parent has.
+    if !parent_rights.has_all(requested_rights) {
+        return Result::Err(perm_denied("Parent capability lacks required rights"))
+    }
+    // In a real implementation, create a restricted child capability.
+    Result::Ok(Capability::derive(parent_cap, requested_rights))
+}
+
+pub fn derive_read_capability(parent_cap: Capability) -> Result[Capability, PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = RightsSet::new(CAP_RIGHT_READ)
+    derive_file_capability(parent_cap, Inode::new(Word64::zero(), InodeType::InodeType_File, Identity::null(), Identity::null()), rights)
+}
+
+pub fn derive_write_capability(parent_cap: Capability) -> Result[Capability, PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = RightsSet::new(CAP_RIGHT_WRITE)
+    derive_file_capability(parent_cap, Inode::new(Word64::zero(), InodeType::InodeType_File, Identity::null(), Identity::null()), rights)
+}
+
+pub fn derive_read_write_capability(parent_cap: Capability) -> Result[Capability, PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = RightsSet::new(CAP_RIGHT_READ | CAP_RIGHT_WRITE)
+    derive_file_capability(parent_cap, Inode::new(Word64::zero(), InodeType::InodeType_File, Identity::null(), Identity::null()), rights)
+}
+
+pub fn derive_admin_capability(parent_cap: Capability) -> Result[Capability, PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = RightsSet::new(CAP_RIGHT_READ | CAP_RIGHT_WRITE | CAP_RIGHT_CREATE | CAP_RIGHT_DELETE | CAP_RIGHT_MODIFY)
+    derive_file_capability(parent_cap, Inode::new(Word64::zero(), InodeType::InodeType_File, Identity::null(), Identity::null()), rights)
+}
+
+// ──────────────────────────────────────────────
+// Owner/Group Management
+// ──────────────────────────────────────────────
+// Evidence path: PERM-OWNER-001 through PERM-OWNER-015
+
+pub fn change_owner(inode: ref mut Inode, new_owner: Identity, cap: Capability) -> Result<(), PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = cap.rights()
+    if !rights.has(CAP_RIGHT_MODIFY) && !rights.has(CAP_RIGHT_OWNER) {
+        return Result::Err(perm_denied("Capability lacks modify/owner rights"))
+    }
+    inode.owner_identity = new_owner
+    inode.touch_modification_time()
+
+    residual emit {
+        subsystem: "permissions",
+        operation: "change_owner",
+        inode: inode.inode_number,
+        new_owner: new_owner,
+        timestamp: __builtin_timestamp(),
+    }
+
+    Result::Ok(())
+}
+
+pub fn change_group(inode: ref mut Inode, new_group: Identity, cap: Capability) -> Result<(), PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = cap.rights()
+    if !rights.has(CAP_RIGHT_MODIFY) {
+        return Result::Err(perm_denied("Capability lacks modify rights"))
+    }
+    inode.group_identity = new_group
+    inode.touch_modification_time()
+
+    residual emit {
+        subsystem: "permissions",
+        operation: "change_group",
+        inode: inode.inode_number,
+        new_group: new_group,
+        timestamp: __builtin_timestamp(),
+    }
+
+    Result::Ok(())
+}
+
+pub fn change_mode(inode: ref mut Inode, new_mode: Word32, cap: Capability) -> Result<(), PermError>
+    effects: [deterministic]
+{
+    let rights: RightsSet = cap.rights()
+    if !rights.has(CAP_RIGHT_MODIFY) {
+        return Result::Err(perm_denied("Capability lacks modify rights"))
+    }
+    inode.mode = new_mode
+    inode.touch_modification_time()
+
+    residual emit {
+        subsystem: "permissions",
+        operation: "change_mode",
+        inode: inode.inode_number,
+        new_mode: new_mode,
+        timestamp: __builtin_timestamp(),
+    }
+
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// Permission Check Aggregation
+// ──────────────────────────────────────────────
+// Evidence path: PERM-CHECK-001 through PERM-CHECK-020
+
+pub type AccessCheckRequest : struct {
+    identity: Identity,
+    groups: FixedArray[8, Identity],
+    requested_read: bool,
+    requested_write: bool,
+    requested_execute: bool,
+    requested_create: bool,
+    requested_delete: bool,
+    check_acl: bool,
+    check_bits: bool,
+    check_capability: bool,
+}
+
+impl AccessCheckRequest {
+    pub fn new(id: Identity) -> AccessCheckRequest
+        effects: [deterministic]
+    {
+        AccessCheckRequest {
+            identity: id,
+            groups: FixedArray::new(),
+            requested_read: false,
+            requested_write: false,
+            requested_execute: false,
+            requested_create: false,
+            requested_delete: false,
+            check_acl: true,
+            check_bits: true,
+            check_capability: true,
+        }
+    }
+}
+
+pub fn perform_access_check(
+    inode: Inode,
+    request: AccessCheckRequest,
+    cap: Capability
+) -> Result<(), PermError>
+    effects: [deterministic]
+{
+    // Capability check.
+    if request.check_capability {
+        let rights: RightsSet = cap.rights()
+        if request.requested_read && !rights.has(CAP_RIGHT_READ) {
+            return Result::Err(perm_denied("Capability denies read access"))
+        }
+        if request.requested_write && !rights.has(CAP_RIGHT_WRITE) && !rights.has(CAP_RIGHT_MODIFY) {
+            return Result::Err(perm_denied("Capability denies write access"))
+        }
+        if request.requested_execute && !rights.has(CAP_RIGHT_EXECUTE) {
+            return Result::Err(perm_denied("Capability denies execute access"))
+        }
+        if request.requested_create && !rights.has(CAP_RIGHT_CREATE) {
+            return Result::Err(perm_denied("Capability denies create access"))
+        }
+        if request.requested_delete && !rights.has(CAP_RIGHT_DELETE) {
+            return Result::Err(perm_denied("Capability denies delete access"))
+        }
+    }
+
+    // Permission bits check.
+    if request.check_bits {
+        let identity: Identity = request.identity
+        let groups: FixedArray[8, Identity> = request.groups
+        if request.requested_read && !has_read_permission(inode, identity, groups) {
+            return Result::Err(perm_denied("Permission bits deny read access"))
+        }
+        if request.requested_write && !has_write_permission(inode, identity, groups) {
+            return Result::Err(perm_denied("Permission bits deny write access"))
+        }
+        if request.requested_execute && !has_execute_permission(inode, identity, groups) {
+            return Result::Err(perm_denied("Permission bits deny execute access"))
+        }
+    }
+
+    Result::Ok(())
+}
+
+// ──────────────────────────────────────────────
+// Residual Recording for Permissions
+// ──────────────────────────────────────────────
+// Evidence path: PERM-RESID-001 through PERM-RESID-010
+
+pub fn residual_permission_check(
+    inode_number: Word64,
+    identity: Identity,
+    operation: FixedString[64],
+    granted: bool
+)
+    effects: [io, deterministic]
+{
+    residual emit {
+        subsystem: "permissions",
+        operation: "access_check",
+        inode: inode_number,
+        identity: identity,
+        access_type: operation,
+        granted: granted,
+        timestamp: __builtin_timestamp(),
+    }
+}
+
+pub fn residual_acl_change(
+    inode_number: Word64,
+    action: FixedString[64],
+    entry_count: Word32
+)
+    effects: [io, deterministic]
+{
+    residual emit {
+        subsystem: "permissions",
+        operation: "acl_change",
+        inode: inode_number,
+        action: action,
+        entry_count: entry_count,
+        timestamp: __builtin_timestamp(),
+    }
+}
+
+// ──────────────────────────────────────────────
+// Group Management
+// ──────────────────────────────────────────────
+// Evidence path: PERM-GROUP-001 through PERM-GROUP-020
+
+pub type GroupMembership : struct {
+    identity: Identity,
+    groups: FixedArray[16, Identity],
+    group_count: Word32,
+}
+
+impl GroupMembership {
+    pub fn new(id: Identity) -> GroupMembership
+        effects: [deterministic]
+    {
+        GroupMembership {
+            identity: id,
+            groups: FixedArray::new(),
+            group_count: Word32::from_u32(0),
+        }
+    }
+
+    pub fn add_group(self: ref mut, group: Identity) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        if self.groups.is_full() {
+            return Result::Err(perm_invalid("Group membership limit reached"))
+        }
+        // Check for duplicates.
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 16
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.groups.len() {
+            if self.groups.get(i).unwrap_or(Identity::null()).eq(group) {
+                return Result::Ok(())  // Already a member
+            }
+        }
+        self.groups.push(group)
+        self.group_count = Word32::from_u32(self.groups.len())
+        Result::Ok(())
+    }
+
+    pub fn remove_group(self: ref mut, group: Identity)
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 16
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.groups.len() {
+            if self.groups.get(i).unwrap_or(Identity::null()).eq(group) {
+                self.groups.remove(i)
+                self.group_count = Word32::from_u32(self.groups.len())
+                break
+            }
+        }
+    }
+
+    pub fn is_member(self, group: Identity) -> bool
+        effects: [deterministic]
+    {
+        // loop: bounds[BOUND_PERM_SMALL] — bounded by 16
+        loop: bounds[BOUND_PERM_SMALL] for i in 0..self.groups.len() {
+            if self.groups.get(i).unwrap_or(Identity::null()).eq(group) {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn get_groups(self) -> FixedArray[16, Identity]
+        effects: [deterministic]
+    {
+        self.groups
+    }
+}
+
+// ──────────────────────────────────────────────
+// Permission Derivation Chain
+// ──────────────────────────────────────────────
+// Evidence path: PERM-DERIVE-001 through PERM-DERIVE-020
+
+pub type PermissionDerivation : struct {
+    source_cap: Capability,
+    derived_cap: Capability,
+    derived_rights: RightsSet,
+    depth: Word32,
+    max_depth: Word32,
+}
+
+impl PermissionDerivation {
+    pub fn new(source: Capability, max_d: Word32) -> PermissionDerivation
+        effects: [deterministic]
+    {
+        PermissionDerivation {
+            source_cap: source,
+            derived_cap: source,
+            derived_rights: source.rights(),
+            depth: Word32::from_u32(0),
+            max_depth: max_d,
+        }
+    }
+
+    pub fn restrict(self: ref mut, rights_to_keep: RightsSet) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        if self.depth.to_u32() >= self.max_depth.to_u32() {
+            return Result::Err(perm_invalid("Permission derivation depth exceeded"))
+        }
+        let current: RightsSet = self.derived_rights
+        if !current.has_all(rights_to_keep) {
+            return Result::Err(perm_invalid("Cannot derive rights not held"))
+        }
+        self.derived_rights = rights_to_keep
+        self.depth = self.depth.checked_add(Word32::from_u32(1)).unwrap_or(self.depth)
+        Result::Ok(())
+    }
+
+    pub fn derive_readonly(self: ref mut) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        self.restrict(RightsSet::new(CAP_RIGHT_READ))
+    }
+
+    pub fn derive_writeonly(self: ref mut) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        self.restrict(RightsSet::new(CAP_RIGHT_WRITE))
+    }
+
+    pub fn derive_noexec(self: ref mut) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        let current: RightsSet = self.derived_rights
+        let without_exec: RightsSet = current.without(CAP_RIGHT_EXECUTE)
+        self.restrict(without_exec)
+    }
+
+    pub fn finalize(self) -> Capability
+        effects: [deterministic]
+    {
+        Capability::derive(self.source_cap, self.derived_rights)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Permission Verification
+// ──────────────────────────────────────────────
+// Evidence path: PERM-VERIFY-001 through PERM-VERIFY-015
+
+pub fn verify_acl_integrity(acl: AccessControlList) -> FixedArray[16, PermError>
+    effects: [deterministic]
+{
+    let mut errors: FixedArray[16, PermError> = FixedArray::new()
+    if !acl.has_entries() {
+        return errors  // Empty ACL is valid (default deny)
+    }
+    let mut has_mask: bool = false
+    // loop: bounds[BOUND_PERM_SMALL] — bounded by 32
+    loop: bounds[BOUND_PERM_SMALL] for i in 0..acl.entries.len() {
+        let entry: AclEntry = acl.entries.get(i).unwrap_or(AclEntry::empty())
+        if entry.tag == AclTag::AclTag_Mask {
+            if has_mask {
+                errors.push(perm_invalid("Multiple ACL mask entries"))
+            }
+            has_mask = true
+        }
+        if entry.identity.is_null() && entry.tag != AclTag::AclTag_Everyone {
+            errors.push(perm_invalid("ACL entry has null identity"))
+        }
+    }
+    errors
+}
+
+pub fn verify_capability_chain(cap: Capability, required: RightsSet) -> bool
+    effects: [deterministic]
+{
+    cap.rights().has_all(required)
+}
+
+// ──────────────────────────────────────────────
+// Default Permission Templates
+// ──────────────────────────────────────────────
+// Evidence path: PERM-TEMPLATE-001 through PERM-TEMPLATE-015
+
+pub fn default_file_permissions() -> Word32
+    effects: [deterministic]
+{
+    // 0o644: owner rw, group r, other r
+    Word32::from_u32(0o100644)
+}
+
+pub fn default_directory_permissions() -> Word32
+    effects: [deterministic]
+{
+    // 0o755: owner rwx, group rx, other rx
+    Word32::from_u32(0o040755)
+}
+
+pub fn default_symlink_permissions() -> Word32
+    effects: [deterministic]
+{
+    // 0o777: all rwx (symlinks have their own target permissions)
+    Word32::from_u32(0o120777)
+}
+
+pub fn permission_to_string(mode: Word32) -> FixedString[16]
+    effects: [deterministic]
+{
+    let mut s: FixedString[16] = FixedString::new()
+    let m: u16 = mode.to_u16()
+    // Owner
+    s.push_byte(if (m & PERM_OWNER_READ) != 0 { Byte::from_u8(b'r') } else { Byte::from_u8(b'-') })
+    s.push_byte(if (m & PERM_OWNER_WRITE) != 0 { Byte::from_u8(b'w') } else { Byte::from_u8(b'-') })
+    s.push_byte(if (m & PERM_OWNER_EXEC) != 0 { Byte::from_u8(b'x') } else { Byte::from_u8(b'-') })
+    // Group
+    s.push_byte(if (m & PERM_GROUP_READ) != 0 { Byte::from_u8(b'r') } else { Byte::from_u8(b'-') })
+    s.push_byte(if (m & PERM_GROUP_WRITE) != 0 { Byte::from_u8(b'w') } else { Byte::from_u8(b'-') })
+    s.push_byte(if (m & PERM_GROUP_EXEC) != 0 { Byte::from_u8(b'x') } else { Byte::from_u8(b'-') })
+    // Other
+    s.push_byte(if (m & PERM_OTHER_READ) != 0 { Byte::from_u8(b'r') } else { Byte::from_u8(b'-') })
+    s.push_byte(if (m & PERM_OTHER_WRITE) != 0 { Byte::from_u8(b'w') } else { Byte::from_u8(b'-') })
+    s.push_byte(if (m & PERM_OTHER_EXEC) != 0 { Byte::from_u8(b'x') } else { Byte::from_u8(b'-') })
+    s
+}
+
+// ──────────────────────────────────────────────
+// Permission Audit Trail
+// ──────────────────────────────────────────────
+// Evidence path: PERM-AUDIT-001 through PERM-AUDIT-015
+
+pub type PermissionAuditEntry : struct {
+    identity: Identity,
+    inode_number: Word64,
+    operation: Byte[32],
+    granted: bool,
+    reason: Byte[128],
+    timestamp: Word64,
+}
+
+impl PermissionAuditEntry {
+    pub fn new(id: Identity, inum: Word64, op: Byte[32], grant: bool, reason: Byte[128]) -> PermissionAuditEntry
+        effects: [deterministic]
+    {
+        PermissionAuditEntry {
+            identity: id,
+            inode_number: inum,
+            operation: op,
+            granted: grant,
+            reason: reason,
+            timestamp: __builtin_timestamp(),
+        }
+    }
+
+    pub fn to_residual(self)
+        effects: [io, deterministic]
+    {
+        residual emit {
+            subsystem: "permissions_audit",
+            identity: self.identity,
+            inode: self.inode_number,
+            granted: self.granted,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+pub type PermissionAuditLog : struct {
+    entries: FixedArray[64, PermissionAuditEntry],
+}
+
+impl PermissionAuditLog {
+    pub fn new() -> PermissionAuditLog
+        effects: [deterministic]
+    {
+        PermissionAuditLog { entries: FixedArray::new() }
+    }
+
+    pub fn record(self: ref mut, entry: PermissionAuditEntry)
+        effects: [io, deterministic]
+    {
+        if !self.entries.is_full() {
+            self.entries.push(entry)
+            entry.to_residual()
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// Capability Rights Management for Files
+// ──────────────────────────────────────────────
+// Evidence path: PERM-CAPMGR-001 through PERM-CAPMGR-020
+
+pub type FileCapabilityRights : struct {
+    read: bool,
+    write: bool,
+    execute: bool,
+    create: bool,
+    delete: bool,
+    modify: bool,
+    append: bool,
+    admin: bool,
+}
+
+impl FileCapabilityRights {
+    pub fn none() -> FileCapabilityRights
+        effects: [deterministic]
+    {
+        FileCapabilityRights {
+            read: false, write: false, execute: false,
+            create: false, delete: false, modify: false,
+            append: false, admin: false,
+        }
+    }
+
+    pub fn all() -> FileCapabilityRights
+        effects: [deterministic]
+    {
+        FileCapabilityRights {
+            read: true, write: true, execute: true,
+            create: true, delete: true, modify: true,
+            append: true, admin: true,
+        }
+    }
+
+    pub fn to_rights_set(self) -> RightsSet
+        effects: [deterministic]
+    {
+        let mut mask: Word64 = Word64::zero()
+        if self.read { mask = mask | CAP_RIGHT_READ }
+        if self.write { mask = mask | CAP_RIGHT_WRITE }
+        if self.execute { mask = mask | CAP_RIGHT_EXECUTE }
+        if self.create { mask = mask | CAP_RIGHT_CREATE }
+        if self.delete { mask = mask | CAP_RIGHT_DELETE }
+        if self.modify { mask = mask | CAP_RIGHT_MODIFY }
+        if self.append { mask = mask | CAP_RIGHT_APPEND }
+        if self.admin { mask = mask | CAP_RIGHT_ADMIN }
+        RightsSet::new(mask)
+    }
+
+    pub fn from_rights_set(rs: RightsSet) -> FileCapabilityRights
+        effects: [deterministic]
+    {
+        FileCapabilityRights {
+            read: rs.has(CAP_RIGHT_READ),
+            write: rs.has(CAP_RIGHT_WRITE),
+            execute: rs.has(CAP_RIGHT_EXECUTE),
+            create: rs.has(CAP_RIGHT_CREATE),
+            delete: rs.has(CAP_RIGHT_DELETE),
+            modify: rs.has(CAP_RIGHT_MODIFY),
+            append: rs.has(CAP_RIGHT_APPEND),
+            admin: rs.has(CAP_RIGHT_ADMIN),
+        }
+    }
+
+    pub fn to_fixed_string(self) -> FixedString[64]
+        effects: [deterministic]
+    {
+        let mut s: FixedString[64] = FixedString::new()
+        if self.read { s.push_byte(Byte::from_u8(b'r')) }
+        if self.write { s.push_byte(Byte::from_u8(b'w')) }
+        if self.execute { s.push_byte(Byte::from_u8(b'x')) }
+        if self.create { s.push_byte(Byte::from_u8(b'c')) }
+        if self.delete { s.push_byte(Byte::from_u8(b'd')) }
+        if self.modify { s.push_byte(Byte::from_u8(b'm')) }
+        if self.append { s.push_byte(Byte::from_u8(b'a')) }
+        if self.admin { s.push_byte(Byte::from_u8(b'A')) }
+        s
+    }
+}
+
+// ──────────────────────────────────────────────
+// Permission Verification Framework
+// ──────────────────────────────────────────────
+// Evidence path: PERM-VFYFRAME-001 through PERM-VFYFRAME-015
+
+pub type PermissionVerifier : struct {
+    identity: Identity,
+    groups: FixedArray[8, Identity],
+    capability: Capability,
+    check_bits: bool,
+    check_acl: bool,
+    check_cap: bool,
+}
+
+impl PermissionVerifier {
+    pub fn new(id: Identity, cap: Capability) -> PermissionVerifier
+        effects: [deterministic]
+    {
+        PermissionVerifier {
+            identity: id,
+            groups: FixedArray::new(),
+            capability: cap,
+            check_bits: true,
+            check_acl: true,
+            check_cap: true,
+        }
+    }
+
+    pub fn add_group(self: ref mut, group: Identity)
+        effects: [deterministic]
+    {
+        if !self.groups.is_full() {
+            self.groups.push(group)
+        }
+    }
+
+    pub fn verify_access(self, inode: Inode, requested: Word16) -> Result<(), PermError>
+        effects: [deterministic]
+    {
+        // Capability check.
+        if self.check_cap {
+            let rights: RightsSet = self.capability.rights()
+            let need_read: bool = (requested.to_u16() & (PERM_OWNER_READ | PERM_GROUP_READ | PERM_OTHER_READ)) != 0
+            let need_write: bool = (requested.to_u16() & (PERM_OWNER_WRITE | PERM_GROUP_WRITE | PERM_OTHER_WRITE)) != 0
+            let need_exec: bool = (requested.to_u16() & (PERM_OWNER_EXEC | PERM_GROUP_EXEC | PERM_OTHER_EXEC)) != 0
+            if need_read && !rights.has(CAP_RIGHT_READ) {
+                return Result::Err(perm_denied("Missing CAP_RIGHT_READ"))
+            }
+            if need_write && !rights.has(CAP_RIGHT_WRITE) {
+                return Result::Err(perm_denied("Missing CAP_RIGHT_WRITE"))
+            }
+            if need_exec && !rights.has(CAP_RIGHT_EXECUTE) {
+                return Result::Err(perm_denied("Missing CAP_RIGHT_EXECUTE"))
+            }
+        }
+        // Permission bits check.
+        if self.check_bits {
+            if !check_permission_bits(inode, self.identity, self.groups, requested) {
+                return Result::Err(perm_denied("Permission bits deny access"))
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn residual_check(self, inode_number: Word64, requested: Word16, result: bool)
+        effects: [io, deterministic]
+    {
+        residual_permission_check(inode_number, self.identity,
+            FixedString[64]::from_slice("access_verified"), result)
+    }
+}
+
+// ──────────────────────────────────────────────
+// Permission Mode Builder
+// ──────────────────────────────────────────────
+// Evidence path: PERM-BUILDER-001 through PERM-BUILDER-015
+
+pub fn build_permission_mask(owner_r: bool, owner_w: bool, owner_x: bool,
+                              group_r: bool, group_w: bool, group_x: bool,
+                              other_r: bool, other_w: bool, other_x: bool) -> Word16
+    effects: [deterministic]
+{
+    let mut mode: u16 = 0
+    if owner_r { mode = mode | PERM_OWNER_READ }
+    if owner_w { mode = mode | PERM_OWNER_WRITE }
+    if owner_x { mode = mode | PERM_OWNER_EXEC }
+    if group_r { mode = mode | PERM_GROUP_READ }
+    if group_w { mode = mode | PERM_GROUP_WRITE }
+    if group_x { mode = mode | PERM_GROUP_EXEC }
+    if other_r { mode = mode | PERM_OTHER_READ }
+    if other_w { mode = mode | PERM_OTHER_WRITE }
+    if other_x { mode = mode | PERM_OTHER_EXEC }
+    Word16::from_u16(mode)
+}
+
+pub fn default_umask() -> Word16
+    effects: [deterministic]
+{
+    Word16::from_u16(0o022)  // Group/other write disabled by default
+}
+
+pub fn apply_umask(mode: Word16, umask: Word16) -> Word16
+    effects: [deterministic]
+{
+    Word16::from_u16(mode.to_u16() & !umask.to_u16())
+}

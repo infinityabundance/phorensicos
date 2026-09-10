@@ -1,0 +1,1050 @@
+// canvas.phor — Phorensic Canvas Rendering
+// Software reference rasterizer: pixel operations, shapes, text, 2D transforms
+// All operations bounded. Every function declares effects.
+
+package gui.canvas;
+
+import gui.protocol;
+
+// ──────────────────────────────────────────────
+// Canvas Constants
+// ──────────────────────────────────────────────
+
+const CANVAS_MAX_WIDTH: u64 = 8192;
+const CANVAS_MAX_HEIGHT: u64 = 8192;
+const CANVAS_MAX_PIXELS: u64 = 67108864; // 8K × 8K
+const MAX_CLIP_STACK: u64 = 16;
+const MAX_PATH_VERTS: u64 = 4096;
+const MAX_GLYPH_CACHE: u64 = 256;
+const MAX_FONT_NAMES: u64 = 32;
+const FONT_ATLAS_SIZE: u64 = 1024;
+const GLYPH_BITMAP_SIZE: u64 = 128;
+const MAX_TEXT_LAYOUT_LINES: u64 = 128;
+const ARC_SEGMENTS: u64 = 64;
+
+// ──────────────────────────────────────────────
+// Pixel Operations
+// ──────────────────────────────────────────────
+
+fn blend_pixel(src: protocol.ColorRGBA, dst: protocol.ColorRGBA) -> protocol.ColorRGBA
+    effect [compute]
+{
+    if src.a == 0 {
+        return dst;
+    }
+    if src.a == 255 {
+        return src;
+    }
+    let alpha: u32 = src.a as u32;
+    let inv_alpha: u32 = 255 - alpha;
+    let r: u8 = ((src.r as u32 * alpha + dst.r as u32 * inv_alpha) / 255) as u8;
+    let g: u8 = ((src.g as u32 * alpha + dst.g as u32 * inv_alpha) / 255) as u8;
+    let b: u8 = ((src.b as u32 * alpha + dst.b as u32 * inv_alpha) / 255) as u8;
+    let a: u8 = (alpha + (dst.a as u32 * inv_alpha) / 255) as u8;
+    return protocol.ColorRGBA { r: r, g: g, b: b, a: a };
+}
+
+fn premultiply_alpha(c: protocol.ColorRGBA) -> protocol.ColorRGBA
+    effect [compute]
+{
+    let a: u32 = c.a as u32;
+    let r: u8 = ((c.r as u32 * a) / 255) as u8;
+    let g: u8 = ((c.g as u32 * a) / 255) as u8;
+    let b: u8 = ((c.b as u32 * a) / 255) as u8;
+    return protocol.ColorRGBA { r: r, g: g, b: b, a: c.a };
+}
+
+fn lerp_color(a: protocol.ColorRGBA, b: protocol.ColorRGBA, t: f64) -> protocol.ColorRGBA
+    effect [compute]
+{
+    let r: u8 = (a.r as f64 + (b.r as f64 - a.r as f64) * t) as u8;
+    let g: u8 = (a.g as f64 + (b.g as f64 - a.g as f64) * t) as u8;
+    let b: u8 = (a.b as f64 + (b.b as f64 - a.b as f64) * t) as u8;
+    let a_: u8 = (a.a as f64 + (b.a as f64 - a.a as f64) * t) as u8;
+    return protocol.ColorRGBA { r: r, g: g, b: b, a: a_ };
+}
+
+// ──────────────────────────────────────────────
+// Canvas State
+// ──────────────────────────────────────────────
+
+struct CanvasState {
+    width: u32,
+    height: u32,
+    stride: u32,
+    data: Array(u8, CANVAS_MAX_PIXELS),
+    clip: protocol.Rectangle,
+    clip_stack: Array(protocol.Rectangle, MAX_CLIP_STACK),
+    clip_depth: u64,
+    fill_color: protocol.ColorRGBA,
+    stroke_color: protocol.ColorRGBA,
+    stroke_width: f64,
+    antialias: bool,
+    transform_a: f64,
+    transform_b: f64,
+    transform_c: f64,
+    transform_d: f64,
+    transform_e: f64,
+    transform_f: f64,
+    compositing_mode: u64, // 0=source-over, 1=source-atop, etc.
+    opacity: f64,
+}
+
+// ──────────────────────────────────────────────
+// Canvas Construction
+// ──────────────────────────────────────────────
+
+fn canvas_create(width: u32, height: u32) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: width,
+        height: height,
+        stride: width * 4,
+        data: Array::zeroed(),
+        clip: protocol.make_rect(0, 0, width as i32, height as i32),
+        clip_stack: Array::zeroed(),
+        clip_depth: 0,
+        fill_color: protocol.color_white(),
+        stroke_color: protocol.color_black(),
+        stroke_width: 1.0,
+        antialias: true,
+        transform_a: 1.0,
+        transform_b: 0.0,
+        transform_c: 0.0,
+        transform_d: 1.0,
+        transform_e: 0.0,
+        transform_f: 0.0,
+        compositing_mode: 0,
+        opacity: 1.0,
+    };
+}
+
+fn canvas_from_buffer(data: Slice(u8), width: u32, height: u32, stride: u32) -> CanvasState
+    effect [compute]
+{
+    let mut cs: CanvasState = canvas_create(width, height);
+    let copy_len: u64 = if data.len() < CANVAS_MAX_PIXELS { data.len() } else { CANVAS_MAX_PIXELS };
+    for i in 0..copy_len {
+        cs.data[i] = data[i];
+    }
+    cs.stride = stride;
+    return cs;
+}
+
+fn canvas_reset(cs: CanvasState) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: Array::zeroed(),
+        clip: protocol.make_rect(0, 0, cs.width as i32, cs.height as i32),
+        clip_stack: Array::zeroed(),
+        clip_depth: 0,
+        fill_color: protocol.color_white(),
+        stroke_color: protocol.color_black(),
+        stroke_width: 1.0,
+        antialias: true,
+        transform_a: 1.0,
+        transform_b: 0.0,
+        transform_c: 0.0,
+        transform_d: 1.0,
+        transform_e: 0.0,
+        transform_f: 0.0,
+        compositing_mode: 0,
+        opacity: 1.0,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Pixel Coordinate Helpers
+// ──────────────────────────────────────────────
+
+fn pixel_offset(cs: CanvasState, x: u32, y: u32) -> u64
+    effect [compute]
+{
+    return (y as u64) * (cs.stride as u64) + (x as u64) * 4;
+}
+
+fn pixel_at(cs: CanvasState, x: u32, y: u32) -> protocol.ColorRGBA
+    effect [io:read, compute]
+{
+    let off: u64 = pixel_offset(cs, x, y);
+    let r: u8 = cs.data[off];
+    let g: u8 = cs.data[off + 1];
+    let b: u8 = cs.data[off + 2];
+    let a: u8 = cs.data[off + 3];
+    return protocol.ColorRGBA { r: r, g: g, b: b, a: a };
+}
+
+fn pixel_set(cs: CanvasState, x: u32, y: u32, c: protocol.ColorRGBA) -> CanvasState
+    effect [io:write, compute]
+{
+    if x >= cs.width || y >= cs.height {
+        return cs;
+    }
+    if x < (cs.clip.x as u32) || y < (cs.clip.y as u32) {
+        return cs;
+    }
+    if x >= (cs.clip.x + cs.clip.width as i32) as u32 || y >= (cs.clip.y + cs.clip.height as i32) as u32 {
+        return cs;
+    }
+    let mut updated: CanvasState = cs;
+    let off: u64 = pixel_offset(updated, x, y);
+    let blended: protocol.ColorRGBA = if cs.compositing_mode == 0 {
+        blend_pixel(c, pixel_at(cs, x, y))
+    } else {
+        c
+    };
+    updated.data[off] = blended.r;
+    updated.data[off + 1] = blended.g;
+    updated.data[off + 2] = blended.b;
+    updated.data[off + 3] = blended.a;
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Transform Operations
+// ──────────────────────────────────────────────
+
+fn transform_point(cs: CanvasState, x: f64, y: f64) -> (f64, f64)
+    effect [compute]
+{
+    let nx: f64 = cs.transform_a * x + cs.transform_c * y + cs.transform_e;
+    let ny: f64 = cs.transform_b * x + cs.transform_d * y + cs.transform_f;
+    return (nx, ny);
+}
+
+fn canvas_translate(cs: CanvasState, tx: f64, ty: f64) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: cs.stroke_color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a,
+        transform_b: cs.transform_b,
+        transform_c: cs.transform_c,
+        transform_d: cs.transform_d,
+        transform_e: cs.transform_e + tx,
+        transform_f: cs.transform_f + ty,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+fn canvas_scale(cs: CanvasState, sx: f64, sy: f64) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: cs.stroke_color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a * sx,
+        transform_b: cs.transform_b * sx,
+        transform_c: cs.transform_c * sy,
+        transform_d: cs.transform_d * sy,
+        transform_e: cs.transform_e,
+        transform_f: cs.transform_f,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+fn canvas_rotate(cs: CanvasState, angle: f64) -> CanvasState
+    effect [compute]
+{
+    let cos_a: f64 = 1.0; // cos(0) approximation — real impl would use trig
+    let sin_a: f64 = 0.0; // sin(0) — simplified
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: cs.stroke_color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a * cos_a - cs.transform_c * sin_a,
+        transform_b: cs.transform_b * cos_a - cs.transform_d * sin_a,
+        transform_c: cs.transform_a * sin_a + cs.transform_c * cos_a,
+        transform_d: cs.transform_b * sin_a + cs.transform_d * cos_a,
+        transform_e: cs.transform_e,
+        transform_f: cs.transform_f,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+fn canvas_identity(cs: CanvasState) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: cs.stroke_color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: 1.0,
+        transform_b: 0.0,
+        transform_c: 0.0,
+        transform_d: 1.0,
+        transform_e: 0.0,
+        transform_f: 0.0,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Clipping
+// ──────────────────────────────────────────────
+
+fn canvas_push_clip(cs: CanvasState, rect: protocol.Rectangle) -> CanvasState
+    effect [compute]
+{
+    if cs.clip_depth >= MAX_CLIP_STACK {
+        return cs;
+    }
+    let mut updated: CanvasState = cs;
+    updated.clip_stack[cs.clip_depth] = cs.clip;
+    updated.clip_depth = cs.clip_depth + 1;
+    // Intersect with current clip
+    let new_x: i32 = if rect.x > cs.clip.x { rect.x } else { cs.clip.x };
+    let new_y: i32 = if rect.y > cs.clip.y { rect.y } else { cs.clip.y };
+    let new_w: u32 = if (rect.x + rect.width as i32) < (cs.clip.x + cs.clip.width as i32) {
+        (rect.x + rect.width as i32 - new_x) as u32
+    } else {
+        (cs.clip.x + cs.clip.width as i32 - new_x) as u32
+    };
+    let new_h: u32 = if (rect.y + rect.height as i32) < (cs.clip.y + cs.clip.height as i32) {
+        (rect.y + rect.height as i32 - new_y) as u32
+    } else {
+        (cs.clip.y + cs.clip.height as i32 - new_y) as u32
+    };
+    updated.clip = protocol.make_rect(new_x, new_y, new_w, new_h);
+    return updated;
+}
+
+fn canvas_pop_clip(cs: CanvasState) -> CanvasState
+    effect [compute]
+{
+    if cs.clip_depth == 0 {
+        return cs;
+    }
+    let mut updated: CanvasState = cs;
+    updated.clip_depth = cs.clip_depth - 1;
+    updated.clip = cs.clip_stack[updated.clip_depth];
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Fill Operations
+// ──────────────────────────────────────────────
+
+fn canvas_clear(cs: CanvasState, color: protocol.ColorRGBA) -> CanvasState
+    effect [io:write, compute]
+    bound iterations CANVAS_MAX_PIXELS
+{
+    let mut updated: CanvasState = cs;
+    let total_pixels: u64 = (cs.stride as u64) * (cs.height as u64);
+    let fill_count: u64 = if total_pixels < CANVAS_MAX_PIXELS { total_pixels } else { CANVAS_MAX_PIXELS };
+    for i in 0..fill_count {
+        if i % 4 == 0 {
+            updated.data[i] = color.r;
+        } else if i % 4 == 1 {
+            updated.data[i] = color.g;
+        } else if i % 4 == 2 {
+            updated.data[i] = color.b;
+        } else {
+            updated.data[i] = color.a;
+        }
+    }
+    return updated;
+}
+
+fn canvas_fill_rect(cs: CanvasState, rect: protocol.Rectangle) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let y_start: u32 = if rect.y < 0 { 0 } else { rect.y as u32 };
+    let y_end: u32 = if (rect.y + rect.height as i32) > (cs.height as i32) {
+        cs.height
+    } else {
+        (rect.y + rect.height as i32) as u32
+    };
+    let x_start: u32 = if rect.x < 0 { 0 } else { rect.x as u32 };
+    let x_end: u32 = if (rect.x + rect.width as i32) > (cs.width as i32) {
+        cs.width
+    } else {
+        (rect.x + rect.width as i32) as u32
+    };
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            updated = pixel_set(updated, x, y, updated.fill_color);
+        }
+    }
+    return updated;
+}
+
+fn canvas_stroke_rect(cs: CanvasState, rect: protocol.Rectangle) -> CanvasState
+    effect [io:read, io:write, compute]
+{
+    let mut updated: CanvasState = cs;
+    let sw: u32 = cs.stroke_width as u32;
+    if sw == 0 { sw = 1; }
+    // Top edge
+    let top_rect: protocol.Rectangle = protocol.make_rect(rect.x, rect.y, rect.width, sw);
+    let top_color: protocol.ColorRGBA = updated.stroke_color;
+    let save_fill: protocol.ColorRGBA = updated.fill_color;
+    updated.fill_color = top_color;
+    updated = canvas_fill_rect(updated, top_rect);
+    // Bottom edge
+    let bottom_rect: protocol.Rectangle = protocol.make_rect(rect.x, rect.y + rect.height as i32 - sw as i32, rect.width, sw);
+    updated.fill_color = top_color;
+    updated = canvas_fill_rect(updated, bottom_rect);
+    // Left edge
+    let left_rect: protocol.Rectangle = protocol.make_rect(rect.x, rect.y, sw, rect.height);
+    updated.fill_color = top_color;
+    updated = canvas_fill_rect(updated, left_rect);
+    // Right edge
+    let right_rect: protocol.Rectangle = protocol.make_rect(rect.x + rect.width as i32 - sw as i32, rect.y, sw, rect.height);
+    updated.fill_color = top_color;
+    updated = canvas_fill_rect(updated, right_rect);
+    updated.fill_color = save_fill;
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Circle / Ellipse
+// ──────────────────────────────────────────────
+
+fn canvas_fill_circle(cs: CanvasState, cx: f64, cy: f64, radius: f64) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let r_sq: f64 = radius * radius;
+    let min_y: i32 = (cy - radius) as i32;
+    let max_y: i32 = (cy + radius) as i32;
+    let min_x: i32 = (cx - radius) as i32;
+    let max_x: i32 = (cx + radius) as i32;
+    let y_start: i32 = if min_y < 0 { 0 } else { min_y };
+    let y_end: i32 = if max_y >= cs.height as i32 { cs.height as i32 - 1 } else { max_y };
+    for y in y_start..(y_end + 1) {
+        let dy: f64 = (y as f64) - cy;
+        for x in min_x..(max_x + 1) {
+            if x < 0 || x >= cs.width as i32 { continue; }
+            let dx: f64 = (x as f64) - cx;
+            if dx * dx + dy * dy <= r_sq {
+                updated = pixel_set(updated, x as u32, y as u32, updated.fill_color);
+            }
+        }
+    }
+    return updated;
+}
+
+fn canvas_stroke_circle(cs: CanvasState, cx: f64, cy: f64, radius: f64) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let inner_r: f64 = radius - cs.stroke_width / 2.0;
+    let outer_r: f64 = radius + cs.stroke_width / 2.0;
+    let inner_sq: f64 = inner_r * inner_r;
+    let outer_sq: f64 = outer_r * outer_r;
+    let min_y: i32 = (cy - outer_r) as i32;
+    let max_y: i32 = (cy + outer_r) as i32;
+    let min_x: i32 = (cx - outer_r) as i32;
+    let max_x: i32 = (cx + outer_r) as i32;
+    for y in min_y..(max_y + 1) {
+        if y < 0 || y >= cs.height as i32 { continue; }
+        let dy: f64 = (y as f64) - cy;
+        for x in min_x..(max_x + 1) {
+            if x < 0 || x >= cs.width as i32 { continue; }
+            let dx: f64 = (x as f64) - cx;
+            let d_sq: f64 = dx * dx + dy * dy;
+            if d_sq <= outer_sq && d_sq >= inner_sq {
+                updated = pixel_set(updated, x as u32, y as u32, updated.stroke_color);
+            }
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Line Drawing (Bresenham)
+// ──────────────────────────────────────────────
+
+fn canvas_draw_line(cs: CanvasState, x1: f64, y1: f64, x2: f64, y2: f64) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_WIDTH
+{
+    let mut updated: CanvasState = cs;
+    let dx: f64 = x2 - x1;
+    let dy: f64 = y2 - y1;
+    let steps: u64 = if dx.abs() > dy.abs() { dx.abs() as u64 } else { dy.abs() as u64 };
+    if steps == 0 {
+        return updated;
+    }
+    let x_inc: f64 = dx / (steps as f64);
+    let y_inc: f64 = dy / (steps as f64);
+    let mut x: f64 = x1;
+    let mut y: f64 = y1;
+    for i in 0..(steps + 1) {
+        let px: u32 = x as u32;
+        let py: u32 = y as u32;
+        if px < updated.width && py < updated.height {
+            updated = pixel_set(updated, px, py, updated.stroke_color);
+        }
+        x = x + x_inc;
+        y = y + y_inc;
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Polygon Fill
+// ──────────────────────────────────────────────
+
+fn canvas_fill_polygon(cs: CanvasState, verts: Slice((f64, f64)), count: u64) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    if count < 3 { return updated; }
+    // Find bounds
+    let mut min_y: f64 = verts[0].1;
+    let mut max_y: f64 = verts[0].1;
+    for i in 1..count {
+        if verts[i].1 < min_y { min_y = verts[i].1; }
+        if verts[i].1 > max_y { max_y = verts[i].1; }
+    }
+    let y_start: i32 = if min_y < 0.0 { 0 } else { min_y as i32 };
+    let y_end: i32 = if max_y >= cs.height as f64 { cs.height as i32 - 1 } else { max_y as i32 };
+    for y in y_start..(y_end + 1) {
+        let mut intersections: Array(f64, MAX_PATH_VERTS) = Array::zeroed();
+        let mut inter_count: u64 = 0;
+        for i in 0..count {
+            let j: u64 = (i + 1) % count;
+            let xi: f64 = verts[i].0;
+            let yi: f64 = verts[i].1;
+            let xj: f64 = verts[j].0;
+            let yj: f64 = verts[j].1;
+            if (yi <= y as f64 && yj > y as f64) || (yj <= y as f64 && yi > y as f64) {
+                let x_int: f64 = xi + (y as f64 - yi) * (xj - xi) / (yj - yi);
+                intersections[inter_count] = x_int;
+                inter_count = inter_count + 1;
+            }
+        }
+        // Sort intersections
+        for i in 0..inter_count {
+            for j in 0..(inter_count - i - 1) {
+                if intersections[j] > intersections[j + 1] {
+                    let tmp: f64 = intersections[j];
+                    intersections[j] = intersections[j + 1];
+                    intersections[j + 1] = tmp;
+                }
+            }
+        }
+        // Fill between pairs
+        let mut i: u64 = 0;
+        while i + 1 < inter_count {
+            let x_start: i32 = intersections[i] as i32;
+            let x_end: i32 = intersections[i + 1] as i32;
+            for x in x_start..(x_end + 1) {
+                if x >= 0 && x < cs.width as i32 {
+                    updated = pixel_set(updated, x as u32, y as u32, updated.fill_color);
+                }
+            }
+            i = i + 2;
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Rounded Rectangle
+// ──────────────────────────────────────────────
+
+fn canvas_fill_rounded_rect(cs: CanvasState, rect: protocol.Rectangle, radius: u32) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let r: u32 = if radius > rect.width / 2 { rect.width / 2 }
+        else if radius > rect.height / 2 { rect.height / 2 }
+        else { radius };
+    let r_sq: f64 = (r * r) as f64;
+
+    let y_start: i32 = if rect.y < 0 { 0 } else { rect.y };
+    let y_end: i32 = if (rect.y + rect.height as i32) > cs.height as i32 {
+        cs.height as i32
+    } else {
+        rect.y + rect.height as i32
+    };
+
+    for y in y_start..y_end {
+        let dy_top: i32 = y - rect.y;
+        let dy_bot: i32 = (rect.y + rect.height as i32) - y - 1;
+        let corner_dy: i32 = if dy_top < r as i32 { dy_top }
+            else if dy_bot < r as i32 { dy_bot }
+            else { -1 };
+
+        let x_start: i32 = if rect.x < 0 { 0 } else { rect.x };
+        let x_end: i32 = if (rect.x + rect.width as i32) > cs.width as i32 {
+            cs.width as i32
+        } else {
+            rect.x + rect.width as i32
+        };
+
+        for x in x_start..x_end {
+            let dx_left: i32 = x - rect.x;
+            let dx_right: i32 = (rect.x + rect.width as i32) - x - 1;
+            let corner_dx: i32 = if dx_left < r as i32 { dx_left }
+                else if dx_right < r as i32 { dx_right }
+                else { -1 };
+
+            if corner_dx >= 0 && corner_dy >= 0 {
+                let dd: f64 = (corner_dx * corner_dx + corner_dy * corner_dy) as f64;
+                if dd > r_sq {
+                    continue; // outside corner
+                }
+            }
+            updated = pixel_set(updated, x as u32, y as u32, updated.fill_color);
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Gradient Fill
+// ──────────────────────────────────────────────
+
+fn canvas_fill_rect_gradient_h(cs: CanvasState, rect: protocol.Rectangle, c1: protocol.ColorRGBA, c2: protocol.ColorRGBA) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let y_start: i32 = if rect.y < 0 { 0 } else { rect.y };
+    let y_end: i32 = if (rect.y + rect.height as i32) > cs.height as i32 { cs.height as i32 } else { rect.y + rect.height as i32 };
+    let x_start: i32 = if rect.x < 0 { 0 } else { rect.x };
+    let x_end: i32 = if (rect.x + rect.width as i32) > cs.width as i32 { cs.width as i32 } else { rect.x + rect.width as i32 };
+    let w: f64 = (x_end - x_start) as f64;
+    if w <= 0.0 { return updated; }
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            let t: f64 = ((x - x_start) as f64) / w;
+            let c: protocol.ColorRGBA = lerp_color(c1, c2, t);
+            updated = pixel_set(updated, x as u32, y as u32, c);
+        }
+    }
+    return updated;
+}
+
+fn canvas_fill_rect_gradient_v(cs: CanvasState, rect: protocol.Rectangle, c1: protocol.ColorRGBA, c2: protocol.ColorRGBA) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let y_start: i32 = if rect.y < 0 { 0 } else { rect.y };
+    let y_end: i32 = if (rect.y + rect.height as i32) > cs.height as i32 { cs.height as i32 } else { rect.y + rect.height as i32 };
+    let x_start: i32 = if rect.x < 0 { 0 } else { rect.x };
+    let x_end: i32 = if (rect.x + rect.width as i32) > cs.width as i32 { cs.width as i32 } else { rect.x + rect.width as i32 };
+    let h: f64 = (y_end - y_start) as f64;
+    if h <= 0.0 { return updated; }
+    for y in y_start..y_end {
+        let t: f64 = ((y - y_start) as f64) / h;
+        let c: protocol.ColorRGBA = lerp_color(c1, c2, t);
+        for x in x_start..x_end {
+            updated = pixel_set(updated, x as u32, y as u32, c);
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Bitmap / Image Copy
+// ──────────────────────────────────────────────
+
+fn canvas_blit(cs: CanvasState, src: Slice(u8), src_w: u32, src_h: u32, dst_x: i32, dst_y: i32) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    for sy in 0..src_h {
+        let dy: i32 = dst_y + sy as i32;
+        if dy < 0 || dy >= cs.height as i32 { continue; }
+        for sx in 0..src_w {
+            let dx: i32 = dst_x + sx as i32;
+            if dx < 0 || dx >= cs.width as i32 { continue; }
+            let src_off: u64 = (sy as u64) * (src_w as u64) * 4 + (sx as u64) * 4;
+            let r: u8 = src[src_off];
+            let g: u8 = src[src_off + 1];
+            let b: u8 = src[src_off + 2];
+            let a: u8 = src[src_off + 3];
+            let color: protocol.ColorRGBA = protocol.ColorRGBA { r: r, g: g, b: b, a: a };
+            updated = pixel_set(updated, dx as u32, dy as u32, color);
+        }
+    }
+    return updated;
+}
+
+fn canvas_blit_scaled(cs: CanvasState, src: Slice(u8), src_w: u32, src_h: u32, dst: protocol.Rectangle) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    let scale_x: f64 = src_w as f64 / dst.width as f64;
+    let scale_y: f64 = src_h as f64 / dst.height as f64;
+    let y_start: i32 = if dst.y < 0 { 0 } else { dst.y };
+    let y_end: i32 = if (dst.y + dst.height as i32) > cs.height as i32 { cs.height as i32 } else { dst.y + dst.height as i32 };
+    let x_start: i32 = if dst.x < 0 { 0 } else { dst.x };
+    let x_end: i32 = if (dst.x + dst.width as i32) > cs.width as i32 { cs.width as i32 } else { dst.x + dst.width as i32 };
+    for y in y_start..y_end {
+        let src_y: u32 = ((y - dst.y) as f64 * scale_y) as u32;
+        if src_y >= src_h { continue; }
+        for x in x_start..x_end {
+            let src_x: u32 = ((x - dst.x) as f64 * scale_x) as u32;
+            if src_x >= src_w { continue; }
+            let src_off: u64 = (src_y as u64) * (src_w as u64) * 4 + (src_x as u64) * 4;
+            let r: u8 = src[src_off];
+            let g: u8 = src[src_off + 1];
+            let b: u8 = src[src_off + 2];
+            let a: u8 = src[src_off + 3];
+            let color: protocol.ColorRGBA = protocol.ColorRGBA { r: r, g: g, b: b, a: a };
+            updated = pixel_set(updated, x as u32, y as u32, color);
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Simple Bitmap Font Glyph
+// ──────────────────────────────────────────────
+
+struct GlyphMetrics {
+    width: u32,
+    height: u32,
+    bearing_x: i32,
+    bearing_y: i32,
+    advance: u32,
+    bitmap: Array(u8, GLYPH_BITMAP_SIZE * GLYPH_BITMAP_SIZE),
+}
+
+struct FontAtlas {
+    glyphs: Array(GlyphMetrics, MAX_GLYPH_CACHE),
+    glyph_count: u64,
+    font_size: u32,
+    line_height: u32,
+    space_width: u32,
+    tab_width: u32,
+}
+
+fn font_atlas_create(size: u32) -> FontAtlas
+    effect [compute]
+{
+    let mut atlas: FontAtlas = FontAtlas {
+        glyphs: Array::zeroed(),
+        glyph_count: 0,
+        font_size: size,
+        line_height: size + size / 2,
+        space_width: size / 3,
+        tab_width: size * 2,
+    };
+    // Seed basic ASCII glyphs with simple patterns
+    for code in 32..127 {
+        let glyph: GlyphMetrics = GlyphMetrics {
+            width: size / 2,
+            height: size,
+            bearing_x: 0,
+            bearing_y: size as i32,
+            advance: size / 2 + 1,
+            bitmap: Array::zeroed(),
+        };
+        atlas.glyphs[atlas.glyph_count] = glyph;
+        atlas.glyph_count = atlas.glyph_count + 1;
+    }
+    return atlas;
+}
+
+fn measure_text(atlas: FontAtlas, text: Slice(u8)) -> (u32, u32)
+    effect [compute]
+    bound iterations 512
+{
+    let mut total_w: u32 = 0;
+    let mut max_h: u32 = atlas.line_height;
+    let mut line_w: u32 = 0;
+    for i in 0..512 {
+        if i >= text.len() { break; }
+        let ch: u8 = text[i];
+        if ch == 10 { // newline
+            if line_w > total_w { total_w = line_w; }
+            line_w = 0;
+            max_h = max_h + atlas.line_height;
+        } else if ch == 32 { // space
+            line_w = line_w + atlas.space_width;
+        } else if ch == 9 { // tab
+            line_w = line_w + atlas.tab_width;
+        } else if ch >= 32 && ch < 127 {
+            let idx: u64 = (ch - 32) as u64;
+            if idx < atlas.glyph_count {
+                line_w = line_w + atlas.glyphs[idx].advance;
+            }
+        } else {
+            line_w = line_w + atlas.space_width;
+        }
+    }
+    if line_w > total_w { total_w = line_w; }
+    return (total_w, max_h);
+}
+
+// ──────────────────────────────────────────────
+// Text Rendering
+// ──────────────────────────────────────────────
+
+fn canvas_draw_text(cs: CanvasState, atlas: FontAtlas, text: Slice(u8), x: i32, y: i32) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations 512
+{
+    let mut updated: CanvasState = cs;
+    let mut cursor_x: i32 = x;
+    let mut cursor_y: i32 = y;
+    for i in 0..512 {
+        if i >= text.len() { break; }
+        let ch: u8 = text[i];
+        if ch == 10 { // newline
+            cursor_x = x;
+            cursor_y = cursor_y + atlas.line_height as i32;
+        } else if ch == 32 { // space
+            cursor_x = cursor_x + atlas.space_width as i32;
+        } else if ch == 9 { // tab
+            cursor_x = cursor_x + atlas.tab_width as i32;
+        } else if ch >= 32 && ch < 127 {
+            let idx: u64 = (ch - 32) as u64;
+            if idx < atlas.glyph_count {
+                let glyph: GlyphMetrics = atlas.glyphs[idx];
+                let gx: i32 = cursor_x + glyph.bearing_x;
+                let gy: i32 = cursor_y - glyph.bearing_y;
+                // Render glyph bitmap (simplified: render as filled rectangle)
+                let gr: protocol.Rectangle = protocol.make_rect(gx, gy, glyph.width, glyph.height);
+                let save_fill: protocol.ColorRGBA = updated.fill_color;
+                updated = canvas_fill_rect(updated, gr);
+                updated.fill_color = save_fill;
+                cursor_x = cursor_x + glyph.advance as i32;
+            } else {
+                cursor_x = cursor_x + atlas.space_width as i32;
+            }
+        }
+    }
+    return updated;
+}
+
+fn canvas_draw_text_colored(cs: CanvasState, atlas: FontAtlas, text: Slice(u8), x: i32, y: i32, color: protocol.ColorRGBA) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations 512
+{
+    let save: protocol.ColorRGBA = cs.fill_color;
+    let mut updated: CanvasState = cs;
+    updated.fill_color = color;
+    updated = canvas_draw_text(updated, atlas, text, x, y);
+    updated.fill_color = save;
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Canvas State Helpers
+// ──────────────────────────────────────────────
+
+fn canvas_set_fill_color(cs: CanvasState, color: protocol.ColorRGBA) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: color,
+        stroke_color: cs.stroke_color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a,
+        transform_b: cs.transform_b,
+        transform_c: cs.transform_c,
+        transform_d: cs.transform_d,
+        transform_e: cs.transform_e,
+        transform_f: cs.transform_f,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+fn canvas_set_stroke_color(cs: CanvasState, color: protocol.ColorRGBA) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a,
+        transform_b: cs.transform_b,
+        transform_c: cs.transform_c,
+        transform_d: cs.transform_d,
+        transform_e: cs.transform_e,
+        transform_f: cs.transform_f,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+fn canvas_set_stroke_width(cs: CanvasState, width: f64) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: cs.stroke_color,
+        stroke_width: width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a,
+        transform_b: cs.transform_b,
+        transform_c: cs.transform_c,
+        transform_d: cs.transform_d,
+        transform_e: cs.transform_e,
+        transform_f: cs.transform_f,
+        compositing_mode: cs.compositing_mode,
+        opacity: cs.opacity,
+    };
+}
+
+fn canvas_set_opacity(cs: CanvasState, opacity: f64) -> CanvasState
+    effect [compute]
+{
+    return CanvasState {
+        width: cs.width,
+        height: cs.height,
+        stride: cs.stride,
+        data: cs.data,
+        clip: cs.clip,
+        clip_stack: cs.clip_stack,
+        clip_depth: cs.clip_depth,
+        fill_color: cs.fill_color,
+        stroke_color: cs.stroke_color,
+        stroke_width: cs.stroke_width,
+        antialias: cs.antialias,
+        transform_a: cs.transform_a,
+        transform_b: cs.transform_b,
+        transform_c: cs.transform_c,
+        transform_d: cs.transform_d,
+        transform_e: cs.transform_e,
+        transform_f: cs.transform_f,
+        compositing_mode: cs.compositing_mode,
+        opacity: opacity,
+    };
+}
+
+// ──────────────────────────────────────────────
+// Composite Two Canvases
+// ──────────────────────────────────────────────
+
+fn canvas_composite(cs: CanvasState, src: Slice(u8), src_w: u32, src_h: u32, dx: i32, dy: i32, alpha: f64) -> CanvasState
+    effect [io:read, io:write, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut updated: CanvasState = cs;
+    for sy in 0..src_h {
+        let py: i32 = dy + sy as i32;
+        if py < 0 || py >= cs.height as i32 { continue; }
+        for sx in 0..src_w {
+            let px: i32 = dx + sx as i32;
+            if px < 0 || px >= cs.width as i32 { continue; }
+            let src_off: u64 = (sy as u64) * (src_w as u64) * 4 + (sx as u64) * 4;
+            let mut r: u8 = src[src_off];
+            let mut g: u8 = src[src_off + 1];
+            let mut b: u8 = src[src_off + 2];
+            let mut a: u8 = src[src_off + 3];
+            if alpha < 1.0 {
+                a = (a as f64 * alpha) as u8;
+                r = (r as f64 * alpha) as u8;
+                g = (g as f64 * alpha) as u8;
+                b = (b as f64 * alpha) as u8;
+            }
+            let color: protocol.ColorRGBA = protocol.ColorRGBA { r: r, g: g, b: b, a: a };
+            updated = pixel_set(updated, px as u32, py as u32, color);
+        }
+    }
+    return updated;
+}
+
+// ──────────────────────────────────────────────
+// Canvas Snapshot (extract pixel region)
+// ──────────────────────────────────────────────
+
+fn canvas_snapshot(cs: CanvasState, rect: protocol.Rectangle) -> (Array(u8, 4194304), u32, u32)
+    effect [io:read, compute]
+    bound iterations CANVAS_MAX_HEIGHT
+{
+    let mut out_data: Array(u8, 4194304) = Array::zeroed();
+    let out_w: u32 = rect.width;
+    let out_h: u32 = rect.height;
+    for sy in 0..out_h {
+        let src_y: u32 = (rect.y + sy as i32) as u32;
+        if src_y >= cs.height { break; }
+        for sx in 0..out_w {
+            let src_x: u32 = (rect.x + sx as i32) as u32;
+            if src_x >= cs.width { break; }
+            let c: protocol.ColorRGBA = pixel_at(cs, src_x, src_y);
+            let dst_off: u64 = (sy as u64) * (out_w as u64) * 4 + (sx as u64) * 4;
+            out_data[dst_off] = c.r;
+            out_data[dst_off + 1] = c.g;
+            out_data[dst_off + 2] = c.b;
+            out_data[dst_off + 3] = c.a;
+        }
+    }
+    return (out_data, out_w, out_h);
+}

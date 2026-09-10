@@ -1,0 +1,1099 @@
+// kernel_main.phor — Kernel entry point, initialization, and main loop
+// Orchestrates all kernel subsystems with capability-gated service registration
+// Every kernel object carries: data, identity, capabilities, provenance, residual history, trust state
+//
+// File: src/kernel/kernel_main.phor
+// Court: kernel_main:v2
+
+package kernel.main;
+
+import kernel.nucleus_interface.*;
+import kernel.capability_manager.*;
+import kernel.session_manager.*;
+import kernel.port_manager.*;
+import kernel.store_manager.*;
+import kernel.generation_manager.*;
+import kernel.scheduler.*;
+import kernel.ipc.*;
+
+// ─────────────────────────────────────────────────────────────
+// Stable Diagnostic Codes
+// ─────────────────────────────────────────────────────────────
+
+type KernelError = enum {
+    InitializationFailed     = 0xB0,  // E00B0: kernel initialization failed
+    ServiceRegistrationFailed = 0xB1, // E00B1: service registration failed
+    SubsystemInitFailed      = 0xB2,  // E00B2: subsystem initialization failed
+    KernelPanic              = 0xB3,  // E00B3: kernel panic condition
+    KernelAlreadyInitialized = 0xB4,  // E00B4: kernel already initialized
+    InvalidBootState         = 0xB5,  // E00B5: boot state is invalid
+    MissingNucleusCapability = 0xB6,  // E00B6: required nucleus capability missing
+    SubsystemNotResponding   = 0xB7,  // E00B7: subsystem not responding to health check
+    IntegrityCheckFailed     = 0xB8,  // E00B8: kernel integrity check failed
+    WatchdogNotConfigured    = 0xB9,  // E00B9: watchdog timer not configured
+    NoRunnableThreads        = 0xBA,  // E00BA: no runnable threads in scheduler
+    ServiceNotFound          = 0xBB,  // E00BB: requested service not found
+    GenerationBootstrapFailed = 0xBC,  // E00BC: generation 0 bootstrap failed
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Service Registration
+// ─────────────────────────────────────────────────────────────
+
+struct KernelService {
+    service_id: Identity,
+    service_name: String(64),
+    service_version: String(16),
+    service_type: ServiceType,
+    entry_point: u64,
+    capability_required: Cap(CapabilityToken),
+    is_registered: bool,
+    registration_timestamp: u64,
+    health_check_fn: u64,
+    health_status: HealthStatus,
+    last_health_check: u64,
+    residual_log: RingBuf(ResidualRecord, 64),
+}
+
+type ServiceType = enum {
+    CoreService      = 0,   // Kernel core service (must always be available)
+    DeviceDriver     = 1,   // Hardware driver
+    FileSystem       = 2,   // Filesystem service
+    Network          = 3,   // Network stack
+    Security         = 4,   // Security/audit service
+    UserInterface    = 5,   // UI/compositor
+    ForensicStore    = 6,   // Store service
+    CourtService     = 7,   // Court/replay service
+    DialectCage      = 8,   // Dialect cage service
+    PackageManager   = 9,   // Package management service
+    Monitoring       = 10,  // System monitoring
+    Debug            = 11,  // Debug service
+}
+
+type HealthStatus = enum {
+    Unknown     = 0,
+    Healthy     = 1,
+    Degraded    = 2,
+    Unhealthy   = 3,
+    NotResponding = 4,
+    Failed      = 5,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel State
+// ─────────────────────────────────────────────────────────────
+
+struct KernelState {
+    initialized: bool,
+    boot_timestamp: u64,
+    kernel_identity: Identity,
+    nucleus_capability: Cap(NucleusCallCapability),
+    boot_protocol: CpuEntryProtocol,
+    capability_manager: CapabilityManagerState,
+    session_manager: SessionManagerState,
+    port_manager: PortManagerState,
+    store_manager: StoreManagerState,
+    generation_manager: GenerationManagerState,
+    scheduler: SchedulerState,
+    ipc_manager: IpcManagerState,
+    services: Array(KernelService, 64),
+    service_count: u64,
+    kernel_residual_log: RingBuf(ResidualRecord, 256),
+    panic_in_progress: bool,
+    kernel_mode: KernelMode,
+    watchdog_configured: bool,
+    integrity_measurement: u64,
+    main_loop_iterations: u64,
+}
+
+type KernelMode = enum {
+    Booting       = 0,  // Kernel is in early boot
+    Initializing  = 1,  // Subsystems being initialized
+    Running       = 2,  // Normal operation
+    Degraded      = 3,  // Non-critical subsystem failure
+    Recovering    = 4,  // Attempting recovery from fault
+    Panicking     = 5,  // Irrecoverable error
+    Halting       = 6,  // System halt in progress
+}
+
+// ─────────────────────────────────────────────────────────────
+// Boot Information
+// ─────────────────────────────────────────────────────────────
+
+struct BootInfo {
+    nucleus_base: u64,
+    nucleus_size: u64,
+    kernel_entry: u64,
+    stack_base: u64,
+    stack_size: u64,
+    page_table: u64,
+    generation_counter: u64,
+    capability_seed: u64,
+    integrity_hash: u64,
+    boot_timestamp: u64,
+    machine_config: MachineConfig,
+    boot_loader_name: String(64),
+    boot_loader_version: String(32),
+    kernel_image_base: u64,
+    kernel_image_size: u64,
+    bss_base: u64,
+    bss_size: u64,
+    rsdp_address: u64,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Entry Point
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_entry(
+    boot_info: BootInfo,
+    nucleus_cap: Cap(NucleusCallCapability),
+) -> Result(void, KernelError)
+    effect [io:read, io:write, deterministic, interrupt, residual]
+    court "kernel_entry:v2"
+{
+    let timestamp: u64 = boot_info.boot_timestamp;
+
+    // Step 1: Create kernel identity
+    let kernel_identity: Identity = identity_new(
+        0x4B_52_4E_4C,  // "KRNL" magic
+        timestamp,
+        0,
+        0,
+    );
+
+    // Step 2: Initialize all subsystems
+    let cap_manager: CapabilityManagerState = capability_manager_init(
+        kernel_identity,
+        timestamp,
+        boot_info.generation_counter,
+    );
+
+    let sess_manager: SessionManagerState = session_manager_init(
+        kernel_identity,
+        Handle(CapabilityManagerState)::from_ptr(&cap_manager),
+        timestamp,
+    );
+
+    let port_mgr: PortManagerState = port_manager_init(
+        kernel_identity,
+        Handle(CapabilityManagerState)::from_ptr(&cap_manager),
+        Handle(SessionManagerState)::from_ptr(&sess_manager),
+        timestamp,
+    );
+
+    let store_mgr: StoreManagerState = store_manager_init(
+        kernel_identity,
+        Handle(CapabilityManagerState)::from_ptr(&cap_manager),
+        timestamp,
+    );
+
+    let gen_mgr: GenerationManagerState = generation_manager_init(
+        kernel_identity,
+        Handle(StoreManagerState)::from_ptr(&store_mgr),
+        Handle(CapabilityManagerState)::from_ptr(&cap_manager),
+        boot_info.generation_counter,
+        timestamp,
+    );
+
+    let sched: SchedulerState = scheduler_init(
+        kernel_identity,
+        Handle(CapabilityManagerState)::from_ptr(&cap_manager),
+        Handle(SessionManagerState)::from_ptr(&sess_manager),
+        SchedulingPolicy::Priority,
+        10,
+        timestamp,
+    );
+
+    let ipc_mgr: IpcManagerState = ipc_manager_init(
+        kernel_identity,
+        Handle(CapabilityManagerState)::from_ptr(&cap_manager),
+        Handle(SessionManagerState)::from_ptr(&sess_manager),
+        Handle(PortManagerState)::from_ptr(&port_mgr),
+        timestamp,
+    );
+
+    // Step 3: Create kernel state
+    let state: Handle(KernelState) = Handle(KernelState)::from_ptr(&KernelState {
+        initialized: true,
+        boot_timestamp: timestamp,
+        kernel_identity: kernel_identity,
+        nucleus_capability: nucleus_cap,
+        boot_protocol: CpuEntryProtocol {
+            boot_cpu: true,
+            apic_id: 0,
+            processor_index: 0,
+            startup_context: CpuRegisterState {
+                rax: 0, rbx: 0, rcx: 0, rdx: 0,
+                rsi: 0, rdi: 0, rbp: 0, rsp: boot_info.stack_base + boot_info.stack_size,
+                r8: 0, r9: 0, r10: 0, r11: 0,
+                r12: 0, r13: 0, r14: 0, r15: 0,
+                rip: boot_info.kernel_entry,
+                rflags: 0x202, cs: 0x08, ds: 0x10, es: 0x10,
+                fs: 0x10, gs: 0x10, ss: 0x10,
+                cr0: 0x80000001, cr2: 0, cr3: boot_info.page_table,
+                cr4: 0x20, efer: 0x100,
+                gdtr_base: 0, gdtr_limit: 0, idtr_base: 0, idtr_limit: 0,
+                tr_segment: 0, fs_base: 0, gs_base: 0,
+                kernel_stack: boot_info.stack_base + boot_info.stack_size,
+            },
+            nucleus_base: boot_info.nucleus_base,
+            nucleus_size: boot_info.nucleus_size,
+            kernel_entry_point: boot_info.kernel_entry,
+            stack_pointer: boot_info.stack_base + boot_info.stack_size,
+            page_table_base: boot_info.page_table,
+            generation_counter: boot_info.generation_counter,
+            capability_seed: boot_info.capability_seed,
+            integrity_hash: boot_info.integrity_hash,
+            boot_timestamp: timestamp,
+            machine_config: boot_info.machine_config,
+        },
+        capability_manager: cap_manager,
+        session_manager: sess_manager,
+        port_manager: port_mgr,
+        store_manager: store_mgr,
+        generation_manager: gen_mgr,
+        scheduler: sched,
+        ipc_manager: ipc_mgr,
+        services: Array::zeroed(),
+        service_count: 0,
+        kernel_residual_log: RingBuf::new(),
+        panic_in_progress: false,
+        kernel_mode: KernelMode::Initializing,
+        watchdog_configured: false,
+        integrity_measurement: boot_info.integrity_hash,
+        main_loop_iterations: 0,
+    });
+
+    // Step 4: Bootstrap generation 0
+    let bootstrap_ok: bool = kernel_bootstrap_generation(state, timestamp);
+    if !bootstrap_ok {
+        return Result::Err(KernelError::GenerationBootstrapFailed);
+    };
+
+    // Step 5: Register core services
+    let reg_ok: bool = kernel_register_core_services(state, timestamp);
+    if !reg_ok {
+        return Result::Err(KernelError::ServiceRegistrationFailed);
+    };
+
+    // Step 6: Transition to running mode
+    state.kernel_mode = KernelMode::Running;
+
+    residual emit {
+        op: "kernel.entry.complete",
+        kernel_identity: kernel_identity.id_hash,
+        boot_timestamp: timestamp,
+        mode: KernelMode::Running as u64,
+    };
+
+    // Step 7: Enter main loop
+    kernel_main_loop(state, timestamp);
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Bootstrap Generation
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_bootstrap_generation(
+    state: Handle(KernelState),
+    timestamp: u64,
+) -> bool
+    effect [deterministic, residual]
+    court "kernel_bootstrap:v1"
+{
+    // Ensure generation 0 is active
+    let active_gen: GenerationEntry = generation_get_active(
+        Handle(GenerationManagerState)::from_ptr(&state.generation_manager),
+    );
+
+    if active_gen.generation_status == GenerationStatus::Active {
+        residual emit {
+            op: "kernel.bootstrap.generation_ok",
+            generation: active_gen.generation_number,
+        };
+        return true;
+    };
+
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Register Core Services
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_register_core_services(
+    state: Handle(KernelState),
+    timestamp: u64,
+) -> bool
+    effect [deterministic, residual]
+{
+    let core_services: Array(KernelService, 8) = Array(KernelService, 8) {
+        data: [
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 1),
+                service_name: String::from_bytes(Slice(u8)::from_str("capability_manager")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 2),
+                service_name: String::from_bytes(Slice(u8)::from_str("session_manager")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 3),
+                service_name: String::from_bytes(Slice(u8)::from_str("port_manager")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 4),
+                service_name: String::from_bytes(Slice(u8)::from_str("store_manager")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::ForensicStore,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 5),
+                service_name: String::from_bytes(Slice(u8)::from_str("generation_manager")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 6),
+                service_name: String::from_bytes(Slice(u8)::from_str("scheduler")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 7),
+                service_name: String::from_bytes(Slice(u8)::from_str("ipc_manager")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+            KernelService {
+                service_id: identity_new(state.kernel_identity.id_hash, timestamp, 0, 8),
+                service_name: String::from_bytes(Slice(u8)::from_str("kernel_main")),
+                service_version: String::from_bytes(Slice(u8)::from_str("1.0.0")),
+                service_type: ServiceType::CoreService,
+                entry_point: 0,
+                capability_required: Cap(CapabilityToken)::null(),
+                is_registered: true,
+                registration_timestamp: timestamp,
+                health_check_fn: 0,
+                health_status: HealthStatus::Healthy,
+                last_health_check: timestamp,
+                residual_log: RingBuf::new(),
+            },
+        ],
+    };
+
+    for i in 0..8 {
+        state.services[state.service_count] = core_services[i];
+        state.service_count = state.service_count + 1;
+    };
+
+    residual emit {
+        op: "kernel.register_core_services",
+        count: 8,
+        timestamp: timestamp,
+    };
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Register Additional Service
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_register_service(
+    state: Handle(KernelState),
+    service: KernelService,
+    registrar_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, KernelError)
+    effect [deterministic, residual]
+{
+    if state.service_count >= 64 {
+        return Result::Err(KernelError::ServiceRegistrationFailed);
+    };
+
+    state.services[state.service_count] = service;
+    state.service_count = state.service_count + 1;
+
+    residual emit {
+        op: "kernel.register_service",
+        service_name: service.service_name,
+        service_type: service.service_type as u64,
+    };
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Find Service by Name
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_find_service(
+    state: Handle(KernelState),
+    name: Slice(u8),
+) -> Option(KernelService)
+    effect [deterministic]
+{
+    for i in 0..state.service_count {
+        let svc: KernelService = state.services[i];
+        if svc.is_registered {
+            // Compare names
+            let svc_name_len: u64 = svc.service_name.len();
+            if svc_name_len == name.len() {
+                let mut match_: bool = true;
+                for j in 0..svc_name_len {
+                    if svc.service_name.data[j] != name[j] {
+                        match_ = false;
+                        break;
+                    };
+                };
+                if match_ {
+                    return Option::Some(svc);
+                };
+            };
+        };
+    };
+    return Option::None;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Main Loop
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_main_loop(
+    state: Handle(KernelState),
+    start_timestamp: u64,
+) -> void
+    effect [io:read, io:write, deterministic, interrupt, residual]
+    court "kernel_main_loop:v2"
+{
+    let mut tick: u64 = 0;
+    let mut last_health_check: u64 = start_timestamp;
+
+    loop bound 4294967295 {  // Large but bounded — 2^32 - 1 iterations
+        tick = tick + 1;
+        state.main_loop_iterations = state.main_loop_iterations + 1;
+
+        // Phase 1: Schedule and run next thread
+        let next_thread: Option(u64) = scheduler_pick_next(
+            Handle(SchedulerState)::from_ptr(&state.scheduler),
+            Option::None,
+            start_timestamp + tick,
+        );
+
+        match next_thread {
+            Option::Some(slot) => {
+                let thread_id: Identity = state.scheduler.threads[slot].thread_id;
+                scheduler_context_switch(
+                    Handle(SchedulerState)::from_ptr(&state.scheduler),
+                    Option::None,
+                    thread_id,
+                    start_timestamp + tick,
+                );
+            },
+            Option::None => {
+                // No runnable threads — yield to idle/nucleus
+                kernel_idle(state, start_timestamp + tick);
+            },
+        };
+
+        // Phase 2: Health check (every 1000 iterations)
+        if tick % 1000 == 0 {
+            kernel_health_check_all(state, start_timestamp + tick);
+            last_health_check = start_timestamp + tick;
+        };
+
+        // Phase 3: Process kernel timer events
+        if tick % 100 == 0 {
+            kernel_timer_tick(state, start_timestamp + tick);
+        };
+
+        // Phase 4: Periodically emit main loop residual
+        if tick % 10000 == 0 {
+            residual emit {
+                op: "kernel.main_loop.tick",
+                iteration: tick,
+                service_count: state.service_count,
+                scheduler_threads: state.scheduler.thread_count,
+                channel_count: state.ipc_manager.channel_count,
+                port_count: state.port_manager.port_count,
+                store_objects: state.store_manager.object_count,
+                generations: state.generation_manager.generation_count,
+            };
+        };
+
+        // Check for kernel panic condition
+        if state.panic_in_progress {
+            kernel_panic(state, KernelError::KernelPanic, start_timestamp + tick);
+            break;
+        };
+
+        // Check for halt condition
+        if state.kernel_mode == KernelMode::Halting {
+            break;
+        };
+    };
+
+    // If loop exits, halt
+    kernel_halt(state);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Idle
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_idle(
+    state: Handle(KernelState),
+    timestamp: u64,
+) -> void
+    effect [deterministic, interrupt]
+    court "kernel_idle:v1"
+{
+    // Emit idle residual periodically
+    if state.main_loop_iterations % 1000 == 0 {
+        residual emit {
+            op: "kernel.idle",
+            timestamp: timestamp,
+            iterations: state.main_loop_iterations,
+        };
+    };
+
+    // In a real system, this would execute the HLT instruction
+    // via a nucleus call gate
+    trusted reason "HLT instruction via nucleus gate — safe: no capability elevation" {
+        // nucleus_call_enter(NucleusOperation::Hlt, ...)
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer Tick
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_timer_tick(
+    state: Handle(KernelState),
+    timestamp: u64,
+) -> void
+    effect [deterministic, residual]
+{
+    // Tick the scheduler
+    let preempt: Option(Identity) = scheduler_tick(
+        Handle(SchedulerState)::from_ptr(&state.scheduler),
+        timestamp,
+    );
+
+    match preempt {
+        Option::Some(thread_id) => {
+            residual emit {
+                op: "kernel.timer.preempt",
+                thread_id: thread_id.id_hash,
+                timestamp: timestamp,
+            };
+        },
+        Option::None => {},
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Health Check
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_health_check_all(
+    state: Handle(KernelState),
+    timestamp: u64,
+) -> void
+    effect [deterministic, residual]
+    court "kernel_health:v1"
+{
+    let mut healthy_count: u64 = 0;
+    let mut degraded_count: u64 = 0;
+    let mut failed_count: u64 = 0;
+
+    for i in 0..state.service_count {
+        let svc: Handle(KernelService) = Handle(KernelService)::from_ptr(&state.services[i]);
+        svc.last_health_check = timestamp;
+
+        // Simplified health check — in real system, each service provides a check fn
+        match svc.health_status {
+            HealthStatus::Healthy => {
+                healthy_count = healthy_count + 1;
+            },
+            HealthStatus::Degraded => {
+                degraded_count = degraded_count + 1;
+            },
+            _ => {
+                failed_count = failed_count + 1;
+                svc.health_status = HealthStatus::NotResponding;
+            },
+        };
+    };
+
+    // Update kernel mode based on health
+    if failed_count > 0 {
+        state.kernel_mode = KernelMode::Degraded;
+    };
+
+    residual emit {
+        op: "kernel.health_check",
+        healthy: healthy_count,
+        degraded: degraded_count,
+        failed: failed_count,
+        kernel_mode: state.kernel_mode as u64,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Panic
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_panic(
+    state: Handle(KernelState),
+    reason: KernelError,
+    timestamp: u64,
+) -> void
+    effect [residual]
+    court "kernel_panic:v1"
+{
+    state.kernel_mode = KernelMode::Panicking;
+    state.panic_in_progress = true;
+
+    // Record catastrophic residual
+    residual emit {
+        op: "kernel.panic",
+        reason: reason as u64,
+        timestamp: timestamp,
+        main_loop_iterations: state.main_loop_iterations,
+        service_count: state.service_count,
+        kernel_mode: KernelMode::Panicking as u64,
+    };
+
+    // Attempt to flush residuals to nucleus debug output
+    trusted reason "panic-time debug output is permitted — system is halting" {
+        // nucleus_call_enter(NucleusOperation::WriteDebugString, panic_message, ...)
+    };
+
+    // Transition to halt
+    state.kernel_mode = KernelMode::Halting;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Halt
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_halt(
+    state: Handle(KernelState),
+) -> void
+    effect [residual, interrupt]
+{
+    state.kernel_mode = KernelMode::Halting;
+
+    residual emit {
+        op: "kernel.halt",
+        uptime_iterations: state.main_loop_iterations,
+        total_services: state.service_count,
+        active_generation: state.generation_manager.active_generation,
+        total_context_switches: state.scheduler.total_context_switches,
+    };
+
+    // Final flush to nucleus
+    trusted reason "nucleus halt via call gate — safe: system is shutting down" {
+        // nucleus_call_enter(NucleusOperation::HaltCpu, ...)
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Query
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_query_state(
+    state: Handle(KernelState),
+    querier_cap: Cap(CapabilityToken),
+) -> KernelState
+    effect [deterministic]
+{
+    return state.value;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Self-Test
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_self_test(
+    state: Handle(KernelState),
+    tester_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, KernelError)
+    effect [deterministic, residual]
+    court "kernel_self_test:v1"
+{
+    let mut checks: u64 = 0;
+    let total_possible: u64 = 10;
+
+    // Check 1: Kernel is initialized
+    if state.initialized {
+        checks = checks + 1;
+    };
+
+    // Check 2: Capability manager self-test
+    let cap_check: Result(u64, CapManagerError) = capability_manager_self_test(
+        Handle(CapabilityManagerState)::from_ptr(&state.capability_manager),
+    );
+    if cap_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 3: Session manager self-test
+    let sess_check: Result(u64, SessionError) = session_manager_self_test(
+        Handle(SessionManagerState)::from_ptr(&state.session_manager),
+    );
+    if sess_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 4: Port manager self-test
+    let port_check: Result(u64, PortError) = port_manager_self_test(
+        Handle(PortManagerState)::from_ptr(&state.port_manager),
+    );
+    if port_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 5: Store manager self-test
+    let store_check: Result(u64, StoreError) = store_manager_self_test(
+        Handle(StoreManagerState)::from_ptr(&state.store_manager),
+    );
+    if store_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 6: Generation manager self-test
+    let gen_check: Result(u64, GenerationError) = generation_manager_self_test(
+        Handle(GenerationManagerState)::from_ptr(&state.generation_manager),
+    );
+    if gen_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 7: Scheduler self-test
+    let sched_check: Result(u64, SchedulerError) = scheduler_self_test(
+        Handle(SchedulerState)::from_ptr(&state.scheduler),
+    );
+    if sched_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 8: IPC manager self-test
+    let ipc_check: Result(u64, IpcError) = ipc_manager_self_test(
+        Handle(IpcManagerState)::from_ptr(&state.ipc_manager),
+    );
+    if ipc_check.is_ok() {
+        checks = checks + 1;
+    };
+
+    // Check 9: Kernel mode is Running
+    if state.kernel_mode == KernelMode::Running || state.kernel_mode == KernelMode::Initializing {
+        checks = checks + 1;
+    };
+
+    // Check 10: Services are registered
+    if state.service_count > 0 {
+        checks = checks + 1;
+    };
+
+    residual emit {
+        op: "kernel.self_test",
+        checks_passed: checks,
+        total_checks: total_possible,
+        timestamp: timestamp,
+    };
+
+    if checks == total_possible {
+        return Result::Ok(checks);
+    };
+
+    return Result::Err(KernelError::IntegrityCheckFailed);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Version Information
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_version() -> String(64)
+    effect [deterministic]
+{
+    return String::from_bytes(Slice(u8)::from_str("Phorensic OS Kernel v0.1.0"));
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cap(CapabilityToken) Helper
+// ─────────────────────────────────────────────────────────────
+
+impl Cap(CapabilityToken) {
+    fn null() -> Cap(CapabilityToken)
+        effect []
+    {
+        return Cap(CapabilityToken) {
+            object_id: Identity { id_hash: 0, creation_timestamp: 0, creation_epoch: 0, nonce: 0, creator: 0 },
+            generation: 0,
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Statistics — Aggregate system statistics
+// ─────────────────────────────────────────────────────────────
+
+struct KernelStatistics {
+    uptime_ticks: u64,
+    total_services: u64,
+    active_sessions: u64,
+    open_ports: u64,
+    store_objects: u64,
+    generations: u64,
+    active_generation: u64,
+    scheduler_threads: u64,
+    ipc_channels: u64,
+    kernel_mode: KernelMode,
+    total_context_switches: u64,
+    total_interrupts: u64,
+    total_errors: u64,
+    memory_used: u64,
+}
+
+fn kernel_statistics(
+    state: Handle(KernelState),
+    querier_cap: Cap(CapabilityToken),
+) -> KernelStatistics
+    effect [deterministic]
+    court "kernel_stats:v1"
+{
+    let mut active_sessions: u64 = 0;
+    for i in 0..128 {
+        if state.session_manager.sessions[i].session_state == SessionState::Active {
+            active_sessions = active_sessions + 1;
+        };
+    };
+
+    let stats: KernelStatistics = KernelStatistics {
+        uptime_ticks: state.main_loop_iterations,
+        total_services: state.service_count,
+        active_sessions: active_sessions,
+        open_ports: state.port_manager.port_count,
+        store_objects: state.store_manager.object_count,
+        generations: state.generation_manager.generation_count,
+        active_generation: state.generation_manager.active_generation,
+        scheduler_threads: state.scheduler.thread_count,
+        ipc_channels: state.ipc_manager.channel_count,
+        kernel_mode: state.kernel_mode,
+        total_context_switches: state.scheduler.total_context_switches,
+        total_interrupts: 0,
+        total_errors: 0,
+        memory_used: 0,
+    };
+
+    return stats;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Reset — Reinitialize kernel subsystems
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_reset_subsystem(
+    state: Handle(KernelState),
+    subsystem_name: Slice(u8),
+    reset_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(void, KernelError)
+    effect [deterministic, residual]
+{
+    // Compare subsystem name and reinitialize appropriate manager
+    // This is a simplified reset — real system would do graceful teardown
+
+    residual emit {
+        op: "kernel.reset_subsystem",
+        name_len: subsystem_name.len(),
+        timestamp: timestamp,
+    };
+
+    // In a real kernel, each subsystem would have a reset protocol
+    // For now, just mark the mode as recovering
+    state.kernel_mode = KernelMode::Recovering;
+
+    return Result::Ok(void);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Debug Command Interface
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_debug_command(
+    state: Handle(KernelState),
+    command: u64,
+    arg0: u64,
+    arg1: u64,
+    debug_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> Result(u64, KernelError)
+    effect [deterministic, residual]
+{
+    let result: u64 = match command {
+        0 => {
+            // Query kernel mode
+            state.kernel_mode as u64
+        },
+        1 => {
+            // Force health check
+            kernel_health_check_all(state, timestamp);
+            state.service_count
+        },
+        2 => {
+            // Dump generation info
+            state.generation_manager.active_generation
+        },
+        3 => {
+            // Dump thread count
+            state.scheduler.thread_count
+        },
+        4 => {
+            // Dump port count
+            state.port_manager.port_count
+        },
+        5 => {
+            // Dump object count
+            state.store_manager.object_count
+        },
+        6 => {
+            // Dump IPC channel count
+            state.ipc_manager.channel_count
+        },
+        _ => {
+            0xFFFFFFFFFFFFFFFF
+        },
+    };
+
+    residual emit {
+        op: "kernel.debug_command",
+        command: command,
+        result: result,
+        timestamp: timestamp,
+    };
+
+    return Result::Ok(result);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Shutdown — Graceful system shutdown
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_shutdown(
+    state: Handle(KernelState),
+    shutdown_cap: Cap(CapabilityToken),
+    reason: Slice(u8),
+    timestamp: u64,
+) -> void
+    effect [residual]
+    court "kernel_shutdown:v1"
+{
+    // Final residual emission
+    residual emit {
+        op: "kernel.shutdown",
+        uptime_ticks: state.main_loop_iterations,
+        active_generation: state.generation_manager.active_generation,
+        total_services: state.service_count,
+        reason_len: reason.len(),
+        timestamp: timestamp,
+    };
+
+    // Set halting mode
+    state.kernel_mode = KernelMode::Halting;
+    state.panic_in_progress = false;
+
+    // Transition to nucleus halt
+    kernel_halt(state);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kernel Reboot — Warm reboot
+// ─────────────────────────────────────────────────────────────
+
+fn kernel_reboot(
+    state: Handle(KernelState),
+    reboot_cap: Cap(CapabilityToken),
+    timestamp: u64,
+) -> void
+    effect [residual]
+{
+    residual emit {
+        op: "kernel.reboot",
+        uptime_ticks: state.main_loop_iterations,
+        timestamp: timestamp,
+    };
+
+    trusted reason "CPU reset via keyboard controller — standard PC-AT reboot method §4.2" {
+        // outb(0x64, 0xFE) — pulse reset line
+    };
+}

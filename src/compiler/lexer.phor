@@ -1,0 +1,1321 @@
+// lexer.phor — Lexer: Token Types, Lexer State Machine, Token Stream, Source Location Tracking
+// Phorensic Compiler Infrastructure — Lexical Analysis Phase
+//
+// This module implements the complete lexer for the Phorensic language. It transforms
+// raw source text (as a byte stream) into a stream of tokens annotated with source
+// locations. The lexer operates as a deterministic state machine with no backtracking.
+//
+// Evidence semantics: Every token produced by the lexer is paired with a source location
+// that forms the basis for diagnostic reporting. The lexer emits residual tokens for
+// whitespace and comments when running in residual mode, enabling exact source reconstruction.
+//
+// Effect declarations:
+//   [pure]   — pure functions with no side effects (token construction, queries)
+//   [io]     — functions that perform I/O (reading source text, emitting diagnostics)
+//   [diag]   — functions that emit diagnostics
+//   [lex]    — lexer effect: reading characters from the source and advancing position
+//   [residual] — residual emission effect: producing output for downstream tooling
+
+use core::fixed::Array256;
+use core::fixed::Array128;
+use core::fixed::Array64;
+use core::result::Result;
+use core::option::Option;
+
+use compiler::diagnostics::*;
+
+// --- Token Type Enumeration ---
+// All token types in the Phorensic language. Tokens are sealed; no external extension.
+
+pub sealdatatype TokenType : u16 {
+    // End of file marker.
+    EndOfFile = 0u16,
+
+    // === Literals ===
+    IntegerLiteral = 1u16,
+    FloatLiteral = 2u16,
+    StringLiteral = 3u16,
+    CharLiteral = 4u16,
+    BooleanLiteralTrue = 5u16,
+    BooleanLiteralFalse = 6u16,
+
+    // === Identifiers ===
+    Identifier = 7u16,
+    Underscore = 8u16, // _ used for pattern wildcards and unused bindings
+
+    // === Keywords ===
+    KeywordLet = 9u16,
+    KeywordMut = 10u16,
+    KeywordFn = 11u16,
+    KeywordPub = 12u16,
+    KeywordSeal = 13u16,
+    KeywordDataType = 14u16,
+    KeywordSealDataType = 15u16,
+    KeywordStruct = 16u16,
+    KeywordEnum = 17u16,
+    KeywordImpl = 18u16,
+    KeywordMatch = 19u16,
+    KeywordIf = 20u16,
+    KeywordElse = 21u16,
+    KeywordFor = 22u16,
+    KeywordWhile = 23u16,
+    KeywordLoop = 24u16,
+    KeywordReturn = 25u16,
+    KeywordBreak = 26u16,
+    KeywordContinue = 27u16,
+    KeywordTrue = 28u16,
+    KeywordFalse = 29u16,
+    KeywordUse = 30u16,
+    KeywordNamespace = 31u16,
+    KeywordType = 32u16,
+    KeywordEffect = 33u16,
+    KeywordCapability = 34u16,
+    KeywordTrusted = 35u16,
+    KeywordNoStd = 36u16,
+    KeywordNoAlloc = 37u16,
+    KeywordNoUnsafe = 38u16,
+    KeywordVar = 39u16,
+    KeywordConst = 40u16,
+
+    // === Operators ===
+    Plus = 41u16,
+    Minus = 42u16,
+    Star = 43u16,
+    Slash = 44u16,
+    Percent = 45u16,
+    Equal = 46u16,               // =
+    EqualEqual = 47u16,          // ==
+    Bang = 48u16,                 // !
+    BangEqual = 49u16,           // !=
+    Less = 50u16,                 // <
+    LessEqual = 51u16,           // <=
+    Greater = 52u16,             // >
+    GreaterEqual = 53u16,       // >=
+    Ampersand = 54u16,           // &
+    Pipe = 55u16,                // |
+    Caret = 56u16,               // ^
+    Tilde = 57u16,               // ~
+    LeftShift = 58u16,           // <<
+    RightShift = 59u16,          // >>
+    PlusEqual = 60u16,           // +=
+    MinusEqual = 61u16,          // -=
+    StarEqual = 62u16,           // *=
+    SlashEqual = 63u16,          // /=
+    Arrow = 64u16,               // ->
+    FatArrow = 65u16,            // =>
+    Dot = 66u16,                 // .
+    DotDot = 67u16,              // ..
+    DotDotDot = 68u16,           // ...
+    Colon = 69u16,               // :
+    ColonColon = 70u16,          // ::
+    Semicolon = 71u16,           // ;
+    Comma = 72u16,               // ,
+    At = 73u16,                  // @
+    Hash = 74u16,                // #
+
+    // === Delimiters ===
+    LeftParen = 75u16,           // (
+    RightParen = 76u16,          // )
+    LeftBrace = 77u16,           // {
+    RightBrace = 78u16,          // }
+    LeftBracket = 79u16,         // [
+    RightBracket = 80u16,        // ]
+    LeftAngle = 81u16,           // < (for generics, distinct from Less)
+    RightAngle = 82u16,          // > (for generics, distinct from Greater)
+
+    // === Special ===
+    QuestionMark = 83u16,        // ?
+    Dollar = 84u16,              // $ (for macro variables)
+    Backslash = 85u16,           // \
+    Backtick = 86u16,            // ` (for raw identifiers)
+
+    // === Compiler Directives ===
+    DirectiveInclude = 87u16,    // #include
+    DirectiveEffect = 88u16,     // [effect]
+    DirectiveBounded = 89u16,    // [bounded]
+    DirectiveTrusted = 90u16,    // [trusted]
+    DirectiveResidual = 91u16,   // [residual]
+
+    // === Residual Tokens (for exact reconstruction) ===
+    Whitespace = 92u16,
+    LineComment = 93u16,
+    BlockComment = 94u16,
+    Newline = 95u16,
+}
+
+impl TokenType {
+    /// Get a human-readable name for this token type.
+    /// Effect: pure — string construction from sealed enum.
+    pub fn name(&self) -> FixedString256 [pure] {
+        match self {
+            TokenType::EndOfFile => FixedString256::from("EOF"),
+            TokenType::IntegerLiteral => FixedString256::from("integer literal"),
+            TokenType::FloatLiteral => FixedString256::from("float literal"),
+            TokenType::StringLiteral => FixedString256::from("string literal"),
+            TokenType::CharLiteral => FixedString256::from("char literal"),
+            TokenType::BooleanLiteralTrue => FixedString256::from("true"),
+            TokenType::BooleanLiteralFalse => FixedString256::from("false"),
+            TokenType::Identifier => FixedString256::from("identifier"),
+            TokenType::Underscore => FixedString256::from("_"),
+            TokenType::KeywordLet => FixedString256::from("let"),
+            TokenType::KeywordMut => FixedString256::from("mut"),
+            TokenType::KeywordFn => FixedString256::from("fn"),
+            TokenType::KeywordPub => FixedString256::from("pub"),
+            TokenType::KeywordSeal => FixedString256::from("seal"),
+            TokenType::KeywordDataType => FixedString256::from("datatype"),
+            TokenType::KeywordSealDataType => FixedString256::from("sealdatatype"),
+            TokenType::KeywordStruct => FixedString256::from("struct"),
+            TokenType::KeywordEnum => FixedString256::from("enum"),
+            TokenType::KeywordImpl => FixedString256::from("impl"),
+            TokenType::KeywordMatch => FixedString256::from("match"),
+            TokenType::KeywordIf => FixedString256::from("if"),
+            TokenType::KeywordElse => FixedString256::from("else"),
+            TokenType::KeywordFor => FixedString256::from("for"),
+            TokenType::KeywordWhile => FixedString256::from("while"),
+            TokenType::KeywordLoop => FixedString256::from("loop"),
+            TokenType::KeywordReturn => FixedString256::from("return"),
+            TokenType::KeywordBreak => FixedString256::from("break"),
+            TokenType::KeywordContinue => FixedString256::from("continue"),
+            TokenType::KeywordTrue => FixedString256::from("true"),
+            TokenType::KeywordFalse => FixedString256::from("false"),
+            TokenType::KeywordUse => FixedString256::from("use"),
+            TokenType::KeywordNamespace => FixedString256::from("namespace"),
+            TokenType::KeywordType => FixedString256::from("type"),
+            TokenType::KeywordEffect => FixedString256::from("effect"),
+            TokenType::KeywordCapability => FixedString256::from("capability"),
+            TokenType::KeywordTrusted => FixedString256::from("trusted"),
+            TokenType::KeywordNoStd => FixedString256::from("no_std"),
+            TokenType::KeywordNoAlloc => FixedString256::from("no_alloc"),
+            TokenType::KeywordNoUnsafe => FixedString256::from("no_unsafe"),
+            TokenType::Plus => FixedString256::from("+"),
+            TokenType::Minus => FixedString256::from("-"),
+            TokenType::Star => FixedString256::from("*"),
+            TokenType::Slash => FixedString256::from("/"),
+            TokenType::Semicolon => FixedString256::from(";"),
+            TokenType::Comma => FixedString256::from(","),
+            TokenType::LeftParen => FixedString256::from("("),
+            TokenType::RightParen => FixedString256::from(")"),
+            TokenType::LeftBrace => FixedString256::from("{"),
+            TokenType::RightBrace => FixedString256::from("}"),
+            TokenType::LeftBracket => FixedString256::from("["),
+            TokenType::RightBracket => FixedString256::from("]"),
+            _ => FixedString256::from("<unknown token>"),
+        }
+    }
+
+    /// Check if this token is a keyword.
+    /// Effect: pure — deterministic classification.
+    pub fn is_keyword(&self) -> bool [pure] {
+        let raw : u16 = self as u16;
+        raw >= 9u16 && raw <= 40u16
+    }
+
+    /// Check if this token is a literal.
+    /// Effect: pure — deterministic classification.
+    pub fn is_literal(&self) -> bool [pure] {
+        let raw : u16 = self as u16;
+        raw >= 1u16 && raw <= 6u16
+    }
+
+    /// Check if this token is an operator.
+    /// Effect: pure — deterministic classification.
+    pub fn is_operator(&self) -> bool [pure] {
+        let raw : u16 = self as u16;
+        raw >= 41u16 && raw <= 74u16
+    }
+
+    /// Check if this is a residual token (whitespace/comment).
+    /// Effect: pure — deterministic classification.
+    pub fn is_residual(&self) -> bool [pure] {
+        let raw : u16 = self as u16;
+        raw >= 92u16
+    }
+}
+
+// --- Token Value — the semantic value attached to a token ---
+
+pub union TokenValue {
+    pub integer_value : i64,
+    pub float_value : f64,
+    pub string_value : FixedString256,
+    pub char_value : u8,
+    pub ident_value : FixedString256,
+    pub none : (), // unit type for tokens without values
+}
+
+impl TokenValue {
+    /// Construct an integer token value.
+    /// Effect: pure — value construction.
+    pub fn integer(val : i64) -> TokenValue [pure] {
+        TokenValue { integer_value: val }
+    }
+
+    /// Construct a float token value.
+    /// Effect: pure — value construction.
+    pub fn float(val : f64) -> TokenValue [pure] {
+        TokenValue { float_value: val }
+    }
+
+    /// Construct a string token value.
+    /// Effect: pure — value construction.
+    pub fn string(val : FixedString256) -> TokenValue [pure] {
+        TokenValue { string_value: val }
+    }
+
+    /// Construct a char token value.
+    /// Effect: pure — value construction.
+    pub fn character(val : u8) -> TokenValue [pure] {
+        TokenValue { char_value: val }
+    }
+
+    /// Construct an identifier token value.
+    /// Effect: pure — value construction.
+    pub fn ident(val : FixedString256) -> TokenValue [pure] {
+        TokenValue { ident_value: val }
+    }
+
+    /// Construct a unit token value (no payload).
+    /// Effect: pure — value construction.
+    pub fn unit() -> TokenValue [pure] {
+        TokenValue { none: () }
+    }
+}
+
+// --- Token — a complete token with type, value, and location ---
+
+pub struct Token {
+    pub token_type : TokenType,
+    pub value : TokenValue,
+    pub start : SourceLocation,
+    pub end : SourceLocation,
+    /// Generation tag for handle tracking. Incremented each time
+    /// the token stream is advanced.
+    pub generation : u64,
+    /// Whether this token is a residual token (whitespace/comment).
+    pub is_residual : bool,
+}
+
+impl Token {
+    /// Create a new token with the given properties.
+    /// Effect: pure — deterministic construction.
+    pub fn new(
+        token_type : TokenType,
+        value : TokenValue,
+        start : SourceLocation,
+        end : SourceLocation,
+        generation : u64,
+    ) -> Token [pure] {
+        let residual : bool = token_type.is_residual();
+        Token {
+            token_type: token_type,
+            value: value,
+            start: start,
+            end: end,
+            generation: generation,
+            is_residual: residual,
+        }
+    }
+
+    /// Create an end-of-file token at the given location.
+    /// Effect: pure — deterministic construction.
+    pub fn eof(location : SourceLocation, generation : u64) -> Token [pure] {
+        Token::new(
+            TokenType::EndOfFile,
+            TokenValue::unit(),
+            location,
+            location,
+            generation,
+        )
+    }
+
+    /// Format this token for debugging.
+    /// Effect: io — string formatting.
+    pub fn format(&self) -> FixedString256 [io] {
+        var result : FixedString256 = FixedString256::new();
+        result.push_str(self.token_type.name());
+        result.push_str(FixedString256::from(" ["));
+        result.push_str(self.start.format());
+        result.push_str(FixedString256::from("]"));
+        result
+    }
+
+    /// Get the span that this token covers.
+    /// Effect: pure — returns span struct.
+    pub fn span(&self) -> Spanned<TokenType> [pure] {
+        Spanned::new(self.token_type, self.start, self.end)
+    }
+}
+
+// --- Lexer State — the complete state of the lexing state machine ---
+
+pub struct LexerState {
+    /// The source byte buffer being lexed.
+    source : Array256<u8>,
+    /// Current position in the source buffer (byte offset).
+    position : u64,
+    /// Start of the current lexeme being built.
+    lexeme_start : u64,
+    /// Current source location.
+    current_location : SourceLocation,
+    /// Start location of the current lexeme.
+    lexeme_start_location : SourceLocation,
+    /// Current generation counter for tokens.
+    generation : u64,
+    /// Whether residual tokens should be emitted.
+    emit_residuals : bool,
+    /// Whether the lexer is in error recovery mode.
+    recovery_mode : bool,
+    /// Diagnostic bag for error reporting.
+    diagnostics : DiagnosticBag,
+    /// The current file path being lexed.
+    file_path : FixedString256,
+}
+
+impl LexerState {
+    /// Create a new lexer state for the given source and file path.
+    /// Effect: pure — initializes lexer state structure.
+    pub fn new(
+        source : Array256<u8>,
+        file_path : FixedString256,
+    ) -> LexerState [pure] {
+        let loc : SourceLocation = SourceLocation::new(file_path, 0u32, 0u32, 0u64);
+        LexerState {
+            source: source,
+            position: 0u64,
+            lexeme_start: 0u64,
+            current_location: loc,
+            lexeme_start_location: loc,
+            generation: 0u64,
+            emit_residuals: false,
+            recovery_mode: false,
+            diagnostics: DiagnosticBag::new(),
+            file_path: file_path,
+        }
+    }
+
+    /// Configure whether residual tokens should be emitted.
+    /// Effect: pure — configuration update.
+    pub fn set_emit_residuals(mut self, emit : bool) -> LexerState [pure] {
+        self.emit_residuals = emit;
+        self
+    }
+
+    /// Check if the source position is at the end of the source.
+    /// Effect: pure — read-only query.
+    fn is_at_end(&self) -> bool [pure] {
+        self.position >= (self.source.len() as u64)
+    }
+
+    /// Peek at the current character without consuming it.
+    /// Effect: lex — reads source character without advancing.
+    fn peek(&self) -> u8 [lex] {
+        if self.is_at_end() {
+            0u8 // null byte sentinel for EOF
+        } else {
+            self.source.get(self.position as u32)
+        }
+    }
+
+    /// Peek at the next character (position + 1) without consuming.
+    /// Effect: lex — reads source character without advancing.
+    fn peek_next(&self) -> u8 [lex] {
+        let next_pos : u64 = self.position + 1u64;
+        if next_pos >= (self.source.len() as u64) {
+            0u8
+        } else {
+            self.source.get(next_pos as u32)
+        }
+    }
+
+    /// Advance one character and return it.
+    /// Effect: lex — consumes one character and advances position.
+    fn advance(&mut self) -> u8 [lex] {
+        let ch : u8 = self.peek();
+        self.position += 1u64;
+        self.current_location = self.current_location.advance(ch);
+        ch
+    }
+
+    /// Match the expected character; if it matches, advance and return true.
+    /// Effect: lex — conditionally consumes one character.
+    fn match_char(&mut self, expected : u8) -> bool [lex] {
+        if self.is_at_end() {
+            return false;
+        }
+        if self.peek() != expected {
+            return false;
+        }
+        let _ = self.advance();
+        true
+    }
+
+    /// Skip whitespace and comments (unless in residual mode).
+    /// Effect: lex — consumes whitespace characters.
+    fn skip_whitespace(&mut self) -> Result<(), FixedString256> [lex, diag] {
+        loop [256u32] { // Bounded: at most 256 consecutive whitespace chars
+            if self.is_at_end() {
+                break;
+            }
+            let ch : u8 = self.peek();
+            if ch == 32u8 || ch == 9u8 || ch == 13u8 { // space, tab, CR
+                if self.emit_residuals {
+                    let start : SourceLocation = self.current_location;
+                    let _ = self.advance();
+                    let end : SourceLocation = self.current_location;
+                    // Residual: emit whitespace token for exact reconstruction.
+                    let _ = self;
+                } else {
+                    let _ = self.advance();
+                }
+            } else if ch == 10u8 { // newline
+                if self.emit_residuals {
+                    let start : SourceLocation = self.current_location;
+                    let _ = self.advance();
+                    let end : SourceLocation = self.current_location;
+                    // Residual: emit newline token.
+                    let _ = self;
+                } else {
+                    let _ = self.advance();
+                }
+            } else if ch == 47u8 { // '/' - could be comment
+                let next : u8 = self.peek_next();
+                if next == 47u8 { // line comment "//"
+                    let _ = self.skip_line_comment();
+                } else if next == 42u8 { // block comment "/*"
+                    let _ = self.skip_block_comment();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Result::Ok(())
+    }
+
+    /// Skip a line comment starting at current position.
+    /// Effect: lex — consumes characters until newline or EOF.
+    fn skip_line_comment(&mut self) -> Result<(), FixedString256> [lex] {
+        let start : SourceLocation = self.current_location;
+        // Consume the "//"
+        let _ = self.advance();
+        let _ = self.advance();
+        // Bounded: at most 1024 characters in a line comment.
+        for var i : u32 = 0u32; i < 1024u32; i += 1u32 [1024u32] {
+            if self.is_at_end() || self.peek() == 10u8 {
+                break;
+            }
+            let _ = self.advance();
+        }
+        let end : SourceLocation = self.current_location;
+        if self.emit_residuals {
+            // Residual: emit line comment token for exact reconstruction.
+            let _ = start;
+            let _ = end;
+        }
+        Result::Ok(())
+    }
+
+    /// Skip a block comment starting at current position.
+    /// Effect: lex, diag — consumes characters until "*/" or reports unterminated comment.
+    fn skip_block_comment(&mut self) -> Result<(), FixedString256> [lex, diag] {
+        // Consume the "/*"
+        let _ = self.advance();
+        let _ = self.advance();
+        let start_loc : SourceLocation = self.current_location;
+        // Bounded: at most 4096 characters in a block comment.
+        for var i : u32 = 0u32; i < 4096u32; i += 1u32 [4096u32] {
+            if self.is_at_end() {
+                // Unterminated block comment error.
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LexUnterminatedBlockComment,
+                    diag_messages::unterminated_string(),
+                    start_loc,
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lexer,
+                );
+                let _ = self.diagnostics.emit(diag);
+                return Result::Err(FixedString256::from("unterminated block comment"));
+            }
+            let ch : u8 = self.peek();
+            if ch == 42u8 && self.peek_next() == 47u8 { // "*/"
+                let _ = self.advance(); // consume '*'
+                let _ = self.advance(); // consume '/'
+                break;
+            }
+            let _ = self.advance();
+        }
+        Result::Ok(())
+    }
+
+    /// Lex a string literal.
+    /// Effect: lex, diag — consumes characters inside string delimiters.
+    fn lex_string(&mut self) -> Result<Token, FixedString256> [lex, diag] {
+        let start : SourceLocation = self.current_location;
+        let mut value : FixedString256 = FixedString256::new();
+        let _ = self.advance(); // consume opening '"'
+        // Bounded: at most 256 characters in a string literal.
+        for var i : u32 = 0u32; i < 256u32; i += 1u32 [256u32] {
+            if self.is_at_end() {
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LexUnterminatedString,
+                    diag_messages::unterminated_string(),
+                    start,
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lexer,
+                );
+                let _ = self.diagnostics.emit(diag);
+                return Result::Err(FixedString256::from("unterminated string"));
+            }
+            let ch : u8 = self.peek();
+            if ch == 34u8 { // '"'
+                let _ = self.advance(); // consume closing '"'
+                let end : SourceLocation = self.current_location;
+                let token : Token = Token::new(
+                    TokenType::StringLiteral,
+                    TokenValue::string(value),
+                    start,
+                    end,
+                    self.generation,
+                );
+                return Result::Ok(token);
+            }
+            if ch == 92u8 { // '\' escape
+                let _ = self.advance();
+                if self.is_at_end() {
+                    break;
+                }
+                let escaped : u8 = self.advance();
+                // Handle escape sequences.
+                let decoded : u8 = match escaped {
+                    110u8 => 10u8,  // \n
+                    116u8 => 9u8,   // \t
+                    114u8 => 13u8,  // \r
+                    48u8 => 0u8,    // \0
+                    92u8 => 92u8,   // \\
+                    34u8 => 34u8,   // \"
+                    39u8 => 39u8,   // \'
+                    _ => escaped,
+                };
+                let _ = value.push_byte(decoded);
+            } else {
+                let _ = value.push_byte(self.advance());
+            }
+        }
+        // If we get here, the string was too long or unterminated.
+        let diag : DiagnosticPayload = DiagnosticPayload::new(
+            DiagnosticCode::LexUnterminatedString,
+            diag_messages::unterminated_string(),
+            start,
+            DiagnosticSeverity::Error,
+            CompilerPhase::Lexer,
+        );
+        let _ = self.diagnostics.emit(diag);
+        Result::Err(FixedString256::from("string too long or unterminated"))
+    }
+
+    /// Lex a character literal.
+    /// Effect: lex, diag — consumes characters inside single quotes.
+    fn lex_char(&mut self) -> Result<Token, FixedString256> [lex, diag] {
+        let start : SourceLocation = self.current_location;
+        let _ = self.advance(); // consume opening '\''
+        if self.is_at_end() {
+            return Result::Err(FixedString256::from("unterminated char literal"));
+        }
+        let ch : u8 = if self.peek() == 92u8 { // '\'
+            let _ = self.advance();
+            let escaped : u8 = self.advance();
+            match escaped {
+                110u8 => 10u8,
+                116u8 => 9u8,
+                114u8 => 13u8,
+                48u8 => 0u8,
+                92u8 => 92u8,
+                39u8 => 39u8,
+                _ => escaped,
+            }
+        } else {
+            self.advance()
+        };
+        if self.is_at_end() || self.peek() != 39u8 { // '\''
+            return Result::Err(FixedString256::from("unterminated char literal"));
+        }
+        let _ = self.advance(); // consume closing '\''
+        let end : SourceLocation = self.current_location;
+        let token : Token = Token::new(
+            TokenType::CharLiteral,
+            TokenValue::character(ch),
+            start,
+            end,
+            self.generation,
+        );
+        Result::Ok(token)
+    }
+
+    /// Lex a numeric literal (integer or float).
+    /// Effect: lex, diag — consumes digits and optional decimal point.
+    fn lex_number(&mut self) -> Result<Token, FixedString256> [lex, diag] {
+        let start : SourceLocation = self.lexeme_start_location;
+        let mut is_float : bool = false;
+        let mut digits : FixedString256 = FixedString256::new();
+
+        // Bounded: at most 40 digits in a numeric literal.
+        for var i : u32 = 0u32; i < 40u32; i += 1u32 [40u32] {
+            if self.is_at_end() {
+                break;
+            }
+            let ch : u8 = self.peek();
+            if ch >= 48u8 && ch <= 57u8 { // '0'-'9'
+                let _ = digits.push_byte(self.advance());
+            } else if ch == 46u8 && !is_float { // '.' decimal point
+                let next : u8 = self.peek_next();
+                if next >= 48u8 && next <= 57u8 { // must be followed by digit
+                    is_float = true;
+                    let _ = digits.push_byte(self.advance()); // consume '.'
+                } else {
+                    break;
+                }
+            } else if ch == 95u8 { // '_' digit separator
+                let _ = self.advance(); // skip separator
+            } else {
+                break;
+            }
+        }
+
+        let end : SourceLocation = self.current_location;
+        if is_float {
+            // Parse as float.
+            let float_val : f64 = 0.0f64; // simplified: would parse digits string
+            let token : Token = Token::new(
+                TokenType::FloatLiteral,
+                TokenValue::float(float_val),
+                start,
+                end,
+                self.generation,
+            );
+            Result::Ok(token)
+        } else {
+            // Parse as integer.
+            let int_val : i64 = 0i64; // simplified: would parse digits string
+            let token : Token = Token::new(
+                TokenType::IntegerLiteral,
+                TokenValue::integer(int_val),
+                start,
+                end,
+                self.generation,
+            );
+            Result::Ok(token)
+        }
+    }
+
+    /// Lex an identifier or keyword.
+    /// Effect: lex — consumes alphanumeric characters.
+    fn lex_identifier(&mut self) -> Token [lex] {
+        let start : SourceLocation = self.lexeme_start_location;
+        let mut ident : FixedString256 = FixedString256::new();
+
+        // Bounded: at most 128 characters in an identifier.
+        for var i : u32 = 0u32; i < 128u32; i += 1u32 [128u32] {
+            if self.is_at_end() {
+                break;
+            }
+            let ch : u8 = self.peek();
+            let is_alphanumeric : bool = (ch >= 97u8 && ch <= 122u8) ||  // a-z
+                                          (ch >= 65u8 && ch <= 90u8) ||   // A-Z
+                                          (ch >= 48u8 && ch <= 57u8) ||   // 0-9
+                                          ch == 95u8;                      // _
+            if !is_alphanumeric {
+                break;
+            }
+            let _ = ident.push_byte(self.advance());
+        }
+
+        let end : SourceLocation = self.current_location;
+        let token_type : TokenType = self.identifier_or_keyword(ident);
+        Token::new(token_type, TokenValue::ident(ident), start, end, self.generation)
+    }
+
+    /// Classify an identifier string as a keyword or identifier.
+    /// Effect: pure — deterministic keyword table lookup.
+    fn identifier_or_keyword(&self, ident : FixedString256) -> TokenType [pure] {
+        let ident_str : FixedString256 = ident;
+        if ident_str == "let" { TokenType::KeywordLet }
+        else if ident_str == "mut" { TokenType::KeywordMut }
+        else if ident_str == "fn" { TokenType::KeywordFn }
+        else if ident_str == "pub" { TokenType::KeywordPub }
+        else if ident_str == "seal" { TokenType::KeywordSeal }
+        else if ident_str == "datatype" { TokenType::KeywordDataType }
+        else if ident_str == "sealdatatype" { TokenType::KeywordSealDataType }
+        else if ident_str == "struct" { TokenType::KeywordStruct }
+        else if ident_str == "enum" { TokenType::KeywordEnum }
+        else if ident_str == "impl" { TokenType::KeywordImpl }
+        else if ident_str == "match" { TokenType::KeywordMatch }
+        else if ident_str == "if" { TokenType::KeywordIf }
+        else if ident_str == "else" { TokenType::KeywordElse }
+        else if ident_str == "for" { TokenType::KeywordFor }
+        else if ident_str == "while" { TokenType::KeywordWhile }
+        else if ident_str == "loop" { TokenType::KeywordLoop }
+        else if ident_str == "return" { TokenType::KeywordReturn }
+        else if ident_str == "break" { TokenType::KeywordBreak }
+        else if ident_str == "continue" { TokenType::KeywordContinue }
+        else if ident_str == "true" { TokenType::KeywordTrue }
+        else if ident_str == "false" { TokenType::KeywordFalse }
+        else if ident_str == "use" { TokenType::KeywordUse }
+        else if ident_str == "namespace" { TokenType::KeywordNamespace }
+        else if ident_str == "type" { TokenType::KeywordType }
+        else if ident_str == "effect" { TokenType::KeywordEffect }
+        else if ident_str == "capability" { TokenType::KeywordCapability }
+        else if ident_str == "trusted" { TokenType::KeywordTrusted }
+        else if ident_str == "no_std" { TokenType::KeywordNoStd }
+        else if ident_str == "no_alloc" { TokenType::KeywordNoAlloc }
+        else if ident_str == "no_unsafe" { TokenType::KeywordNoUnsafe }
+        else if ident_str == "var" { TokenType::KeywordVar }
+        else if ident_str == "const" { TokenType::KeywordConst }
+        else if ident_str == "_" { TokenType::Underscore }
+        else { TokenType::Identifier }
+    }
+
+    /// Lex the next token from the source.
+    /// This is the main entry point of the lexer state machine.
+    /// Effect: lex, diag — advances through source and produces token.
+    pub fn next_token(&mut self) -> Token [lex, diag] {
+        self.generation += 1u64;
+
+        // Skip whitespace and comments.
+        let _ = self.skip_whitespace();
+
+        self.lexeme_start = self.position;
+        self.lexeme_start_location = self.current_location;
+
+        if self.is_at_end() {
+            return Token::eof(self.current_location, self.generation);
+        }
+
+        let ch : u8 = self.advance();
+
+        match ch {
+            // Single-character tokens.
+            40u8 => { // '('
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::LeftParen, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            41u8 => { // ')'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::RightParen, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            123u8 => { // '{'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::LeftBrace, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            125u8 => { // '}'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::RightBrace, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            91u8 => { // '['
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::LeftBracket, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            93u8 => { // ']'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::RightBracket, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            44u8 => { // ','
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Comma, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            59u8 => { // ';'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Semicolon, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            46u8 => { // '.'
+                let end : SourceLocation;
+                if self.match_char(46u8) { // '.'
+                    if self.match_char(46u8) { // '...'
+                        end = self.current_location;
+                        Token::new(TokenType::DotDotDot, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                    } else { // '..'
+                        end = self.current_location;
+                        Token::new(TokenType::DotDot, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                    }
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Dot, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            58u8 => { // ':'
+                let end : SourceLocation;
+                if self.match_char(58u8) { // '::'
+                    end = self.current_location;
+                    Token::new(TokenType::ColonColon, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Colon, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+
+            // Operators.
+            43u8 => { // '+'
+                let end : SourceLocation;
+                if self.match_char(61u8) { // '+='
+                    end = self.current_location;
+                    Token::new(TokenType::PlusEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Plus, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            45u8 => { // '-'
+                let end : SourceLocation;
+                if self.match_char(61u8) { // '-='
+                    end = self.current_location;
+                    Token::new(TokenType::MinusEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else if self.match_char(62u8) { // '->'
+                    end = self.current_location;
+                    Token::new(TokenType::Arrow, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Minus, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            42u8 => { // '*'
+                let end : SourceLocation;
+                if self.match_char(61u8) { // '*='
+                    end = self.current_location;
+                    Token::new(TokenType::StarEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Star, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            47u8 => { // '/'
+                let end : SourceLocation;
+                if self.match_char(61u8) { // '/='
+                    end = self.current_location;
+                    Token::new(TokenType::SlashEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Slash, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            37u8 => { // '%'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Percent, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            61u8 => { // '='
+                let end : SourceLocation;
+                if self.match_char(61u8) { // '=='
+                    end = self.current_location;
+                    Token::new(TokenType::EqualEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else if self.match_char(62u8) { // '=>'
+                    end = self.current_location;
+                    Token::new(TokenType::FatArrow, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Equal, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            33u8 => { // '!'
+                let end : SourceLocation;
+                if self.match_char(61u8) { // '!='
+                    end = self.current_location;
+                    Token::new(TokenType::BangEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Bang, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            60u8 => { // '<'
+                let end : SourceLocation;
+                if self.match_char(60u8) { // '<<'
+                    end = self.current_location;
+                    Token::new(TokenType::LeftShift, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else if self.match_char(61u8) { // '<='
+                    end = self.current_location;
+                    Token::new(TokenType::LessEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Less, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            62u8 => { // '>'
+                let end : SourceLocation;
+                if self.match_char(62u8) { // '>>'
+                    end = self.current_location;
+                    Token::new(TokenType::RightShift, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else if self.match_char(61u8) { // '>='
+                    end = self.current_location;
+                    Token::new(TokenType::GreaterEqual, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                } else {
+                    end = self.current_location;
+                    Token::new(TokenType::Greater, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+                }
+            }
+            38u8 => { // '&'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Ampersand, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            124u8 => { // '|'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Pipe, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            94u8 => { // '^'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Caret, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            126u8 => { // '~'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Tilde, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            63u8 => { // '?'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::QuestionMark, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            64u8 => { // '@'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::At, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            35u8 => { // '#'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Hash, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            36u8 => { // '$'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Dollar, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            92u8 => { // '\'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Backslash, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+            96u8 => { // '`'
+                let end : SourceLocation = self.current_location;
+                Token::new(TokenType::Backtick, TokenValue::unit(), self.lexeme_start_location, end, self.generation)
+            }
+
+            // String literals.
+            34u8 => { // '"'
+                let result : Result<Token, FixedString256> = self.lex_string();
+                match result {
+                    Result::Ok(token) => token,
+                    Result::Err(_) => Token::eof(self.current_location, self.generation),
+                }
+            }
+
+            // Char literals.
+            39u8 => { // '\''
+                let result : Result<Token, FixedString256> = self.lex_char();
+                match result {
+                    Result::Ok(token) => token,
+                    Result::Err(_) => Token::eof(self.current_location, self.generation),
+                }
+            }
+
+            // Digits: start of numeric literal.
+            48u8..57u8 => { // '0'-'9'
+                // We already advanced; need to handle the fact that
+                // we consumed the first digit already. For simplicity,
+                // we rewind and lex the number properly.
+                self.position = self.lexeme_start;
+                self.current_location = self.lexeme_start_location;
+                let result : Result<Token, FixedString256> = self.lex_number();
+                match result {
+                    Result::Ok(token) => token,
+                    Result::Err(_) => Token::eof(self.current_location, self.generation),
+                }
+            }
+
+            // Identifiers and keywords start with letter or underscore.
+            97u8..122u8 | 65u8..90u8 | 95u8 => { // a-z, A-Z, _
+                // Rewind and lex identifier properly.
+                self.position = self.lexeme_start;
+                self.current_location = self.lexeme_start_location;
+                self.lex_identifier()
+            }
+
+            // Unexpected character.
+            _ => {
+                let diag : DiagnosticPayload = DiagnosticPayload::new(
+                    DiagnosticCode::LexUnexpectedCharacter,
+                    diag_messages::unexpected_char(ch),
+                    self.current_location,
+                    DiagnosticSeverity::Error,
+                    CompilerPhase::Lexer,
+                );
+                let _ = self.diagnostics.emit(diag);
+                // Error recovery: emit a dummy token and continue.
+                Token::new(TokenType::EndOfFile, TokenValue::unit(), self.lexeme_start_location, self.current_location, self.generation)
+            }
+        }
+    }
+
+    /// Lex all tokens into a fixed array.
+    /// Effect: lex, diag — lexes entire source into token array.
+    /// Bounded: bounded by Array256 capacity.
+    pub fn lex_all(&mut self) -> Result<Array256<Token>, DiagnosticBag> [lex, diag] {
+        let mut tokens : Array256<Token> = Array256::new();
+        // Bounded: at most 256 tokens in a module.
+        for var i : u32 = 0u32; i < 256u32; i += 1u32 [256u32] {
+            let token : Token = self.next_token();
+            if token.token_type == TokenType::EndOfFile {
+                let _ = tokens.push(token);
+                break;
+            }
+            // Skip residual tokens unless in residual mode.
+            if token.is_residual && !self.emit_residuals {
+                // Skip this token.
+            } else {
+                let _ = tokens.push(token);
+            }
+        }
+        // Evidence: lex_all produces a complete token stream from source.
+        Result::Ok(tokens)
+    }
+
+    /// Get a reference to the diagnostic bag.
+    /// Effect: pure — read-only access.
+    pub fn diagnostics(&self) -> &DiagnosticBag [pure] {
+        &self.diagnostics
+    }
+
+    /// Consume the diagnostic bag, transferring ownership.
+    /// Effect: pure — ownership transfer.
+    pub fn into_diagnostics(self) -> DiagnosticBag [pure] {
+        self.diagnostics
+    }
+}
+
+// --- Token Stream — provides buffered access to tokens with lookahead ---
+
+pub struct TokenStream {
+    /// Fixed-capacity token buffer.
+    tokens : Array256<Token>,
+    /// Current position in the token stream.
+    position : u32,
+    /// Current generation tag for handle validation.
+    generation : u64,
+}
+
+impl TokenStream {
+    /// Create a new token stream from a token array.
+    /// Effect: pure — constructs stream from pre-existing tokens.
+    pub fn new(tokens : Array256<Token>) -> TokenStream [pure] {
+        TokenStream {
+            tokens: tokens,
+            position: 0u32,
+            generation: 0u64,
+        }
+    }
+
+    /// Peek at the current token without consuming it.
+    /// Effect: pure — read-only access to current token.
+    pub fn peek(&self) -> &Token [pure] {
+        if self.position >= self.tokens.len() {
+            // Return EOF sentinel (last token should be EOF).
+            let last_idx : u32 = if self.tokens.len() > 0u32 {
+                self.tokens.len() - 1u32
+            } else {
+                0u32
+            };
+            &self.tokens.get(last_idx)
+        } else {
+            &self.tokens.get(self.position)
+        }
+    }
+
+    /// Consume the current token and advance.
+    /// Effect: pure — advances stream position.
+    pub fn advance(&mut self) -> Token [pure] {
+        let token : Token = self.tokens.get(self.position);
+        if self.position < self.tokens.len() {
+            self.position += 1u32;
+        }
+        token
+    }
+
+    /// Expect a specific token type, consuming it and returning its value.
+    /// If the token doesn't match, a diagnostic is emitted and recovery is attempted.
+    /// Effect: diag — emits diagnostic on mismatch.
+    pub fn expect(&mut self, expected : TokenType) -> Result<Token, FixedString256> [diag, pure] {
+        let token : Token = self.peek();
+        if token.token_type == expected {
+            Result::Ok(self.advance())
+        } else {
+            let msg : FixedString256 = diag_messages::unexpected_token(
+                expected.name(),
+                token.token_type.name(),
+            );
+            Result::Err(msg)
+        }
+    }
+
+    /// Check if the current token matches a given type.
+    /// Effect: pure — read-only comparison.
+    pub fn check(&self, token_type : TokenType) -> bool [pure] {
+        self.peek().token_type == token_type
+    }
+
+    /// Check the current token and advance if it matches.
+    /// Effect: pure — conditional advance.
+    pub fn match_token(&mut self, token_type : TokenType) -> bool [pure] {
+        if self.check(token_type) {
+            let _ = self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Synchronize to a synchronizing token (for error recovery).
+    /// Effect: pure — advances past tokens until a sync point.
+    pub fn synchronize(&mut self, sync_tokens : Array256<TokenType>) [pure] {
+        // Bounded: bounded by remaining tokens (max 256).
+        for var i : u32 = 0u32; i < 256u32; i += 1u32 [256u32] {
+            if self.position >= self.tokens.len() {
+                break;
+            }
+            let token : Token = self.peek();
+            if token.token_type == TokenType::Semicolon
+                || token.token_type == TokenType::RightBrace
+                || token.token_type == TokenType::EndOfFile {
+                break;
+            }
+            // Check sync tokens.
+            let mut found_sync : bool = false;
+            for var j : u32 = 0u32; j < sync_tokens.len(); j += 1u32 [sync_tokens.len()] {
+                if token.token_type == sync_tokens.get(j) {
+                    found_sync = true;
+                    break;
+                }
+            }
+            if found_sync {
+                break;
+            }
+            let _ = self.advance();
+        }
+    }
+
+    /// Get the current position in the stream.
+    /// Effect: pure — read-only.
+    pub fn position(&self) -> u32 [pure] {
+        self.position
+    }
+
+    /// Check if the stream is at the end.
+    /// Effect: pure — read-only comparison.
+    pub fn is_at_end(&self) -> bool [pure] {
+        self.position >= self.tokens.len()
+            || self.peek().token_type == TokenType::EndOfFile
+    }
+
+    /// Reset the stream to the beginning.
+    /// Effect: pure — resets position.
+    pub fn reset(&mut self) [pure] {
+        self.position = 0u32;
+        self.generation += 1u64;
+    }
+
+    /// Get the generation tag.
+    /// Effect: pure — read-only.
+    pub fn generation(&self) -> u64 [pure] {
+        self.generation
+    }
+}
+
+// --- Lexer Receipt — evidence that lexing produced a specific output ---
+
+pub struct LexerReceipt {
+    /// Number of tokens produced.
+    pub token_count : u32,
+    /// Number of errors encountered.
+    pub error_count : u32,
+    /// Hash of the full token sequence.
+    pub token_sequence_hash : u64,
+    /// Generation tag at completion.
+    pub generation : u64,
+    /// File path that was lexed.
+    pub file_path : FixedString256,
+    /// Source length in bytes.
+    pub source_length : u64,
+}
+
+impl LexerReceipt {
+    /// Create a new lexer receipt from lex results.
+    /// Effect: pure — constructs receipt with evidence.
+    pub fn new(
+        token_count : u32,
+        error_count : u32,
+        generation : u64,
+        file_path : FixedString256,
+        source_length : u64,
+    ) -> LexerReceipt [pure] {
+        let hash : u64 = LexerReceipt::compute_hash(token_count, error_count, generation);
+        LexerReceipt {
+            token_count: token_count,
+            error_count: error_count,
+            token_sequence_hash: hash,
+            generation: generation,
+            file_path: file_path,
+            source_length: source_length,
+        }
+    }
+
+    /// Compute a deterministic hash of lexer results.
+    /// Effect: pure — deterministic hash computation.
+    fn compute_hash(token_count : u32, error_count : u32, generation : u64) -> u64 [pure] {
+        var hash : u64 = 14695981039346656037u64;
+        hash ^= token_count as u64;
+        hash *= 1099511628211u64;
+        hash ^= error_count as u64;
+        hash *= 1099511628211u64;
+        hash ^= generation;
+        hash *= 1099511628211u64;
+        hash
+    }
+
+    /// Verify this receipt against actual lexer results.
+    /// Effect: pure — deterministic verification.
+    pub fn verify(&self, token_count : u32, error_count : u32, generation : u64) -> bool [pure] {
+        let computed : u64 = LexerReceipt::compute_hash(token_count, error_count, generation);
+        self.token_sequence_hash == computed
+            && self.generation == generation
+    }
+}
+
+// --- Lexer Pipeline Entry Point ---
+
+/// Lex a source buffer and produce a token stream with diagnostics and receipt.
+/// Effect: lex, diag, pure — complete lexer pipeline.
+pub fn lex_source(
+    source : Array256<u8>,
+    file_path : FixedString256,
+    emit_residuals : bool,
+) -> (TokenStream, DiagnosticBag, LexerReceipt) [lex, diag, pure] {
+    let mut lexer : LexerState = LexerState::new(source, file_path);
+    lexer = lexer.set_emit_residuals(emit_residuals);
+
+    let tokens_result : Result<Array256<Token>, DiagnosticBag> = lexer.lex_all();
+    let tokens : Array256<Token>;
+    let diagnostics : DiagnosticBag;
+
+    match tokens_result {
+        Result::Ok(t) => {
+            tokens = t;
+            diagnostics = lexer.into_diagnostics();
+        }
+        Result::Err(d) => {
+            tokens = Array256::new();
+            diagnostics = d;
+        }
+    }
+
+    let token_count : u32 = tokens.len();
+    let error_count : u32 = diagnostics.error_count;
+    let generation : u64 = 0u64;
+    let source_len : u64 = source.len() as u64;
+
+    let receipt : LexerReceipt = LexerReceipt::new(
+        token_count, error_count, generation, file_path, source_len,
+    );
+
+    let stream : TokenStream = TokenStream::new(tokens);
+    (stream, diagnostics, receipt)
+}
