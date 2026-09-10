@@ -309,11 +309,14 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → composition court (sealed ports become runtime building blocks) → runtime prefers native
 ```
 
-- **Dialect cage** — observes a foreign API surface as a black box. Three targets
+- **Dialect cage** — observes a foreign API surface as a black box. Four targets
   so far: libc `toupper` (exhaustive `0x00..=0xff`), libc `memcmp` (a bounded
-  deterministic corpus forcing length, buffers and ordering) and libc `memchr`
+  deterministic corpus forcing length, buffers and ordering), libc `memchr`
   (a bounded deterministic corpus forcing search: first-match index, absent
   needle, repeated needles, the `n`-boundary, and an exhaustive 256-value needle
+  sweep) and libc `strlen` (a bounded deterministic corpus forcing NUL
+  termination: the complete `(k, n)` terminator-index/scan-bound grid, non-NUL
+  fillers, first-NUL-wins tails, and an exhaustive 256-value non-terminator
   sweep). `memchr`'s pointer result is normalized to the index, which is the
   portable part of its contract. No foreign source is read or copied.
 - **Court session** — replays a clean-room native candidate against sealed oracle

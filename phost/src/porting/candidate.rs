@@ -5,7 +5,8 @@
 //
 // Relationship to the compiled artifact: the **authoritative** promoted
 // implementation is the ELF64 object `phorc` emits from
-// examples/jit_port_toupper.phor / examples/jit_port_memcmp.phor, and the
+// examples/jit_port_toupper.phor, examples/jit_port_memcmp.phor,
+// examples/jit_port_memchr.phor and examples/jit_port_strlen.phor, and the
 // execution court (`phost::porting::exec`) loads and calls *that*. The functions
 // here are the behavioral mirror the replay court compares against the oracle;
 // the execution court then proves the compiled object agrees too. They are
@@ -22,7 +23,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
+use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_TOUPPER};
 use crate::porting::{json_escape, sha256_hex};
 
 /// Why a candidate could not produce a result for a case.
@@ -140,6 +141,35 @@ pub fn decode_usize(bytes: &[u8]) -> usize {
     u64::from_le_bytes(buf) as usize
 }
 
+/// Encode a `usize` result as 8 little-endian bytes (the wire form of a
+/// `strlen` length). Fixed width so the trace is byte-stable.
+pub fn encode_usize(value: usize) -> Vec<u8> {
+    (value as u64).to_le_bytes().to_vec()
+}
+
+// ============================================================================
+// strlen
+// ============================================================================
+
+/// Native clean-room `strlen`: the length of a NUL-terminated byte string — the
+/// index of the first NUL byte within the first `n` bytes.
+///
+/// `strlen` takes no length argument; `n` is the ABI's precondition bound (the
+/// terminator lies within it). When no terminator is found inside the bound the
+/// candidate fails closed by returning `n` rather than reading on.
+#[inline]
+pub fn phor_strlen(bytes: &[u8], n: usize) -> usize {
+    let m = n.min(bytes.len());
+    let mut i = 0;
+    while i < m {
+        if bytes[i] == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    n
+}
+
 /// Run the native candidate for a qualified target id over its argument list.
 ///
 /// Returns `Err(UnsupportedTarget)` for unknown ids and `Err(MalformedArgs)` for
@@ -171,6 +201,14 @@ pub fn run_candidate(target_id: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, Candi
             .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
         let index = phor_memchr(&args[0], needle, decode_usize(&args[2]));
         return Ok(encode_index(index));
+    }
+
+    if target_id == LIBC_STRLEN.id {
+        if args.len() < 2 {
+            return Err(CandidateError::MalformedArgs(target_id.to_string()));
+        }
+        let len = phor_strlen(&args[0], decode_usize(&args[1]));
+        return Ok(encode_usize(len));
     }
 
     Err(CandidateError::UnsupportedTarget(target_id.to_string()))
@@ -320,11 +358,11 @@ mod tests {
 
     #[test]
     fn test_unknown_candidate_fails_closed() {
-        let err = run_candidate("libc:strlen:c-locale:u64:v1", &[alloc::vec![0x41]]);
+        let err = run_candidate("libc:strcspn:c-locale:u64:v1", &[alloc::vec![0x41]]);
         assert_eq!(
             err,
             Err(CandidateError::UnsupportedTarget(String::from(
-                "libc:strlen:c-locale:u64:v1"
+                "libc:strcspn:c-locale:u64:v1"
             )))
         );
     }
@@ -374,6 +412,31 @@ mod tests {
         for case in crate::porting::target::memchr_corpus() {
             match run_candidate(LIBC_MEMCHR.id, &case.args) {
                 Ok(out) => assert_eq!(out.len(), 4, "case {}", case.case_id),
+                Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_native_strlen_behavior() {
+        assert_eq!(phor_strlen(b"", 0), 0);
+        assert_eq!(phor_strlen(b"\0", 1), 0);
+        assert_eq!(phor_strlen(b"abc\0", 4), 3);
+        assert_eq!(phor_strlen(b"\0abc", 4), 0);
+        // The FIRST NUL wins, even when a later NUL is present.
+        assert_eq!(phor_strlen(b"ab\0c\0", 5), 2);
+        // Non-NUL high bytes do not terminate (unsigned 0x7f/0x80/0xff).
+        assert_eq!(phor_strlen(&[0x7f, 0x80, 0xff, 0x00], 4), 3);
+        // The bound is respected: a terminator outside it is not observed.
+        assert_eq!(phor_strlen(&[0x41, 0x42, 0x00], 2), 2);
+        assert_eq!(phor_strlen(&[0x41, 0x42, 0x00], 3), 2);
+    }
+
+    #[test]
+    fn test_strlen_candidate_covers_corpus_without_error() {
+        for case in crate::porting::target::strlen_corpus() {
+            match run_candidate(LIBC_STRLEN.id, &case.args) {
+                Ok(out) => assert_eq!(out.len(), 8, "case {}", case.case_id),
                 Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
             }
         }

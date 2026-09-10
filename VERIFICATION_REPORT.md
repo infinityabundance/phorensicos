@@ -19,8 +19,8 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 135 pass, 4 ignored | 139 total: 8 serial + 4 kernel + 49 nucleus + 70 porting (incl. exec, dispatch and composition courts); the 4 ignored read privileged control registers and require ring 0 |
-| All tests (phorc) | ✅ 48 pass | 44 unit (parser/checker/lower/codegen) + 4 integration lowering regressions |
+| All tests (phost) | ✅ 143 pass, 4 ignored | 147 total: 8 serial + 4 kernel + 49 nucleus + 78 porting (incl. exec, dispatch and composition courts); the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
 | `console` module | ✅ | Scrolling text console on framebuffer |
@@ -87,35 +87,35 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 108 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp) + sealed-object execution court |
+| phost reach | 143 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen) + sealed-object execution + sealed native dispatch + sealed composition courts |
 
 ### JIT-Porting Court
-| Aspect | `toupper` | `memcmp` | `memchr` |
-|--------|-----------|----------|----------|
-| Qualified target id | `libc:toupper:c-locale:u8:v1` | `libc:memcmp:c-locale:sign:v1` | `libc:memchr:c-locale:index:v1` |
-| Corpus | exhaustive `0x00..=0xff` (256) | bounded deterministic (312) | bounded deterministic (482) |
-| Dialect cage observation | ✅ 256/256 | ✅ 312/312 | ✅ 482/482 |
-| Replay court | ✅ 256/256, `consistent` | ✅ 312/312, `consistent` | ✅ 482/482, `consistent` |
-| Contract | `u8` (C locale) | sign `(-1 \| 0 \| 1)`, unsigned, n-bounded | first-match index or `-1`, unsigned, n-bounded |
-| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` | `918c86d5302aaa0394a782b68e4aed7494549bcaaf06a82948c6d945ccb43210` | `bd89e67c4d7cd22d5006c1c3a7c3759dd47a218de9f977f2f8db549b77d43498` |
-| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` | `5e987fae450eb623a749e2b662b84c59ad390fb2eade75b728ae86399687cba5` |
-| Candidate source hash | `a23bea4da98b4526635d295b6f71f1dbfc14e1a219fb2849d94ee89ca80a37b8` | `adcb65fbd2e54a04c78ed019947d157d0935247b69be828ceb0702af75088a0c` | `ccce8c195bb826866e5505aebbc9a4e38334f58529b2f80a3777e959747e23ec` |
-| Candidate object hash | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` | `23ae1e515557ab9449838ad1f72666e70d7ff9f689acf306877a9f3a0a1bd854` | `90d35156eef8b7009352ebb0ac6fa0f9137c95a515ae1a1e760a37147032bbb8` |
-| Candidate receipt hash | `614fd9a0860eeee816512a26320001a24217fcfaf2c37344d2a528ca24133485` | `83f0698ed7c1d684be3b0522cfa0e816e00a2708a9f67acb295e3d68c6446aa7` | `e09e4c739b32f9287e27dc4f91f4a3b2c1f6b346eb7d53b060600bf66680c51e` |
-| Compiler | `phorc 0.1.0` | `phorc 0.1.0` | `phorc 0.1.0` |
-| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` | `98843827cbbf97866221127651840eaaee6dbb17dc1bf3e0053476ce30a8290d` | `8855cf626df5d8e6e75520f80149938a00505596b080bbb2105ba79b13599c66` |
-| Executed ELF symbol | `_phor_phor_toupper` | `_phor_phor_memcmp_sign` | `_phor_phor_memchr_index` |
-| Execution court | ✅ 256/256, `consistent` | ✅ 312/312, `consistent` | ✅ 482/482, `consistent` |
-| Dispatch court | ✅ 256/256 native | ✅ 312/312 native | ✅ 482/482 native |
-| Dispatch hash | `a3f7c0606ae6b6da6353c1b532957dbe40022e206cb059c1512620ecaa0df90d` | `fb00385a5ecaf78c2031d25d7d6c98b7a040d44c53fd12579fa6931394387231` | `a611cc809aa507350fd6b6aba824f681a5e3e977c0fcd7eb8300f58ed995f3d7` |
-| Promotion | ✅ → `sealed` | ✅ → `sealed` | ✅ → `sealed` |
-| Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` | `native:libc:memchr:c-locale:index:v1` |
+| Aspect | `toupper` | `memcmp` | `memchr` | `strlen` |
+|--------|-----------|----------|----------|----------|
+| Qualified target id | `libc:toupper:c-locale:u8:v1` | `libc:memcmp:c-locale:sign:v1` | `libc:memchr:c-locale:index:v1` | `libc:strlen:c-locale:u64:v1` |
+| Corpus | exhaustive `0x00..=0xff` (256) | bounded deterministic (312) | bounded deterministic (482) | bounded deterministic (308) |
+| Dialect cage observation | ✅ 256/256 | ✅ 312/312 | ✅ 482/482 | ✅ 308/308 |
+| Replay court | ✅ 256/256, `consistent` | ✅ 312/312, `consistent` | ✅ 482/482, `consistent` | ✅ 308/308, `consistent` |
+| Contract | `u8` (C locale) | sign `(-1 \| 0 \| 1)`, unsigned, n-bounded | first-match index or `-1`, unsigned, n-bounded | first-NUL length, `u64`, n-bounded (fail closed at `n`) |
+| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` | `918c86d5302aaa0394a782b68e4aed7494549bcaaf06a82948c6d945ccb43210` | `bd89e67c4d7cd22d5006c1c3a7c3759dd47a218de9f977f2f8db549b77d43498` | `6a0b3f237e0346d3556f6f68828ce6ad723a8e62f7d28108d0031dc8dc4d580e` |
+| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` | `5e987fae450eb623a749e2b662b84c59ad390fb2eade75b728ae86399687cba5` | `93324220b42484122fbd804533318c17f01d7cedbae7bb3a50d1493dfa9d2ffe` |
+| Candidate source hash | `a23bea4da98b4526635d295b6f71f1dbfc14e1a219fb2849d94ee89ca80a37b8` | `adcb65fbd2e54a04c78ed019947d157d0935247b69be828ceb0702af75088a0c` | `ccce8c195bb826866e5505aebbc9a4e38334f58529b2f80a3777e959747e23ec` | `d508323ce7cb44f944c0d748f1cea250f29b49d7a5a29e9a281e6de33dd0a14e` |
+| Candidate object hash | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` | `23ae1e515557ab9449838ad1f72666e70d7ff9f689acf306877a9f3a0a1bd854` | `90d35156eef8b7009352ebb0ac6fa0f9137c95a515ae1a1e760a37147032bbb8` | `ffb0f5699df2455d6f1597c3bb2bbf1d94596cd772d2fd4b84d6036b99967b94` |
+| Candidate receipt hash | `614fd9a0860eeee816512a26320001a24217fcfaf2c37344d2a528ca24133485` | `83f0698ed7c1d684be3b0522cfa0e816e00a2708a9f67acb295e3d68c6446aa7` | `e09e4c739b32f9287e27dc4f91f4a3b2c1f6b346eb7d53b060600bf66680c51e` | `d5fa62f3dffc7b1c689e87044527e7970d002350d01bd373503c33616ccfefa7` |
+| Compiler | `phorc 0.1.0` | `phorc 0.1.0` | `phorc 0.1.0` | `phorc 0.1.0` |
+| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` | `98843827cbbf97866221127651840eaaee6dbb17dc1bf3e0053476ce30a8290d` | `8855cf626df5d8e6e75520f80149938a00505596b080bbb2105ba79b13599c66` | `e942f6fd7de3d654fe8063d097d7040a41b54e9ee9d903e7c97386be6502b8fc` |
+| Executed ELF symbol | `_phor_phor_toupper` | `_phor_phor_memcmp_sign` | `_phor_phor_memchr_index` | `_phor_phor_strlen_len` |
+| Execution court | ✅ 256/256, `consistent` | ✅ 312/312, `consistent` | ✅ 482/482, `consistent` | ✅ 308/308, `consistent` |
+| Dispatch court | ✅ 256/256 native | ✅ 312/312 native | ✅ 482/482 native | ✅ 308/308 native |
+| Dispatch hash | `a3f7c0606ae6b6da6353c1b532957dbe40022e206cb059c1512620ecaa0df90d` | `fb00385a5ecaf78c2031d25d7d6c98b7a040d44c53fd12579fa6931394387231` | `a611cc809aa507350fd6b6aba824f681a5e3e977c0fcd7eb8300f58ed995f3d7` | `fd8f09df324dd6feaa111e5c8d79c0ae5d446fa5e62d36d88251ff29180b3ae2` |
+| Promotion | ✅ → `sealed` | ✅ → `sealed` | ✅ → `sealed` | ✅ → `sealed` |
+| Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` | `native:libc:memchr:c-locale:index:v1` | `native:libc:strlen:c-locale:u64:v1` |
 
 For every target the **execution behavior hash equals the candidate behavior hash**: the
 Rust mirror and the compiled object reproduce the identical output for every case,
 computed through different code paths (slice-based vs packed-word).
 
-Shared properties (both targets):
+Shared properties (all targets):
 | Aspect | Result |
 |--------|--------|
 | Compiled candidate authority | ✅ candidate.o is the promoted implementation; object + receipt hashes bound |
@@ -141,7 +141,8 @@ reproducible across runs and environments.
 Sealed-object execution: the object is then **loaded and executed**. The execution
 court verifies the object's SHA-256 against the seal before use, parses the ELF64
 sections/symbol table, locates the ABI entry symbol (`_phor_phor_toupper` /
-`_phor_phor_memcmp_sign`), rejects an entry whose byte range contains a relocation
+`_phor_phor_memcmp_sign` / `_phor_phor_memchr_index` / `_phor_phor_strlen_len`),
+rejects an entry whose byte range contains a relocation
 or which is an undefined/external symbol, maps `.text` read-only/executable, calls
 the function through an explicit SysV integer ABI harness, and replays the exact
 same corpus through the compiled code. Promotion requires both the replay court
@@ -154,15 +155,27 @@ alternating; every first-mismatch position with both orderings; the `n`-boundary
 around a mismatch (`n = j` excludes it, `n = j+1` includes it); and the unsigned
 edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`.
 
+`memchr` corpus axes: lengths `0..=8`; the first match at every index (on
+distinct-byte patterns); repeated needles (first occurrence wins); an absent
+needle; the `n`-boundary around a match; the unsigned edge bytes; and an
+exhaustive sweep of all 256 needle values. Every case satisfies `n <= len(hay)`.
+
+`strlen` corpus axes: the complete `(k, n)` grid of terminator index `k` and scan
+bound `n` with `0 <= k < n <= 8` (36 cases); non-NUL filler bytes at every prefix
+position; tails after the terminator that are themselves NUL (the *first* NUL must
+win); buffers longer than the bound; and an exhaustive sweep of all 256 byte
+values proving only `0x00` terminates (308 cases). Every case has a NUL inside its
+bound, so libc `strlen` is well defined and never reads beyond it.
+
 Sealed native dispatch: the runtime call site (`phost::porting::dispatch`) looks
 the target up in the capability-gated sealed store and, if a sealed entry is
 present, verifies the object hash, maps the entry function once and calls it;
 otherwise it reports a foreign fallback. A *broken seal* is counted separately
 (`broken_seal_cases`) and is terminal — it never falls back. The dispatch court
 replays the whole corpus through this path and requires 256/256 (`toupper`),
-312/312 (`memcmp`) and 482/482 (`memchr`) cases served natively with zero
-fallbacks and zero broken seals; `dispatch_hash` is bound into the promotion
-receipt and the sealed package.
+312/312 (`memcmp`), 482/482 (`memchr`) and 308/308 (`strlen`) cases served
+natively with zero fallbacks and zero broken seals; `dispatch_hash` is bound into
+the promotion receipt and the sealed package.
 Try it: `phost port native toupper 61` (native) and
 `phost port native toupper 61 --no-capability` (foreign fallback).
 
@@ -200,7 +213,7 @@ The fold cases (`G.*`) only match *after* `toupper` normalizes both sides, so a
 composition that dropped the toupper stage cannot pass.
 
 ### Test Results (reproduced on `main`)
-- phost: 135 passed, 0 failed, 4 ignored (139 total). The ignored tests read
+- phost: 143 passed, 0 failed, 4 ignored (147 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -222,9 +235,12 @@ cargo run -p phorc -- --court-replay /tmp/hello.sealed_package.json
 cargo run -p phost -- port promote toupper       # JIT-porting court (256)
 cargo run -p phost -- port promote memcmp        # JIT-porting court (312)
 cargo run -p phost -- port promote memchr        # JIT-porting court (482)
+cargo run -p phost -- port promote strlen        # JIT-porting court (308)
 cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
 ./verify_jit_porting_court.sh --target toupper                    # determinism
 ./verify_jit_porting_court.sh --target memcmp
+./verify_jit_porting_court.sh --target memchr
+./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture

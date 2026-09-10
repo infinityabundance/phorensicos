@@ -403,6 +403,11 @@ fn default_args(target: &PortTarget) -> Vec<Vec<u8>> {
             alloc::vec![0x62],
             3u64.to_le_bytes().to_vec(),
         ],
+        id if id == target::LIBC_STRLEN.id => alloc::vec![
+            // "abc\0" with the terminator inside the bound n = 4 -> length 3.
+            alloc::vec![0x61, 0x62, 0x63, 0x00],
+            4u64.to_le_bytes().to_vec(),
+        ],
         _ => alloc::vec::Vec::new(),
     }
 }
@@ -839,6 +844,49 @@ mod tests {
         .unwrap();
         assert_eq!(r.source, "sealed-object");
         assert_eq!(r.output_hex, "ffffffff");
+        assert!(r.matches_mirror);
+    }
+
+    #[test]
+    fn test_native_call_strlen_returns_the_terminator_index() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("strlen");
+        let r = run_native_call(
+            "strlen",
+            // "abc\0" with the terminator inside the bound n = 4 -> length 3.
+            Some("61626300:0400000000000000"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::granted(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "sealed-object");
+        assert_eq!(r.output_hex, "0300000000000000");
+        assert!(r.matches_mirror);
+        assert_eq!(r.elf_symbol, "_phor_phor_strlen_len");
+    }
+
+    #[test]
+    fn test_native_call_strlen_empty_string_is_zero() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("strlen_empty");
+        let r = run_native_call(
+            "strlen",
+            // The very first byte is NUL -> length 0, and the tail is ignored.
+            Some("0061626300:0500000000000000"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::granted(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "sealed-object");
+        assert_eq!(r.output_hex, "0000000000000000");
         assert!(r.matches_mirror);
     }
 

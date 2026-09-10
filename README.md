@@ -97,8 +97,8 @@ A top-level `manifest_claim` states exactly what is and is not asserted.
 
 ## JIT-Porting Court
 
-Phorensic OS ports *behavior*, not binaries. Three courts have run end-to-end at
-the API boundary:
+Phorensic OS ports *behavior*, not binaries. Four leaf courts have run
+end-to-end at the API boundary:
 
 ```text
 foreign behavior → dialect cage       (observe libc as a black box)
@@ -119,6 +119,7 @@ foreign behavior → dialect cage       (observe libc as a black box)
 | `libc:toupper:c-locale:u8:v1` | exhaustive `0x00..=0xff` (256 cases) | **256/256 pass** | **256/256 pass** | **256/256 native**, 0 fallback |
 | `libc:memcmp:c-locale:sign:v1` | bounded deterministic corpus (312 cases) | **312/312 pass** | **312/312 pass** | **312/312 native**, 0 fallback |
 | `libc:memchr:c-locale:index:v1` | bounded deterministic corpus (482 cases) | **482/482 pass** | **482/482 pass** | **482/482 native**, 0 fallback |
+| `libc:strlen:c-locale:u64:v1` | bounded deterministic corpus (308 cases) | **308/308 pass** | **308/308 pass** | **308/308 native**, 0 fallback |
 
 The `memcmp` corpus deliberately forces length, buffers and ordering: lengths
 `0..=8`, five patterns, every first-mismatch position, the `n`-boundary around a
@@ -131,6 +132,16 @@ every index, an absent needle, repeated needles (first occurrence wins), the
 all 256 needle values. `memchr` returns a *pointer*, which is not portable
 behavior, so the observable is normalized to the **index** of the first match or
 `-1` when absent — the actual C contract (`result - s`).
+
+The `strlen` corpus forces NUL-termination semantics: the complete `(k, n)` grid
+of terminator index `k` and scan bound `n` with `0 <= k < n <= 8`, non-NUL
+filler bytes (including `0x7f`/`0x80`) at every prefix position, tails after the
+terminator that are themselves NUL so the *first* NUL must win, buffers longer
+than the bound, and an exhaustive sweep of all 256 byte values proving that only
+`0x00` terminates. `strlen` takes no length argument, so the observable is the
+**length** (index of the first NUL), and the ABI carries `n` only as a
+precondition bound so the foreign observation cannot read past the caller's
+window; a terminator outside the bound is out of contract and fails closed at `n`.
 
 ### Composition: sealed ports as runtime building blocks
 
@@ -164,15 +175,18 @@ index.
 cargo run -p phost -- port promote toupper   # observe → replay → execute → dispatch → seal
 cargo run -p phost -- port promote memcmp
 cargo run -p phost -- port promote memchr
+cargo run -p phost -- port promote strlen
 cargo run -p phost -- port native toupper 61              # call site: run the sealed object
 cargo run -p phost -- port native memcmp 616263:616264:0300000000000000
 cargo run -p phost -- port native memchr 616263:62:0300000000000000
+cargo run -p phost -- port native strlen 61626300:0400000000000000
 cargo run -p phost -- port native toupper 61 --no-capability   # → foreign fallback
 cargo run -p phost -- port compose                             # composition court
 cargo run -p phost -- port compose 614263:62:0300000000000000   # one composed call
 ./verify_jit_porting_court.sh --target toupper             # determinism court
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
+./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target memchr --check-committed   # fresh == checked-in
 ./verify_composition_court.sh                              # composition court
 ./verify_composition_court.sh --check-committed
@@ -187,14 +201,16 @@ recompiled object invalidates the seal.
 The **compiled `.phor` object is the authoritative promoted implementation**, and
 it is **loaded and executed**: the court invokes `phorc` on the target's `.phor`
 source, hashes the emitted object and its receipt file, then maps the sealed ELF64
-object, locates the ABI entry symbol (`_phor_phor_toupper` / `_phor_phor_memcmp_sign`),
+object, locates the ABI entry symbol (`_phor_phor_toupper` / `_phor_phor_memcmp_sign` /
+`_phor_phor_memchr_index` / `_phor_phor_strlen_len`),
 rejects any entry point with relocations or external symbols, and replays the exact
 same corpus through the compiled code. Promotion now requires *both* the replay
 court and the execution court to match. The verifier independently recompiles and
 confirms the object/receipt hashes match the committed seal (`Compiled object:
 MATCH`) and that the executed object is the sealed object (`Execution object:
-MATCH`). Evidence is committed under `phost/evidence/porting/{toupper,memcmp}/`
-including `execution_verdict.json`; the compiled `candidate.o` and
+MATCH`). Evidence is committed under
+`phost/evidence/porting/{toupper,memcmp,memchr,strlen}/` including
+`execution_verdict.json`; the compiled `candidate.o` and
 `candidate.receipts.json` are regenerated, not committed.
 
 Executed ABI (SysV AMD64, leaf/pure integer functions only):
@@ -204,6 +220,7 @@ Executed ABI (SysV AMD64, leaf/pure integer functions only):
 | `_phor_phor_toupper` | `(u64 byte) -> u64` | folded byte in the low 8 bits |
 | `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign `-1 \| 0 \| 1`; buffers packed big-endian |
 | `_phor_phor_memchr_index` | `(u64 wh, u64 needle, u64 n) -> u64` | `i64` index or `-1`; haystack packed little-endian |
+| `_phor_phor_strlen_len` | `(u64 w, u64 n) -> u64` | `u64` length (first NUL index), `n` when out of contract; buffer packed little-endian |
 
 At a call site the **runtime dispatcher** (`phost::porting::dispatch`) looks the
 target up in the capability-gated sealed store and, if a sealed entry is present,
@@ -253,7 +270,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **135 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **143 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (47), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -261,9 +278,9 @@ All numbers below were reproduced on a clean checkout.
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
-| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
-| Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**; executed object == sealed object |
-| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
+| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, `strlen`: **308/308**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
+| Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**, `strlen` **308/308**; executed object == sealed object |
+| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
 | Sealed composition | `toupper ∘ memchr` composed from two sealed ports: **560/560**, all three stages native, **0 fallbacks / 0 broken seals**, 4776 sealed dispatches; dispatched objects match the committed leaf seals |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |

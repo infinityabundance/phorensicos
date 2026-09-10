@@ -29,10 +29,10 @@ use alloc::vec::Vec;
 
 use core::ffi::c_void;
 
-use crate::porting::candidate::{decode_usize, encode_index, encode_sign};
+use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
-use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
+use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_TOUPPER};
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
 
 /// Why the execution court could not run (or refused to).
@@ -246,8 +246,8 @@ fn call_target(
             .first()
             .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
         let n = decode_usize(&args[2]);
-        // The candidate packs the searched prefix big-endian into a u64 and scans
-        // it branchlessly, so the corpus is contracted to at most 8 compared
+        // The candidate packs the searched prefix little-endian into a u64 and
+        // scans it branchlessly, so the corpus is contracted to at most 8 compared
         // bytes. Bytes past `n` are never examined.
         if n > 8 || hay.len() < n {
             return Err(ExecError::MalformedArgs(format!(
@@ -259,6 +259,27 @@ fn call_target(
         let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
         let raw = f(wh, needle as u64, n as u64) as u32 as i32;
         return Ok(encode_index(raw));
+    }
+
+    if target.id == LIBC_STRLEN.id {
+        if args.len() < 2 {
+            return Err(ExecError::MalformedArgs(target.id.to_string()));
+        }
+        let buf = &args[0];
+        let n = decode_usize(&args[1]);
+        // The candidate scans the first `n` bytes packed little-endian into a u64,
+        // so the corpus is contracted to at most 8 bytes with a NUL terminator
+        // inside them. Bytes past `n` are never examined.
+        if n > 8 || buf.len() < n {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: scanned length {} exceeds the 8-byte packed-word contract or the buffer",
+                target.id, n
+            )));
+        }
+        let w = pack_le_prefix(&buf[..n]);
+        let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
+        let len = f(w, n as u64);
+        return Ok(encode_usize(len as usize));
     }
 
     Err(ExecError::UnsupportedTarget(target.id.to_string()))

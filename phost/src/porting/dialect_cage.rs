@@ -3,7 +3,7 @@
 // The cage is the clean-room boundary. It runs the *foreign* implementation as
 // an observed black box and records input/output/status/locale/effects — it never
 // reads, copies, or embeds foreign source. Foreign functions are reached through
-// a single narrow FFI shim (libc `toupper`, `memcmp`, `memchr`).
+// a single narrow FFI shim (libc `toupper`, `memcmp`, `memchr`, `strlen`).
 //
 // This module is std-only: observing a foreign implementation requires the
 // foreign runtime to be present. Kernel-side replay against already-sealed
@@ -12,23 +12,26 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 
-use crate::porting::candidate::{decode_usize, encode_index, encode_sign};
+use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
+use crate::porting::target::{
+    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_TOUPPER,
+};
 use crate::porting::{PortError, PortingAuthority};
 
 // Foreign implementations under observation. In the "C" locale (the initial
 // locale for a process that never calls setlocale), `toupper` folds ASCII
 // `a`..=`z` and leaves every other byte unchanged; `memcmp` compares unsigned
-// bytes. Both are recorded with `locale_contract` so these courts can never be
-// confused with locale-aware ones.
+// bytes; `strlen` counts bytes up to the first NUL. All are recorded with
+// `locale_contract` so these courts can never be confused with locale-aware ones.
 extern "C" {
     fn toupper(c: c_int) -> c_int;
     fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int;
     fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void;
+    fn strlen(s: *const c_char) -> usize;
 }
 
 /// Observe `cases` against `target` through the cage.
@@ -121,6 +124,35 @@ pub fn observe_target(
                     &case.case_id,
                     &case.args,
                     &encode_index(idx),
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect());
+    }
+
+    if target.id == LIBC_STRLEN.id {
+        return Ok(cases
+            .iter()
+            .map(|case| {
+                let buf = case.args.first().cloned().unwrap_or_default();
+                // The ABI precondition is that a NUL terminator lies within the
+                // first n bytes. libc `strlen` takes no bound, so observe the WHOLE
+                // buffer: a terminator outside the window stays visible and is a
+                // real mismatch, not a silently clamped observation.
+                let mut c_buf = buf.clone();
+                if !c_buf.contains(&0) {
+                    // Defensive only: every corpus case has a terminator inside its
+                    // bound, so this never fires for a sealed case. It exists so a
+                    // hand-written case can never make the cage read out of bounds.
+                    c_buf.push(0x00);
+                }
+                let len = unsafe { strlen(c_buf.as_ptr() as *const c_char) };
+                OracleTrace::new(
+                    target,
+                    &case.case_id,
+                    &case.args,
+                    &encode_usize(len),
                     "ok",
                     &["compute"],
                 )
@@ -332,6 +364,57 @@ mod tests {
         assert!(!traces.is_empty());
         assert!(traces.iter().all(|t| t.is_intact()));
         assert!(traces.iter().all(|t| t.output_hex.len() == 8));
+    }
+
+    #[test]
+    fn test_cage_reports_strlen_length_not_pointer() {
+        let target = LIBC_STRLEN;
+        let cases = alloc::vec![
+            TestCase::new(
+                "empty",
+                alloc::vec![alloc::vec![0x00], 1u64.to_le_bytes().to_vec()],
+            ),
+            TestCase::new(
+                "three",
+                alloc::vec![
+                    alloc::vec![0x61, 0x62, 0x63, 0x00],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            TestCase::new(
+                "first-nul-wins",
+                alloc::vec![
+                    alloc::vec![0x61, 0x00, 0x62, 0x00],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            TestCase::new(
+                "high-bytes-do-not-terminate",
+                alloc::vec![
+                    alloc::vec![0x7f, 0x80, 0xff, 0x00],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+        ];
+        let traces = observe_target(&target, &cases, &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces[0].output_hex, "0000000000000000"); // length 0
+        assert_eq!(traces[1].output_hex, "0300000000000000"); // length 3
+        assert_eq!(traces[2].output_hex, "0100000000000000"); // first NUL wins -> 1
+        assert_eq!(traces[3].output_hex, "0300000000000000"); // only 0x00 terminates
+        assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_observes_whole_strlen_corpus() {
+        let traces = observe_target(
+            &LIBC_STRLEN,
+            &crate::porting::target::strlen_corpus(),
+            &PortingAuthority::granted(),
+        )
+        .unwrap();
+        assert_eq!(traces.len(), 308);
+        assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 16));
     }
 
     #[test]

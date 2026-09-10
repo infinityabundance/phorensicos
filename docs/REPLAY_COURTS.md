@@ -328,7 +328,7 @@ traces, replays a clean-room native candidate against them, and promotes the
 candidate only on exact, evidence-backed equivalence.
 
 This is **API-surface** porting (byte-in/byte-out and small buffer functions such
-as `toupper`, `memcmp` and `memchr`), not arbitrary binary translation.
+as `toupper`, `memcmp`, `memchr` and `strlen`), not arbitrary binary translation.
 
 ### Flow
 
@@ -389,6 +389,30 @@ bytes `00/01/7f/80/fe/ff`; and an exhaustive sweep of all 256 needle values.
 Arguments are framed in the trace as `hay_hex:needle_hex:n_hex` (little-endian
 `n`).
 
+### Fourth target: libc `strlen`
+
+```text
+target id: libc:strlen:c-locale:u64:v1
+dialect:   libc   symbol: strlen   version: host-observed-v1
+locale:    C
+contract:  length of a NUL-terminated string (index of the first NUL byte)
+corpus:    308 bounded deterministic cases
+```
+
+`strlen` takes no length argument, so the observable is the **length** — the
+index of the first NUL byte — which is the portable part of its contract. The ABI
+carries `n` only as a *precondition bound*: the terminator lies within the first
+`n` bytes, which is what makes the buffer packable into one word and keeps the
+foreign observation from reading past the caller's window. A case whose terminator
+falls outside the bound is out of contract, and the native candidate fails closed
+by returning `n`. Its corpus forces NUL-termination semantics: the complete
+`(k, n)` grid of terminator index `k` and scan bound `n` with `0 <= k < n <= 8`;
+non-NUL filler bytes (including `0x7f`/`0x80`) at every prefix position; tails
+after the terminator that are themselves NUL so the *first* NUL must win; buffers
+longer than the bound (bytes past `n` are ignored); and an exhaustive sweep of all
+256 byte values proving that only `0x00` terminates. Arguments are framed in the
+trace as `buf_hex:n_hex` (little-endian `n`).
+
 ### Target identity is qualified
 
 A target id is `dialect:symbol:locale:contract:version`, so a future
@@ -400,8 +424,9 @@ silent redefinition of an existing one.
 The cage calls the foreign functions through a single narrow FFI shim and records
 input/output/locale/status/effects — it never reads or copies foreign source. The
 native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold),
-`phor_memcmp` (unsigned, `n`-bounded, sign result) and `phor_memchr` (unsigned,
-`n`-bounded, first-match index). Unknown target ids return
+`phor_memcmp` (unsigned, `n`-bounded, sign result), `phor_memchr` (unsigned,
+`n`-bounded, first-match index) and `phor_strlen` (first-NUL length, `n`-bounded
+and fail-closed at `n`). Unknown target ids return
 `CandidateError::UnsupportedTarget` and malformed arguments return
 `CandidateError::MalformedArgs`; there is no identity fallback, so an unsupported
 candidate can never pass by accident.
@@ -488,6 +513,8 @@ Executed ABI (SysV AMD64):
 |--------------|-----------|--------|
 | `_phor_phor_toupper` | `(u64 byte) -> u64` | folded byte in the low 8 bits |
 | `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign (`-1`/`0`/`1`); buffers packed big-endian into the word |
+| `_phor_phor_memchr_index` | `(u64 wh, u64 needle, u64 n) -> u64` | `i64` index or `-1`; haystack packed little-endian into the word |
+| `_phor_phor_strlen_len` | `(u64 w, u64 n) -> u64` | `u64` length (first NUL index), `n` when out of contract; buffer packed little-endian |
 
 ### Sealed native dispatch court
 
@@ -537,6 +564,8 @@ Call site (CLI):
 ```sh
 phost port native toupper 61                                    # sealed-object → 41
 phost port native memcmp 616263:616264:0300000000000000         # sealed-object → ffffffff
+phost port native memchr 616263:62:0300000000000000             # sealed-object → 01000000
+phost port native strlen 61626300:0400000000000000              # sealed-object → 0300000000000000
 phost port native toupper 61 --no-capability                    # foreign-fallback
 ```
 

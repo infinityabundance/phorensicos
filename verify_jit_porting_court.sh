@@ -14,7 +14,7 @@
 #                       check: it proves the committed seal matches a fresh run.
 #
 #  Checks (both modes, for the selected target):
-#    * all seven evidence artifacts exist and are valid JSON
+#    * all eight evidence artifacts exist and are valid JSON
 #    * the corpus is structurally well-formed (see the target-specific checks)
 #    * every replay case passed, with no mismatches
 #    * the recorded locale contract is C and the target id is qualified
@@ -30,7 +30,7 @@
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
-#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr] [--check-committed] [evidence_dir]
+#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr|strlen] [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -69,8 +69,13 @@ case "$TARGET" in
         EXPECTED_COUNT=482
         SOURCE="examples/jit_port_memchr.phor"
         ;;
+    strlen)
+        TARGET_ID="libc:strlen:c-locale:u64:v1"
+        EXPECTED_COUNT=308
+        SOURCE="examples/jit_port_strlen.phor"
+        ;;
     *)
-        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr)"
+        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr|strlen)"
         exit 2
         ;;
 esac
@@ -275,6 +280,46 @@ if SYMBOL == "memchr":
     for group in ("A.", "B.", "C.", "C2.", "D.", "E.", "F."):
         if not any(i.startswith(group) for i in id_set):
             errors.append("memchr corpus is missing group %s" % group)
+
+if SYMBOL == "strlen":
+    for t in traces:
+        a = args_of(t)
+        if len(a) != 2:
+            errors.append("strlen case %s does not have exactly 2 arguments" % t.get("case_id"))
+            break
+        if len(a[1]) != 16:
+            errors.append("strlen case %s has a non-8-byte scan bound" % t.get("case_id"))
+            break
+        try:
+            buf = bytes.fromhex(a[0])
+            n = int.from_bytes(bytes.fromhex(a[1]), "little")
+        except ValueError:
+            errors.append("strlen case %s has non-hex arguments" % t.get("case_id"))
+            break
+        if n > len(buf):
+            errors.append("strlen case %s has n > len(buf)" % t.get("case_id"))
+            break
+        if n > 8 or len(buf) > 8:
+            errors.append("strlen case %s exceeds the 8-byte packed-word contract" % t.get("case_id"))
+            break
+        # The ABI precondition: a NUL terminator inside the scan bound.
+        if 0 not in buf[:n]:
+            errors.append("strlen case %s has no terminator inside its bound" % t.get("case_id"))
+            break
+        if len(t.get("output_hex", "")) != 16:
+            errors.append("strlen case %s output is not an 8-byte length" % t.get("case_id"))
+            break
+    id_set = set(t.get("case_id") for t in traces)
+    for required in ("A.0.1", "A.7.8", "B2.empty.high", "C.0", "D.00", "D.7f", "D.80", "D.ff"):
+        if required not in id_set:
+            errors.append("strlen corpus is missing case %s" % required)
+    for group in ("A.", "B.", "B2.", "C.", "D."):
+        if not any(i.startswith(group) for i in id_set):
+            errors.append("strlen corpus is missing group %s" % group)
+    if len([i for i in id_set if i.startswith("A.")]) != 36:
+        errors.append("strlen corpus does not have the complete 36-case (k, n) grid")
+    if len([i for i in id_set if i.startswith("D.")]) != 256:
+        errors.append("strlen corpus does not have the exhaustive 256-value sweep")
 
 # ---- hash cross-checks ----------------------------------------------------
 oracle = sig.get("combined_oracle_hash", "")
