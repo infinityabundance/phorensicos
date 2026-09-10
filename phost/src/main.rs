@@ -201,16 +201,21 @@ fn port_cli(args: &[String]) -> i32 {
         eprintln!(
             "Usage: phost port <observe|replay|promote|court> <symbol> [--out DIR] [--phorc PATH]"
         );
+        eprintln!("       phost port native <symbol> [ARGS_HEX] [--no-capability] [--store PATH]");
         eprintln!(
-            "       phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
+            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr] [ARGS_HEX] [--no-capability] [--store|--derive] [--out DIR] [--phorc PATH]"
         );
-        eprintln!(
-            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr] [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
-        );
+        eprintln!("       phost port store [--check|--write] [PATH]");
         return 2;
     }
 
     let stage = args[0].as_str();
+
+    // The persistent sealed port store: load and verify the committed index, or
+    // regenerate it from committed evidence.
+    if stage == "store" {
+        return store_cli(&args[1..]);
+    }
 
     // Runtime call-site path: publish the seal, then dispatch one call through
     // the sealed-native dispatcher.
@@ -312,23 +317,23 @@ fn port_cli(args: &[String]) -> i32 {
     }
 }
 
-/// `phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
+/// `phost port native <symbol> [ARGS_HEX] [--no-capability] [--store PATH]`
 ///
-/// The runtime call-site path: publish/refresh the seal, then dispatch **one**
-/// call through the sealed-native dispatcher. With `--no-capability` the call
-/// site has no `PORTING` authority, so the dispatcher reports a foreign fallback
-/// instead of running the native artifact.
+/// The runtime call-site path: **load** the committed persistent store (no
+/// compiler invocation, no oracle replay), then dispatch **one** call through the
+/// sealed-native dispatcher. With `--no-capability` the call site has no `PORTING`
+/// authority, so the store is not read and the dispatcher reports a foreign
+/// fallback instead of running the native artifact.
 fn native_cli(args: &[String]) -> i32 {
-    use phost::porting::{self, PortingAuthority};
+    use phost::porting::{self, store, PortingAuthority};
     if args.is_empty() {
-        eprintln!("Usage: phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]");
+        eprintln!("Usage: phost port native <symbol> [ARGS_HEX] [--no-capability] [--store PATH]");
         return 2;
     }
 
     let symbol = args[0].as_str();
     let mut framed: Option<String> = None;
-    let mut out = format!("phost/evidence/porting/{}", symbol);
-    let mut phorc: Option<String> = None;
+    let mut store_path = store::STORE_PATH.to_string();
     let mut dispatch_auth = PortingAuthority::granted();
 
     let mut i = 1;
@@ -338,12 +343,8 @@ fn native_cli(args: &[String]) -> i32 {
                 dispatch_auth = PortingAuthority::none();
                 i += 1;
             }
-            "--out" if i + 1 < args.len() => {
-                out = args[i + 1].clone();
-                i += 2;
-            }
-            "--phorc" if i + 1 < args.len() => {
-                phorc = Some(args[i + 1].clone());
+            "--store" if i + 1 < args.len() => {
+                store_path = args[i + 1].clone();
                 i += 2;
             }
             other => {
@@ -357,19 +358,12 @@ fn native_cli(args: &[String]) -> i32 {
         }
     }
 
-    let court_auth = PortingAuthority::granted();
-    match porting::run_native_call(
-        symbol,
-        framed.as_deref(),
-        &court_auth,
-        &dispatch_auth,
-        &out,
-        phorc.as_deref(),
-    ) {
+    match porting::run_native_call(symbol, framed.as_deref(), &store_path, &dispatch_auth) {
         Ok(r) => {
             println!("=== Sealed Native Dispatch: {} ===", symbol);
             println!("Target:        {}", r.target);
             println!("Source:        {}", r.source);
+            println!("Store:         {}", store_path);
             if r.source == "sealed-object" {
                 println!("Trust:         {}", r.trust);
                 println!("Object hash:   {}", r.object_hash);
@@ -385,7 +379,10 @@ fn native_cli(args: &[String]) -> i32 {
                     if r.matches_mirror { "yes" } else { "no" }
                 );
             }
-            println!("Sealed package: {}", r.sealed_package);
+            println!("Promotion:     {}", r.promotion);
+            if !r.sealed_package.is_empty() {
+                println!("Sealed package: {}", r.sealed_package);
+            }
             0
         }
         Err(e) => {
@@ -395,24 +392,28 @@ fn native_cli(args: &[String]) -> i32 {
     }
 }
 
-/// `phost port compose [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
+/// `phost port compose [--target NAME] [ARGS_HEX] [--no-capability] [--store|--derive] [--out DIR] [--phorc PATH]`
 ///
 /// The Sealed Composition Dispatch Court.
-///
-/// `phost port compose [--target NAME] [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
 ///
 /// With no positional argument it runs the whole composition corpus through the
 /// sealed chain and writes the composition evidence; with an argument it runs one
 /// composed call and prints each stage. `--target` selects the chain
 /// (`toupper_memchr`, `toupper_strlen_memchr`, `toupper_strlen_memchr_pair`,
 /// `toupper_each`, or `toupper_each_strlen_memchr`).
+///
+/// The court **derives** the seal by default (it compiles the leaves and replays
+/// nested chains); `--store` makes it load the seal from the committed persistent
+/// store instead, so the same verdict must reproduce with no compiler at all. The
+/// single composed **call** always runs from the store: that is the runtime path.
 fn compose_cli(args: &[String]) -> i32 {
-    use phost::porting::{self, CompositionKind, PortingAuthority};
+    use phost::porting::{self, CompositionKind, IndexSource, PortingAuthority};
 
     let mut call: Option<String> = None;
     let mut kind = CompositionKind::ToupperMemchr;
     let mut out: Option<String> = None;
     let mut phorc: Option<String> = None;
+    let mut index_source = IndexSource::Derived;
     let mut dispatch_auth = PortingAuthority::granted();
 
     let mut i = 0;
@@ -420,6 +421,14 @@ fn compose_cli(args: &[String]) -> i32 {
         match args[i].as_str() {
             "--no-capability" => {
                 dispatch_auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--store" => {
+                index_source = IndexSource::Persistent;
+                i += 1;
+            }
+            "--derive" => {
+                index_source = IndexSource::Derived;
                 i += 1;
             }
             "--target" if i + 1 < args.len() => {
@@ -460,6 +469,7 @@ fn compose_cli(args: &[String]) -> i32 {
             &PortingAuthority::granted(),
             &out,
             phorc.as_deref(),
+            index_source,
         ) {
             Ok(r) => {
                 println!("=== Sealed Composition Dispatch Court ===");
@@ -499,6 +509,13 @@ fn compose_cli(args: &[String]) -> i32 {
                 println!("Oracle hash:   {}", r.oracle_hash);
                 println!("Verdict:       {}", r.verdict);
                 println!("Sealed:        {}", if r.sealed { "yes" } else { "no" });
+                println!(
+                    "Index source:  {}",
+                    match index_source {
+                        IndexSource::Derived => "derived (compiled fresh)",
+                        IndexSource::Persistent => "persistent store",
+                    }
+                );
                 println!("Evidence:      {}", r.evidence_dir);
                 0
             }
@@ -544,15 +561,7 @@ fn compose_cli(args: &[String]) -> i32 {
                 }
             }) as usize;
 
-            match porting::run_composition_call(
-                kind,
-                hay,
-                needle_a,
-                needle_b,
-                n,
-                &dispatch_auth,
-                phorc.as_deref(),
-            ) {
+            match porting::run_composition_call(kind, hay, needle_a, needle_b, n, &dispatch_auth) {
                 Ok(c) => {
                     println!("=== Sealed Composition Call ===");
                     println!("Target:        {}", c.target);
@@ -601,4 +610,80 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// `phost port store [--check|--write] [PATH]`
+///
+/// The persistent sealed port store. With no flags it **loads and verifies** the
+/// committed index — hashing every leaf object against its seal and resolving
+/// every composition's stages — and prints what it found. `--write` regenerates
+/// the index deterministically from the committed evidence (no compiler, no
+/// oracle replay). `--check` is the default and is accepted for explicitness.
+fn store_cli(args: &[String]) -> i32 {
+    use phost::porting::store;
+
+    let mut write = false;
+    let mut path = store::STORE_PATH.to_string();
+
+    for arg in args {
+        match arg.as_str() {
+            "--write" => write = true,
+            "--check" => {}
+            other => path = other.to_string(),
+        }
+    }
+
+    if write {
+        match store::regenerate(&path) {
+            Ok(doc) => {
+                println!("=== Persistent Sealed Port Store (regenerated) ===");
+                println!("Path:     {}", path);
+                println!("Entries:  {}", doc.entries.len());
+                println!("Residual: {}", doc.residual_hash());
+                println!("Status:   WRITTEN");
+                0
+            }
+            Err(e) => {
+                eprintln!("port store --write: {}", e);
+                1
+            }
+        }
+    } else {
+        match store::load_with_document(&path) {
+            Ok((doc, index)) => {
+                let leaves = index
+                    .entries()
+                    .iter()
+                    .filter(|e| e.artifact_kind() == "leaf-object")
+                    .count();
+                let compositions = index.len() - leaves;
+                println!("=== Persistent Sealed Port Store ===");
+                println!("Path:     {}", path);
+                println!(
+                    "Entries:  {} ({} leaf objects, {} compositions)",
+                    index.len(),
+                    leaves,
+                    compositions
+                );
+                println!("Residual: {}", doc.residual_hash());
+                println!();
+                for entry in index.entries() {
+                    let hash = entry.artifact_hash();
+                    println!(
+                        "  {:<58} {:<12} {}",
+                        entry.target,
+                        entry.artifact_kind(),
+                        &hash[..12.min(hash.len())]
+                    );
+                }
+                println!();
+                println!("Status:   VERIFIED");
+                0
+            }
+            Err(e) => {
+                eprintln!("port store: {}", e);
+                1
+            }
+        }
+    }
 }

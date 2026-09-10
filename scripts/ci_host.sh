@@ -18,6 +18,13 @@ cargo build -q -p phorc -p phost
 cargo test
 
 echo
+echo "=== Persistent Sealed Port Store ==="
+cargo build -q -p phost -p phorc
+# Validate the committed store against committed evidence FIRST, before any
+# regenerating pass touches the evidence dirs.
+./verify_store.sh
+
+echo
 echo "=== JIT-Porting Court ==="
 cargo build -q -p phost -p phorc
 # Validate the committed evidence against a fresh run FIRST (writes only to temp),

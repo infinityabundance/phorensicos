@@ -306,7 +306,9 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → native candidate → replay court → comparison → promotion → sealed package
 → execution court (load and call the sealed object)
 → dispatch court (runtime serves calls from the sealed object)
-→ composition court (sealed ports become runtime building blocks) → runtime prefers native
+→ composition court (sealed ports become runtime building blocks)
+→ persistent store (the seal is committed; the runtime loads it, not re-derives it)
+→ runtime prefers native
 ```
 
 - **Dialect cage** — observes a foreign API surface as a black box. Five targets
@@ -359,6 +361,18 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 - **Promotion** — advances the candidate to `sealed` only when the replay court,
   the execution court *and* the dispatch court all match exactly, with a complete
   evidence set. Gated by the `PORTING` capability.
+- **Persistent store** — the seal is a committed artifact, not something the
+  runtime recomputes. `phost/evidence/store/index.json` names every sealed port
+  (five leaf object hashes, five composition chain hashes) and loading it verifies
+  each entry: leaf object bytes must hash to their seal, every composition stage
+  must be a sealed entry, and the document's residual hash must cover its entries.
+  It fails closed — a missing or broken entry is an error, never a partial store —
+  and it is gated by `PORTING`, so there is no ambient authority to read it. The
+  leaf `candidate.o` files are committed because they *are* the seal; the
+  verifier independently recompiles each `.phor` source and requires
+  byte-equality. `--store` runs the composition court from the index instead of
+  deriving it, so the committed verdict reproduces with no compiler at all.
+
 - **Runtime preference** — the sealed package (e.g.
   `native:libc:memcmp:c-locale:sign:v1`) binds the compiled ELF64 candidate
   object; that object is the artifact the runtime prefers over the foreign

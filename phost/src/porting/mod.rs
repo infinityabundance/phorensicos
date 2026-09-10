@@ -41,9 +41,11 @@ pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;
 pub mod exec;
+pub mod json;
 pub mod oracle_trace;
 pub mod promotion;
 pub mod replay_court;
+pub mod store;
 pub mod target;
 
 pub use behavior_signature::BehaviorSignature;
@@ -313,6 +315,30 @@ impl SealedPortIndex {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// The sealed entries, in insertion order (store inspection/serialization).
+    pub fn entries(&self) -> &[SealedPortEntry] {
+        &self.entries
+    }
+}
+
+impl SealedPortEntry {
+    /// `"leaf-object"` or `"composition"` — the artifact kind this port publishes.
+    pub fn artifact_kind(&self) -> &'static str {
+        match &self.artifact {
+            SealedArtifact::LeafObject { .. } => "leaf-object",
+            SealedArtifact::Composition { .. } => "composition",
+        }
+    }
+
+    /// The verified artifact hash this port publishes: the object hash for a leaf,
+    /// the chain hash for a composition.
+    pub fn artifact_hash(&self) -> &str {
+        match &self.artifact {
+            SealedArtifact::LeafObject { object_hash, .. } => object_hash,
+            SealedArtifact::Composition { chain_hash, .. } => chain_hash,
+        }
+    }
 }
 
 /// How far the court should run.
@@ -413,23 +439,21 @@ pub fn parse_hex_args(framed: &str) -> Result<Vec<Vec<u8>>, PortError> {
         .collect()
 }
 
-/// Publish the target's seal, then perform **one** dispatch through the runtime
-/// dispatcher. This is the call-site path: seal in the store → verify → load the
-/// sealed object → call it (or fall back to the foreign implementation).
+/// Perform **one** dispatch through the runtime dispatcher, using the seal loadable
+/// from the **persistent store**.
 ///
-/// `dispatch_auth` is separate so the CLI can demonstrate the fail-closed/
-/// fallback behaviour without capability: the court runs with `PORTING`, but the
-/// runtime call site is only given what it would really have.
+/// This is the call-site path: the committed store is loaded and verified (no
+/// compiler invocation and no oracle replay), the target is looked up, the sealed
+/// object is loaded and called — or the call site reports a foreign fallback.
+///
+/// `auth` is the capability the call site really has: without `PORTING` the store
+/// reveals nothing and the dispatch falls back, exactly as at a real call site.
 pub fn run_native_call(
     symbol: &str,
     args_framed: Option<&str>,
-    court_auth: &PortingAuthority,
-    dispatch_auth: &PortingAuthority,
-    out_dir: &str,
-    phorc: Option<&str>,
+    store_path: &str,
+    auth: &PortingAuthority,
 ) -> Result<NativeCallReport, PortError> {
-    // Publish (or refresh) the seal through the normal court pipeline.
-    let report = run_port_court(symbol, court_auth, out_dir, PortDepth::Promote, phorc)?;
     let target =
         resolve_target(symbol).ok_or_else(|| PortError::UnknownTarget(symbol.to_string()))?;
 
@@ -437,23 +461,41 @@ pub fn run_native_call(
         Some(framed) => parse_hex_args(framed)?,
         None => default_args(&target),
     };
+    let input_hex = args
+        .iter()
+        .map(hex::encode)
+        .collect::<Vec<String>>()
+        .join(":");
 
-    let entry = SealedPortEntry {
-        target: report.target.clone(),
-        trust: TrustState::Sealed,
-        artifact: SealedArtifact::leaf_object(
-            report.candidate_object_hash.clone(),
-            report.candidate_object_path.clone(),
-        ),
-        oracle_hash: report.oracle_hash.clone(),
-        candidate_behavior_hash: report.candidate_behavior_hash.clone(),
-        candidate_source_hash: report.candidate_source_hash.clone(),
-        sealed_package: report.sealed_package.clone(),
-    };
+    // No ambient authority: without PORTING the store is not even read, and the
+    // call site falls back to the foreign implementation.
+    if !auth.can_observe() {
+        return Ok(NativeCallReport {
+            target: target.id.to_string(),
+            source: DispatchSource::ForeignFallback.as_str().to_string(),
+            trust: TrustState::Unknown.as_str().to_string(),
+            object_hash: String::new(),
+            elf_symbol: String::new(),
+            input_hex,
+            output_hex: String::new(),
+            mirror_output_hex: String::new(),
+            matches_mirror: false,
+            reason: String::from("capability denied (no ambient authority)"),
+            promotion: TrustState::Unknown.as_str().to_string(),
+            sealed_package: String::new(),
+        });
+    }
 
-    let mut dispatcher = dispatch::NativeDispatcher::with_entry(entry);
+    // Load the *committed* seal: no `phorc`, no cage, no replay.
+    let index = store::load(store_path).map_err(|e| PortError::Io(e.to_string()))?;
+    let sealed_package = index
+        .lookup(target.id)
+        .map(|e| e.sealed_package.clone())
+        .unwrap_or_default();
+
+    let mut dispatcher = dispatch::NativeDispatcher::new(index);
     let outcome = dispatcher
-        .dispatch(&target, &args, dispatch_auth)
+        .dispatch(&target, &args, auth)
         .map_err(|e| PortError::Execution(format!("{}", e)))?;
 
     let mirror = candidate::run_candidate(target.id, &args).ok();
@@ -462,22 +504,22 @@ pub fn run_native_call(
     let matches_mirror = outcome.source.is_native() && mirror_output_hex == output_hex;
 
     Ok(NativeCallReport {
-        target: report.target,
+        target: target.id.to_string(),
         source: outcome.source.as_str().to_string(),
         trust: outcome.trust,
         object_hash: outcome.object_hash,
         elf_symbol: outcome.elf_symbol,
-        input_hex: args
-            .iter()
-            .map(hex::encode)
-            .collect::<Vec<String>>()
-            .join(":"),
+        input_hex,
         output_hex,
         matches_mirror,
         mirror_output_hex,
         reason: outcome.reason.to_string(),
-        promotion: report.promotion,
-        sealed_package: report.sealed_package,
+        promotion: if outcome.source.is_native() {
+            TrustState::Sealed.as_str().to_string()
+        } else {
+            TrustState::Unknown.as_str().to_string()
+        },
+        sealed_package,
     })
 }
 
@@ -731,6 +773,18 @@ pub fn run_port_court(
     })
 }
 
+/// Where a composition court's sealed index comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexSource {
+    /// **Derive** the seal: compile each leaf with `phorc` and replay any nested
+    /// composition's court to obtain its chain hash. This is the court's
+    /// independent derivation, and the only path that needs a compiler.
+    Derived,
+    /// **Load** the seal from the committed persistent store: no compiler
+    /// invocation and no oracle replay. Every entry is verified as it loads.
+    Persistent,
+}
+
 /// Which sealed composition court to run.
 ///
 /// A composition is a qualified target built entirely from already-sealed leaf
@@ -869,20 +923,30 @@ impl CompositionKind {
     }
 }
 
-/// Build the sealed store index for a composition.
+/// Build the sealed store index a composition dispatches through.
 ///
-/// The leaf ports it dispatches are compiled fresh (deterministically) and marked
-/// sealed. Any composition it dispatches as a **nested stage** is added to the store
-/// too, sealed with the chain hash its own court deterministically produces — the
-/// same way a leaf's object hash is re-derived from source rather than trusted.
+/// With [`IndexSource::Derived`], the leaf ports are compiled fresh
+/// (deterministically) and marked sealed, and any composition dispatched as a
+/// **nested stage** is sealed with the chain hash its own court deterministically
+/// produces — the same way a leaf's object hash is re-derived from source rather
+/// than trusted.
 ///
-/// A composition adds no new trusted code: its implementation *is* these already-
-/// sealed ports.
+/// With [`IndexSource::Persistent`], the seal is **loaded** from the committed
+/// store instead: no `phorc`, no nested replay. The store is verified as it loads,
+/// and every port the chain needs must be present, or this fails closed.
+///
+/// A composition adds no new trusted code either way: its implementation *is*
+/// these already-sealed ports.
 fn build_composition_index(
     kind: CompositionKind,
     auth: &PortingAuthority,
     phorc: Option<&str>,
+    source: IndexSource,
 ) -> Result<SealedPortIndex, PortError> {
+    if source == IndexSource::Persistent {
+        return load_persistent_index(kind);
+    }
+
     let mut index = SealedPortIndex::new();
     for target in kind.leaf_targets() {
         let dir = format!("phost/evidence/porting/{}", target.symbol);
@@ -924,6 +988,34 @@ fn build_composition_index(
     Ok(index)
 }
 
+/// Load a composition's sealed index from the committed persistent store.
+///
+/// No compiler is invoked and no oracle is replayed. The store is verified as it
+/// loads (object bytes hashed against their seals, stages resolved), and every
+/// port this chain dispatches must be present and sealed — otherwise the chain
+/// would silently lose a stage, so it fails closed.
+fn load_persistent_index(kind: CompositionKind) -> Result<SealedPortIndex, PortError> {
+    let index = store::load_default().map_err(|e| PortError::Io(e.to_string()))?;
+
+    let mut required: Vec<&str> = kind.leaf_targets().iter().map(|t| t.id).collect();
+    for nested in kind.nested_compositions() {
+        required.push(nested.id);
+    }
+    for id in required {
+        let sealed = index
+            .lookup(id)
+            .map(|e| e.trust == TrustState::Sealed)
+            .unwrap_or(false);
+        if !sealed {
+            return Err(PortError::Execution(format!(
+                "persistent store has no sealed port {}",
+                id
+            )));
+        }
+    }
+    Ok(index)
+}
+
 /// The committed evidence directory for a composition id.
 fn nested_evidence_dir(composition_id: &str) -> String {
     match CompositionKind::parse(composition_id) {
@@ -944,7 +1036,7 @@ fn nested_composition_chain_hash(
     let kind = CompositionKind::parse(composition_id)
         .ok_or_else(|| PortError::UnknownTarget(composition_id.to_string()))?;
     // A nested port's own chain must not itself nest (kept simple and acyclic).
-    let index = build_composition_index(kind, auth, None)?;
+    let index = build_composition_index(kind, auth, None, IndexSource::Derived)?;
     match kind {
         CompositionKind::ToupperEach => {
             let cases = composition_toupper_each::composition_corpus();
@@ -1003,12 +1095,13 @@ pub fn run_composition_court(
     auth: &PortingAuthority,
     out_dir: &str,
     phorc: Option<&str>,
+    source: IndexSource,
 ) -> Result<CompositionReport, PortError> {
     if !auth.can_observe() {
         return Err(PortError::CapabilityDenied);
     }
 
-    let index = build_composition_index(kind, auth, phorc)?;
+    let index = build_composition_index(kind, auth, phorc, source)?;
 
     match kind {
         CompositionKind::ToupperMemchr => {
@@ -1290,9 +1383,14 @@ pub fn run_composition_call(
     needle_b: u8,
     n: usize,
     auth: &PortingAuthority,
-    phorc: Option<&str>,
 ) -> Result<CompositionCallReport, PortError> {
-    let index = build_composition_index(kind, auth, phorc)?;
+    // The runtime call site loads the committed seal: no compiler, no replay.
+    // Without `PORTING` the store is not read at all and every stage falls back.
+    let index = if auth.can_observe() {
+        store::load_default().map_err(|e| PortError::Io(e.to_string()))?
+    } else {
+        SealedPortIndex::new()
+    };
 
     match kind {
         CompositionKind::ToupperMemchr => {
@@ -1492,18 +1590,12 @@ mod tests {
 
     #[test]
     fn test_native_call_memchr_finds_the_first_match_index() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("memchr");
         let r = run_native_call(
             "memchr",
             // "abc" search 'b' over n = 3 -> index 1
             Some("616263:62:0300000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1514,18 +1606,12 @@ mod tests {
 
     #[test]
     fn test_native_call_memchr_absent_is_minus_one() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("memchr_absent");
         let r = run_native_call(
             "memchr",
             // "abc" search 'z' over n = 3 -> -1
             Some("616263:7a:0300000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1535,18 +1621,12 @@ mod tests {
 
     #[test]
     fn test_native_call_strlen_returns_the_terminator_index() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("strlen");
         let r = run_native_call(
             "strlen",
             // "abc\0" with the terminator inside the bound n = 4 -> length 3.
             Some("61626300:0400000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1557,18 +1637,12 @@ mod tests {
 
     #[test]
     fn test_native_call_strlen_empty_string_is_zero() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("strlen_empty");
         let r = run_native_call(
             "strlen",
             // The very first byte is NUL -> length 0, and the tail is ignored.
             Some("0061626300:0500000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1578,18 +1652,12 @@ mod tests {
 
     #[test]
     fn test_native_call_strrchr_returns_the_last_match() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("strrchr");
         let r = run_native_call(
             "strrchr",
             // "ababc\0" search 'b' -> last occurrence at index 3.
             Some("616261626300:62:0600000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1600,18 +1668,12 @@ mod tests {
 
     #[test]
     fn test_native_call_strrchr_nul_needle_is_the_length() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("strrchr_term");
         let r = run_native_call(
             "strrchr",
             // "abc\0" search NUL -> the terminator index (the length) = 3.
             Some("61626300:00:0400000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1621,18 +1683,12 @@ mod tests {
 
     #[test]
     fn test_native_call_strrchr_absent_is_minus_one() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("strrchr_miss");
         let r = run_native_call(
             "strrchr",
             // "abc\0" search 'z' -> absent.
             Some("61626300:7a:0400000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
@@ -1651,67 +1707,31 @@ mod tests {
         );
     }
 
-    // ---- runtime dispatch (end-to-end through a compiled sealed object) ----
-
-    fn phorc_bin() -> Option<std::path::PathBuf> {
-        if let Ok(p) = std::env::var("PHORC_BIN") {
-            let pb = std::path::PathBuf::from(p);
-            if pb.is_file() {
-                return Some(pb);
-            }
-        }
-        let root = compiled::workspace_root();
-        for cand in [
-            root.join("target/debug/phorc"),
-            root.join("target/release/phorc"),
-        ] {
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-        None
-    }
-
-    fn tmp_dir(tag: &str) -> String {
-        let d = std::env::temp_dir().join(format!("phost_dispatch_{}_{}", tag, std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d.display().to_string()
-    }
+    // ---- runtime dispatch (end-to-end through the committed persistent store) ----
 
     #[test]
     fn test_native_call_prefers_the_sealed_object() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("native");
         let r = run_native_call(
             "toupper",
             Some("61"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
         assert_eq!(r.output_hex, "41");
         assert!(r.matches_mirror);
         assert_eq!(r.elf_symbol, "_phor_phor_toupper");
+        assert!(r.sealed_package.ends_with("toupper/sealed_package.json"));
     }
 
     #[test]
     fn test_native_call_without_capability_falls_back_to_foreign() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("fallback");
         let r = run_native_call(
             "toupper",
             Some("61"),
-            &PortingAuthority::granted(),
+            store::STORE_PATH,
             &PortingAuthority::none(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "foreign-fallback");
@@ -1721,22 +1741,56 @@ mod tests {
 
     #[test]
     fn test_native_call_memcmp_orders_two_buffers() {
-        let Some(phorc) = phorc_bin() else {
-            return;
-        };
-        let out = tmp_dir("memcmp");
         let r = run_native_call(
             "memcmp",
             // "abc" vs "abd", n = 3 (little-endian u64)
             Some("616263:616264:0300000000000000"),
+            store::STORE_PATH,
             &PortingAuthority::granted(),
-            &PortingAuthority::granted(),
-            &out,
-            Some(&phorc.display().to_string()),
         )
         .unwrap();
         assert_eq!(r.source, "sealed-object");
         assert_eq!(r.output_hex, "ffffffff"); // less
         assert!(r.matches_mirror);
+    }
+
+    #[test]
+    fn test_native_call_without_a_store_fails_closed() {
+        // The committed store is the seal. If it is missing the call site must not
+        // pretend to have native code: it is an error, not a silent fallback.
+        let err = run_native_call(
+            "toupper",
+            Some("61"),
+            "phost/evidence/store/does-not-exist.json",
+            &PortingAuthority::granted(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PortError::Io(_)));
+    }
+
+    #[test]
+    fn test_persistent_composition_index_carries_every_sealed_port() {
+        // The runtime load must carry both leaf objects and composition chain
+        // hashes, and must need no compiler to build.
+        let index = load_persistent_index(CompositionKind::ToupperEach).unwrap();
+        let auth = PortingAuthority::granted();
+        assert!(index
+            .native_artifact(target::LIBC_TOUPPER.id, &auth)
+            .is_some());
+        let each = "phor:compose:toupper_each:c-locale:u8s:v1";
+        let (id, chain_hash) = index.sealed_chain(each, &auth).unwrap();
+        assert_eq!(id, each);
+        assert_eq!(chain_hash.len(), 64);
+    }
+
+    #[test]
+    fn test_nested_persistent_index_needs_its_inner_composition() {
+        // A nested chain needs the inner composition in the store, not just leaves.
+        let index = load_persistent_index(CompositionKind::ToupperEachStrlenMemchr).unwrap();
+        let auth = PortingAuthority::granted();
+        assert!(index
+            .sealed_chain("phor:compose:toupper_each:c-locale:u8s:v1", &auth)
+            .is_some());
+        assert!(index.sealed_chain(target::LIBC_MEMCHR.id, &auth).is_none());
     }
 }

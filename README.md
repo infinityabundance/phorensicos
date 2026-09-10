@@ -114,6 +114,7 @@ foreign behavior → dialect cage       (observe libc as a black box)
                  → execution court    (load the sealed ELF64 object and call it)
                  → dispatch court     (the runtime serves calls from the sealed object)
                  → composition court  (sealed ports become runtime building blocks)
+                 → persistent store   (the seal is committed; the runtime loads, not re-derives)
 ```
 
 | Target | Corpus | Replay | Executed object | Runtime dispatch |
@@ -292,6 +293,54 @@ Two details make this a real check rather than a label:
   The implementation boundary is recorded separately, not smuggled into the behavior
   hash.
 
+### Persistent sealed port store
+
+A court *derives* a seal: it observes foreign behavior, compiles the clean-room
+candidate, replays it, and publishes what survives. That derivation is expensive —
+it invokes `phorc` and re-runs nested composition courts — and a running system
+should not do it at a call site.
+
+So the store is itself **a committed artifact**. `phost/evidence/store/index.json`
+names every sealed port and its verified hashes — leaf object hashes *and*
+composition chain hashes — and the runtime **loads** it instead of re-deriving it:
+no compiler invocation, no oracle replay.
+
+Loading is **verified**, and fails closed:
+
+```text
+schema match + residual-hash match     (the entries are covered, not appended to)
+every entry is `sealed`, targets unique
+leaf:  object_path exists and SHA-256(object bytes) == object_hash
+composition: chain_hash is a SHA-256, and every leaf is itself a sealed entry
+```
+
+One store holds ten ports:
+
+| Kind | Ports |
+|------|-------|
+| Leaf objects | the five compiled `.phor` candidates (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`) |
+| Compositions | `toupper_memchr`, `toupper_strlen_memchr`, `toupper_strlen_memchr_pair`, `toupper_each`, `toupper_each_strlen_memchr` |
+
+This is what makes the store a real artifact rather than a cache: the committed leaf
+`candidate.o` files **are** committed evidence (the seal is the object's bytes), and
+the composition chain hashes are read from the committed verdicts instead of being
+recomputed by re-running the inner court.
+
+```sh
+cargo run -p phost -- port store              # load + verify the committed index
+cargo run -p phost -- port store --write      # regenerate it from committed evidence
+cargo run -p phost -- port native toupper 61  # call site: loads the store, no compiler
+# The composition court can also run from the store; an impossible --phorc path
+# proves no compiler is invoked:
+cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
+./verify_store.sh                             # the store verifier
+```
+
+`--store` on the composition court is the A/B: the same verdict must reproduce from
+the committed index alone, and its `chain_hash` must equal the committed one. The
+single composed **call** (`port compose <args>`) always runs from the store — that is
+the runtime path.
+
 ```sh
 cargo run -p phost -- port promote toupper   # observe → replay → execute → dispatch → seal
 cargo run -p phost -- port promote memcmp
@@ -330,6 +379,7 @@ cargo run -p phost -- port compose --target toupper_each_strlen_memchr 62006161:
 ./verify_composition_court.sh --target toupper_each --check-committed
 ./verify_composition_court.sh --target toupper_each_strlen_memchr         # composition #5 (nested)
 ./verify_composition_court.sh --target toupper_each_strlen_memchr --check-committed
+./verify_store.sh                                                          # persistent store
 ```
 
 Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
@@ -350,8 +400,8 @@ confirms the object/receipt hashes match the committed seal (`Compiled object:
 MATCH`) and that the executed object is the sealed object (`Execution object:
 MATCH`). Evidence is committed under
 `phost/evidence/porting/{toupper,memcmp,memchr,strlen,strrchr}/` including
-`execution_verdict.json`; the compiled `candidate.o` and
-`candidate.receipts.json` are regenerated, not committed.
+`execution_verdict.json`; the compiled `candidate.o` **is committed** (it is the
+seal, and the store loads it), while `candidate.receipts.json` is regenerated.
 
 Executed ABI (SysV AMD64, leaf/pure integer functions only):
 
@@ -390,12 +440,13 @@ See `docs/REPLAY_COURTS.md` and `docs/PHORENSIC_OS.md`.
 Two minimal, resource-capped containers (QEMU boots inside the kernel one):
 
 ```sh
-docker compose run --rm host     # cargo test + the JIT-porting court verifier
+docker compose run --rm host     # cargo test + the store, court and composition verifiers
 docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 docker compose up --build        # both, one shot
 ```
 
-`host` runs the compiler/runtime tests and the court verifier. `kernel` builds the
+`host` runs the compiler/runtime tests and the court verifiers (`verify_store.sh`,
+`verify_jit_porting_court.sh`, `verify_composition_court.sh`). `kernel` builds the
 Multiboot kernel, boots it under QEMU, verifies the boot evidence (13 checks) and
 checks the boot evidence is byte-reproducible against the committed
 `phost_kernel/evidence_manifest.json`. Boot evidence is byte-identical across
@@ -417,7 +468,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **177 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **197 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (47), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -433,7 +484,8 @@ All numbers below were reproduced on a clean checkout.
 | Sealed composition (dataflow) | `toupper ∘ strlen ∘ memchr ∘ toupper ∘ memchr`, where **one derived bound is consumed by two searches**, the second non-adjacent to the stage that produced it: **474/474**, all six stage-accounts native, **0 fallbacks / 0 broken seals**, 6102 sealed dispatches; dispatched objects match the committed leaf seals |
 | Composition as a sealed port | the store publishes two artifact kinds (`LeafObject` and `Composition`); a nested chain resolves the sealed **composition** `toupper_each` from the store, checks its seal and recurses: `toupper_each` **267/267** (311 dispatches) and `toupper_each_strlen_memchr` **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**; the recorded nested seal matches the committed `toupper_each` chain hash |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
-| Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
+| Persistent sealed port store | `phost/evidence/store/index.json` commits all **10** sealed ports (5 leaf object hashes + 5 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
+| Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
 
 ### Known gaps
 
@@ -449,6 +501,11 @@ All numbers below were reproduced on a clean checkout.
   sources and as `phost` Rust modules; unifying them is in progress.
 - **Porting scope.** The JIT-porting court covers API-surface (byte-in/byte-out)
   targets only; arbitrary binary translation is not implemented.
+- **Store index upkeep.** `phost/evidence/store/index.json` is committed and
+  regenerated explicitly (`phost port store --write`), as the leaf `candidate.o`
+  files and composition verdicts change. It is not rebuilt automatically, so a
+  stale index is a real possibility — `verify_store.sh` fails closed on one
+  (object hash mismatch, dangling stage, or a regeneration diff).
 - **Kernel image bytes.** Boot evidence is byte-reproducible, but kernel image
   bytes depend on the linker toolchain; cross-toolchain bit-reproducibility is
   not yet asserted.

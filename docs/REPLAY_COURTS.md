@@ -831,6 +831,42 @@ object is the one loaded, executed and dispatched.
 Sealed store lookups are gated: without `PORTING`, sealed port entries are not
 revealed.
 
+### Persistent sealed port store
+
+Deriving a seal is the court's job; **loading** one is the runtime's. The store
+index `phost/evidence/store/index.json` is a committed artifact that names every
+sealed port — five leaf object hashes and five composition chain hashes — so a
+call site can resolve a seal without invoking `phorc` and without replaying an
+oracle.
+
+```text
+phost/src/porting/store.rs     StoreDocument + StoreEntry (leaf/composition),
+                              load / load_with_document / document_from_evidence
+                              / regenerate; StoreError fails closed
+```
+
+Loading is verified end to end:
+
+```text
+schema == phorensic.porting.store.v1, entry_count matches, residual hash matches
+every entry is `sealed`; targets are unique
+leaf:        object_path exists and SHA-256(object bytes) == object_hash
+composition: chain_hash is a 64-hex digest; every leaf is a sealed entry here
+```
+
+The leaf `candidate.o` files **are committed**: the seal is the object's bytes, so
+committing them is what lets the store be loaded without a compiler. The verifier
+independently recompiles each `.phor` source and requires byte-equality, so the
+committed object is checked rather than trusted. A composition's chain hash is
+read from its committed verdict, so a nested chain resolves its inner port instead
+of re-running the inner court.
+
+`--store` makes the composition court load its index from the store rather than
+derive it; the committed verdict must reproduce (same `chain_hash`), and with an
+impossible `--phorc` path it proves no compiler is invoked. Loads fail closed:
+a missing store is an error, never a silent fallback, and without `PORTING` the
+store is not read at all.
+
 ### Where it lives
 
 ```text
@@ -839,7 +875,16 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   promotion, evidence, compiled, exec, dispatch,
                                   composition, composition_strlen_memchr,
                                   composition_pair, composition_toupper_each,
-                                  composition_nested
+                                  composition_nested, store, json
+phost/evidence/store/index.json   persistent store: every sealed port (leaf objects
+                                  + composition chain hashes), committed
+verify_store.sh                   persistent store verifier (load, regenerate,
+                                  independent recompilation, no-compiler runtime)
+```
+
+The examples and evidence:
+
+```text
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
@@ -853,19 +898,23 @@ phost/evidence/porting/strrchr/   strrchr evidence set (336 cases) + candidate.o
 phost/evidence/composition/      composition verdicts (chains over sealed ports)
 verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr)
 verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr)
+verify_store.sh                   persistent store verifier
 ```
 
-The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are
-not committed); only their hashes are sealed. The promoted artifact is the
-compiled object, not the Rust mirror — and that object is executed, not merely
-hashed.
+The committed leaf `candidate.o` is the seal, so it is committed; only
+`candidate.receipts.json` is regenerated (its hash is sealed). The promoted
+artifact is the compiled object, not the Rust mirror — and that object is executed
+and dispatched, not merely hashed.
 
 Reproduce:
 
 ```sh
+cargo run -p phost -- port store                            # load + verify the store
+cargo run -p phost -- port store --write                    # regenerate it
 cargo run -p phost -- port promote toupper
-cargo run -p phost -- port promote memcmp
-cargo run -p phost -- port native toupper 61                 # dispatch one call
+cargo run -p phost -- port native toupper 61                # dispatch one call (from the store)
+cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
+./verify_store.sh                                           # persistent store
 ./verify_jit_porting_court.sh --target toupper                 # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
