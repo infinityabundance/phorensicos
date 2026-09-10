@@ -177,6 +177,42 @@ fn const_literal_value(
             _ => None,
         },
         Expr::Ident(id) => resolved.get(&id.name).cloned(),
+        // Integer constant folding. Without this, a const like `0 - 1` (a
+        // branchless -1) was left unresolved and fell through to the global-load
+        // path, materializing as 0 at runtime.
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let l = const_literal_value(lhs, resolved)?;
+            let r = const_literal_value(rhs, resolved)?;
+            match (l, r) {
+                (Value::Const(Constant::Int(a, w)), Value::Const(Constant::Int(b, _))) => {
+                    let v = match op {
+                        BinOp::Add => a.wrapping_add(b),
+                        BinOp::Sub => a.wrapping_sub(b),
+                        BinOp::Mul => a.wrapping_mul(b),
+                        BinOp::Div => {
+                            if b == 0 {
+                                return None;
+                            }
+                            a / b
+                        }
+                        BinOp::Rem => {
+                            if b == 0 {
+                                return None;
+                            }
+                            a % b
+                        }
+                        BinOp::And => a & b,
+                        BinOp::Or => a | b,
+                        BinOp::Xor => a ^ b,
+                        BinOp::Shl => a.wrapping_shl(b as u32),
+                        BinOp::Shr => a.wrapping_shr(b as u32),
+                        _ => return None,
+                    };
+                    Some(Value::Const(Constant::Int(v, w)))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -541,48 +577,56 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) {
         }
         Stmt::Assignment { target, value, .. } => {
             let val = lower_expr(value, ctx);
-            // Resolve assignment target
-            match target.as_ref() {
-                // Handle struct field assignment: p.x = expr
-                Expr::FieldAccess { obj, field, .. } => {
-                    if let Expr::Ident(id) = obj.as_ref() {
-                        if let Some(binding) = ctx.struct_vars.get(&id.name) {
-                            if let Some(&field_local) = binding.field_locals.get(&field.name) {
-                                ctx.emit(Op::Store {
-                                    addr: Value::Local(field_local, PhirType::Prim(PrimType::U64)),
-                                    val,
-                                });
-                                return;
-                            }
-                        }
-                    }
-                    // Fallback: store to target local
-                    ctx.emit(Op::Store {
-                        addr: Value::Global("_".to_string(), PhirType::Prim(PrimType::U64)),
-                        val,
-                    });
-                }
-                Expr::Ident(id) => {
-                    if let Some((local_idx, ty)) = ctx.locals.get(&id.name).cloned() {
+            store_to_target(target, val, ctx);
+        }
+    }
+}
+
+/// Store `val` to the lvalue `target`.
+///
+/// Shared by `Stmt::Assignment` and by the `x = expr` expression form (the
+/// parser produces the latter as `Expr::Binary { op: Assign, .. }`, so both paths
+/// must resolve targets identically).
+fn store_to_target(target: &Expr, val: Value, ctx: &mut LowerCtx) {
+    match target {
+        // Handle struct field assignment: p.x = expr
+        Expr::FieldAccess { obj, field, .. } => {
+            if let Expr::Ident(id) = obj.as_ref() {
+                if let Some(binding) = ctx.struct_vars.get(&id.name) {
+                    if let Some(&field_local) = binding.field_locals.get(&field.name) {
                         ctx.emit(Op::Store {
-                            addr: Value::Local(local_idx, ty),
+                            addr: Value::Local(field_local, PhirType::Prim(PrimType::U64)),
                             val,
                         });
-                    } else {
-                        // Fallback: global store
-                        ctx.emit(Op::Store {
-                            addr: Value::Global(id.name.clone(), PhirType::Prim(PrimType::U64)),
-                            val,
-                        });
+                        return;
                     }
-                }
-                _ => {
-                    ctx.emit(Op::Store {
-                        addr: Value::Global("_".to_string(), PhirType::Prim(PrimType::U64)),
-                        val,
-                    });
                 }
             }
+            // Fallback: store to a placeholder global slot
+            ctx.emit(Op::Store {
+                addr: Value::Global("_".to_string(), PhirType::Prim(PrimType::U64)),
+                val,
+            });
+        }
+        Expr::Ident(id) => {
+            if let Some((local_idx, ty)) = ctx.locals.get(&id.name).cloned() {
+                ctx.emit(Op::Store {
+                    addr: Value::Local(local_idx, ty),
+                    val,
+                });
+            } else {
+                // Fallback: global store
+                ctx.emit(Op::Store {
+                    addr: Value::Global(id.name.clone(), PhirType::Prim(PrimType::U64)),
+                    val,
+                });
+            }
+        }
+        _ => {
+            ctx.emit(Op::Store {
+                addr: Value::Global("_".to_string(), PhirType::Prim(PrimType::U64)),
+                val,
+            });
         }
     }
 }
@@ -630,6 +674,16 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Value {
         }
 
         Expr::Binary { op, lhs, rhs, .. } => {
+            // `x = expr` reaches the lowerer as an assignment *expression*
+            // (the parser builds `Binary { op: Assign, .. }`), and the statement
+            // parser never produces `Stmt::Assignment` for it. Before this was
+            // handled, `Assign` fell through `lower_binop`'s catch-all and became
+            // `Add`, so every reassignment silently added instead of storing.
+            if *op == BinOp::Assign {
+                let val = lower_expr(rhs, ctx);
+                store_to_target(lhs, val.clone(), ctx);
+                return val;
+            }
             let lhs_val = lower_expr(lhs, ctx);
             let rhs_val = lower_expr(rhs, ctx);
             let out = ctx.fresh_temp(PhirType::Prim(PrimType::U64));

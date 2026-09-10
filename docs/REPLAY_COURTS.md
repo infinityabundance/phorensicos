@@ -327,14 +327,16 @@ foreign API surface as a black box, seals the observed behavior as oracle
 traces, replays a clean-room native candidate against them, and promotes the
 candidate only on exact, evidence-backed equivalence.
 
-This is **API-surface** porting (byte-in/byte-out functions such as `toupper`),
-not arbitrary binary translation.
+This is **API-surface** porting (byte-in/byte-out and small buffer functions such
+as `toupper`, `memcmp` and `memchr`), not arbitrary binary translation.
 
 ### Flow
 
 ```text
 foreign behavior → dialect cage → oracle traces → behavior signature
 → native candidate → replay court → comparison → promotion → sealed package
+→ execution court (load and call the sealed object)
+→ dispatch court (runtime serves calls from the sealed object) → runtime prefers native
 ```
 
 ### First target: libc `toupper`
@@ -365,6 +367,28 @@ edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`,
 so no observation reads past a buffer. Arguments are framed in the trace as
 `a_hex:b_hex:n_hex` (little-endian `n`).
 
+### Third target: libc `memchr`
+
+```text
+target id: libc:memchr:c-locale:index:v1
+dialect:   libc   symbol: memchr   version: host-observed-v1
+locale:    C
+contract:  index of the first matching byte, or -1 when absent (unsigned, n-bounded)
+corpus:    482 bounded deterministic cases
+```
+
+`memchr` returns a *pointer* to the first match, or NULL. A pointer value is not
+portable behavior — it depends on the caller's buffer address — so the observable
+is normalized to the **index** of the first match (`0..n-1`), or `-1` when the
+byte is absent. That is the portable part of the C contract (`result - s`) and
+the value a native caller actually needs. Its corpus forces search semantics:
+lengths `0..=8`; the first match at every index (on distinct-byte patterns);
+repeated needles (first occurrence wins); an absent needle; the `n`-boundary
+around a match (`n = j` excludes it, `n = j+1` includes it); the unsigned edge
+bytes `00/01/7f/80/fe/ff`; and an exhaustive sweep of all 256 needle values.
+Arguments are framed in the trace as `hay_hex:needle_hex:n_hex` (little-endian
+`n`).
+
 ### Target identity is qualified
 
 A target id is `dialect:symbol:locale:contract:version`, so a future
@@ -375,8 +399,9 @@ silent redefinition of an existing one.
 
 The cage calls the foreign functions through a single narrow FFI shim and records
 input/output/locale/status/effects — it never reads or copies foreign source. The
-native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold) and
-`phor_memcmp` (unsigned, `n`-bounded, sign result). Unknown target ids return
+native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold),
+`phor_memcmp` (unsigned, `n`-bounded, sign result) and `phor_memchr` (unsigned,
+`n`-bounded, first-match index). Unknown target ids return
 `CandidateError::UnsupportedTarget` and malformed arguments return
 `CandidateError::MalformedArgs`; there is no identity fallback, so an unsupported
 candidate can never pass by accident.
@@ -545,9 +570,11 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   promotion, evidence, compiled, exec, dispatch
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
-phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
-phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
-verify_jit_porting_court.sh       court verifier (--target toupper|memcmp)
+examples/jit_port_memchr.phor      memchr native candidate, in Phorensic
+phost/evidence/porting/toupper/    toupper evidence set (256 cases) + candidate.o
+phost/evidence/porting/memcmp/     memcmp evidence set (312 cases) + candidate.o
+phost/evidence/porting/memchr/     memchr evidence set (482 cases) + candidate.o
+verify_jit_porting_court.sh        court verifier (--target toupper|memcmp|memchr)
 ```
 
 The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are

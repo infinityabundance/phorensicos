@@ -14,9 +14,9 @@ use alloc::vec::Vec;
 
 use core::ffi::{c_int, c_void};
 
-use crate::porting::candidate::{decode_usize, encode_sign};
+use crate::porting::candidate::{decode_usize, encode_index, encode_sign};
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, TestCase, LIBC_MEMCMP, LIBC_TOUPPER};
+use crate::porting::target::{PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
 use crate::porting::{PortError, PortingAuthority};
 
 // Foreign implementations under observation. In the "C" locale (the initial
@@ -27,6 +27,7 @@ use crate::porting::{PortError, PortingAuthority};
 extern "C" {
     fn toupper(c: c_int) -> c_int;
     fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int;
+    fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void;
 }
 
 /// Observe `cases` against `target` through the cage.
@@ -83,6 +84,42 @@ pub fn observe_target(
                     &case.case_id,
                     &case.args,
                     &output,
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect());
+    }
+
+    if target.id == LIBC_MEMCHR.id {
+        return Ok(cases
+            .iter()
+            .map(|case| {
+                let hay = case.args.first().cloned().unwrap_or_default();
+                let needle = case
+                    .args
+                    .get(1)
+                    .and_then(|a| a.first())
+                    .copied()
+                    .unwrap_or(0);
+                let n = case.args.get(2).map(|x| decode_usize(x)).unwrap_or(0);
+                // n is bounded by the haystack in the corpus; clamp defensively so
+                // a malformed case can never read past its slice.
+                let n = n.min(hay.len());
+                let base = hay.as_ptr();
+                let found = unsafe { memchr(base as *const c_void, needle as c_int, n) };
+                // Normalize the pointer result to the index, or -1 when absent.
+                // A pointer value is not portable behavior; the index is.
+                let idx: i32 = if found.is_null() {
+                    -1
+                } else {
+                    (found as usize - base as usize) as i32
+                };
+                OracleTrace::new(
+                    target,
+                    &case.case_id,
+                    &case.args,
+                    &encode_index(idx),
                     "ok",
                     &["compute"],
                 )
@@ -171,6 +208,73 @@ mod tests {
         assert_eq!(traces[3].output_hex, "00000000"); // n = 0
         assert_eq!(traces[4].output_hex, "01000000"); // 0x80 > 0x7f (unsigned)
         assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_reports_memchr_index_not_pointer() {
+        let target = LIBC_MEMCHR;
+        let cases = alloc::vec![
+            TestCase::new(
+                "at0",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    alloc::vec![b'a'],
+                    3u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "at2",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    alloc::vec![b'c'],
+                    3u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "absent",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    alloc::vec![b'z'],
+                    3u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "n0",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    alloc::vec![b'a'],
+                    0u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "edge",
+                alloc::vec![
+                    alloc::vec![0x00, 0x80],
+                    alloc::vec![0x80],
+                    2u64.to_le_bytes().to_vec()
+                ]
+            ),
+        ];
+        let traces = observe_target(&target, &cases, &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces[0].output_hex, "00000000"); // index 0
+        assert_eq!(traces[1].output_hex, "02000000"); // index 2
+        assert_eq!(traces[2].output_hex, "ffffffff"); // -1 (absent)
+        assert_eq!(traces[3].output_hex, "ffffffff"); // n = 0
+        assert_eq!(traces[4].output_hex, "01000000"); // unsigned 0x80 found at 1
+        assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_observes_whole_memchr_corpus() {
+        let traces = observe_target(
+            &LIBC_MEMCHR,
+            &crate::porting::target::memchr_corpus(),
+            &PortingAuthority::granted(),
+        )
+        .unwrap();
+        assert!(!traces.is_empty());
+        assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 8));
     }
 
     #[test]

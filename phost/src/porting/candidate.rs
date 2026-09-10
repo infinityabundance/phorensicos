@@ -22,7 +22,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, LIBC_MEMCMP, LIBC_TOUPPER};
+use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
 use crate::porting::{json_escape, sha256_hex};
 
 /// Why a candidate could not produce a result for a case.
@@ -95,6 +95,34 @@ pub fn encode_sign(value: i32) -> Vec<u8> {
     normalized.to_le_bytes().to_vec()
 }
 
+// ============================================================================
+// memchr
+// ============================================================================
+
+/// Native clean-room `memchr`: the index of the first byte equal to `needle`
+/// within the first `n` bytes of `haystack`, or `-1` when it is absent.
+///
+/// `memchr` returns a pointer; the portable observable is the index
+/// (`result - s`), which is what this returns.
+#[inline]
+pub fn phor_memchr(haystack: &[u8], needle: u8, n: usize) -> i32 {
+    let m = n.min(haystack.len());
+    let mut i = 0;
+    while i < m {
+        if haystack[i] == needle {
+            return i as i32;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Encode a memchr index as 4 little-endian bytes (`-1` 0xffffffff when absent).
+/// The wire form is a fixed-width i32 so the trace is byte-stable.
+pub fn encode_index(index: i32) -> Vec<u8> {
+    index.to_le_bytes().to_vec()
+}
+
 /// Decode a little-endian `usize` argument (the compared length).
 pub fn decode_usize(bytes: &[u8]) -> usize {
     let mut buf = [0u8; 8];
@@ -123,6 +151,17 @@ pub fn run_candidate(target_id: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, Candi
         }
         let sign = phor_memcmp(&args[0], &args[1], decode_usize(&args[2]));
         return Ok(encode_sign(sign));
+    }
+
+    if target_id == LIBC_MEMCHR.id {
+        if args.len() < 3 {
+            return Err(CandidateError::MalformedArgs(target_id.to_string()));
+        }
+        let needle = *args[1]
+            .first()
+            .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
+        let index = phor_memchr(&args[0], needle, decode_usize(&args[2]));
+        return Ok(encode_index(index));
     }
 
     Err(CandidateError::UnsupportedTarget(target_id.to_string()))
@@ -297,6 +336,34 @@ mod tests {
     fn test_memcmp_candidate_covers_corpus_without_error() {
         for case in memcmp_corpus() {
             match run_candidate(LIBC_MEMCMP.id, &case.args) {
+                Ok(out) => assert_eq!(out.len(), 4, "case {}", case.case_id),
+                Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_native_memchr_behavior() {
+        assert_eq!(phor_memchr(b"abc", b'a', 3), 0);
+        assert_eq!(phor_memchr(b"abc", b'c', 3), 2);
+        assert_eq!(phor_memchr(b"abc", b'z', 3), -1);
+        // n bounds the search.
+        assert_eq!(phor_memchr(b"abc", b'c', 2), -1);
+        assert_eq!(phor_memchr(b"abc", b'a', 0), -1);
+        // The FIRST occurrence wins.
+        assert_eq!(phor_memchr(&[0x00, 0x00, 0x00], 0x00, 3), 0);
+        assert_eq!(phor_memchr(&[0xff, 0xff], 0xff, 2), 0);
+        // Unsigned bytes are just byte values: 0x80 matches 0x80, not 0x7f.
+        assert_eq!(phor_memchr(&[0x7f, 0x80], 0x80, 2), 1);
+        assert_eq!(phor_memchr(&[0x7f, 0x80], 0x7f, 2), 0);
+        // Matching past the searched length is not found.
+        assert_eq!(phor_memchr(&[0x01, 0x02, 0x03], 0x03, 2), -1);
+    }
+
+    #[test]
+    fn test_memchr_candidate_covers_corpus_without_error() {
+        for case in crate::porting::target::memchr_corpus() {
+            match run_candidate(LIBC_MEMCHR.id, &case.args) {
                 Ok(out) => assert_eq!(out.len(), 4, "case {}", case.case_id),
                 Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
             }

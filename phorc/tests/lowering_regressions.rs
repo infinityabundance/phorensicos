@@ -115,7 +115,72 @@ fn test_logical_and_lowers_to_bitand() {
     assert!(!added_bool, "`&&` must not lower to Add: {:?}", ops);
 }
 
-/// Shift precedence: `a + b << c` parses as `(a + b) << c`.
+/// Integer `const` expressions must fold. `const NEG: u64 = 0 - 1;` (a
+/// branchless -1) previously stayed unresolved and materialized as 0.
+#[test]
+fn test_const_arithmetic_folds() {
+    let module = lower_src(
+        "const NEG: u64 = 0 - 1;\n\
+         fn f(x: u64) -> u64 effect [compute] { return x - NEG; }",
+    );
+    let f = &module.functions[0];
+    let ops = &f.blocks[0].ops;
+    let folded = ops.iter().any(|op| {
+        matches!(
+            op,
+            phorc::ir::Op::BinOp {
+                rhs: phorc::ir::Value::Const(phorc::ir::Constant::Int(u64::MAX, _)),
+                ..
+            }
+        )
+    });
+    assert!(folded, "`0 - 1` should fold to u64::MAX, got {:?}", ops);
+    let leaked = ops
+        .iter()
+        .any(|op| format!("{:?}", op).contains("Global(\"NEG\""));
+    assert!(!leaked, "const leaked as a Global: {:?}", ops);
+}
+
+/// Regression: `x = expr` reaches the lowerer as `Binary { op: Assign }`, and
+/// the `lower_binop` catch-all used to turn `Assign` into `Add` — so every
+/// reassignment silently added instead of storing (which is why the memchr
+/// candidate returned mirrored indices).
+#[test]
+fn test_assignment_stores_instead_of_adding() {
+    let module =
+        lower_src("fn f() -> u64 effect [compute] { let mut x: u64 = 0; x = 7; return x; }");
+    let f = &module.functions[0];
+    let ops = &f.blocks[0].ops;
+
+    let adds = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                phorc::ir::Op::BinOp {
+                    op: phorc::ir::BinOpKind::Add,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(adds, 0, "assignment must not lower to Add: {:?}", ops);
+
+    let stored_seven = ops.iter().any(|op| {
+        matches!(
+            op,
+            phorc::ir::Op::Store {
+                val: phorc::ir::Value::Const(phorc::ir::Constant::Int(7, _)),
+                ..
+            }
+        )
+    });
+    assert!(
+        stored_seven,
+        "`x = 7` should emit a Store of the literal 7, got {:?}",
+        ops
+    );
+}
 #[test]
 fn test_shift_binds_looser_than_addition() {
     let module =

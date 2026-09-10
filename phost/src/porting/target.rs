@@ -74,6 +74,27 @@ pub const LIBC_MEMCMP: PortTarget = PortTarget {
     abi_symbol: "phor_memcmp_sign",
 };
 
+/// libc `memchr` — bounded deterministic corpus, index contract.
+///
+/// The observable is the **index of the first matching byte** (`0..n-1`) or
+/// `-1` when the byte is absent. `memchr` returns a pointer, and a pointer value
+/// is not portable behavior (it depends on the caller's buffer address), so the
+/// court normalizes it to the index — which is the actual C contract
+/// (`result - s`), and is what a native caller needs.
+pub const LIBC_MEMCHR: PortTarget = PortTarget {
+    id: "libc:memchr:c-locale:index:v1",
+    dialect: "libc",
+    symbol: "memchr",
+    version: "host-observed-v1",
+    locale_contract: "C",
+    input_schema: "(u8[], u8 needle, usize n) — haystack, needle byte, searched length",
+    output_schema: "i32 index of the first match, or -1 when absent",
+    domain_summary: "bounded deterministic corpus: lengths 0..=8, first match at every index, absent needle, repeated needles, n-boundary, edge bytes, exhaustive 0..=255 needle sweep",
+    candidate_source: "examples/jit_port_memchr.phor",
+    // ABI: (wh: u64 packed big-endian, needle: u64, n: u64) -> u64 index or -1.
+    abi_symbol: "phor_memchr_index",
+};
+
 /// One input case for a target: an ordered list of byte-slice arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestCase {
@@ -266,11 +287,135 @@ pub fn memcmp_corpus() -> Vec<TestCase> {
     c
 }
 
+/// The `memchr` corpus — bounded, deterministic, exhaustive over its axes.
+///
+/// Axes: lengths `0..=8`; the first match at every index (distinct patterns);
+/// repeated needles (first occurrence wins); an absent needle; the `n`-boundary
+/// around a match (`n = j` excludes it, `n = j+1` includes it); the unsigned edge
+/// bytes `00/01/7f/80/fe/ff`; and an exhaustive sweep of all 256 needle values.
+pub fn memchr_corpus() -> Vec<TestCase> {
+    let mut c: Vec<TestCase> = Vec::new();
+
+    let mk = |cases: &mut Vec<TestCase>, id: &str, hay: &[u8], needle: u8, n: usize| {
+        cases.push(TestCase::new(
+            id,
+            vec![
+                hay.to_vec(),
+                alloc::vec![needle],
+                (n as u64).to_le_bytes().to_vec(),
+            ],
+        ));
+    };
+
+    // A — n = 0: absent regardless of the haystack and needle.
+    mk(&mut c, "A.000", &[], 0x00, 0);
+    mk(&mut c, "A.001", &[0xff], 0xff, 0);
+    mk(&mut c, "A.002", &[0x61, 0x62], 0x61, 0);
+    mk(&mut c, "A.003", &[0x00, 0x01, 0x02], 0x01, 0);
+
+    // B — absent needle (0x5a is not in zero/ones/asc/desc/alt for len <= 8).
+    for len in 0..=8usize {
+        for p in PATTERNS {
+            let v = p.bytes(len);
+            mk(&mut c, &format!("B.{}.{}", p.name(), len), &v, 0x5a, len);
+        }
+    }
+
+    // C — first match at index i, on patterns with distinct bytes (asc/desc),
+    //     so the expected index is exactly i.
+    for len in 1..=8usize {
+        for p in [Pattern::Asc, Pattern::Desc] {
+            let v = p.bytes(len);
+            for i in 0..len {
+                mk(
+                    &mut c,
+                    &format!("C.{}.{}.{}", p.name(), len, i),
+                    &v,
+                    v[i],
+                    len,
+                );
+            }
+        }
+    }
+
+    // C2 — repeated bytes: the FIRST occurrence wins (index 0).
+    for len in 1..=8usize {
+        mk(
+            &mut c,
+            &format!("C2.zero.{}", len),
+            &Pattern::Zero.bytes(len),
+            0x00,
+            len,
+        );
+        mk(
+            &mut c,
+            &format!("C2.ones.{}", len),
+            &Pattern::Ones.bytes(len),
+            0xff,
+            len,
+        );
+        mk(
+            &mut c,
+            &format!("C2.alt.{}", len),
+            &Pattern::Alt.bytes(len),
+            0x00,
+            len,
+        );
+        mk(
+            &mut c,
+            &format!("C2.alt2.{}", len),
+            &Pattern::Alt.bytes(len),
+            0xff,
+            1.min(len),
+        );
+    }
+
+    // D — the n boundary around a match at index j:
+    //     n = j excludes it (absent); n = j+1 includes it (index j).
+    for len in 1..=8usize {
+        let v = Pattern::Asc.bytes(len);
+        for j in 0..len {
+            if j > 0 {
+                mk(&mut c, &format!("D.{}.{}.n{}", len, j, j), &v, v[j], j);
+            }
+            mk(
+                &mut c,
+                &format!("D.{}.{}.n{}", len, j, j + 1),
+                &v,
+                v[j],
+                j + 1,
+            );
+        }
+    }
+
+    // E — the unsigned edge bytes plus ASCII, each at a known index.
+    const SWEEP: [u8; 8] = [0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0x41, 0x61];
+    for &b in SWEEP.iter() {
+        mk(&mut c, &format!("E.{:02x}", b), &SWEEP, b, SWEEP.len());
+    }
+    mk(&mut c, "E.absent", &SWEEP, 0x5a, SWEEP.len());
+
+    // F — exhaustive needle sweep: all 256 needle values against a fixed
+    //     haystack containing the unsigned edge bytes and two ASCII letters.
+    for needle in 0..=255u16 {
+        mk(
+            &mut c,
+            &format!("F.{:02x}", needle),
+            &SWEEP,
+            needle as u8,
+            SWEEP.len(),
+        );
+    }
+
+    c
+}
+
 /// The deterministic case set for a target.
 pub fn cases_for(target: &PortTarget) -> Vec<TestCase> {
     match target.id {
         id if id == LIBC_TOUPPER.id => byte_domain_cases(),
         id if id == LIBC_MEMCMP.id => memcmp_corpus(),
+        id if id == LIBC_MEMCHR.id => memchr_corpus(),
         _ => Vec::new(),
     }
 }
@@ -280,6 +425,7 @@ pub fn resolve_target(name: &str) -> Option<PortTarget> {
     match name {
         "toupper" | "libc:toupper:c-locale:u8:v1" => Some(LIBC_TOUPPER),
         "memcmp" | "libc:memcmp:c-locale:sign:v1" => Some(LIBC_MEMCMP),
+        "memchr" | "libc:memchr:c-locale:index:v1" => Some(LIBC_MEMCHR),
         _ => None,
     }
 }
@@ -292,9 +438,14 @@ mod tests {
     fn test_resolve_known_and_unknown() {
         assert_eq!(resolve_target("toupper"), Some(LIBC_TOUPPER));
         assert_eq!(resolve_target("memcmp"), Some(LIBC_MEMCMP));
+        assert_eq!(resolve_target("memchr"), Some(LIBC_MEMCHR));
         assert_eq!(
             resolve_target("libc:memcmp:c-locale:sign:v1"),
             Some(LIBC_MEMCMP)
+        );
+        assert_eq!(
+            resolve_target("libc:memchr:c-locale:index:v1"),
+            Some(LIBC_MEMCHR)
         );
         assert_eq!(resolve_target("strlen"), None);
     }
@@ -303,7 +454,62 @@ mod tests {
     fn test_target_ids_are_qualified() {
         assert_eq!(LIBC_TOUPPER.id, "libc:toupper:c-locale:u8:v1");
         assert_eq!(LIBC_MEMCMP.id, "libc:memcmp:c-locale:sign:v1");
+        assert_eq!(LIBC_MEMCHR.id, "libc:memchr:c-locale:index:v1");
         assert_eq!(LIBC_MEMCMP.locale_contract, "C");
+        assert_eq!(LIBC_MEMCHR.locale_contract, "C");
+    }
+
+    #[test]
+    fn test_memchr_corpus_is_deterministic_and_bounded() {
+        let a = memchr_corpus();
+        let b = memchr_corpus();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 482);
+
+        // Case ids are unique.
+        let mut ids: Vec<&str> = a.iter().map(|c| c.case_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), a.len());
+
+        // Every case is well formed: 3 args; a 1-byte needle; an 8-byte length;
+        // n <= len(haystack); and n within the packed-word contract.
+        for c in &a {
+            assert_eq!(c.args.len(), 3, "case {} args", c.case_id);
+            assert_eq!(c.args[1].len(), 1, "case {} needle", c.case_id);
+            let n = u64::from_le_bytes(c.args[2].as_slice().try_into().unwrap()) as usize;
+            assert!(n <= c.args[0].len(), "case {}", c.case_id);
+            assert!(n <= 8, "case {}", c.case_id);
+            assert!(c.args[0].len() <= 8, "case {}", c.case_id);
+        }
+    }
+
+    #[test]
+    fn test_memchr_corpus_covers_required_axes() {
+        let cases = memchr_corpus();
+        let ids: Vec<&str> = cases.iter().map(|c| c.case_id.as_str()).collect();
+
+        for group in ["A.", "B.", "C.", "C2.", "D.", "E.", "F."] {
+            assert!(
+                ids.iter().any(|id| id.starts_with(group)),
+                "memchr corpus is missing group {}",
+                group
+            );
+        }
+
+        // n = 0 is exercised; the absent needle is exercised; the n boundary is
+        // exercised; the first match at index 0 on a repeated pattern is
+        // exercised; and the exhaustive 256-value needle sweep is present.
+        assert!(ids.contains(&"A.000"));
+        assert!(ids.contains(&"B.zero.0"));
+        assert!(ids.contains(&"D.4.2.n2"));
+        assert!(ids.contains(&"C2.ones.3"));
+        assert_eq!(ids.iter().filter(|id| id.starts_with("F.")).count(), 256);
+
+        // The exhaustive sweep covers the unsigned edge bytes at known indices.
+        for id in ["F.00", "F.01", "F.7f", "F.80", "F.fe", "F.ff"] {
+            assert!(ids.contains(&id), "memchr sweep is missing {}", id);
+        }
     }
 
     #[test]

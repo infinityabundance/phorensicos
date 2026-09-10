@@ -396,6 +396,11 @@ fn default_args(target: &PortTarget) -> Vec<Vec<u8>> {
             alloc::vec![0x61, 0x62, 0x64],
             3u64.to_le_bytes().to_vec(),
         ],
+        id if id == target::LIBC_MEMCHR.id => alloc::vec![
+            alloc::vec![0x61, 0x62, 0x63],
+            alloc::vec![0x62],
+            3u64.to_le_bytes().to_vec(),
+        ],
         _ => alloc::vec::Vec::new(),
     }
 }
@@ -679,6 +684,49 @@ mod tests {
             .unwrap();
         assert!(path.ends_with("candidate.o"));
         assert_eq!(hash, "dd");
+    }
+
+    #[test]
+    fn test_native_call_memchr_finds_the_first_match_index() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("memchr");
+        let r = run_native_call(
+            "memchr",
+            // "abc" search 'b' over n = 3 -> index 1
+            Some("616263:62:0300000000000000"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::granted(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "sealed-object");
+        assert_eq!(r.output_hex, "01000000");
+        assert!(r.matches_mirror);
+        assert_eq!(r.elf_symbol, "_phor_phor_memchr_index");
+    }
+
+    #[test]
+    fn test_native_call_memchr_absent_is_minus_one() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("memchr_absent");
+        let r = run_native_call(
+            "memchr",
+            // "abc" search 'z' over n = 3 -> -1
+            Some("616263:7a:0300000000000000"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::granted(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "sealed-object");
+        assert_eq!(r.output_hex, "ffffffff");
+        assert!(r.matches_mirror);
     }
 
     #[test]

@@ -29,10 +29,10 @@ use alloc::vec::Vec;
 
 use core::ffi::c_void;
 
-use crate::porting::candidate::{decode_usize, encode_sign};
+use crate::porting::candidate::{decode_usize, encode_index, encode_sign};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
-use crate::porting::target::{PortTarget, LIBC_MEMCMP, LIBC_TOUPPER};
+use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
 
 /// Why the execution court could not run (or refused to).
@@ -237,7 +237,41 @@ fn call_target(
         return Ok(encode_sign(raw));
     }
 
+    if target.id == LIBC_MEMCHR.id {
+        if args.len() < 3 {
+            return Err(ExecError::MalformedArgs(target.id.to_string()));
+        }
+        let hay = &args[0];
+        let needle = *args[1]
+            .first()
+            .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
+        let n = decode_usize(&args[2]);
+        // The candidate packs the searched prefix big-endian into a u64 and scans
+        // it branchlessly, so the corpus is contracted to at most 8 compared
+        // bytes. Bytes past `n` are never examined.
+        if n > 8 || hay.len() < n {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: searched length {} exceeds the 8-byte packed-word contract or the haystack",
+                target.id, n
+            )));
+        }
+        let wh = pack_le_prefix(&hay[..n]);
+        let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
+        let raw = f(wh, needle as u64, n as u64) as u32 as i32;
+        return Ok(encode_index(raw));
+    }
+
     Err(ExecError::UnsupportedTarget(target.id.to_string()))
+}
+
+/// Pack up to 8 bytes **little-endian** — i.e. the machine word you get by
+/// loading the first 8 bytes of the buffer on x86-64. Byte `i` occupies bits
+/// `8*i`, which is the convention the compiled `phor_memchr_index` reads.
+fn pack_le_prefix(buf: &[u8]) -> u64 {
+    let mut w = [0u8; 8];
+    let n = buf.len().min(8);
+    w[..n].copy_from_slice(&buf[..n]);
+    u64::from_le_bytes(w)
 }
 
 /// Pack up to 8 bytes big-endian into a u64 (byte 0 in the most-significant

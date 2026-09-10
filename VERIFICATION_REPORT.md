@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 121 pass, 4 ignored | 125 total: 8 serial + 4 kernel + 49 nucleus + 56 porting (incl. exec + dispatch courts); the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 130 pass, 4 ignored | 134 total: 8 serial + 4 kernel + 49 nucleus + 65 porting (incl. exec + dispatch courts); the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc) | ✅ 48 pass | 44 unit (parser/checker/lower/codegen) + 4 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -28,7 +28,7 @@
 | `serial` driver | ✅ | UART serial driver with capability model |
 | `status_screen` | ✅ | Boot phase display, progress bar, log messages |
 | `input/keyboard` | ✅ | PS/2 keyboard driver with scancode→ASCII |
-| `.phor` corpus | ✅ 315/315 → ELF64 | `src/` 235 + `examples/` 46 + `tests/` 34, all emit objects (checker diagnostics may be emitted; see Known Gaps) |
+| `.phor` corpus | ✅ 316/316 → ELF64 | `src/` 232 + `examples/` 47 + `tests/` 34 + `fixtures/` 2 + `README.phor`, all emit objects (checker diagnostics may be emitted; see Known Gaps) |
 | `compositor` module | ✅ | Window manager, surface blitting to canvas |
 | `phorc_bridge` | ✅ | Compiler invocation from shell with result parsing |
 | `pub` visibility tracking | ✅ | FnDecl/StructDecl/EnumDecl/ImplBlock/ConstDecl |
@@ -90,31 +90,28 @@ GUI compositor → window manager → surface management → inspector
 | phost reach | 108 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp) + sealed-object execution court |
 
 ### JIT-Porting Court
-| Aspect | `toupper` | `memcmp` |
-|--------|-----------|----------|
-| Qualified target id | `libc:toupper:c-locale:u8:v1` | `libc:memcmp:c-locale:sign:v1` |
-| Corpus | exhaustive `0x00..=0xff` (256) | bounded deterministic (312) |
-| Dialect cage observation | ✅ 256/256 | ✅ 312/312 |
-| Replay court | ✅ 256/256, 0 failed, `consistent` | ✅ 312/312, 0 failed, `consistent` |
-| Contract | `u8` (C locale) | sign `(-1 \| 0 \| 1)`, unsigned, n-bounded |
-| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` | `918c86d5302aaa0394a782b68e4aed7494549bcaaf06a82948c6d945ccb43210` |
-| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` |
-| Candidate source hash | `a23bea4da98b4526635d295b6f71f1dbfc14e1a219fb2849d94ee89ca80a37b8` | `adcb65fbd2e54a04c78ed019947d157d0935247b69be828ceb0702af75088a0c` |
-| Candidate object hash | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` | `23ae1e515557ab9449838ad1f72666e70d7ff9f689acf306877a9f3a0a1bd854` |
-| Candidate receipt hash | `614fd9a0860eeee816512a26320001a24217fcfaf2c37344d2a528ca24133485` | `83f0698ed7c1d684be3b0522cfa0e816e00a2708a9f67acb295e3d68c6446aa7` |
-| Compiler | `phorc 0.1.0` | `phorc 0.1.0` |
-| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` | `98843827cbbf97866221127651840eaaee6dbb17dc1bf3e0053476ce30a8290d` |
-| Executed ELF symbol | `_phor_phor_toupper` | `_phor_phor_memcmp_sign` |
-| Execution court | ✅ 256/256, 0 failed, `consistent` | ✅ 312/312, 0 failed, `consistent` |
-| Execution behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` |
-| Execution residual | `e73092e6e2d112cfd5334d9fa840e22b12056fb3f53b63dfc8b7d38898b970d7` | `9ac82dc7a3872ca8b4e493322f5164d54c9732f1dece88ca8e995d5b7015ab03` |
-| Dispatch court | ✅ 256/256 native, 0 fallback, `consistent` | ✅ 312/312 native, 0 fallback, `consistent` |
-| Dispatch hash | `a3f7c0606ae6b6da6353c1b532957dbe40022e206cb059c1512620ecaa0df90d` | `fb00385a5ecaf78c2031d25d7d6c98b7a040d44c53fd12579fa6931394387231` |
-| Dispatch residual | `c2c360eb46bc24957b8a88852c7bf9b946b4908efcbebbe3cc6ca3950aa102bd` | `ce74b873d5ec2e652a6ff48cf2b5c7dcec9d45a6d768f649858e17a91f1d1d09` |
-| Promotion | ✅ → `sealed` | ✅ → `sealed` |
-| Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` |
+| Aspect | `toupper` | `memcmp` | `memchr` |
+|--------|-----------|----------|----------|
+| Qualified target id | `libc:toupper:c-locale:u8:v1` | `libc:memcmp:c-locale:sign:v1` | `libc:memchr:c-locale:index:v1` |
+| Corpus | exhaustive `0x00..=0xff` (256) | bounded deterministic (312) | bounded deterministic (482) |
+| Dialect cage observation | ✅ 256/256 | ✅ 312/312 | ✅ 482/482 |
+| Replay court | ✅ 256/256, `consistent` | ✅ 312/312, `consistent` | ✅ 482/482, `consistent` |
+| Contract | `u8` (C locale) | sign `(-1 \| 0 \| 1)`, unsigned, n-bounded | first-match index or `-1`, unsigned, n-bounded |
+| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` | `918c86d5302aaa0394a782b68e4aed7494549bcaaf06a82948c6d945ccb43210` | `bd89e67c4d7cd22d5006c1c3a7c3759dd47a218de9f977f2f8db549b77d43498` |
+| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` | `5e987fae450eb623a749e2b662b84c59ad390fb2eade75b728ae86399687cba5` |
+| Candidate source hash | `a23bea4da98b4526635d295b6f71f1dbfc14e1a219fb2849d94ee89ca80a37b8` | `adcb65fbd2e54a04c78ed019947d157d0935247b69be828ceb0702af75088a0c` | `ccce8c195bb826866e5505aebbc9a4e38334f58529b2f80a3777e959747e23ec` |
+| Candidate object hash | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` | `23ae1e515557ab9449838ad1f72666e70d7ff9f689acf306877a9f3a0a1bd854` | `90d35156eef8b7009352ebb0ac6fa0f9137c95a515ae1a1e760a37147032bbb8` |
+| Candidate receipt hash | `614fd9a0860eeee816512a26320001a24217fcfaf2c37344d2a528ca24133485` | `83f0698ed7c1d684be3b0522cfa0e816e00a2708a9f67acb295e3d68c6446aa7` | `e09e4c739b32f9287e27dc4f91f4a3b2c1f6b346eb7d53b060600bf66680c51e` |
+| Compiler | `phorc 0.1.0` | `phorc 0.1.0` | `phorc 0.1.0` |
+| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` | `98843827cbbf97866221127651840eaaee6dbb17dc1bf3e0053476ce30a8290d` | `8855cf626df5d8e6e75520f80149938a00505596b080bbb2105ba79b13599c66` |
+| Executed ELF symbol | `_phor_phor_toupper` | `_phor_phor_memcmp_sign` | `_phor_phor_memchr_index` |
+| Execution court | ✅ 256/256, `consistent` | ✅ 312/312, `consistent` | ✅ 482/482, `consistent` |
+| Dispatch court | ✅ 256/256 native | ✅ 312/312 native | ✅ 482/482 native |
+| Dispatch hash | `a3f7c0606ae6b6da6353c1b532957dbe40022e206cb059c1512620ecaa0df90d` | `fb00385a5ecaf78c2031d25d7d6c98b7a040d44c53fd12579fa6931394387231` | `a611cc809aa507350fd6b6aba824f681a5e3e977c0fcd7eb8300f58ed995f3d7` |
+| Promotion | ✅ → `sealed` | ✅ → `sealed` | ✅ → `sealed` |
+| Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` | `native:libc:memchr:c-locale:index:v1` |
 
-For both targets the **execution behavior hash equals the candidate behavior hash**: the
+For every target the **execution behavior hash equals the candidate behavior hash**: the
 Rust mirror and the compiled object reproduce the identical output for every case,
 computed through different code paths (slice-based vs packed-word).
 
@@ -162,23 +159,26 @@ the target up in the capability-gated sealed store and, if a sealed entry is
 present, verifies the object hash, maps the entry function once and calls it;
 otherwise it reports a foreign fallback. A *broken seal* is counted separately
 (`broken_seal_cases`) and is terminal — it never falls back. The dispatch court
-replays the whole corpus through this path and requires 256/256 (`toupper`) and
-312/312 (`memcmp`) cases served natively with zero fallbacks and zero broken
-seals; `dispatch_hash` is bound into the promotion receipt and the sealed package.
+replays the whole corpus through this path and requires 256/256 (`toupper`),
+312/312 (`memcmp`) and 482/482 (`memchr`) cases served natively with zero
+fallbacks and zero broken seals; `dispatch_hash` is bound into the promotion
+receipt and the sealed package.
 Try it: `phost port native toupper 61` (native) and
 `phost port native toupper 61 --no-capability` (foreign fallback).
 
 ### Test Results (reproduced on `main`)
-- phost: 121 passed, 0 failed, 4 ignored (125 total). The ignored tests read
+- phost: 130 passed, 0 failed, 4 ignored (134 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
-- phorc: 44 unit + 4 integration tests passed (0 warnings). The integration tests
+- phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
   pin the lowering fixes that unblocked execution: `<<` lowering to `Shl`, named
-  constants resolving to literals, `&&` lowering to `And`, and shift precedence.
-- `.phor` corpus: 315/315 files lower to non-empty ELF64 objects
-  (`src/` 235, `examples/` 46, `tests/` 34). These are bootstrap-stage
-  results: the checker still reports diagnostics for constructs outside its
-  current subset, but lowering and ELF emission complete for every file.
+  constants resolving to literals (including integer constant folding of `0 - 1`),
+  `&&` lowering to `And`, shift precedence, and `x = expr` storing instead of
+  adding.
+- `.phor` corpus: 316/316 files lower to non-empty ELF64 objects
+  (`src/` 232, `examples/` 47, `tests/` 34, `fixtures/` 2, `README.phor`). These are
+  bootstrap-stage results: the checker still reports diagnostics for constructs
+  outside its current subset, but lowering and ELF emission complete for every file.
 - `.ph` compile-pass fixtures: 46/46 files emit objects.
 
 ### Reproduce
@@ -188,6 +188,7 @@ cargo run -p phorc -- examples/hello.phor /tmp/hello.o --emit-receipts --emit-se
 cargo run -p phorc -- --court-replay /tmp/hello.sealed_package.json
 cargo run -p phost -- port promote toupper       # JIT-porting court (256)
 cargo run -p phost -- port promote memcmp        # JIT-porting court (312)
+cargo run -p phost -- port promote memchr        # JIT-porting court (482)
 cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
 ./verify_jit_porting_court.sh --target toupper                    # determinism
 ./verify_jit_porting_court.sh --target memcmp
@@ -216,4 +217,4 @@ explicitly, and the kernel CI verifies the flag is still `false` before checking
 the evidence. The porting evidence set (oracle traces,
 behavior/candidate signatures, replay verdict, execution verdict, dispatch
 verdict, promotion receipt, sealed package) is committed as
-`phost/evidence/porting/{toupper,memcmp}/`.
+`phost/evidence/porting/{toupper,memcmp,memchr}/`.

@@ -30,7 +30,7 @@
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
-#    ./verify_jit_porting_court.sh [--target toupper|memcmp] [--check-committed] [evidence_dir]
+#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr] [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -64,8 +64,13 @@ case "$TARGET" in
         EXPECTED_COUNT=312
         SOURCE="examples/jit_port_memcmp.phor"
         ;;
+    memchr)
+        TARGET_ID="libc:memchr:c-locale:index:v1"
+        EXPECTED_COUNT=482
+        SOURCE="examples/jit_port_memchr.phor"
+        ;;
     *)
-        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp)"
+        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr)"
         exit 2
         ;;
 esac
@@ -235,6 +240,41 @@ if SYMBOL == "memcmp":
     for group in ("A.", "B.", "C.", "D.", "E.", "F.", "G."):
         if not any(i.startswith(group) for i in id_set):
             errors.append("memcmp corpus is missing group %s" % group)
+
+if SYMBOL == "memchr":
+    for t in traces:
+        a = args_of(t)
+        if len(a) != 3:
+            errors.append("memchr case %s does not have exactly 3 arguments" % t.get("case_id"))
+            break
+        if len(a[1]) != 2:
+            errors.append("memchr case %s does not have a 1-byte needle" % t.get("case_id"))
+            break
+        if len(a[2]) != 16:
+            errors.append("memchr case %s has a non-8-byte length" % t.get("case_id"))
+            break
+        try:
+            hay = bytes.fromhex(a[0])
+            n = int.from_bytes(bytes.fromhex(a[2]), "little")
+        except ValueError:
+            errors.append("memchr case %s has non-hex arguments" % t.get("case_id"))
+            break
+        if n > len(hay):
+            errors.append("memchr case %s has n > len(haystack)" % t.get("case_id"))
+            break
+        if n > 8 or len(hay) > 8:
+            errors.append("memchr case %s exceeds the 8-byte packed-word contract" % t.get("case_id"))
+            break
+        if len(t.get("output_hex", "")) != 8:
+            errors.append("memchr case %s output is not a 4-byte index" % t.get("case_id"))
+            break
+    id_set = set(t.get("case_id") for t in traces)
+    for required in ("A.000", "B.zero.0", "C2.ones.3", "D.4.2.n2", "E.80", "F.7f", "F.80"):
+        if required not in id_set:
+            errors.append("memchr corpus is missing case %s" % required)
+    for group in ("A.", "B.", "C.", "C2.", "D.", "E.", "F."):
+        if not any(i.startswith(group) for i in id_set):
+            errors.append("memchr corpus is missing group %s" % group)
 
 # ---- hash cross-checks ----------------------------------------------------
 oracle = sig.get("combined_oracle_hash", "")

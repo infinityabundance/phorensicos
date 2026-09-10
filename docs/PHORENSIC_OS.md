@@ -308,10 +308,13 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → dispatch court (runtime serves calls from the sealed object) → runtime prefers native
 ```
 
-- **Dialect cage** — observes a foreign API surface as a black box. Two targets
-  so far: libc `toupper` (exhaustive `0x00..=0xff`) and libc `memcmp` (a bounded
-  deterministic corpus forcing length, buffers and ordering). No foreign source is
-  read or copied.
+- **Dialect cage** — observes a foreign API surface as a black box. Three targets
+  so far: libc `toupper` (exhaustive `0x00..=0xff`), libc `memcmp` (a bounded
+  deterministic corpus forcing length, buffers and ordering) and libc `memchr`
+  (a bounded deterministic corpus forcing search: first-match index, absent
+  needle, repeated needles, the `n`-boundary, and an exhaustive 256-value needle
+  sweep). `memchr`'s pointer result is normalized to the index, which is the
+  portable part of its contract. No foreign source is read or copied.
 - **Court session** — replays a clean-room native candidate against sealed oracle
   traces and compares exact output/status/effects. The verdict derives from case
   comparisons, not receipt counts, and fails closed.
