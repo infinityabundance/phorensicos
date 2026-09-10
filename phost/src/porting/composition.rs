@@ -51,7 +51,9 @@ pub struct CompositionTarget {
     /// Qualified identity, e.g. `phor:compose:toupper_memchr:c-locale:index:v1`.
     pub id: &'static str,
     pub locale_contract: &'static str,
-    /// The qualified ids of the sealed leaf ports this composition is built from.
+    /// The qualified ids of the sealed ports this composition is built from. These
+    /// may be leaf ports or other compositions (a composition is itself a sealed
+    /// port), which is what makes a nested chain expressible.
     pub stages: &'static [&'static str],
     pub input_schema: &'static str,
     pub output_schema: &'static str,
@@ -684,27 +686,31 @@ mod tests {
     #[test]
     fn test_composition_broken_seal_is_not_a_fallback() {
         use crate::porting::promotion::TrustState;
-        use crate::porting::SealedPortEntry;
+        use crate::porting::{SealedArtifact, SealedPortEntry};
 
         let mut index = SealedPortIndex::new();
         index.insert(SealedPortEntry {
             target: TOUPPER.id.to_string(),
             trust: TrustState::Sealed,
+            artifact: SealedArtifact::leaf_object(
+                String::from("deadbeef"),
+                String::from("/nonexistent/candidate.o"),
+            ),
             oracle_hash: String::new(),
             candidate_behavior_hash: String::new(),
             candidate_source_hash: String::new(),
-            candidate_object_hash: String::from("deadbeef"),
-            candidate_object_path: String::from("/nonexistent/candidate.o"),
             sealed_package: String::new(),
         });
         index.insert(SealedPortEntry {
             target: MEMCHR.id.to_string(),
             trust: TrustState::Sealed,
+            artifact: SealedArtifact::leaf_object(
+                String::from("deadbeef"),
+                String::from("/nonexistent/candidate.o"),
+            ),
             oracle_hash: String::new(),
             candidate_behavior_hash: String::new(),
             candidate_source_hash: String::new(),
-            candidate_object_hash: String::from("deadbeef"),
-            candidate_object_path: String::from("/nonexistent/candidate.o"),
             sealed_package: String::new(),
         });
 

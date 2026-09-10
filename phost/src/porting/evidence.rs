@@ -18,8 +18,10 @@ use std::path::PathBuf;
 use crate::porting::behavior_signature::BehaviorSignature;
 use crate::porting::candidate::CandidateSignature;
 use crate::porting::composition::CompositionVerdict;
+use crate::porting::composition_nested::NestedVerdict;
 use crate::porting::composition_pair::PairVerdict;
 use crate::porting::composition_strlen_memchr::StrlenMemchrVerdict;
+use crate::porting::composition_toupper_each::ToupperEachVerdict;
 use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
@@ -197,6 +199,18 @@ impl CompositionEvidence for StrlenMemchrVerdict {
 }
 
 impl CompositionEvidence for PairVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
+impl CompositionEvidence for ToupperEachVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
+impl CompositionEvidence for NestedVerdict {
     fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
         self.to_json(mismatches)
     }

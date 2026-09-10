@@ -16,7 +16,7 @@
 // error. The runtime must not silently run the foreign implementation when it
 // believes it is running verified native code.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -25,8 +25,10 @@ use crate::porting::exec::{ExecError, SealedObjectHandle};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::promotion::TrustState;
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
-use crate::porting::target::PortTarget;
-use crate::porting::{json_escape, sha256_hex, PortingAuthority, SealedPortEntry, SealedPortIndex};
+use crate::porting::target::{resolve_target, PortTarget};
+use crate::porting::{
+    json_escape, sha256_hex, PortingAuthority, SealedArtifact, SealedPortEntry, SealedPortIndex,
+};
 
 /// Where a dispatched result came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,9 +92,9 @@ pub struct DispatchOutcome {
 }
 
 impl DispatchOutcome {
-    fn fallback(target: &PortTarget, reason: &'static str) -> Self {
+    fn fallback(port_id: &str, reason: &'static str) -> Self {
         Self {
-            target: target.id.to_string(),
+            target: port_id.to_string(),
             source: DispatchSource::ForeignFallback,
             trust: TrustState::Unknown.as_str().to_string(),
             object_hash: String::new(),
@@ -107,9 +109,16 @@ impl DispatchOutcome {
 ///
 /// Objects are loaded (hash-verified and mapped) lazily on first use and reused
 /// afterwards, so steady-state dispatch is a plain indirect call.
+///
+/// A port may be a leaf object or a **composition**; a composition dispatch recurses
+/// through this same dispatcher, so every nested stage is resolved from the same
+/// sealed store.
 pub struct NativeDispatcher {
     index: SealedPortIndex,
     loaded: BTreeMap<String, SealedObjectHandle>,
+    /// Composition port ids actually dispatched through this dispatcher, so a nested
+    /// stage's seal is only reported once it has really been used.
+    dispatched_compositions: BTreeSet<String>,
 }
 
 impl NativeDispatcher {
@@ -117,6 +126,7 @@ impl NativeDispatcher {
         Self {
             index,
             loaded: BTreeMap::new(),
+            dispatched_compositions: BTreeSet::new(),
         }
     }
 
@@ -136,72 +146,145 @@ impl NativeDispatcher {
         self.loaded.len()
     }
 
-    /// The object hash + ELF symbol of the sealed object loaded for `target_id`,
-    /// if it has already been dispatched to (which is how a composition records
-    /// the concrete artifact each stage used).
+    /// The object hash + ELF symbol (leaf) or chain hash + composition marker
+    /// (composition) of the sealed artifact loaded for `target_id`.
+    ///
+    /// A composition has no loaded object, so its binding is the seal it published —
+    /// and it is only reported once the composition has actually been dispatched.
     pub fn sealed_binding(&self, target_id: &str) -> Option<(String, String)> {
-        self.loaded
-            .get(target_id)
-            .map(|h| (h.object_hash.clone(), h.elf_symbol.clone()))
+        if let Some(h) = self.loaded.get(target_id) {
+            return Some((h.object_hash.clone(), h.elf_symbol.clone()));
+        }
+        if self.dispatched_compositions.contains(target_id) {
+            if let Some(entry) = self.index.lookup(target_id) {
+                if let SealedArtifact::Composition {
+                    composition_id,
+                    chain_hash,
+                    ..
+                } = &entry.artifact
+                {
+                    return Some((chain_hash.clone(), format!("compose:{}", composition_id)));
+                }
+            }
+        }
+        None
     }
 
-    /// Dispatch one call for `target`.
+    /// Dispatch one call for `target` (a leaf port).
     pub fn dispatch(
         &mut self,
         target: &PortTarget,
         args: &[Vec<u8>],
         auth: &PortingAuthority,
     ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_port(target.id, args, auth)
+    }
+
+    /// Dispatch one call by qualified **port id**.
+    ///
+    /// A leaf id loads and calls the sealed ELF64 object. A composition id resolves to
+    /// the sealed chain and recurses through this same dispatcher, so a composition is
+    /// consumed like any other sealed port.
+    pub fn dispatch_port(
+        &mut self,
+        port_id: &str,
+        args: &[Vec<u8>],
+        auth: &PortingAuthority,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // No ambient authority: without PORTING the sealed store reveals nothing.
         if !auth.can_observe() {
             return Ok(DispatchOutcome::fallback(
-                target,
+                port_id,
                 "capability denied (no ambient authority)",
             ));
         }
 
-        let entry = match self.index.lookup_gated(target.id, auth) {
+        let entry = match self.index.lookup_gated(port_id, auth) {
             Some(e) => e.clone(),
             None => {
                 return Ok(DispatchOutcome::fallback(
-                    target,
+                    port_id,
                     "no sealed artifact in the store",
                 ))
             }
         };
 
         if entry.trust != TrustState::Sealed {
-            return Ok(DispatchOutcome::fallback(target, "artifact is not sealed"));
+            return Ok(DispatchOutcome::fallback(port_id, "artifact is not sealed"));
         }
 
         // A sealed entry exists: from here on, failure is terminal (fail closed).
-        if !self.loaded.contains_key(target.id) {
-            let handle = SealedObjectHandle::load(
-                target,
-                &entry.candidate_object_path,
-                &entry.candidate_object_hash,
-            )
-            .map_err(|e: ExecError| DispatchError::SealBroken(format!("{}", e)))?;
-            self.loaded.insert(target.id.to_string(), handle);
+        match entry.artifact.clone() {
+            SealedArtifact::LeafObject {
+                object_hash,
+                object_path,
+            } => {
+                let target = resolve_target(port_id).ok_or_else(|| {
+                    DispatchError::SealBroken(format!("no port target for {}", port_id))
+                })?;
+                if !self.loaded.contains_key(port_id) {
+                    let handle = SealedObjectHandle::load(&target, &object_path, &object_hash)
+                        .map_err(|e: ExecError| DispatchError::SealBroken(format!("{}", e)))?;
+                    self.loaded.insert(port_id.to_string(), handle);
+                }
+                let handle = self
+                    .loaded
+                    .get(port_id)
+                    .expect("entry was just inserted or already loaded");
+
+                let output = handle
+                    .call(&target, args)
+                    .map_err(|e| DispatchError::SealBroken(format!("{}", e)))?;
+
+                Ok(DispatchOutcome {
+                    target: port_id.to_string(),
+                    source: DispatchSource::SealedObject,
+                    trust: entry.trust.as_str().to_string(),
+                    object_hash: handle.object_hash.clone(),
+                    elf_symbol: handle.elf_symbol.clone(),
+                    output,
+                    reason: "",
+                })
+            }
+            SealedArtifact::Composition {
+                composition_id,
+                chain_hash,
+                leaves,
+            } => {
+                // The recursion must bottom out in sealed leaves: a composition entry
+                // whose leaves are not themselves sealed is a broken seal.
+                for leaf in &leaves {
+                    let ok = self
+                        .index
+                        .lookup_gated(leaf, auth)
+                        .map(|e| e.trust == TrustState::Sealed)
+                        .unwrap_or(false);
+                    if !ok {
+                        return Err(DispatchError::SealBroken(format!(
+                            "composition {} requires the sealed port {}",
+                            composition_id, leaf
+                        )));
+                    }
+                }
+
+                let runner =
+                    crate::porting::composition_runner(&composition_id).ok_or_else(|| {
+                        DispatchError::SealBroken(format!("unknown composition {}", composition_id))
+                    })?;
+                let output = runner(self, args, auth)?;
+                self.dispatched_compositions.insert(port_id.to_string());
+
+                Ok(DispatchOutcome {
+                    target: port_id.to_string(),
+                    source: DispatchSource::SealedObject,
+                    trust: entry.trust.as_str().to_string(),
+                    object_hash: chain_hash,
+                    elf_symbol: format!("compose:{}", composition_id),
+                    output,
+                    reason: "",
+                })
+            }
         }
-        let handle = self
-            .loaded
-            .get(target.id)
-            .expect("entry was just inserted or already loaded");
-
-        let output = handle
-            .call(target, args)
-            .map_err(|e| DispatchError::SealBroken(format!("{}", e)))?;
-
-        Ok(DispatchOutcome {
-            target: target.id.to_string(),
-            source: DispatchSource::SealedObject,
-            trust: entry.trust.as_str().to_string(),
-            object_hash: handle.object_hash.clone(),
-            elf_symbol: handle.elf_symbol.clone(),
-            output,
-            reason: "",
-        })
     }
 }
 
@@ -413,11 +496,13 @@ mod tests {
         SealedPortEntry {
             target: LIBC_TOUPPER.id.to_string(),
             trust: TrustState::Sealed,
+            artifact: crate::porting::SealedArtifact::leaf_object(
+                hash.to_string(),
+                path.to_string(),
+            ),
             oracle_hash: "oracle".to_string(),
             candidate_behavior_hash: "behavior".to_string(),
             candidate_source_hash: "source".to_string(),
-            candidate_object_hash: hash.to_string(),
-            candidate_object_path: path.to_string(),
             sealed_package: "sealed_package.json".to_string(),
         }
     }

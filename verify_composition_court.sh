@@ -12,14 +12,17 @@
 #                       compare it against the checked-in verdict, without
 #                       touching the committed file.
 #
-#  Three compositions are checked, selected with --target:
+#  Five compositions are checked, selected with --target:
 #
 #    toupper_memchr         (default)  phor:compose:toupper_memchr:c-locale:index:v1
 #    toupper_strlen_memchr            phor:compose:toupper_strlen_memchr:c-locale:index:v1
 #    toupper_strlen_memchr_pair       phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1
+#    toupper_each                     phor:compose:toupper_each:c-locale:u8s:v1
+#    toupper_each_strlen_memchr       phor:compose:toupper_each_strlen_memchr:c-locale:index:v1
 #
-#  Each is built from already-sealed leaf ports and executed entirely through the
-#  sealed dispatcher. This verifier checks:
+#  Each is built from already-sealed ports and executed entirely through the sealed
+#  dispatcher. The last one is **nested**: its fold stage is the sealed composition
+#  `toupper_each`, dispatched through the store. This verifier checks:
 #    * the composition verdict exists and is valid JSON
 #    * every stage was served by the SEALED object for every case: zero foreign
 #      fallback and zero broken seals (a broken seal is never a fallback, and both
@@ -27,13 +30,14 @@
 #    * every case matched the foreign oracle
 #    * the objects the chain dispatched to are exactly the committed sealed leaf
 #      objects (object hash cross-check against the leaf candidate signatures)
+#    * for the nested chain, the recorded nested seal (the fold composition's chain
+#      hash) is exactly the committed `toupper_each` chain hash — a seal of a seal
 #    * the chain hash is present (it covers the intermediates — including, for the
 #      chains with a length stage, the bound the strlen stage derived, and for the
 #      pair chain both indexes — not just the answer)
 #
 #  Usage:
-#    ./verify_composition_court.sh [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair] \
-#                                  [--check-committed] [evidence_dir]
+#    ./verify_composition_court.sh [--target <name>] [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -69,8 +73,16 @@ case "$TARGET" in
         TARGET_ID="phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1"
         EXPECTED_COUNT=474
         ;;
+    toupper_each)
+        TARGET_ID="phor:compose:toupper_each:c-locale:u8s:v1"
+        EXPECTED_COUNT=267
+        ;;
+    toupper_each_strlen_memchr)
+        TARGET_ID="phor:compose:toupper_each_strlen_memchr:c-locale:index:v1"
+        EXPECTED_COUNT=350
+        ;;
     *)
-        echo "ERROR: unknown composition target '$TARGET' (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair)"
+        echo "ERROR: unknown composition target '$TARGET'"
         exit 2
         ;;
 esac
@@ -213,6 +225,34 @@ SPECS = {
             ("memchr(needle A)", "memchr", "memchr"),
         ],
     },
+    "toupper_each": {
+        "stages": ["libc:toupper:c-locale:u8:v1"],
+        "native_keys": ["toupper_native_cases"],
+        "objects": [("toupper(each byte)", "toupper", "toupper")],
+    },
+    "toupper_each_strlen_memchr": {
+        "stages": [
+            "phor:compose:toupper_each:c-locale:u8s:v1",
+            "libc:strlen:c-locale:u64:v1",
+            "libc:memchr:c-locale:index:v1",
+        ],
+        "native_keys": [
+            "fold_hay_native_cases",
+            "strlen_native_cases",
+            "fold_needle_native_cases",
+            "memchr_native_cases",
+        ],
+        # The fold stages dispatch the *composition*, so the only leaf objects to
+        # cross-check are strlen and memchr; the nested seal is checked separately.
+        "objects": [
+            ("strlen(derived bound)", "strlen", "strlen"),
+            ("memchr", "memchr", "memchr"),
+        ],
+        "nested_seal": {
+            "field": "fold_composition_chain_hash",
+            "composition": "toupper_each",
+        },
+    },
 }
 
 spec = SPECS.get(SYMBOL)
@@ -273,6 +313,36 @@ for label, prefix, symbol in spec["objects"]:
         errors.append("%s_elf_symbol is missing or unmangled" % prefix)
     results.append((label, got, leaf))
 
+# A nested composition stage is sealed with the *chain hash* of the composition it
+# dispatches, so verify the recorded value against that composition's committed verdict
+# — a seal of a seal.
+nested = spec.get("nested_seal")
+nested_result = None
+if nested:
+    inner = load(
+        os.path.join(
+            root,
+            "phost",
+            "evidence",
+            "composition",
+            nested["composition"],
+            "composition_verdict.json",
+        ),
+        "%s composition_verdict.json" % nested["composition"],
+    )
+    expected_chain = inner.get("chain_hash", "")
+    got_chain = v.get(nested["field"], "")
+    if not expected_chain:
+        errors.append("committed %s verdict has no chain hash" % nested["composition"])
+    if got_chain != expected_chain:
+        errors.append(
+            "%s (%s) does not match the committed %s chain hash"
+            % (nested["field"], got_chain, nested["composition"])
+        )
+    if v.get("fold_composition_id") != "phor:compose:%s:c-locale:u8s:v1" % nested["composition"]:
+        errors.append("fold_composition_id is not the nested composition id")
+    nested_result = (nested["composition"], got_chain, expected_chain)
+
 # Unique stages, in the order they first appear.
 print("Target: %s" % v.get("target", "?"))
 print("Stages: %s" % " -> ".join(stages))
@@ -290,6 +360,12 @@ for label, got, leaf in results:
         continue
     seen.add(leaf)
     print("%s object: %s" % (label, "MATCH" if got == leaf else "MISMATCH"))
+if nested_result is not None:
+    name, got, expected = nested_result
+    print(
+        "nested %s chain hash: %s"
+        % (name, "MATCH" if got == expected else "MISMATCH")
+    )
 print("Chain hash bound: %s" % ("yes" if v.get("chain_hash") else "no"))
 print("Verdict: %s" % v.get("verdict", "?"))
 

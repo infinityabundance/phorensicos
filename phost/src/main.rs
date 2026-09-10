@@ -205,7 +205,7 @@ fn port_cli(args: &[String]) -> i32 {
             "       phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
         );
         eprintln!(
-            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair] [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
+            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr] [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
         );
         return 2;
     }
@@ -404,8 +404,8 @@ fn native_cli(args: &[String]) -> i32 {
 /// With no positional argument it runs the whole composition corpus through the
 /// sealed chain and writes the composition evidence; with an argument it runs one
 /// composed call and prints each stage. `--target` selects the chain
-/// (`toupper_memchr`, the default, `toupper_strlen_memchr`, or
-/// `toupper_strlen_memchr_pair`, which takes two needles).
+/// (`toupper_memchr`, `toupper_strlen_memchr`, `toupper_strlen_memchr_pair`,
+/// `toupper_each`, or `toupper_each_strlen_memchr`).
 fn compose_cli(args: &[String]) -> i32 {
     use phost::porting::{self, CompositionKind, PortingAuthority};
 
@@ -427,7 +427,7 @@ fn compose_cli(args: &[String]) -> i32 {
                     Some(k) => kind = k,
                     None => {
                         eprintln!(
-                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair)",
+                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr)",
                             args[i + 1]
                         );
                         return 2;
@@ -515,25 +515,26 @@ fn compose_cli(args: &[String]) -> i32 {
                     return 2;
                 }
             };
-            let pair = kind == CompositionKind::ToupperStrlenMemchrPair;
-            let want = if pair { 4 } else { 3 };
+            let (want, usage) = match kind {
+                CompositionKind::ToupperStrlenMemchrPair => {
+                    (4usize, "HAY_HEX:NEEDLE_A_HEX:NEEDLE_B_HEX:N_HEX")
+                }
+                CompositionKind::ToupperEach => (2usize, "BYTES_HEX:N_HEX"),
+                _ => (3usize, "HAY_HEX:NEEDLE_HEX:N_HEX"),
+            };
             if args.len() < want {
-                eprintln!(
-                    "port compose: expected {}",
-                    if pair {
-                        "HAY_HEX:NEEDLE_A_HEX:NEEDLE_B_HEX:N_HEX"
-                    } else {
-                        "HAY_HEX:NEEDLE_HEX:N_HEX"
-                    }
-                );
+                eprintln!("port compose: expected {}", usage);
                 return 2;
             }
             let hay = &args[0];
-            let needle_a = args[1].first().copied().unwrap_or(0);
-            let (needle_b, n_bytes): (u8, &Vec<u8>) = if pair {
-                (args[2].first().copied().unwrap_or(0), &args[3])
-            } else {
-                (0, &args[2])
+            let (needle_a, needle_b, n_bytes): (u8, u8, &Vec<u8>) = match kind {
+                CompositionKind::ToupperStrlenMemchrPair => (
+                    args[1].first().copied().unwrap_or(0),
+                    args[2].first().copied().unwrap_or(0),
+                    &args[3],
+                ),
+                CompositionKind::ToupperEach => (0, 0, &args[1]),
+                _ => (args[1].first().copied().unwrap_or(0), 0, &args[2]),
             };
             let n = u64::from_le_bytes(match n_bytes.as_slice().try_into() {
                 Ok(b) => b,

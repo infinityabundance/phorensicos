@@ -17,8 +17,10 @@ use core::ffi::{c_char, c_int, c_void};
 
 use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
+use crate::porting::composition_nested::COMPOSITION_TOUPPER_EACH_STRLEN_MEMCHR;
 use crate::porting::composition_pair::COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR;
 use crate::porting::composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR;
+use crate::porting::composition_toupper_each::COMPOSITION_TOUPPER_EACH;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
     PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
@@ -280,8 +282,36 @@ pub fn observe_composition_strlen_memchr(
     if !auth.can_observe() {
         return Err(PortError::CapabilityDenied);
     }
+    Ok(folded_search_traces(
+        COMPOSITION_TOUPPER_STRLEN_MEMCHR.id,
+        cases,
+    ))
+}
 
-    Ok(cases
+/// Observe the nested composition `toupper_each ∘ strlen ∘ memchr` through the
+/// **foreign** runtime.
+///
+/// Its oracle is deliberately identical to `toupper_strlen_memchr`'s — same corpus,
+/// same foreign semantics — so the two chains' evidence is directly comparable: any
+/// difference is attributable to the implementation boundary (a sealed composition
+/// dispatched as a stage) rather than to the observable.
+pub fn observe_composition_nested(
+    cases: &[TestCase],
+    auth: &PortingAuthority,
+) -> Result<Vec<OracleTrace>, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+    Ok(folded_search_traces(
+        COMPOSITION_TOUPPER_EACH_STRLEN_MEMCHR.id,
+        cases,
+    ))
+}
+
+/// The shared foreign oracle: fold the haystack, derive the bound with `strlen`,
+/// fold the needle, then `memchr` bounded by the derived length.
+fn folded_search_traces(target_id: &str, cases: &[TestCase]) -> Vec<OracleTrace> {
+    cases
         .iter()
         .map(|case| {
             let hay = case.args.first().cloned().unwrap_or_default();
@@ -320,11 +350,47 @@ pub fn observe_composition_strlen_memchr(
             };
 
             OracleTrace::for_target_id(
-                COMPOSITION_TOUPPER_STRLEN_MEMCHR.id,
-                COMPOSITION_TOUPPER_STRLEN_MEMCHR.locale_contract,
+                target_id,
+                "C",
                 &case.case_id,
                 &case.args,
                 &encode_index(idx),
+                "ok",
+                &["compute"],
+            )
+        })
+        .collect()
+}
+
+/// Observe the map composition `toupper_each` through the **foreign** runtime: run
+/// libc `toupper` (C locale) over each of the first `n` bytes.
+pub fn observe_composition_toupper_each(
+    cases: &[TestCase],
+    auth: &PortingAuthority,
+) -> Result<Vec<OracleTrace>, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+    Ok(cases
+        .iter()
+        .map(|case| {
+            let buf = case.args.first().cloned().unwrap_or_default();
+            let n = case
+                .args
+                .get(1)
+                .map(|x| decode_usize(x))
+                .unwrap_or(0)
+                .min(buf.len());
+            let folded: Vec<u8> = buf[..n]
+                .iter()
+                .map(|&b| unsafe { toupper(b as c_int) as u8 })
+                .collect();
+            OracleTrace::for_target_id(
+                COMPOSITION_TOUPPER_EACH.id,
+                COMPOSITION_TOUPPER_EACH.locale_contract,
+                &case.case_id,
+                &case.args,
+                &folded,
                 "ok",
                 &["compute"],
             )

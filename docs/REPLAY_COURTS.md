@@ -605,8 +605,9 @@ The leaf courts prove a sealed artifact is correct (`exec`), then preferred
 (`dispatch`). The composition courts prove they can be **composed by the
 runtime**: composed targets built from already-sealed ports, executed entirely
 through `NativeDispatcher`, with no foreign calls in the sealed path and no Rust
-mirror consulted. Three chains are sealed: the first two are pipelines, the third is
-a dataflow graph where one derived value feeds two stages.
+mirror consulted. Five chains are sealed: the first three are pipelines / dataflow
+graphs over sealed leaves, and the last two prove that a composition is itself a
+sealed port the store publishes.
 
 ```text
 phor:compose:toupper_memchr:c-locale:index:v1
@@ -758,6 +759,56 @@ The second call is the decisive demo: the haystack folds to `41 00 42 42`, the s
 is found at `0` while needle B, which occurs only *after* the terminator, is correctly
 not found (`Index B: -1`).
 
+#### Composition as a first-class sealed port
+
+A composition is not only something the runtime *runs*; it is something the store
+*publishes*. The port model therefore has two artifact kinds:
+
+```text
+SealedArtifact::LeafObject   { object_hash, object_path }
+SealedArtifact::Composition  { composition_id, chain_hash, leaves }
+```
+
+`NativeDispatcher::dispatch_port(id, args, auth)`:
+
+1. looks the id up in the capability-gated store (leaf or composition);
+2. for a **leaf**, verifies the object hash, maps it once and calls the ABI entry;
+3. for a **composition**, checks that every port in the chain's `leaves` is itself
+   sealed in the same store, resolves the chain runner by id, and recurses through
+   the *same* dispatcher — so nested stages are resolved from the same store and the
+   recursion bottoms out in verified objects;
+4. binds the result to the composition's `chain_hash` (reported by `sealed_binding`
+   only once the composition has actually been dispatched).
+
+An unknown composition id, or a composition whose leaves are not sealed, is a
+`SealBroken` — terminal, never a fallback. So a composition is consumed like any other
+sealed port, and the outer chain holds no fold logic of its own.
+
+`toupper_each` is the map port that makes this useful: `(bytes, n) -> folded bytes`,
+the first sealed port whose output is a buffer rather than a scalar. The nested chain
+`phor:compose:toupper_each_strlen_memchr:c-locale:index:v1` dispatches it twice — once
+over the haystack, once over the needle — and derives its search bound from the sealed
+`strlen`:
+
+```sh
+phost port compose --target toupper_each                       # 267 cases, 311 dispatches
+phost port compose --target toupper_each 616263:0300000000000000            # folded 414243
+phost port compose --target toupper_each_strlen_memchr         # 350 cases, 1400 dispatches
+phost port compose --target toupper_each_strlen_memchr 62006161:41:0400000000000000
+./verify_composition_court.sh --target toupper_each
+./verify_composition_court.sh --target toupper_each --check-committed
+./verify_composition_court.sh --target toupper_each_strlen_memchr
+./verify_composition_court.sh --target toupper_each_strlen_memchr --check-committed
+```
+
+Its corpus and oracle are deliberately identical to `toupper_strlen_memchr`'s, so the
+two chains are a controlled experiment: their `chain_hash`es are **equal**
+(`97fa3999…`). The chain hash is a *behavior* hash over the corpus, so behavioral
+equivalence is exactly what it should report; the implementation boundary is recorded
+separately as `fold_composition_id` + `fold_composition_chain_hash`, and the verifier
+cross-checks that nested seal against the committed `toupper_each` verdict — a seal of
+a seal.
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
@@ -787,7 +838,8 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   behavior_signature, candidate, replay_court,
                                   promotion, evidence, compiled, exec, dispatch,
                                   composition, composition_strlen_memchr,
-                                  composition_pair
+                                  composition_pair, composition_toupper_each,
+                                  composition_nested
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
@@ -800,7 +852,7 @@ phost/evidence/porting/strlen/    strlen evidence set (308 cases) + candidate.o
 phost/evidence/porting/strrchr/   strrchr evidence set (336 cases) + candidate.o
 phost/evidence/composition/      composition verdicts (chains over sealed ports)
 verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr)
-verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair)
+verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr)
 ```
 
 The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are

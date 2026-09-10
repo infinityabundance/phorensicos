@@ -799,18 +799,20 @@ mod tests {
     #[test]
     fn test_composition_broken_seal_is_not_a_fallback() {
         use crate::porting::promotion::TrustState;
-        use crate::porting::SealedPortEntry;
+        use crate::porting::{SealedArtifact, SealedPortEntry};
 
         let mut index = SealedPortIndex::new();
         for target in [TOUPPER, STRLEN, MEMCHR] {
             index.insert(SealedPortEntry {
                 target: target.id.to_string(),
                 trust: TrustState::Sealed,
+                artifact: SealedArtifact::leaf_object(
+                    String::from("deadbeef"),
+                    String::from("/nonexistent/candidate.o"),
+                ),
                 oracle_hash: String::new(),
                 candidate_behavior_hash: String::new(),
                 candidate_source_hash: String::new(),
-                candidate_object_hash: String::from("deadbeef"),
-                candidate_object_path: String::from("/nonexistent/candidate.o"),
                 sealed_package: String::new(),
             });
         }

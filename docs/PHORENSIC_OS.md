@@ -335,20 +335,27 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   artifact the call falls back to the foreign implementation; a *broken seal* is
   terminal and never falls back. The court requires every case to be served
   natively.
-- **Composition court** — proves sealed ports compose. Three composed targets are
-  sealed. `phor:compose:toupper_memchr:c-locale:index:v1` is `toupper` over the
-  haystack and needle followed by `memchr`.
+- **Composition court** — proves sealed ports compose, and that a composition is
+  itself a sealed **port**. Five composed targets are sealed.
+  `phor:compose:toupper_memchr:c-locale:index:v1` is `toupper` over the haystack and
+  needle followed by `memchr`.
   `phor:compose:toupper_strlen_memchr:c-locale:index:v1` adds a third stage whose
   **result becomes the next stage's argument**: the sealed `strlen` derives the
-  search bound and the sealed `memchr` searches exactly that measured prefix, so
-  the chain is a case-insensitive search of a C string.
+  search bound and the sealed `memchr` searches exactly that measured prefix.
   `phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1` shows the
   dependency pattern is not a pipeline: **one derived bound is consumed by two
-  searches**, the second non-adjacent to the stage that produced it, so the runner
-  behaves as a dataflow graph. All three are dispatched entirely through the sealed
-  store with no foreign calls and no Rust mirror. Each verdict records per-stage
-  native/fallback/broken-seal counts and a chain hash over the intermediates —
-  including the derived bound, and for the pair both indexes — not just the answer.
+  searches**, the second non-adjacent to the stage that produced it.
+  `phor:compose:toupper_each:c-locale:u8s:v1` is a buffer-to-buffer map, the first
+  sealed port whose output is a buffer, and
+  `phor:compose:toupper_each_strlen_memchr:c-locale:index:v1` **nests** it as its fold
+  stage. The store therefore publishes two artifact kinds — `LeafObject` and
+  `Composition` — so the dispatcher resolves a composition id to its sealed chain,
+  checks that the chain's leaves are sealed, recurses, and binds the result to the
+  chain hash; an unknown or unbacked composition is a broken seal, never a fallback.
+  All five are dispatched entirely through the sealed store with no foreign calls and
+  no Rust mirror. Each verdict records per-stage native/fallback/broken-seal counts
+  and a chain hash over the intermediates — including the derived bound, for the pair
+  both indexes, and for the nested chain the seal of the composition it dispatched.
 - **Promotion** — advances the candidate to `sealed` only when the replay court,
   the execution court *and* the dispatch court all match exactly, with a complete
   evidence set. Gated by the `PORTING` capability.
