@@ -1,5 +1,7 @@
 # Phorensicos — Phorensic OS
 
+[![Phorensic OS CI](https://github.com/infinityabundance/phorensicos/actions/workflows/ci.yml/badge.svg)](https://github.com/infinityabundance/phorensicos/actions/workflows/ci.yml)
+
 <img src="assets/screen.png" alt="Phorensic OS boot screen: 1024x768 QEMU framebuffer with the boot phase table and compositor window" width="100%">
 
 **Phorensic OS** is a research operating system built around *residual primacy*:
@@ -278,6 +280,12 @@ hosts and containers (the manifest's `asserted_reproducible_evidence`); kernel
 *image* bytes additionally depend on the linker toolchain
 (`nasm`/`ld.lld`/binutils), so they are recorded under
 `observed_toolchain_bound_build` with `asserted_reproducible: false`.
+
+Public CI runs exactly these two commands on a clean checkout: the
+[`ci` workflow](.github/workflows/ci.yml) builds and runs the `host` and `kernel`
+services on every push to `main`, every pull request, and on manual dispatch. There
+is no GitHub-specific logic — the badge above reflects the same containers a
+reviewer runs locally, so the external and local results cannot drift.
 
 ## Current status
 
