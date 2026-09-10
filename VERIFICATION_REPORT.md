@@ -18,8 +18,8 @@
 | Component | Status | Notes |
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
-| `phost` (kernel runtime) | ✅ Builds | 0 errors, 6 warnings |
-| All tests (phost) | ✅ 61/61 pass | 8 serial + 4 kernel + 49 nucleus |
+| `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
+| All tests (phost) | ✅ 57 pass, 4 ignored | 61 total: 8 serial + 4 kernel + 49 nucleus; the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc lib) | ✅ 43/43 pass | Parser/checker/lower/codegen |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -28,7 +28,7 @@
 | `serial` driver | ✅ | UART serial driver with capability model |
 | `status_screen` | ✅ | Boot phase display, progress bar, log messages |
 | `input/keyboard` | ✅ | PS/2 keyboard driver with scancode→ASCII |
-| `.phor` example compilation | ✅ 32/32 files | All examples + demos compile cleanly |
+| `.phor` corpus | ✅ 310/310 → ELF64 | `src/` 232 + `examples/` 44 + `tests/` 34, all emit objects (checker diagnostics may be emitted; see Known Gaps) |
 | `compositor` module | ✅ | Window manager, surface blitting to canvas |
 | `phorc_bridge` | ✅ | Compiler invocation from shell with result parsing |
 | `pub` visibility tracking | ✅ | FnDecl/StructDecl/EnumDecl/ImplBlock/ConstDecl |
@@ -80,14 +80,33 @@ GUI compositor → window manager → surface management → inspector
 | Single-surface render | `render_surface_to_canvas()` for independent surface redrawing |
 | `.phor` live revocation | Driver with periodic trust checks, drift detection, bounded recovery |
 | `.phor` full port demo | 6-stage toupper port: observe->analyze->spec->implement->verify->promote |
-| `.phor` examples | 44/44 files compile cleanly |
+| `.phor` examples | 44/44 files lower to ELF64 objects |
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
 | phost reach | 61 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell |
 
-### Test Results (Last Run: July 4, 2026)
-- phost: 61/61 passed (kernel + serial + compositor tests)
-- phorc: 43/43 passed (all unit tests, 0 warnings)
-- `.phor` compilation: 44/44 files pass
-- `.ph` test files: 46/46 files pass
+### Test Results (reproduced on `main`)
+- phost: 57 passed, 0 failed, 4 ignored (61 total). The ignored tests read
+  privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
+  run them under a kernel harness with `cargo test -- --ignored`.
+- phorc: 43/43 passed (0 warnings).
+- `.phor` corpus: 310/310 files lower to non-empty ELF64 objects
+  (`src/` 232, `examples/` 44, `tests/` 34). These are bootstrap-stage
+  results: the checker still reports diagnostics for constructs outside its
+  current subset, but lowering and ELF emission complete for every file.
+- `.ph` compile-pass fixtures: 46/46 files emit objects.
+
+### Reproduce
+```sh
+cargo test                                       # phorc + phost
+cargo run -p phorc -- examples/hello.phor /tmp/hello.o --emit-receipts --emit-seal
+cargo run -p phorc -- --court-replay /tmp/hello.sealed_package.json
+cd phost_kernel && ./build_kernel.sh             # Multiboot image
+./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
+./verify_evidence.sh evidence                    # 13/13 boot-evidence checks
+./evidence_manifest.sh evidence --update-screenshot
+```
+
+Boot evidence (hashes, ABI address, commands, toolchain) is committed as
+`phost_kernel/evidence_manifest.json`.

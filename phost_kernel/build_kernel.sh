@@ -19,6 +19,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PHORC_DIR="$(dirname "$SCRIPT_DIR")"
+# Absolute host path mounted into the container for the Docker fallback.
+# Resolved from SCRIPT_DIR so the script is not tied to any one machine.
+HOST_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_TRIPLE="x86_64-unknown-none"
 RELEASE_DIR="$PHORC_DIR/target/$TARGET_TRIPLE/release"
 OUTPUT="${1:-$SCRIPT_DIR/phorensic-kernel.elf}"
@@ -54,7 +57,7 @@ if [ "$HAS_NASM" = "yes" ]; then
     run_nasm
 elif [ "$HAS_DOCKER" = "yes" ]; then
     echo "--- Stage 2: Assemble entry stub (Docker) ---"
-    docker run --rm -v "C:\\Code\\PhorensicOS:/work" -w "//work/phost_kernel" \
+    docker run --rm -v "$HOST_ROOT://work" -w //work/phost_kernel \
         debian:trixie-slim bash -c \
         "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq nasm >/dev/null 2>&1 && \
          nasm -f elf64 src/boot/multiboot_entry.asm -o multiboot_entry.o"
@@ -75,8 +78,8 @@ if [ "$HAS_LLD" = "yes" ]; then
     run_link "$RUST_LIB"
 elif [ "$HAS_DOCKER" = "yes" ]; then
     echo "--- Stage 3: Link (Docker ld.lld) ---"
-    CONTAINER_LIB=$(echo "$RUST_LIB" | sed -E 's|^/[a-zA-Z]/Code/PhorensicOS/|/work/|')
-    docker run --rm -v "C:\\Code\\PhorensicOS:/work" -w "//work/phost_kernel" \
+    CONTAINER_LIB="//work/target/$TARGET_TRIPLE/release/libphost_kernel.a"
+    docker run --rm -v "$HOST_ROOT://work" -w //work/phost_kernel \
         debian:trixie-slim bash -c \
         "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq lld binutils >/dev/null 2>&1 && \
          ld.lld -m elf_x86_64 -no-pie -T linker.ld -e _start \
@@ -93,7 +96,7 @@ if [ "$HAS_OBJCOPY" = "yes" ]; then
     objcopy -O binary "$ELF_OUT" "$OUTPUT"
 elif [ "$HAS_DOCKER" = "yes" ]; then
     echo "--- Stage 4: objcopy -O binary (Docker) ---"
-    docker run --rm -v "C:\\Code\\PhorensicOS:/work" \
+    docker run --rm -v "$HOST_ROOT://work" \
         debian:trixie-slim bash -c \
         "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq binutils >/dev/null 2>&1 && \
          objcopy -O binary //work/phost_kernel/$(basename "$ELF_OUT") //work/phost_kernel/$(basename "$OUTPUT")"

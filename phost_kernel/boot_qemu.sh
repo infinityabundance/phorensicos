@@ -12,7 +12,7 @@
 #    fw_cfg.txt       — QEMU monitor: info fw_cfg (kernel blob registered?)
 #    monitor.txt      — full monitor transcript
 #    mem-1m.bin       — guest memory at 0x100000 (kernel loaded?)
-#    fb-abi.bin       — guest memory at 0x108000 (framebuffer ABI written?)
+#    fb-abi.bin       — guest memory at 0x300000 (framebuffer ABI written?)
 #    lfb.bin          — linear framebuffer dump (0xFD000000, 4 MiB)
 #    screen.ppm       — QEMU screendump (what a real display would show)
 #
@@ -74,10 +74,13 @@ sleep "$SECS"
 if exec 3<>/dev/tcp/127.0.0.1/$MON_PORT 2>/dev/null; then
     { cat <&3 > "$OUT/monitor.txt" & } ; CATPID=$!
     printf 'info fw_cfg\n' >&3; sleep 1
-    printf 'pmemsave 0x100000 4096 %s/mem-1m.bin\n' "$OUT" >&3; sleep 1
-    printf 'pmemsave 0x108000 64 %s/fb-abi.bin\n' "$OUT" >&3; sleep 1
-    printf 'pmemsave 0xFD000000 4194304 %s/lfb.bin\n' "$OUT" >&3; sleep 2
-    printf 'screendump %s/screen.ppm\n' "$OUT" >&3; sleep 2
+    # NOTE: filenames must be quoted. QEMU's HMP splits on whitespace and a
+    # bare token starting with '/' is parsed as an expression (division),
+    # which silently drops the dump for absolute output paths.
+    printf 'pmemsave 0x100000 4096 "%s/mem-1m.bin"\n' "$OUT" >&3; sleep 1
+    printf 'pmemsave 0x300000 64 "%s/fb-abi.bin"\n' "$OUT" >&3; sleep 1
+    printf 'pmemsave 0xFD000000 4194304 "%s/lfb.bin"\n' "$OUT" >&3; sleep 2
+    printf 'screendump "%s/screen.ppm"\n' "$OUT" >&3; sleep 2
     printf 'quit\n' >&3; sleep 1
     exec 3>&-
     wait "$CATPID" 2>/dev/null

@@ -10,7 +10,7 @@
 ;   2. Sets a 1024x768x32 linear framebuffer via Bochs VBE ports
 ;      (0x1CE/0x1CF — QEMU std-VGA mode path; QEMU does NOT support
 ;      multiboot video mode itself)
-;   3. Writes the compact 5-field framebuffer ABI at 0x108000
+;   3. Writes the compact 5-field framebuffer ABI at 0x300000
 ;   4. Builds 4GB identity page tables
 ;   5. Transitions to long mode
 ;   6. Zeroes .bss (the flat image carries no .bss content)

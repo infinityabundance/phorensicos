@@ -65,12 +65,18 @@ cd phost_kernel
 rustup target add x86_64-unknown-none   # once
 ./build_kernel.sh                       # staticlib → nasm stub → ld.lld → flat image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8
+./verify_evidence.sh evidence           # proof bytes, ABI @0x300000, screen palette
+./evidence_manifest.sh evidence         # refresh evidence_manifest.json
 cat evidence/serial.log evidence/debug.log
 ```
 
 On a successful boot the kernel writes its proof bytes (`Ph`) to both COM1
 (`0x3F8`) and the QEMU debug port (`0xE9`), and the 1024×768 boot GUI is rendered
-to the linear framebuffer (`evidence/screen.ppm`).
+to the linear framebuffer (`evidence/screen.ppm`). `verify_evidence.sh` checks
+all of that (13 checks) and `evidence_manifest.sh` records the hashes, the
+framebuffer ABI location (`0x300000`) and the exact commands/toolchain used.
+The committed manifest is `phost_kernel/evidence_manifest.json`; the raw dumps
+stay gitignored.
 
 > `phost_kernel` is a `no_std` staticlib cross-compiled for
 > `x86_64-unknown-none`, so it is excluded from the default workspace build. Use
@@ -90,6 +96,7 @@ All numbers below were reproduced on a clean checkout.
 | Court replay | 6 / 6 phases **PASS**, verdict `consistent` |
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
+| Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass** (proof bytes, ABI at `0x300000`, screendump palette, LFB content); manifest committed |
 
 ### Known gaps
 
