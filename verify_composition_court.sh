@@ -12,7 +12,7 @@
 #                       compare it against the checked-in verdict, without
 #                       touching the committed file.
 #
-#  Six compositions are checked, selected with --target:
+#  Seven compositions are checked, selected with --target:
 #
 #    toupper_memchr         (default)  phor:compose:toupper_memchr:c-locale:index:v1
 #    toupper_strlen_memchr            phor:compose:toupper_strlen_memchr:c-locale:index:v1
@@ -20,13 +20,18 @@
 #    toupper_each                     phor:compose:toupper_each:c-locale:u8s:v1
 #    toupper_each_strlen_memchr       phor:compose:toupper_each_strlen_memchr:c-locale:index:v1
 #    toupper_memchr_suffix            phor:compose:toupper_memchr_suffix:c-locale:index:v1
+#    toupper_each_slice_search        phor:compose:toupper_each_slice_search:c-locale:index:v1
 #
 #  Each is built from already-sealed ports and executed entirely through the sealed
-#  dispatcher. The nested one resolves the sealed composition `toupper_each` from the
-#  store. The last is the first chain where a derived value selects a **buffer**: the
-#  folded haystack is sliced at the origin the first `memchr` derived, and its second
-#  search is data-dependent (no origin = no slice = the search is never dispatched),
-#  which the verifier checks as a group rather than as a per-case native count.
+#  dispatcher. The nested ones resolve a sealed **composition** from the store. The
+#  sixth is the first chain where a derived value selects a **buffer**: the folded
+#  haystack is sliced at the origin the first `memchr` derived, and its second search
+#  is data-dependent (no origin = no slice = the search is never dispatched). The
+#  seventh is the first chain where a **composition consumes a derived buffer**: the
+#  nested `toupper_each` produces the folded view, a leaf derives the origin in it,
+#  and the nested `toupper_memchr` consumes the slice — folding it itself, because the
+#  slice is taken from the unfolded haystack. Both data-dependent stages are checked
+#  as a group rather than as a per-case native count.
 #  This verifier checks:
 #    * the composition verdict exists and is valid JSON
 #    * every stage was served by the SEALED object for every case: zero foreign
@@ -35,11 +40,13 @@
 #    * every case matched the foreign oracle
 #    * the objects the chain dispatched to are exactly the committed sealed leaf
 #      objects (object hash cross-check against the leaf candidate signatures)
-#    * for the nested chain, the recorded nested seal (the fold composition's chain
-#      hash) is exactly the committed `toupper_each` chain hash — a seal of a seal
+#    * for a nested chain, every recorded nested seal (the inner composition's chain
+#      hash) is exactly that composition's committed chain hash — a seal of a seal
 #    * the chain hash is present (it covers the intermediates — including, for the
-#      chains with a length stage, the bound the strlen stage derived, and for the
-#      pair chain both indexes — not just the answer)
+#      chains with a length stage, the bound the strlen stage derived, for the pair
+#      chain both indexes, for the suffix chain the derived origin, and for the
+#      slice-search chain the origin and the slice the consumer composition received
+#      — not just the answer)
 #
 #  Usage:
 #    ./verify_composition_court.sh [--target <name>] [--check-committed] [evidence_dir]
@@ -87,6 +94,10 @@ case "$TARGET" in
         ;;
     toupper_memchr_suffix)
         TARGET_ID="phor:compose:toupper_memchr_suffix:c-locale:index:v1"
+        EXPECTED_COUNT=688
+        ;;
+    toupper_each_slice_search)
+        TARGET_ID="phor:compose:toupper_each_slice_search:c-locale:index:v1"
         EXPECTED_COUNT=688
         ;;
     *)
@@ -256,10 +267,14 @@ SPECS = {
             ("strlen(derived bound)", "strlen", "strlen"),
             ("memchr", "memchr", "memchr"),
         ],
-        "nested_seal": {
-            "field": "fold_composition_chain_hash",
-            "composition": "toupper_each",
-        },
+        "nested_seals": [
+            {
+                "field": "fold_composition_chain_hash",
+                "composition": "toupper_each",
+                "id_field": "fold_composition_id",
+                "id": "phor:compose:toupper_each:c-locale:u8s:v1",
+            },
+        ],
     },
     "toupper_memchr_suffix": {
         "stages": [
@@ -278,9 +293,48 @@ SPECS = {
         "native_key_groups": [
             (["memchr_b_native_cases", "memchr_b_not_reached_cases"], 688),
         ],
+        "data_dependent": ("memchr_b_native_cases", "memchr_b_not_reached_cases"),
         "objects": [
             ("toupper(haystack)", "toupper", "toupper"),
             ("memchr(origin)", "memchr", "memchr"),
+        ],
+    },
+    "toupper_each_slice_search": {
+        "stages": [
+            "phor:compose:toupper_each:c-locale:u8s:v1",
+            "libc:memchr:c-locale:index:v1",
+            "phor:compose:toupper_memchr:c-locale:index:v1",
+        ],
+        # The two folds and the origin search run on every case; the consumer
+        # composition is data-dependent, so its two accounts are checked as a group.
+        "native_keys": [
+            "fold_hay_native_cases",
+            "fold_needle_a_native_cases",
+            "memchr_a_native_cases",
+        ],
+        "native_key_groups": [
+            (["search_native_cases", "search_not_reached_cases"], 688),
+        ],
+        "data_dependent": ("search_native_cases", "search_not_reached_cases"),
+        # The folds dispatch the *composition* toupper_each and the slice stage the
+        # *composition* toupper_memchr, so the only leaf object to cross-check is
+        # memchr; both nested seals are checked separately — a seal of a seal.
+        "objects": [
+            ("memchr(origin)", "memchr", "memchr"),
+        ],
+        "nested_seals": [
+            {
+                "field": "fold_composition_chain_hash",
+                "composition": "toupper_each",
+                "id_field": "fold_composition_id",
+                "id": "phor:compose:toupper_each:c-locale:u8s:v1",
+            },
+            {
+                "field": "search_composition_chain_hash",
+                "composition": "toupper_memchr",
+                "id_field": "search_composition_id",
+                "id": "phor:compose:toupper_memchr:c-locale:index:v1",
+            },
         ],
     },
 }
@@ -313,13 +367,12 @@ for keys, total in spec.get("native_key_groups", []):
         errors.append(
             "%s != %d (a data-dependent stage is unaccounted for)" % ("+".join(keys), total)
         )
-if v.get("memchr_b_not_reached_cases") is not None:
-    ran = v.get("memchr_b_native_cases")
-    skipped = v.get("memchr_b_not_reached_cases")
-    if not (ran > 0 and skipped > 0):
+if spec.get("data_dependent"):
+    ran, skipped = spec["data_dependent"]
+    if not (v.get(ran, 0) > 0 and v.get(skipped, 0) > 0):
         errors.append(
-            "the suffix search was not exercised both ways (ran %s, not reached %s)"
-            % (ran, skipped)
+            "the %s stage was not exercised both ways (ran %s, not reached %s)"
+            % (ran, v.get(ran), v.get(skipped))
         )
 if v.get("fallback_cases") != 0:
     errors.append("fallback_cases != 0 (foreign fallback in the sealed path)")
@@ -359,11 +412,10 @@ for label, prefix, symbol in spec["objects"]:
     results.append((label, got, leaf))
 
 # A nested composition stage is sealed with the *chain hash* of the composition it
-# dispatches, so verify the recorded value against that composition's committed verdict
-# — a seal of a seal.
-nested = spec.get("nested_seal")
-nested_result = None
-if nested:
+# dispatches, so verify each recorded value against that composition's committed
+# verdict — a seal of a seal.
+nested_results = []
+for nested in spec.get("nested_seals", []):
     inner = load(
         os.path.join(
             root,
@@ -384,9 +436,9 @@ if nested:
             "%s (%s) does not match the committed %s chain hash"
             % (nested["field"], got_chain, nested["composition"])
         )
-    if v.get("fold_composition_id") != "phor:compose:%s:c-locale:u8s:v1" % nested["composition"]:
-        errors.append("fold_composition_id is not the nested composition id")
-    nested_result = (nested["composition"], got_chain, expected_chain)
+    if v.get(nested["id_field"]) != nested["id"]:
+        errors.append("%s is not the nested composition id" % nested["id_field"])
+    nested_results.append((nested["composition"], got_chain, expected_chain))
 
 # Unique stages, in the order they first appear.
 print("Target: %s" % v.get("target", "?"))
@@ -407,12 +459,12 @@ for label, got, leaf in results:
         continue
     seen.add(leaf)
     print("%s object: %s" % (label, "MATCH" if got == leaf else "MISMATCH"))
-if nested_result is not None:
-    name, got, expected = nested_result
-    print(
-        "nested %s chain hash: %s"
-        % (name, "MATCH" if got == expected else "MISMATCH")
-    )
+if nested_results:
+    for name, got, expected in nested_results:
+        print(
+            "nested %s chain hash: %s"
+            % (name, "MATCH" if got == expected else "MISMATCH")
+        )
 print("Chain hash bound: %s" % ("yes" if v.get("chain_hash") else "no"))
 print("Verdict: %s" % v.get("verdict", "?"))
 

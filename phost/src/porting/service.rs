@@ -12,7 +12,7 @@
 // and `session` evidence records `store_loads: 1` alongside the call count.
 //
 // A session is a deterministic plan: it serves every sealed port in the store
-// (five leaves and five compositions) with a fixed argument and a recorded
+// (six leaves and seven compositions) with a fixed argument and a recorded
 // expected result, then reports the fan-in — how many consumers each port served.
 
 use alloc::collections::BTreeMap;
@@ -321,6 +321,22 @@ pub fn session_plan() -> Vec<SessionCall> {
             ],
             expect_hex: "03000000",
         },
+        // The slice-search chain: the nested `toupper_each` folds the haystack to
+        // "BAXB"; needleA 'a' -> origin 1; the derived slice "axb" is handed to the
+        // nested `toupper_memchr`, which folds it to "AXB" and finds 'b' at offset 2,
+        // so the absolute index is 3.
+        SessionCall {
+            label: "toupper_each_slice_search(\"baxb\",'a','b',4)",
+            port: crate::porting::composition_slice_search::COMPOSITION_TOUPPER_EACH_SLICE_SEARCH
+                .id,
+            args: alloc::vec![
+                alloc::vec![0x62, 0x61, 0x78, 0x62],
+                alloc::vec![0x61],
+                alloc::vec![0x62],
+                n8(4)
+            ],
+            expect_hex: "03000000",
+        },
     ]
 }
 
@@ -512,7 +528,7 @@ mod tests {
     fn test_session_plan_covers_every_sealed_port() {
         let plan = session_plan();
         let ports: Vec<&str> = plan.iter().map(|c| c.port).collect();
-        assert_eq!(ports.len(), 12, "the plan serves every sealed port once");
+        assert_eq!(ports.len(), 13, "the plan serves every sealed port once");
         assert_eq!(
             ports.iter().filter(|p| p.starts_with("libc:")).count(),
             5,
@@ -528,8 +544,8 @@ mod tests {
                 .iter()
                 .filter(|p| p.starts_with("phor:compose:"))
                 .count(),
-            6,
-            "six compositions"
+            7,
+            "seven compositions"
         );
         for c in &plan {
             assert!(!c.args.is_empty(), "{} has arguments", c.label);
@@ -586,19 +602,31 @@ mod tests {
             crate::porting::CompositionKind::ToupperEach,
             crate::porting::CompositionKind::ToupperEachStrlenMemchr,
             crate::porting::CompositionKind::ToupperMemchrSuffix,
+            crate::porting::CompositionKind::ToupperEachSliceSearch,
         ] {
             let n = v.per_port.get(kind.target_id()).copied().unwrap_or(0);
             assert!(n >= 1, "{} was not served by the service", kind.target_id());
         }
-        // The nested chain consumes the sealed **composition** `toupper_each` twice
-        // (fold the haystack, fold the needle) on top of its own top-level call — a
-        // composition consumed by another composition, from the same index.
+        // The slice-search chain consumes the sealed **composition** `toupper_memchr`
+        // as well as `toupper_each`: a composition consumed by another composition,
+        // from the same index. `toupper_each` therefore serves its own call plus the
+        // two fold stages of each nested chain.
         let each = v
             .per_port
             .get(crate::porting::CompositionKind::ToupperEach.target_id())
             .copied()
             .unwrap_or(0);
         assert!(each >= 3, "toupper_each resolutions were {}", each);
+        let memchr_comp = v
+            .per_port
+            .get(crate::porting::CompositionKind::ToupperMemchr.target_id())
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            memchr_comp >= 2,
+            "toupper_memchr resolutions were {}",
+            memchr_comp
+        );
     }
 
     #[test]

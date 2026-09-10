@@ -203,7 +203,7 @@ fn port_cli(args: &[String]) -> i32 {
         );
         eprintln!("       phost port native <symbol> [ARGS_HEX] [--no-capability] [--store PATH]");
         eprintln!(
-            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr] [ARGS_HEX] [--no-capability] [--store|--derive] [--out DIR] [--phorc PATH]"
+            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix|toupper_each_slice_search] [ARGS_HEX] [--no-capability] [--store|--derive] [--out DIR] [--phorc PATH]"
         );
         eprintln!("       phost port store [--check|--write] [PATH]");
         eprintln!("       phost port session [--out DIR] [--no-capability]");
@@ -413,7 +413,8 @@ fn native_cli(args: &[String]) -> i32 {
 /// sealed chain and writes the composition evidence; with an argument it runs one
 /// composed call and prints each stage. `--target` selects the chain
 /// (`toupper_memchr`, `toupper_strlen_memchr`, `toupper_strlen_memchr_pair`,
-/// `toupper_each`, or `toupper_each_strlen_memchr`).
+/// `toupper_each`, `toupper_each_strlen_memchr`, `toupper_memchr_suffix`, or
+/// `toupper_each_slice_search`).
 ///
 /// The court **derives** the seal by default (it compiles the leaves and replays
 /// nested chains); `--store` makes it load the seal from the committed persistent
@@ -449,7 +450,7 @@ fn compose_cli(args: &[String]) -> i32 {
                     Some(k) => kind = k,
                     None => {
                         eprintln!(
-                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix)",
+                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix|toupper_each_slice_search)",
                             args[i + 1]
                         );
                         return 2;
@@ -555,6 +556,9 @@ fn compose_cli(args: &[String]) -> i32 {
                 CompositionKind::ToupperMemchrSuffix => {
                     (4usize, "HAY_HEX:NEEDLE_A_HEX:NEEDLE_B_HEX:N_HEX")
                 }
+                CompositionKind::ToupperEachSliceSearch => {
+                    (4usize, "HAY_HEX:NEEDLE_A_HEX:NEEDLE_B_HEX:N_HEX")
+                }
                 CompositionKind::ToupperEach => (2usize, "BYTES_HEX:N_HEX"),
                 _ => (3usize, "HAY_HEX:NEEDLE_HEX:N_HEX"),
             };
@@ -564,13 +568,13 @@ fn compose_cli(args: &[String]) -> i32 {
             }
             let hay = &args[0];
             let (needle_a, needle_b, n_bytes): (u8, u8, &Vec<u8>) = match kind {
-                CompositionKind::ToupperStrlenMemchrPair | CompositionKind::ToupperMemchrSuffix => {
-                    (
-                        args[1].first().copied().unwrap_or(0),
-                        args[2].first().copied().unwrap_or(0),
-                        &args[3],
-                    )
-                }
+                CompositionKind::ToupperStrlenMemchrPair
+                | CompositionKind::ToupperMemchrSuffix
+                | CompositionKind::ToupperEachSliceSearch => (
+                    args[1].first().copied().unwrap_or(0),
+                    args[2].first().copied().unwrap_or(0),
+                    &args[3],
+                ),
                 CompositionKind::ToupperEach => (0, 0, &args[1]),
                 _ => (args[1].first().copied().unwrap_or(0), 0, &args[2]),
             };
@@ -591,6 +595,9 @@ fn compose_cli(args: &[String]) -> i32 {
                         println!("{:<22} {}", format!("{}:", label), status);
                     }
                     println!("Haystack norm: {}", hex_encode(&c.hay_norm));
+                    if let Some(slice) = &c.slice {
+                        println!("Slice consumed: {}", hex_encode(slice));
+                    }
                     println!(
                         "Derived bound: {}",
                         c.derived_len

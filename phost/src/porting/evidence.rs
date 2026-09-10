@@ -20,6 +20,7 @@ use crate::porting::candidate::CandidateSignature;
 use crate::porting::composition::CompositionVerdict;
 use crate::porting::composition_nested::NestedVerdict;
 use crate::porting::composition_pair::PairVerdict;
+use crate::porting::composition_slice_search::SliceSearchVerdict;
 use crate::porting::composition_strlen_memchr::StrlenMemchrVerdict;
 use crate::porting::composition_suffix::SuffixVerdict;
 use crate::porting::composition_toupper_each::ToupperEachVerdict;
@@ -220,6 +221,12 @@ impl CompositionEvidence for NestedVerdict {
 }
 
 impl CompositionEvidence for SuffixVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
+impl CompositionEvidence for SliceSearchVerdict {
     fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
         self.to_json(mismatches)
     }

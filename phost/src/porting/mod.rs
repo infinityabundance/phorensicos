@@ -35,6 +35,7 @@ pub mod compiled;
 pub mod composition;
 pub mod composition_nested;
 pub mod composition_pair;
+pub mod composition_slice_search;
 pub mod composition_strlen_memchr;
 pub mod composition_suffix;
 pub mod composition_toupper_each;
@@ -87,6 +88,9 @@ pub fn composition_runner(id: &str) -> Option<CompositionRunner> {
     }
     if id == composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id {
         return Some(composition_suffix::run_chain_encoded);
+    }
+    if id == composition_slice_search::COMPOSITION_TOUPPER_EACH_SLICE_SEARCH.id {
+        return Some(composition_slice_search::run_chain_encoded);
     }
     if id == composition_toupper_each::COMPOSITION_TOUPPER_EACH.id {
         return Some(composition_toupper_each::run_chain_encoded);
@@ -829,6 +833,12 @@ pub enum CompositionKind {
     /// selects a **buffer**: the folded haystack is sliced at the origin the first
     /// `memchr` derived, and the second `memchr` searches that slice.
     ToupperMemchrSuffix,
+    /// `toupper_each ∘ memchr ∘ slice ∘ toupper_memchr` — the first chain where a
+    /// sealed **composition consumes a buffer another composition selected**: the
+    /// nested `toupper_each` produces the folded view, a leaf derives the origin in
+    /// it, and the nested `toupper_memchr` consumes the derived slice — folding it
+    /// itself, because the slice is taken from the *unfolded* haystack.
+    ToupperEachSliceSearch,
 }
 
 const TOUPPER_MEMCHR_LEAVES: [PortTarget; 2] = [target::LIBC_TOUPPER, target::LIBC_MEMCHR];
@@ -852,10 +862,22 @@ const TOUPPER_EACH_STRLEN_MEMCHR_LEAVES: [PortTarget; 3] = [
 ];
 /// The slice chain dispatches `toupper` (the fold) and `memchr` (both searches).
 const TOUPPER_MEMCHR_SUFFIX_LEAVES: [PortTarget; 2] = [target::LIBC_TOUPPER, target::LIBC_MEMCHR];
+/// The slice-search chain dispatches the leaf `memchr` directly (the origin search)
+/// and delegates its folds and its suffix search to nested compositions, which
+/// resolve the `toupper` and `memchr` leaves through the same index.
+const TOUPPER_EACH_SLICE_SEARCH_LEAVES: [PortTarget; 2] =
+    [target::LIBC_TOUPPER, target::LIBC_MEMCHR];
 
 /// The nested ports `toupper_each_strlen_memchr` dispatches as stages.
 const NESTED_OF_TOUPPER_EACH_STRLEN_MEMCHR: [CompositionTarget; 1] =
     [composition_toupper_each::COMPOSITION_TOUPPER_EACH];
+
+/// The nested ports `toupper_each_slice_search` dispatches as stages: the fold that
+/// produces the buffer, and the composition that consumes the derived slice.
+const NESTED_OF_TOUPPER_EACH_SLICE_SEARCH: [CompositionTarget; 2] = [
+    composition_toupper_each::COMPOSITION_TOUPPER_EACH,
+    composition::COMPOSITION_TOUPPER_MEMCHR,
+];
 
 impl CompositionKind {
     /// Parse a short name or a qualified composition id.
@@ -886,6 +908,11 @@ impl CompositionKind {
         {
             return Some(CompositionKind::ToupperMemchrSuffix);
         }
+        if name == "toupper_each_slice_search"
+            || name == composition_slice_search::COMPOSITION_TOUPPER_EACH_SLICE_SEARCH.id
+        {
+            return Some(CompositionKind::ToupperEachSliceSearch);
+        }
         None
     }
 
@@ -897,6 +924,7 @@ impl CompositionKind {
             CompositionKind::ToupperEach => "toupper_each",
             CompositionKind::ToupperEachStrlenMemchr => "toupper_each_strlen_memchr",
             CompositionKind::ToupperMemchrSuffix => "toupper_memchr_suffix",
+            CompositionKind::ToupperEachSliceSearch => "toupper_each_slice_search",
         }
     }
 
@@ -915,6 +943,9 @@ impl CompositionKind {
             }
             CompositionKind::ToupperMemchrSuffix => {
                 composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id
+            }
+            CompositionKind::ToupperEachSliceSearch => {
+                composition_slice_search::COMPOSITION_TOUPPER_EACH_SLICE_SEARCH.id
             }
         }
     }
@@ -936,6 +967,9 @@ impl CompositionKind {
             CompositionKind::ToupperMemchrSuffix => {
                 "phost/evidence/composition/toupper_memchr_suffix"
             }
+            CompositionKind::ToupperEachSliceSearch => {
+                "phost/evidence/composition/toupper_each_slice_search"
+            }
         }
     }
 
@@ -947,6 +981,7 @@ impl CompositionKind {
             CompositionKind::ToupperEach => &TOUPPER_EACH_LEAVES,
             CompositionKind::ToupperEachStrlenMemchr => &TOUPPER_EACH_STRLEN_MEMCHR_LEAVES,
             CompositionKind::ToupperMemchrSuffix => &TOUPPER_MEMCHR_SUFFIX_LEAVES,
+            CompositionKind::ToupperEachSliceSearch => &TOUPPER_EACH_SLICE_SEARCH_LEAVES,
         }
     }
 
@@ -954,6 +989,7 @@ impl CompositionKind {
     fn nested_compositions(&self) -> &'static [CompositionTarget] {
         match self {
             CompositionKind::ToupperEachStrlenMemchr => &NESTED_OF_TOUPPER_EACH_STRLEN_MEMCHR,
+            CompositionKind::ToupperEachSliceSearch => &NESTED_OF_TOUPPER_EACH_SLICE_SEARCH,
             _ => &[],
         }
     }
@@ -1078,6 +1114,18 @@ fn nested_composition_chain_hash(
             let cases = composition_toupper_each::composition_corpus();
             let traces = dialect_cage::observe_composition_toupper_each(&cases, auth)?;
             let (v, _) = composition_toupper_each::run_composition_court(&traces, &index, auth);
+            if !v.is_sealed_eligible() {
+                return Err(PortError::Execution(format!(
+                    "nested composition {} is not internally consistent",
+                    composition_id
+                )));
+            }
+            Ok(v.chain_hash)
+        }
+        CompositionKind::ToupperMemchr => {
+            let cases = composition::composition_corpus();
+            let traces = dialect_cage::observe_composition(&cases, auth)?;
+            let (v, _) = composition::run_composition_court(&traces, &index, auth);
             if !v.is_sealed_eligible() {
                 return Err(PortError::Execution(format!(
                     "nested composition {} is not internally consistent",
@@ -1456,6 +1504,66 @@ pub fn run_composition_court(
                 evidence_dir,
             })
         }
+        CompositionKind::ToupperEachSliceSearch => {
+            let cases = composition_slice_search::composition_corpus();
+            let traces = dialect_cage::observe_composition_suffix(&cases, auth)?;
+            let (v, m) = composition_slice_search::run_composition_court(&traces, &index, auth);
+            let evidence_dir = evidence::write_composition_evidence(out_dir, &traces, &v, &m)
+                .map_err(|e| PortError::Io(format!("{}", e)))?;
+
+            Ok(CompositionReport {
+                target: v.target.clone(),
+                stages: v.stages.clone(),
+                cases_run: v.cases_run,
+                stage_reports: alloc::vec![
+                    StageReport {
+                        label: String::from("fold(haystack) [composition]"),
+                        leaf: v.fold_composition_id.clone(),
+                        native_cases: v.fold_hay_native_cases,
+                        object_hash: v.fold_composition_chain_hash.clone(),
+                        elf_symbol: format!("compose:{}", v.fold_composition_id),
+                    },
+                    StageReport {
+                        label: String::from("fold(needle A) [composition]"),
+                        leaf: v.fold_composition_id.clone(),
+                        native_cases: v.fold_needle_a_native_cases,
+                        object_hash: v.fold_composition_chain_hash.clone(),
+                        elf_symbol: format!("compose:{}", v.fold_composition_id),
+                    },
+                    StageReport {
+                        label: String::from("memchr(origin)"),
+                        leaf: target::LIBC_MEMCHR.id.to_string(),
+                        native_cases: v.memchr_a_native_cases,
+                        object_hash: v.memchr_object_hash.clone(),
+                        elf_symbol: v.memchr_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        // The derived slice is consumed by a sealed *composition*,
+                        // which folds it and searches it — the outer runner holds no
+                        // fold logic here.
+                        label: String::from("search(slice) [composition]"),
+                        leaf: v.search_composition_id.clone(),
+                        native_cases: v.search_native_cases,
+                        object_hash: v.search_composition_chain_hash.clone(),
+                        elf_symbol: format!("compose:{}", v.search_composition_id),
+                    },
+                ],
+                notes: alloc::vec![format!(
+                    "search(slice) is data-dependent: it did not run on {} of {} cases (needleA absent, so no origin and no slice)",
+                    v.search_not_reached_cases, v.cases_run
+                )],
+                fallback_cases: v.fallback_cases,
+                broken_seal_cases: v.broken_seal_cases,
+                cases_passed: v.cases_passed,
+                cases_failed: v.cases_failed,
+                dispatches_run: v.dispatches_run,
+                oracle_hash: v.oracle_hash.clone(),
+                chain_hash: v.chain_hash.clone(),
+                verdict: v.verdict.as_str().to_string(),
+                sealed: v.is_sealed_eligible(),
+                evidence_dir,
+            })
+        }
     }
 }
 
@@ -1468,6 +1576,9 @@ pub struct CompositionCallReport {
     pub hay_norm: Vec<u8>,
     /// The bound a `strlen` stage derived, when the chain has one.
     pub derived_len: Option<usize>,
+    /// The buffer a derived origin selected for a composition to consume, when the
+    /// chain has one.
+    pub slice: Option<Vec<u8>>,
     /// `(label, folded needle)` per needle the chain folds.
     pub needles: Vec<(String, Option<u8>)>,
     /// `(label, index)` per search result the chain produces.
@@ -1510,6 +1621,7 @@ pub fn run_composition_call(
                 ],
                 hay_norm: c.hay_norm,
                 derived_len: None,
+                slice: None,
                 needles: alloc::vec![(String::from("Needle"), c.needle_norm)],
                 indexes: alloc::vec![(String::from("Index"), c.index)],
                 dispatches: c.dispatches,
@@ -1535,6 +1647,7 @@ pub fn run_composition_call(
                 ],
                 hay_norm: c.hay_norm,
                 derived_len: c.derived_len,
+                slice: None,
                 needles: alloc::vec![(String::from("Needle"), c.needle_norm)],
                 indexes: alloc::vec![(String::from("Index"), c.index)],
                 dispatches: c.dispatches,
@@ -1572,6 +1685,7 @@ pub fn run_composition_call(
                 ],
                 hay_norm: c.hay_norm,
                 derived_len: c.derived_len,
+                slice: None,
                 needles: alloc::vec![
                     (String::from("Needle A"), c.needle_a_norm),
                     (String::from("Needle B"), c.needle_b_norm),
@@ -1592,6 +1706,7 @@ pub fn run_composition_call(
                 stages: alloc::vec![(String::from("toupper(each byte)"), String::from(c.stage))],
                 hay_norm: c.folded,
                 derived_len: None,
+                slice: None,
                 needles: alloc::vec::Vec::new(),
                 indexes: alloc::vec::Vec::new(),
                 dispatches: c.dispatches,
@@ -1620,6 +1735,7 @@ pub fn run_composition_call(
                 ],
                 hay_norm: c.hay_norm,
                 derived_len: c.derived_len,
+                slice: None,
                 needles: alloc::vec![(String::from("Needle"), c.needle_norm)],
                 indexes: alloc::vec![(String::from("Index"), c.index)],
                 dispatches: c.dispatches,
@@ -1647,10 +1763,47 @@ pub fn run_composition_call(
                 ],
                 hay_norm: c.hay_norm,
                 derived_len: None,
+                slice: None,
                 needles: alloc::vec![
                     (String::from("Needle A"), c.needle_a_norm),
                     (String::from("Needle B"), c.needle_b_norm),
                 ],
+                indexes: alloc::vec![
+                    (String::from("Origin"), c.origin),
+                    (String::from("Suffix offset"), c.suffix_index),
+                    (String::from("Index"), c.index),
+                ],
+                dispatches: c.dispatches,
+            })
+        }
+        CompositionKind::ToupperEachSliceSearch => {
+            let c = composition_slice_search::run_composition_call(
+                &index, hay, needle_a, needle_b, n, auth,
+            );
+            Ok(CompositionCallReport {
+                target: composition_slice_search::COMPOSITION_TOUPPER_EACH_SLICE_SEARCH
+                    .id
+                    .to_string(),
+                stages: alloc::vec![
+                    (
+                        String::from("fold(haystack) [composition]"),
+                        String::from(c.fold_hay_stage)
+                    ),
+                    (
+                        String::from("memchr(origin)"),
+                        String::from(c.memchr_a_stage)
+                    ),
+                    // "-" when needleA was absent, so no slice existed and the
+                    // consumer composition was never dispatched.
+                    (
+                        String::from("search(slice) [composition]"),
+                        String::from(c.search_stage)
+                    ),
+                ],
+                hay_norm: c.hay_norm,
+                derived_len: None,
+                slice: Some(c.slice),
+                needles: alloc::vec![(String::from("Needle A"), c.needle_a_norm)],
                 indexes: alloc::vec![
                     (String::from("Origin"), c.origin),
                     (String::from("Suffix offset"), c.suffix_index),

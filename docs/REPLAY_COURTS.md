@@ -714,10 +714,11 @@ The leaf courts prove a sealed artifact is correct (`exec`), then preferred
 (`dispatch`). The composition courts prove they can be **composed by the
 runtime**: composed targets built from already-sealed ports, executed entirely
 through `NativeDispatcher`, with no foreign calls in the sealed path and no Rust
-mirror consulted. Six chains are sealed: the first three are pipelines / dataflow
+mirror consulted. Seven chains are sealed: the first three are pipelines / dataflow
 graphs over sealed leaves, the next two prove that a composition is itself a
-sealed port the store publishes, and the sixth is the first where a derived value
-selects a *buffer* rather than a bound.
+sealed port the store publishes, the sixth is the first where a derived value
+selects a *buffer* rather than a bound, and the seventh is the first where a
+sealed **composition consumes a buffer another composition selected**.
 
 ```text
 phor:compose:toupper_memchr:c-locale:index:v1
@@ -953,6 +954,59 @@ not reported as a native run of a stage that did not happen.
 `chain_hash` covers the folded haystack, the derived origin, the suffix offset and the
 final index.
 
+### The derived-buffer chain: a composition consumes a buffer another composition selected
+
+`composition_slice_search` adds the seventh chain and the last shape in the dataflow
+vocabulary. In every earlier chain a stage reads a caller argument or a slice of a
+**leaf** fold the runner performed; here the buffer is produced by one sealed
+composition and consumed by another.
+
+```text
+phor:compose:toupper_each_slice_search:c-locale:index:v1
+
+  input:  haystack, needleA, needleB, n
+  stages: phor:compose:toupper_each (fold the haystack) -> H'
+          libc:memchr (derive the origin i in H')
+          SLICE the ORIGINAL haystack at i -> S
+          phor:compose:toupper_memchr (consume S; fold it and search) -> j
+  output: i32 absolute index (i + j), or -1
+```
+
+Two things make it a new shape rather than a re-labelling of the sixth chain:
+
+- **The buffer the second half reads is the one the first half selected**, and it is
+handed to `toupper_memchr` as that composition's *haystack*. The outer runner holds
+no fold or search of its own.
+- **The consumer must fold the slice itself.** The slice is taken from the *unfolded*
+haystack, so a chain that handed the raw slice to a bare `memchr` with a folded
+needle would miss every lowercase match in the suffix. A test asserts at least 50 of
+the 688 cases falsify that shape, so the composition is load-bearing rather than
+decorative.
+
+The corpus, oracle and observable are deliberately the same as
+`toupper_memchr_suffix`'s — a controlled experiment: the committed **oracle hash is
+identical** (`8c354e38…`), while the implementation boundary is recorded separately as
+two nested seals. The verdict adds `fold_composition_id`/
+`fold_composition_chain_hash` (`toupper_each`, `196940c2…`) and
+`search_composition_id`/`search_composition_chain_hash` (`toupper_memchr`,
+`d00bdf26…`), each cross-checked by the verifier against the committed inner verdict —
+a seal of a seal. Its `chain_hash` covers the folded haystack, the derived origin, the
+**slice handed to the consumer composition**, the suffix offset and the final index.
+
+Reproduce:
+
+```sh
+phost port compose --target toupper_each_slice_search                    # 688 cases
+phost port compose --target toupper_each_slice_search 62617862:61:62:0400000000000000
+./verify_composition_court.sh --target toupper_each_slice_search
+./verify_composition_court.sh --target toupper_each_slice_search --check-committed
+```
+
+The second call is the decisive demo: `baxb` folds to `BAXB`, needleA `a` gives origin
+`1`, so the buffer handed to `toupper_memchr` is the **unfolded** slice `617862`
+(`axb`) — which the composition folds to `AXB` before finding `b` at offset `2`, for
+the absolute index `3`. A chain that searched the raw slice would report `-1`.
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
@@ -979,7 +1033,7 @@ revealed.
 
 Deriving a seal is the court's job; **loading** one is the runtime's. The store
 index `phost/evidence/store/index.json` is a committed artifact that names every
-sealed port — six leaf object hashes and six composition chain hashes — so a
+sealed port — six leaf object hashes and seven composition chain hashes — so a
 call site can resolve a seal without invoking `phorc` and without replaying an
 oracle.
 
@@ -1030,20 +1084,22 @@ A **session** is the deterministic plan — `session_plan()` — that serves eve
 sealed port in the store once, with a recorded expected result:
 
 ```text
-five leaves          six compositions
-store loads:     1   ports: 12   calls: 12 native   fallback: 0   broken: 0
-objects mapped:  6   dispatches: 53
-fan-in:  toupper 30  memchr 8  strlen 4  memcmp 1  strrchr 1
-         toupper_each 3 (own call + nested chain's two fold stages)
+six leaves          seven compositions
+store loads:     1   ports: 13   calls: 13 native   fallback: 0   broken: 0
+objects mapped:  6   dispatches: 68
+fan-in:  toupper 39  memchr 10  strlen 4  memcmp 1  strrchr 1
+         toupper_each 5 (own call + four nested fold stages)
+         toupper_memchr 2 (own call + the slice-search chain's stage)
 ```
 
 `dispatches` and `per_port` count every `dispatch_port` resolution, including the
 stages a chain dispatches from inside its own runner — that is what makes the
-fan-in visible rather than just "ten calls".
+fan-in visible rather than just "thirteen calls".
 
 Every composition in the store is also a **dispatchable port**: `composition_runner`
-resolves all five chain ids, so `dispatch_port` on `phor:compose:toupper_memchr:…`
-returns its chain output. A cycle in the composition graph is rejected when the
+resolves all seven chain ids, so `dispatch_port` on `phor:compose:toupper_memchr:…`
+returns its chain output — and the nested chains resolve the sealed compositions
+`toupper_each` and `toupper_memchr`. A cycle in the composition graph is rejected when the
 store loads (`StoreError::CompositionCycle`), because resolving a chain recurses
 through the index and a cycle could never terminate.
 
@@ -1055,7 +1111,8 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   promotion, evidence, compiled, exec, dispatch,
                                   composition, composition_strlen_memchr,
                                   composition_pair, composition_toupper_each,
-                                  composition_nested, composition_suffix, store,
+                                  composition_nested, composition_suffix,
+                                  composition_slice_search, store,
                                   json, service, cross_impl
 phost/foreign/musl_probe.c        the second-implementation observer (musl-gcc -static)
 phost/evidence/store/index.json   persistent store: every sealed port (leaf objects
@@ -1064,7 +1121,7 @@ phost/evidence/session/           session verdict (one load, many consumers)
 phost/evidence/cross/             cross-implementation verdicts (one per sealed leaf)
 verify_store.sh                   persistent store verifier (load, regenerate,
                                   independent recompilation, no-compiler runtime)
-verify_session.sh                 sealed native service verifier (one load, twelve
+verify_session.sh                 sealed native service verifier (one load, thirteen
                                   ports, six objects, fan-in, fail-closed)
 verify_cross_implementation.sh    cross-implementation verifier (rebuilds the musl
                                   probe, checks independence, all six leaves)
@@ -1088,7 +1145,7 @@ phost/evidence/porting/strspn/    strspn evidence set (578 cases, POSIX) + candi
 phost/evidence/composition/      composition verdicts (chains over sealed ports)
 phost/evidence/cross/            cross-implementation verdicts (one per sealed leaf)
 verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr|strspn)
-verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix)
+verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix|toupper_each_slice_search)
 verify_store.sh                   persistent store verifier
 verify_cross_implementation.sh    cross-implementation verifier
 ```

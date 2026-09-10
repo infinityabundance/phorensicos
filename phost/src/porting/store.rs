@@ -50,13 +50,14 @@ const LEAF_SYMBOLS: [&str; 6] = ["toupper", "memcmp", "memchr", "strlen", "strrc
 
 /// The compositions the store covers, in dependency order (a nested chain's inner
 /// composition is emitted before the chain that consumes it).
-const COMPOSITION_NAMES: [&str; 6] = [
+const COMPOSITION_NAMES: [&str; 7] = [
     "toupper_memchr",
     "toupper_strlen_memchr",
     "toupper_strlen_memchr_pair",
     "toupper_each",
     "toupper_each_strlen_memchr",
     "toupper_memchr_suffix",
+    "toupper_each_slice_search",
 ];
 
 /// Every way the store can fail to verify. All of them are terminal: the loader

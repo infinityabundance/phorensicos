@@ -164,6 +164,7 @@ EXPECTED_COMPOSITIONS = {
     "toupper_each": "phor:compose:toupper_each:c-locale:u8s:v1",
     "toupper_each_strlen_memchr": "phor:compose:toupper_each_strlen_memchr:c-locale:index:v1",
     "toupper_memchr_suffix": "phor:compose:toupper_memchr_suffix:c-locale:index:v1",
+    "toupper_each_slice_search": "phor:compose:toupper_each_slice_search:c-locale:index:v1",
 }
 
 expected_targets = set(EXPECTED_LEAVES) | set(EXPECTED_COMPOSITIONS.values())

@@ -341,7 +341,7 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   terminal and never falls back. The court requires every case to be served
   natively.
 - **Composition court** — proves sealed ports compose, and that a composition is
-  itself a sealed **port**. Six composed targets are sealed.
+  itself a sealed **port**. Seven composed targets are sealed.
   `phor:compose:toupper_memchr:c-locale:index:v1` is `toupper` over the haystack and
   needle followed by `memchr`.
   `phor:compose:toupper_strlen_memchr:c-locale:index:v1` adds a third stage whose
@@ -351,26 +351,32 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   dependency pattern is not a pipeline: **one derived bound is consumed by two
   searches**, the second non-adjacent to the stage that produced it.
   `phor:compose:toupper_each:c-locale:u8s:v1` is a buffer-to-buffer map, the first
-  sealed port whose output is a buffer, and
+  sealed port whose output is a buffer,
   `phor:compose:toupper_each_strlen_memchr:c-locale:index:v1` **nests** it as its fold
-  stage, and `phor:compose:toupper_memchr_suffix:c-locale:index:v1` is the first chain
-  where a derived value selects a **buffer**: the folded haystack is sliced at the origin
+  stage, `phor:compose:toupper_memchr_suffix:c-locale:index:v1` is the first chain
+  where a derived value selects a **buffer** (the folded haystack is sliced at the origin
   the first `memchr` derived, the second search reads that slice, and with no origin that
-  search is skipped entirely rather than run over the wrong window. The store therefore
+  search is skipped entirely rather than run over the wrong window), and
+  `phor:compose:toupper_each_slice_search:c-locale:index:v1` is the first chain where a
+  sealed **composition consumes a buffer another composition selected**: `toupper_each`
+  produces the folded view, a leaf derives the origin in it, and `toupper_memchr`
+  consumes the derived slice — folding it itself, because the slice is taken from the
+  unfolded haystack. The store therefore
   publishes two artifact kinds — `LeafObject` and
   `Composition` — so the dispatcher resolves a composition id to its sealed chain,
   checks that the chain's leaves are sealed, recurses, and binds the result to the
   chain hash; an unknown or unbacked composition is a broken seal, never a fallback.
-  All six are dispatched entirely through the sealed store with no foreign calls and
+  All seven are dispatched entirely through the sealed store with no foreign calls and
   no Rust mirror. Each verdict records per-stage native/fallback/broken-seal counts
   and a chain hash over the intermediates — including the derived bound, for the pair
-  both indexes, and for the nested chain the seal of the composition it dispatched.
+  both indexes, for the nested chain the seal of the composition it dispatched, and for
+  the slice-search chain the origin and the slice the consumer composition received.
 - **Promotion** — advances the candidate to `sealed` only when the replay court,
   the execution court *and* the dispatch court all match exactly, with a complete
   evidence set. Gated by the `PORTING` capability.
 - **Persistent store** — the seal is a committed artifact, not something the
   runtime recomputes. `phost/evidence/store/index.json` names every sealed port
-  (six leaf object hashes, six composition chain hashes) and loading it verifies
+  (six leaf object hashes, seven composition chain hashes) and loading it verifies
   each entry: leaf object bytes must hash to their seal, every composition stage
   must be a sealed entry, and the document's residual hash must cover its entries.
   It fails closed — a missing or broken entry is an error, never a partial store —
@@ -395,10 +401,10 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 - **Sealed native service** — one verified load, many consumers. The service owns
   an index for its lifetime; `open` is the only place with a store path, so a call
   cannot re-read it. A deterministic session serves every sealed port in the store
-  (six leaves, six compositions) through that one service: twelve ports from six
+  (six leaves, seven compositions) through that one service: thirteen ports from six
   mapped objects, with `per_port` resolution counts that make the fan-in explicit
-  (`toupper` serves 30 resolutions once nested stages are counted, `memchr` 8) and
-  `toupper_each` consumed three times. Every composition in the index is a
+  (`toupper` serves 39 resolutions once nested stages are counted, `memchr` 10) and
+  `toupper_each` consumed five times. Every composition in the index is a
   dispatchable port, and a composition cycle is rejected at load, since resolving a
   chain recurses through the index.
 

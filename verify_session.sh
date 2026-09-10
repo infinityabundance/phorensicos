@@ -9,13 +9,13 @@
 #
 #  This verifier checks the committed session residual
 #  (phost/evidence/session/session_verdict.json) and proves:
-#    * the store is loaded exactly ONCE (`store_loads == 1`) for twelve calls
-#    * every planned call was served by a sealed object: 12 native, 0 foreign
+#    * the store is loaded exactly ONCE (`store_loads == 1`) for thirteen calls
+#    * every planned call was served by a sealed object: 13 native, 0 foreign
 #      fallback, 0 broken seals
-#    * twelve ports resolve to SIX mapped objects — one seal reused by many consumers
-#    * the fan-in is real: `toupper` serves 30 resolutions, `memchr` 8, `strlen` 4
-#      (nested stage resolutions included), and `toupper_each` is consumed 3 times
-#      (its own call plus the nested chain's two fold stages)
+#    * thirteen ports resolve to SIX mapped objects — one seal reused by many consumers
+#    * the fan-in is real: `toupper` serves 39 resolutions, `memchr` 10, `strlen` 4
+#      (nested stage resolutions included), `toupper_each` is consumed 5 times and
+#      `toupper_memchr` twice (its own call plus the slice-search chain's stage)
 #    * the session residual hash covers the reported fields
 #    * the session names the committed store and its residual hash
 #    * a fresh run is byte-identical to the checked-in verdict
@@ -148,10 +148,10 @@ if v.get("store_loads") != 1:
 if v.get("ports_in_store") != len(store.get("entries", [])):
     errors.append("ports_in_store != the committed store entry count")
 
-if v.get("calls") != 12:
-    errors.append("calls != 12")
-if v.get("native_calls") != 12:
-    errors.append("native_calls != 12 (a port was not served by a sealed object)")
+if v.get("calls") != 13:
+    errors.append("calls != 13")
+if v.get("native_calls") != 13:
+    errors.append("native_calls != 13 (a port was not served by a sealed object)")
 if v.get("fallback_calls") != 0:
     errors.append("fallback_calls != 0 (a foreign fallback entered the sealed path)")
 if v.get("broken_seal_calls") != 0:
@@ -161,25 +161,26 @@ if v.get("mismatches"):
 if v.get("verdict") != "consistent":
     errors.append("verdict != consistent")
 
-# Ten ports, five objects: the leaves are mapped once and reused.
+# Thirteen ports, six objects: the leaves are mapped once and reused.
 if v.get("objects_mapped") != 6:
     errors.append("objects_mapped != 6 (sealed objects were not reused)")
 
 # Every sealed port in the store must have been served, and the fan-in must be
 # the one the plan implies (nested stage resolutions included).
 EXPECTED_FANIN = {
-    "libc:toupper:c-locale:u8:v1": 30,
-    "libc:memchr:c-locale:index:v1": 8,
+    "libc:toupper:c-locale:u8:v1": 39,
+    "libc:memchr:c-locale:index:v1": 10,
     "libc:strlen:c-locale:u64:v1": 4,
     "libc:memcmp:c-locale:sign:v1": 1,
     "libc:strrchr:c-locale:index:v1": 1,
     "posix:strspn:c-locale:u64:v1": 1,
-    "phor:compose:toupper_memchr:c-locale:index:v1": 1,
+    "phor:compose:toupper_memchr:c-locale:index:v1": 2,
     "phor:compose:toupper_strlen_memchr:c-locale:index:v1": 1,
     "phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1": 1,
-    "phor:compose:toupper_each:c-locale:u8s:v1": 3,
+    "phor:compose:toupper_each:c-locale:u8s:v1": 5,
     "phor:compose:toupper_each_strlen_memchr:c-locale:index:v1": 1,
     "phor:compose:toupper_memchr_suffix:c-locale:index:v1": 1,
+    "phor:compose:toupper_each_slice_search:c-locale:index:v1": 1,
 }
 per_port = v.get("per_port", {})
 if set(per_port) != set(EXPECTED_FANIN):
