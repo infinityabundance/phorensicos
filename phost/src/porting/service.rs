@@ -208,9 +208,9 @@ fn n8(n: usize) -> Vec<u8> {
 
 /// The deterministic session plan: every sealed port in the store, once.
 ///
-/// The five leaves come first, then the five compositions. Because the
+/// The five leaves come first, then the compositions. Because the
 /// compositions resolve to the same leaves, a full session maps **five** objects
-/// and serves **ten** ports — that reuse is the point.
+/// and serves every port — that reuse is the point.
 pub fn session_plan() -> Vec<SessionCall> {
     alloc::vec![
         // ---- leaves ----
@@ -295,6 +295,20 @@ pub fn session_plan() -> Vec<SessionCall> {
                 n8(4)
             ],
             expect_hex: "01000000",
+        },
+        // The slice chain: "baxb" folds to "BAXB"; needleA 'a' -> origin 1; the
+        // suffix "AXB" searched for 'b' -> offset 2; the absolute index is 3.
+        // A chain that searched the caller's window would report the 'b' at 0.
+        SessionCall {
+            label: "toupper_memchr_suffix(\"baxb\",'a','b',4)",
+            port: crate::porting::composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id,
+            args: alloc::vec![
+                alloc::vec![0x62, 0x61, 0x78, 0x62],
+                alloc::vec![0x61],
+                alloc::vec![0x62],
+                n8(4)
+            ],
+            expect_hex: "03000000",
         },
     ]
 }
@@ -487,7 +501,7 @@ mod tests {
     fn test_session_plan_covers_every_sealed_port() {
         let plan = session_plan();
         let ports: Vec<&str> = plan.iter().map(|c| c.port).collect();
-        assert_eq!(ports.len(), 10, "the plan serves every sealed port once");
+        assert_eq!(ports.len(), 11, "the plan serves every sealed port once");
         assert_eq!(
             ports.iter().filter(|p| p.starts_with("libc:")).count(),
             5,
@@ -498,8 +512,8 @@ mod tests {
                 .iter()
                 .filter(|p| p.starts_with("phor:compose:"))
                 .count(),
-            5,
-            "five compositions"
+            6,
+            "six compositions"
         );
         for c in &plan {
             assert!(!c.args.is_empty(), "{} has arguments", c.label);
@@ -522,11 +536,11 @@ mod tests {
         assert!(mismatches.is_empty(), "{:?}", mismatches);
         assert!(v.is_consistent());
         assert_eq!(v.store_loads, 1);
-        assert_eq!(v.calls, 10);
-        assert_eq!(v.native_calls, 10);
+        assert_eq!(v.calls, session_plan().len() as u64);
+        assert_eq!(v.native_calls, v.calls);
         assert_eq!(v.fallback_calls, 0);
         assert_eq!(v.broken_seal_calls, 0);
-        assert_eq!(v.ports_in_store, 10);
+        assert_eq!(v.ports_in_store, v.calls as usize);
         // Ten ports, five objects: the leaves are mapped once and reused by every
         // chain that consumes them.
         assert_eq!(v.objects_mapped, 5);
@@ -555,6 +569,7 @@ mod tests {
             crate::porting::CompositionKind::ToupperStrlenMemchrPair,
             crate::porting::CompositionKind::ToupperEach,
             crate::porting::CompositionKind::ToupperEachStrlenMemchr,
+            crate::porting::CompositionKind::ToupperMemchrSuffix,
         ] {
             let n = v.per_port.get(kind.target_id()).copied().unwrap_or(0);
             assert!(n >= 1, "{} was not served by the service", kind.target_id());

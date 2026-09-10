@@ -442,7 +442,7 @@ fn compose_cli(args: &[String]) -> i32 {
                     Some(k) => kind = k,
                     None => {
                         eprintln!(
-                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr)",
+                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix)",
                             args[i + 1]
                         );
                         return 2;
@@ -515,6 +515,9 @@ fn compose_cli(args: &[String]) -> i32 {
                 println!("Oracle hash:   {}", r.oracle_hash);
                 println!("Verdict:       {}", r.verdict);
                 println!("Sealed:        {}", if r.sealed { "yes" } else { "no" });
+                for note in &r.notes {
+                    println!("Note:          {}", note);
+                }
                 println!(
                     "Index source:  {}",
                     match index_source {
@@ -542,6 +545,9 @@ fn compose_cli(args: &[String]) -> i32 {
                 CompositionKind::ToupperStrlenMemchrPair => {
                     (4usize, "HAY_HEX:NEEDLE_A_HEX:NEEDLE_B_HEX:N_HEX")
                 }
+                CompositionKind::ToupperMemchrSuffix => {
+                    (4usize, "HAY_HEX:NEEDLE_A_HEX:NEEDLE_B_HEX:N_HEX")
+                }
                 CompositionKind::ToupperEach => (2usize, "BYTES_HEX:N_HEX"),
                 _ => (3usize, "HAY_HEX:NEEDLE_HEX:N_HEX"),
             };
@@ -551,11 +557,13 @@ fn compose_cli(args: &[String]) -> i32 {
             }
             let hay = &args[0];
             let (needle_a, needle_b, n_bytes): (u8, u8, &Vec<u8>) = match kind {
-                CompositionKind::ToupperStrlenMemchrPair => (
-                    args[1].first().copied().unwrap_or(0),
-                    args[2].first().copied().unwrap_or(0),
-                    &args[3],
-                ),
+                CompositionKind::ToupperStrlenMemchrPair | CompositionKind::ToupperMemchrSuffix => {
+                    (
+                        args[1].first().copied().unwrap_or(0),
+                        args[2].first().copied().unwrap_or(0),
+                        &args[3],
+                    )
+                }
                 CompositionKind::ToupperEach => (0, 0, &args[1]),
                 _ => (args[1].first().copied().unwrap_or(0), 0, &args[2]),
             };

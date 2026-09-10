@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 207 pass, 4 ignored | 211 total: 150 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
+| All tests (phost) | ✅ 217 pass, 4 ignored | 221 total: 160 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -87,7 +87,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 207 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + five sealed composition courts (incl. a nested one) + persistent sealed port store + sealed native service |
+| phost reach | 217 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + six sealed composition courts (incl. a nested one and a buffer-slicing one) + persistent sealed port store + sealed native service |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -298,7 +298,7 @@ kept one search's bound live but re-derived or reused the caller's `n` for the o
 cannot pass. `chain_hash` covers the derived bound and both indexes. Bound in
 `phost/evidence/composition/toupper_strlen_memchr_pair/composition_verdict.json`.
 
-#### Chains 4 and 5: composition as a first-class sealed port
+#### Chains 4, 5 and 6: composition as a first-class sealed port
 
 The first three chains are built from sealed *leaves*. These two close the loop: a
 composition is itself a sealed port the store publishes and another chain dispatches.
@@ -339,6 +339,50 @@ implementation boundary is recorded separately (`fold_composition_id` +
 Bound in `phost/evidence/composition/toupper_each/composition_verdict.json` and
 `phost/evidence/composition/toupper_each_strlen_memchr/composition_verdict.json`.
 
+#### Chain 6: `toupper ∘ memchr ∘ slice ∘ memchr` — a derived value selects a buffer
+
+The first five chains derive a **scalar**: a length used as a search bound. A bound
+narrows how far a search looks, but every stage still reads the same buffer from the
+same origin. This chain derives an **origin**: the folded haystack is sliced at the
+index the first `memchr` returned, and the second `memchr` searches the suffix.
+
+```text
+phor:compose:toupper_memchr_suffix:c-locale:index:v1
+
+  input:  haystack, needleA, needleB, n
+  oracle: foreign toupper over the haystack -> H',
+          foreign memchr of H' for folded needleA, bounded by n -> i,
+          and only if that matched, foreign memchr of H'[i..] for folded
+          needleB, bounded by n - i -> j, reporting i + j or -1
+```
+
+| Aspect | Result |
+|--------|--------|
+| Corpus | 688 cases (needleB before the origin, needleB in the suffix, needleA absent, origin at 0, identical needles, the n-boundary, both exhaustive 0..=255 needle sweeps, the edge bytes) |
+| Cases passed | **688 / 0 failed** |
+| Stage accounts | fold 688 ✔, needleA fold 688 ✔, needleB fold 688 ✔, `memchr` origin 688 ✔ |
+| Suffix search | **data-dependent**: ran natively on **434**, never reached on **254** (needleA absent, so no origin and no slice) — the two accounts cover every case |
+| Foreign fallback | **0** |
+| Broken seal | **0** |
+| Dispatches | 7654 |
+| Chain hash | `feabc0067db6e908e4a21a0b3b7dbd273529564e849b0657a57ee3b6812bfd80` |
+| Oracle hash | `8c354e3801dd656689747aae557ed5eaaf7debce5eb6c0b273bd2fd83192ed9a` |
+| Verdict | `consistent` |
+
+The corpus is built so a chain without the slice *fails*, not merely differs:
+
+- Group `B` (28 cases) has needleB at index 0 and needleA later, with no needleB in the
+  suffix. The answer is `-1`; a chain that searched the caller's window would find the
+  `b` at 0 and return `0`. The tests assert a window-searching chain disagrees with the
+  foreign oracle on at least 80 cases.
+- Groups `A` (56 cases) place needleB both **before** and **in** the suffix, so the
+  sliced answer is `i + (j_in_suffix)` — strictly greater than the window answer.
+
+The `chain_hash` covers the derived origin, the suffix offset and the final index, so a
+chain that skipped the slice but landed on the same answer still differs.
+
+Bound in `phost/evidence/composition/toupper_memchr_suffix/composition_verdict.json`.
+
 ### Persistent Sealed Port Store
 
 The courts derive a seal; the runtime loads one. `phost/evidence/store/index.json`
@@ -347,7 +391,7 @@ loads and verifies it.
 
 | Aspect | Result |
 |--------|--------|
-| Ports covered | 10 — 5 leaf objects (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`) and 5 compositions (incl. the nested `toupper_each_strlen_memchr`) |
+| Ports covered | 11 — 5 leaf objects (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`) and 6 compositions (incl. the nested `toupper_each_strlen_memchr` and the buffer-slicing `toupper_memchr_suffix`) |
 | Leaf artifact | the committed `candidate.o` bytes; its SHA-256 equals the recorded `object_hash` and the committed `candidate_signature.json` object hash |
 | Composition artifact | the `chain_hash` read from the committed `composition_verdict.json` — not re-derived by re-running the inner court |
 | Load verification | schema + residual hash; unique sealed targets; object bytes hashed against the seal; composition stages resolved in the same store; **fails closed** on any failure |
@@ -356,7 +400,7 @@ loads and verifies it.
 | Independent recompilation | `verify_store.sh` recompiles each `.phor` candidate with `phorc` and requires byte-equality with the committed object |
 | Commit policy | the leaf `candidate.o` files are committed (the seal *is* the object's bytes); `candidate.receipts.json` and the large composition oracle traces stay generated |
 
-Store residual hash: `81fa3b3a74fab1d9cd9865b5ab7ca4e459312562e0be50e07bed85f3c45a5b94`.
+Store residual hash: `8277a1d52a5bacf80b95656aad01ac0b4b003d5595e7593796ad11ff6b6a0290`.
 
 ```sh
 ./verify_store.sh
@@ -372,16 +416,16 @@ lifetime, so no call re-reads the store.
 | Aspect | Result |
 |--------|--------|
 | Store loads | **1** for the whole session (the type has no store access after `open`) |
-| Ports served | **10** — the five leaves and the five compositions, each once |
-| Calls | 10 native, **0** foreign fallback, **0** broken seals |
+| Ports served | **11** — the five leaves and the six compositions, each once |
+| Calls | 11 native, **0** foreign fallback, **0** broken seals |
 | Objects mapped | **5** — the leaf objects are mapped once and reused by every chain |
-| Sealed-port resolutions | **43**, including the stages a chain dispatches from inside its runner |
-| Fan-in | `toupper` **24**, `memchr` **6**, `strlen` **4**, `memcmp` **1**, `strrchr` **1**; `toupper_each` **3** (its own call plus the nested chain's two fold stages); the other chains **1** |
+| Sealed-port resolutions | **52**, including the stages a chain dispatches from inside its runner |
+| Fan-in | `toupper` **30**, `memchr` **8**, `strlen` **4**, `memcmp` **1**, `strrchr` **1**; `toupper_each` **3** (its own call plus the nested chain's two fold stages); the other chains **1** |
 | Every port dispatchable | `composition_runner` resolves all five chain ids, so `dispatch_port` on a composition runs the sealed chain — and the nested chain resolves the sealed composition `toupper_each` through the same index |
 | Cycle safety | a composition cycle in the index is rejected at load (recurring through the index could never terminate) |
 | Independent of path | the same verdict reproduces from a copy of the store at another path |
 
-Session hash: `04fd6affd7ac1a332cdb30a39e224be89df73c75c09ce054ea1e3937105ab80f`.
+Session hash: `878f67066341a019ab18ffe5af97ffe49faab9eef384df543b1e7683bbabe181`.
 Evidence: `phost/evidence/session/session_verdict.json`.
 
 ```sh
@@ -389,7 +433,7 @@ Evidence: `phost/evidence/session/session_verdict.json`.
 ```
 
 ### Test Results (reproduced on `main`)
-- phost: 207 passed, 0 failed, 4 ignored (211 total). The ignored tests read
+- phost: 217 passed, 0 failed, 4 ignored (221 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -425,6 +469,8 @@ cargo run -p phost -- port compose --target toupper_strlen_memchr   # compositio
 cargo run -p phost -- port compose --target toupper_strlen_memchr_pair  # composition court (474)
 cargo run -p phost -- port compose --target toupper_each            # map court (267)
 cargo run -p phost -- port compose --target toupper_each_strlen_memchr  # nested court (350)
+cargo run -p phost -- port compose --target toupper_memchr_suffix       # slice court (688)
+cargo run -p phost -- port compose --target toupper_memchr_suffix 62617862:61:62:0400000000000000
 ./verify_jit_porting_court.sh --target toupper                    # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
@@ -441,6 +487,8 @@ cargo run -p phost -- port compose --target toupper_each_strlen_memchr  # nested
 ./verify_composition_court.sh --target toupper_each --check-committed
 ./verify_composition_court.sh --target toupper_each_strlen_memchr     # composition #5 (350)
 ./verify_composition_court.sh --target toupper_each_strlen_memchr --check-committed
+./verify_composition_court.sh --target toupper_memchr_suffix          # composition #6 (688)
+./verify_composition_court.sh --target toupper_memchr_suffix --check-committed
 # The store-backed composition court: no compiler, no nested replay.
 cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
 cargo run -p phost -- port compose --target toupper_each_strlen_memchr --store --phorc /nonexistent/phorc

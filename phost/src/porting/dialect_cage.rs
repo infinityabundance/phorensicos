@@ -20,6 +20,7 @@ use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
 use crate::porting::composition_nested::COMPOSITION_TOUPPER_EACH_STRLEN_MEMCHR;
 use crate::porting::composition_pair::COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR;
 use crate::porting::composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR;
+use crate::porting::composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX;
 use crate::porting::composition_toupper_each::COMPOSITION_TOUPPER_EACH;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
@@ -468,6 +469,87 @@ pub fn observe_composition_pair(
                 &case.case_id,
                 &case.args,
                 &output,
+                "ok",
+                &["compute"],
+            )
+        })
+        .collect())
+}
+
+/// Observe the composition `toupper ∘ memchr ∘ slice ∘ memchr` through the
+/// **foreign** runtime.
+///
+/// This is the first oracle whose dataflow *slices a buffer*: foreign `memchr`
+/// derives an origin, the folded haystack is sliced at that origin, and the second
+/// foreign `memchr` runs over the slice — not over the caller's window. The slice
+/// is expressed literally (the base pointer advances), so the oracle has no
+/// "bound-only" fallback interpretation.
+pub fn observe_composition_suffix(
+    cases: &[TestCase],
+    auth: &PortingAuthority,
+) -> Result<Vec<OracleTrace>, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+
+    Ok(cases
+        .iter()
+        .map(|case| {
+            let hay = case.args.first().cloned().unwrap_or_default();
+            let needle_a = case
+                .args
+                .get(1)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(0);
+            let needle_b = case
+                .args
+                .get(2)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(0);
+            let n = case
+                .args
+                .get(3)
+                .map(|x| decode_usize(x))
+                .unwrap_or(0)
+                .min(hay.len());
+
+            // Stage 1-3: foreign C-locale `toupper` over the haystack and both needles.
+            let folded: Vec<u8> = hay
+                .iter()
+                .map(|&b| unsafe { toupper(b as c_int) as u8 })
+                .collect();
+            let folded_a = unsafe { toupper(needle_a as c_int) as u8 };
+            let folded_b = unsafe { toupper(needle_b as c_int) as u8 };
+
+            // Stage 4: foreign `memchr` of the first `n` bytes -> the origin.
+            let base = folded.as_ptr();
+            let found_a = unsafe { memchr(base as *const c_void, folded_a as c_int, n) };
+
+            let index: i32 = if found_a.is_null() {
+                -1
+            } else {
+                let origin = found_a as usize - base as usize;
+                // Stage 5: SLICE the folded haystack at the origin, keeping the
+                // caller's window end. Stage 6: search that slice.
+                let suffix = unsafe { base.add(origin) };
+                let suffix_len = n - origin;
+                let found_b =
+                    unsafe { memchr(suffix as *const c_void, folded_b as c_int, suffix_len) };
+                if found_b.is_null() {
+                    -1
+                } else {
+                    (origin + (found_b as usize - suffix as usize)) as i32
+                }
+            };
+
+            OracleTrace::for_target_id(
+                COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id,
+                COMPOSITION_TOUPPER_MEMCHR_SUFFIX.locale_contract,
+                &case.case_id,
+                &case.args,
+                &encode_index(index),
                 "ok",
                 &["compute"],
             )

@@ -21,6 +21,7 @@ use crate::porting::composition::CompositionVerdict;
 use crate::porting::composition_nested::NestedVerdict;
 use crate::porting::composition_pair::PairVerdict;
 use crate::porting::composition_strlen_memchr::StrlenMemchrVerdict;
+use crate::porting::composition_suffix::SuffixVerdict;
 use crate::porting::composition_toupper_each::ToupperEachVerdict;
 use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
@@ -212,6 +213,12 @@ impl CompositionEvidence for ToupperEachVerdict {
 }
 
 impl CompositionEvidence for NestedVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
+impl CompositionEvidence for SuffixVerdict {
     fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
         self.to_json(mismatches)
     }

@@ -18,6 +18,8 @@
 #      compilation of its `.phor` source (the object *is* the promoted artifact)
 #    * every composition entry's `chain_hash` equals the committed
 #      `composition_verdict.json` chain hash, and its `leaves` are all in the store
+#    * the composition graph is acyclic (resolving a chain recurses through the
+#      index, so a cycle is rejected as data)
 #    * the index regenerates byte-identically from committed evidence (written to
 #      a temp path; the committed file is never touched)
 #    * the runtime path needs no compiler: the composition court reproduces its
@@ -160,6 +162,7 @@ EXPECTED_COMPOSITIONS = {
     "toupper_strlen_memchr_pair": "phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1",
     "toupper_each": "phor:compose:toupper_each:c-locale:u8s:v1",
     "toupper_each_strlen_memchr": "phor:compose:toupper_each_strlen_memchr:c-locale:index:v1",
+    "toupper_memchr_suffix": "phor:compose:toupper_memchr_suffix:c-locale:index:v1",
 }
 
 expected_targets = set(EXPECTED_LEAVES) | set(EXPECTED_COMPOSITIONS.values())

@@ -12,17 +12,22 @@
 #                       compare it against the checked-in verdict, without
 #                       touching the committed file.
 #
-#  Five compositions are checked, selected with --target:
+#  Six compositions are checked, selected with --target:
 #
 #    toupper_memchr         (default)  phor:compose:toupper_memchr:c-locale:index:v1
 #    toupper_strlen_memchr            phor:compose:toupper_strlen_memchr:c-locale:index:v1
 #    toupper_strlen_memchr_pair       phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1
 #    toupper_each                     phor:compose:toupper_each:c-locale:u8s:v1
 #    toupper_each_strlen_memchr       phor:compose:toupper_each_strlen_memchr:c-locale:index:v1
+#    toupper_memchr_suffix            phor:compose:toupper_memchr_suffix:c-locale:index:v1
 #
 #  Each is built from already-sealed ports and executed entirely through the sealed
-#  dispatcher. The last one is **nested**: its fold stage is the sealed composition
-#  `toupper_each`, dispatched through the store. This verifier checks:
+#  dispatcher. The nested one resolves the sealed composition `toupper_each` from the
+#  store. The last is the first chain where a derived value selects a **buffer**: the
+#  folded haystack is sliced at the origin the first `memchr` derived, and its second
+#  search is data-dependent (no origin = no slice = the search is never dispatched),
+#  which the verifier checks as a group rather than as a per-case native count.
+#  This verifier checks:
 #    * the composition verdict exists and is valid JSON
 #    * every stage was served by the SEALED object for every case: zero foreign
 #      fallback and zero broken seals (a broken seal is never a fallback, and both
@@ -38,7 +43,6 @@
 #
 #  Usage:
 #    ./verify_composition_court.sh [--target <name>] [--check-committed] [evidence_dir]
-#
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
 set -u
@@ -80,6 +84,10 @@ case "$TARGET" in
     toupper_each_strlen_memchr)
         TARGET_ID="phor:compose:toupper_each_strlen_memchr:c-locale:index:v1"
         EXPECTED_COUNT=350
+        ;;
+    toupper_memchr_suffix)
+        TARGET_ID="phor:compose:toupper_memchr_suffix:c-locale:index:v1"
+        EXPECTED_COUNT=688
         ;;
     *)
         echo "ERROR: unknown composition target '$TARGET'"
@@ -253,6 +261,28 @@ SPECS = {
             "composition": "toupper_each",
         },
     },
+    "toupper_memchr_suffix": {
+        "stages": [
+            "libc:toupper:c-locale:u8:v1",
+            "libc:memchr:c-locale:index:v1",
+        ],
+        # The fold stages and the origin search run on every case; the suffix search
+        # is data-dependent, so its two accounts (ran natively / never reached
+        # because needleA was absent) are checked as a group below.
+        "native_keys": [
+            "toupper_hay_native_cases",
+            "toupper_needle_a_native_cases",
+            "toupper_needle_b_native_cases",
+            "memchr_a_native_cases",
+        ],
+        "native_key_groups": [
+            (["memchr_b_native_cases", "memchr_b_not_reached_cases"], 688),
+        ],
+        "objects": [
+            ("toupper(haystack)", "toupper", "toupper"),
+            ("memchr(origin)", "memchr", "memchr"),
+        ],
+    },
 }
 
 spec = SPECS.get(SYMBOL)
@@ -271,11 +301,26 @@ for required in spec["stages"]:
 if v.get("cases_run") != EXPECTED:
     errors.append("cases_run != %d" % EXPECTED)
 
-# Every stage must be sealed-native for every case, with no fallback and no
-# broken seal. A broken seal is not a fallback; both are disqualifying.
+# Every stage must be sealed-native, with no fallback and no broken seal. A broken
+# seal is not a fallback; both are disqualifying. Stages that are data-dependently
+# skipped are checked as a group (the group must sum to the case count).
 for key in spec["native_keys"]:
     if v.get(key) != EXPECTED:
         errors.append("%s != %d (stage was not served by the sealed object)" % (key, EXPECTED))
+for keys, total in spec.get("native_key_groups", []):
+    got = sum(v.get(k, 0) for k in keys)
+    if got != total:
+        errors.append(
+            "%s != %d (a data-dependent stage is unaccounted for)" % ("+".join(keys), total)
+        )
+if v.get("memchr_b_not_reached_cases") is not None:
+    ran = v.get("memchr_b_native_cases")
+    skipped = v.get("memchr_b_not_reached_cases")
+    if not (ran > 0 and skipped > 0):
+        errors.append(
+            "the suffix search was not exercised both ways (ran %s, not reached %s)"
+            % (ran, skipped)
+        )
 if v.get("fallback_cases") != 0:
     errors.append("fallback_cases != 0 (foreign fallback in the sealed path)")
 if v.get("broken_seal_cases") != 0:
@@ -349,6 +394,8 @@ print("Stages: %s" % " -> ".join(stages))
 print("Cases: %d" % v.get("cases_run", 0))
 for key in spec["native_keys"]:
     print("%s: %d" % (key, v.get(key, 0)))
+for keys, total in spec.get("native_key_groups", []):
+    print("%s: %d" % ("+".join(keys), sum(v.get(k, 0) for k in keys)))
 print("Foreign fallback: %d" % v.get("fallback_cases", 0))
 print("Broken seal:      %d" % v.get("broken_seal_cases", 0))
 print("Passed: %d" % v.get("cases_passed", 0))

@@ -36,6 +36,7 @@ pub mod composition;
 pub mod composition_nested;
 pub mod composition_pair;
 pub mod composition_strlen_memchr;
+pub mod composition_suffix;
 pub mod composition_toupper_each;
 pub mod dialect_cage;
 pub mod dispatch;
@@ -82,6 +83,9 @@ pub fn composition_runner(id: &str) -> Option<CompositionRunner> {
     }
     if id == composition_pair::COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id {
         return Some(composition_pair::run_chain_encoded);
+    }
+    if id == composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id {
+        return Some(composition_suffix::run_chain_encoded);
     }
     if id == composition_toupper_each::COMPOSITION_TOUPPER_EACH.id {
         return Some(composition_toupper_each::run_chain_encoded);
@@ -820,6 +824,10 @@ pub enum CompositionKind {
     /// **composition** `toupper_each`, resolved from the store and dispatched
     /// recursively.
     ToupperEachStrlenMemchr,
+    /// `toupper ∘ memchr ∘ slice ∘ memchr` — the first chain where a derived value
+    /// selects a **buffer**: the folded haystack is sliced at the origin the first
+    /// `memchr` derived, and the second `memchr` searches that slice.
+    ToupperMemchrSuffix,
 }
 
 const TOUPPER_MEMCHR_LEAVES: [PortTarget; 2] = [target::LIBC_TOUPPER, target::LIBC_MEMCHR];
@@ -841,6 +849,8 @@ const TOUPPER_EACH_STRLEN_MEMCHR_LEAVES: [PortTarget; 3] = [
     target::LIBC_STRLEN,
     target::LIBC_MEMCHR,
 ];
+/// The slice chain dispatches `toupper` (the fold) and `memchr` (both searches).
+const TOUPPER_MEMCHR_SUFFIX_LEAVES: [PortTarget; 2] = [target::LIBC_TOUPPER, target::LIBC_MEMCHR];
 
 /// The nested ports `toupper_each_strlen_memchr` dispatches as stages.
 const NESTED_OF_TOUPPER_EACH_STRLEN_MEMCHR: [CompositionTarget; 1] =
@@ -870,6 +880,11 @@ impl CompositionKind {
         {
             return Some(CompositionKind::ToupperEachStrlenMemchr);
         }
+        if name == "toupper_memchr_suffix"
+            || name == composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id
+        {
+            return Some(CompositionKind::ToupperMemchrSuffix);
+        }
         None
     }
 
@@ -880,6 +895,7 @@ impl CompositionKind {
             CompositionKind::ToupperStrlenMemchrPair => "toupper_strlen_memchr_pair",
             CompositionKind::ToupperEach => "toupper_each",
             CompositionKind::ToupperEachStrlenMemchr => "toupper_each_strlen_memchr",
+            CompositionKind::ToupperMemchrSuffix => "toupper_memchr_suffix",
         }
     }
 
@@ -895,6 +911,9 @@ impl CompositionKind {
             CompositionKind::ToupperEach => composition_toupper_each::COMPOSITION_TOUPPER_EACH.id,
             CompositionKind::ToupperEachStrlenMemchr => {
                 composition_nested::COMPOSITION_TOUPPER_EACH_STRLEN_MEMCHR.id
+            }
+            CompositionKind::ToupperMemchrSuffix => {
+                composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id
             }
         }
     }
@@ -913,6 +932,9 @@ impl CompositionKind {
             CompositionKind::ToupperEachStrlenMemchr => {
                 "phost/evidence/composition/toupper_each_strlen_memchr"
             }
+            CompositionKind::ToupperMemchrSuffix => {
+                "phost/evidence/composition/toupper_memchr_suffix"
+            }
         }
     }
 
@@ -923,6 +945,7 @@ impl CompositionKind {
             CompositionKind::ToupperStrlenMemchrPair => &TOUPPER_STRLEN_MEMCHR_PAIR_LEAVES,
             CompositionKind::ToupperEach => &TOUPPER_EACH_LEAVES,
             CompositionKind::ToupperEachStrlenMemchr => &TOUPPER_EACH_STRLEN_MEMCHR_LEAVES,
+            CompositionKind::ToupperMemchrSuffix => &TOUPPER_MEMCHR_SUFFIX_LEAVES,
         }
     }
 
@@ -1084,6 +1107,9 @@ pub struct CompositionReport {
     pub stages: Vec<String>,
     pub cases_run: u64,
     pub stage_reports: Vec<StageReport>,
+    /// Free-form notes the CLI prints after the stage table (e.g. a stage that is
+    /// data-dependently skipped).
+    pub notes: Vec<String>,
     pub fallback_cases: u64,
     pub broken_seal_cases: u64,
     pub cases_passed: u64,
@@ -1150,6 +1176,7 @@ pub fn run_composition_court(
                         elf_symbol: v.memchr_elf_symbol.clone(),
                     },
                 ],
+                notes: alloc::vec::Vec::new(),
                 fallback_cases: v.fallback_cases,
                 broken_seal_cases: v.broken_seal_cases,
                 cases_passed: v.cases_passed,
@@ -1203,6 +1230,7 @@ pub fn run_composition_court(
                         elf_symbol: v.memchr_elf_symbol.clone(),
                     },
                 ],
+                notes: alloc::vec::Vec::new(),
                 fallback_cases: v.fallback_cases,
                 broken_seal_cases: v.broken_seal_cases,
                 cases_passed: v.cases_passed,
@@ -1270,6 +1298,7 @@ pub fn run_composition_court(
                         elf_symbol: v.memchr_elf_symbol.clone(),
                     },
                 ],
+                notes: alloc::vec::Vec::new(),
                 fallback_cases: v.fallback_cases,
                 broken_seal_cases: v.broken_seal_cases,
                 cases_passed: v.cases_passed,
@@ -1300,6 +1329,7 @@ pub fn run_composition_court(
                     object_hash: v.toupper_object_hash.clone(),
                     elf_symbol: v.toupper_elf_symbol.clone(),
                 }],
+                notes: alloc::vec::Vec::new(),
                 fallback_cases: v.fallback_cases,
                 broken_seal_cases: v.broken_seal_cases,
                 cases_passed: v.cases_passed,
@@ -1353,6 +1383,66 @@ pub fn run_composition_court(
                         elf_symbol: v.memchr_elf_symbol.clone(),
                     },
                 ],
+                notes: alloc::vec::Vec::new(),
+                fallback_cases: v.fallback_cases,
+                broken_seal_cases: v.broken_seal_cases,
+                cases_passed: v.cases_passed,
+                cases_failed: v.cases_failed,
+                dispatches_run: v.dispatches_run,
+                oracle_hash: v.oracle_hash.clone(),
+                chain_hash: v.chain_hash.clone(),
+                verdict: v.verdict.as_str().to_string(),
+                sealed: v.is_sealed_eligible(),
+                evidence_dir,
+            })
+        }
+        CompositionKind::ToupperMemchrSuffix => {
+            let cases = composition_suffix::composition_corpus();
+            let traces = dialect_cage::observe_composition_suffix(&cases, auth)?;
+            let (v, m) = composition_suffix::run_composition_court(&traces, &index, auth);
+            let evidence_dir = evidence::write_composition_evidence(out_dir, &traces, &v, &m)
+                .map_err(|e| PortError::Io(format!("{}", e)))?;
+
+            Ok(CompositionReport {
+                target: v.target.clone(),
+                stages: v.stages.clone(),
+                cases_run: v.cases_run,
+                stage_reports: alloc::vec![
+                    StageReport {
+                        label: String::from("toupper(haystack)"),
+                        leaf: target::LIBC_TOUPPER.id.to_string(),
+                        native_cases: v.toupper_hay_native_cases,
+                        object_hash: v.toupper_object_hash.clone(),
+                        elf_symbol: v.toupper_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        // Both needles are folded before the origin is derived.
+                        label: String::from("toupper(needles A+B)"),
+                        leaf: target::LIBC_TOUPPER.id.to_string(),
+                        native_cases: v.toupper_needle_a_native_cases
+                            + v.toupper_needle_b_native_cases,
+                        object_hash: v.toupper_object_hash.clone(),
+                        elf_symbol: v.toupper_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("memchr(origin)"),
+                        leaf: target::LIBC_MEMCHR.id.to_string(),
+                        native_cases: v.memchr_a_native_cases,
+                        object_hash: v.memchr_object_hash.clone(),
+                        elf_symbol: v.memchr_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("memchr(suffix)"),
+                        leaf: target::LIBC_MEMCHR.id.to_string(),
+                        native_cases: v.memchr_b_native_cases,
+                        object_hash: v.memchr_object_hash.clone(),
+                        elf_symbol: v.memchr_elf_symbol.clone(),
+                    },
+                ],
+                notes: alloc::vec![format!(
+                    "memchr(suffix) is data-dependent: it did not run on {} of {} cases (needleA absent, so no origin and no slice)",
+                    v.memchr_b_not_reached_cases, v.cases_run
+                )],
                 fallback_cases: v.fallback_cases,
                 broken_seal_cases: v.broken_seal_cases,
                 cases_passed: v.cases_passed,
@@ -1531,6 +1621,40 @@ pub fn run_composition_call(
                 derived_len: c.derived_len,
                 needles: alloc::vec![(String::from("Needle"), c.needle_norm)],
                 indexes: alloc::vec![(String::from("Index"), c.index)],
+                dispatches: c.dispatches,
+            })
+        }
+        CompositionKind::ToupperMemchrSuffix => {
+            let c =
+                composition_suffix::run_composition_call(&index, hay, needle_a, needle_b, n, auth);
+            Ok(CompositionCallReport {
+                target: composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX
+                    .id
+                    .to_string(),
+                stages: alloc::vec![
+                    (String::from("toupper(haystack)"), String::from(c.hay_stage)),
+                    (
+                        String::from("memchr(origin)"),
+                        String::from(c.memchr_a_stage)
+                    ),
+                    // "-" when needleA was absent, so no slice existed and the
+                    // second search was never dispatched.
+                    (
+                        String::from("memchr(suffix)"),
+                        String::from(c.memchr_b_stage)
+                    ),
+                ],
+                hay_norm: c.hay_norm,
+                derived_len: None,
+                needles: alloc::vec![
+                    (String::from("Needle A"), c.needle_a_norm),
+                    (String::from("Needle B"), c.needle_b_norm),
+                ],
+                indexes: alloc::vec![
+                    (String::from("Origin"), c.origin),
+                    (String::from("Suffix offset"), c.suffix_index),
+                    (String::from("Index"), c.index),
+                ],
                 dispatches: c.dispatches,
             })
         }

@@ -605,9 +605,10 @@ The leaf courts prove a sealed artifact is correct (`exec`), then preferred
 (`dispatch`). The composition courts prove they can be **composed by the
 runtime**: composed targets built from already-sealed ports, executed entirely
 through `NativeDispatcher`, with no foreign calls in the sealed path and no Rust
-mirror consulted. Five chains are sealed: the first three are pipelines / dataflow
-graphs over sealed leaves, and the last two prove that a composition is itself a
-sealed port the store publishes.
+mirror consulted. Six chains are sealed: the first three are pipelines / dataflow
+graphs over sealed leaves, the next two prove that a composition is itself a
+sealed port the store publishes, and the sixth is the first where a derived value
+selects a *buffer* rather than a bound.
 
 ```text
 phor:compose:toupper_memchr:c-locale:index:v1
@@ -799,6 +800,8 @@ phost port compose --target toupper_each_strlen_memchr 62006161:41:0400000000000
 ./verify_composition_court.sh --target toupper_each --check-committed
 ./verify_composition_court.sh --target toupper_each_strlen_memchr
 ./verify_composition_court.sh --target toupper_each_strlen_memchr --check-committed
+./verify_composition_court.sh --target toupper_memchr_suffix          # the slice chain (688)
+./verify_composition_court.sh --target toupper_memchr_suffix --check-committed
 ```
 
 Its corpus and oracle are deliberately identical to `toupper_strlen_memchr`'s, so the
@@ -808,6 +811,38 @@ equivalence is exactly what it should report; the implementation boundary is rec
 separately as `fold_composition_id` + `fold_composition_chain_hash`, and the verifier
 cross-checks that nested seal against the committed `toupper_each` verdict — a seal of
 a seal.
+
+### The slice chain: a derived value selects a buffer
+
+`composition_suffix` adds the sixth chain and the first shape where a derived value
+selects a **buffer** rather than a bound:
+
+```text
+phor:compose:toupper_memchr_suffix:c-locale:index:v1
+
+  stages:  libc:toupper (fold)  ->  libc:memchr (derive the origin i)
+           ->  SLICE the folded haystack at i  ->  libc:memchr (search the suffix)
+  output:  i32 absolute index (i + j), or -1
+```
+
+The oracle expresses the slice literally: the foreign `memchr` result advances the base
+pointer, and the second foreign `memchr` runs over that slice. There is no
+bound-only reading of the oracle.
+
+Two things the corpus is built to pin down:
+
+- `B.*` (28 cases): needleB occurs **before** the origin and nowhere in the suffix, so
+the answer is `-1`. A chain that searched the caller's window finds the earlier byte and
+returns a smaller index — the court fails it. A test asserts a window-searching chain
+disagrees with the foreign oracle on at least 80 of the 688 cases.
+- The second search is **data-dependent**: with needleA absent there is no origin and no
+slice, so it is never dispatched. That is a separate account
+(`memchr_b_not_reached_cases`, 254 of 688) and the sealed-eligibility rule requires
+`memchr_b_native_cases + memchr_b_not_reached_cases == cases_run`. It is deliberately
+not reported as a native run of a stage that did not happen.
+
+`chain_hash` covers the folded haystack, the derived origin, the suffix offset and the
+final index.
 
 ### Seal contents
 
@@ -835,7 +870,7 @@ revealed.
 
 Deriving a seal is the court's job; **loading** one is the runtime's. The store
 index `phost/evidence/store/index.json` is a committed artifact that names every
-sealed port — five leaf object hashes and five composition chain hashes — so a
+sealed port — five leaf object hashes and six composition chain hashes — so a
 call site can resolve a seal without invoking `phorc` and without replaying an
 oracle.
 
@@ -886,10 +921,10 @@ A **session** is the deterministic plan — `session_plan()` — that serves eve
 sealed port in the store once, with a recorded expected result:
 
 ```text
-five leaves          five compositions
-store loads:     1   ports: 10   calls: 10 native   fallback: 0   broken: 0
-objects mapped:  5   dispatches: 43
-fan-in:  toupper 24  memchr 6  strlen 4  memcmp 1  strrchr 1
+five leaves          six compositions
+store loads:     1   ports: 11   calls: 11 native   fallback: 0   broken: 0
+objects mapped:  5   dispatches: 52
+fan-in:  toupper 30  memchr 8  strlen 4  memcmp 1  strrchr 1
          toupper_each 3 (own call + nested chain's two fold stages)
 ```
 
@@ -911,7 +946,8 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   promotion, evidence, compiled, exec, dispatch,
                                   composition, composition_strlen_memchr,
                                   composition_pair, composition_toupper_each,
-                                  composition_nested, store, json, service
+                                  composition_nested, composition_suffix, store,
+                                  json, service
 phost/evidence/store/index.json   persistent store: every sealed port (leaf objects
                                   + composition chain hashes), committed
 phost/evidence/session/           session verdict (one load, many consumers)

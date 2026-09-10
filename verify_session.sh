@@ -9,11 +9,11 @@
 #
 #  This verifier checks the committed session residual
 #  (phost/evidence/session/session_verdict.json) and proves:
-#    * the store is loaded exactly ONCE (`store_loads == 1`) for ten calls
-#    * every planned call was served by a sealed object: 10 native, 0 foreign
+#    * the store is loaded exactly ONCE (`store_loads == 1`) for eleven calls
+#    * every planned call was served by a sealed object: 11 native, 0 foreign
 #      fallback, 0 broken seals
-#    * ten ports resolve to FIVE mapped objects — one seal reused by many consumers
-#    * the fan-in is real: `toupper` serves 24 resolutions, `memchr` 6, `strlen` 4
+#    * eleven ports resolve to FIVE mapped objects — one seal reused by many consumers
+#    * the fan-in is real: `toupper` serves 30 resolutions, `memchr` 8, `strlen` 4
 #      (nested stage resolutions included), and `toupper_each` is consumed 3 times
 #      (its own call plus the nested chain's two fold stages)
 #    * the session residual hash covers the reported fields
@@ -148,10 +148,10 @@ if v.get("store_loads") != 1:
 if v.get("ports_in_store") != len(store.get("entries", [])):
     errors.append("ports_in_store != the committed store entry count")
 
-if v.get("calls") != 10:
-    errors.append("calls != 10")
-if v.get("native_calls") != 10:
-    errors.append("native_calls != 10 (a port was not served by a sealed object)")
+if v.get("calls") != 11:
+    errors.append("calls != 11")
+if v.get("native_calls") != 11:
+    errors.append("native_calls != 11 (a port was not served by a sealed object)")
 if v.get("fallback_calls") != 0:
     errors.append("fallback_calls != 0 (a foreign fallback entered the sealed path)")
 if v.get("broken_seal_calls") != 0:
@@ -168,8 +168,8 @@ if v.get("objects_mapped") != 5:
 # Every sealed port in the store must have been served, and the fan-in must be
 # the one the plan implies (nested stage resolutions included).
 EXPECTED_FANIN = {
-    "libc:toupper:c-locale:u8:v1": 24,
-    "libc:memchr:c-locale:index:v1": 6,
+    "libc:toupper:c-locale:u8:v1": 30,
+    "libc:memchr:c-locale:index:v1": 8,
     "libc:strlen:c-locale:u64:v1": 4,
     "libc:memcmp:c-locale:sign:v1": 1,
     "libc:strrchr:c-locale:index:v1": 1,
@@ -178,6 +178,7 @@ EXPECTED_FANIN = {
     "phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1": 1,
     "phor:compose:toupper_each:c-locale:u8s:v1": 3,
     "phor:compose:toupper_each_strlen_memchr:c-locale:index:v1": 1,
+    "phor:compose:toupper_memchr_suffix:c-locale:index:v1": 1,
 }
 per_port = v.get("per_port", {})
 if set(per_port) != set(EXPECTED_FANIN):
