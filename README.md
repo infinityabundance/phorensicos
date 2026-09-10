@@ -1,5 +1,7 @@
 # Phorensicos — Phorensic OS
 
+<img src="assets/screen.png" alt="Phorensic OS boot screen: 1024x768 QEMU framebuffer with the boot phase table and compositor window" width="25%">
+
 **Phorensic OS** is a research operating system built around *residual primacy*:
 every state change emits a **residual** — a signed, replayable evidence record —
 so that the system's history is always reconstructable and auditable. Authority
