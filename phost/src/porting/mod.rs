@@ -33,6 +33,7 @@ pub mod behavior_signature;
 pub mod candidate;
 pub mod compiled;
 pub mod dialect_cage;
+pub mod dispatch;
 pub mod evidence;
 pub mod exec;
 pub mod oracle_trace;
@@ -42,6 +43,9 @@ pub mod target;
 
 pub use behavior_signature::BehaviorSignature;
 pub use candidate::{CandidateArtifacts, CandidateSignature};
+pub use dispatch::{
+    DispatchError, DispatchOutcome, DispatchSource, DispatchVerdict, NativeDispatcher,
+};
 pub use exec::{ExecError, ExecutionVerdict};
 pub use oracle_trace::OracleTrace;
 pub use promotion::{PromotionError, PromotionEvidence, PromotionReceipt, TrustState};
@@ -273,6 +277,12 @@ pub struct PortCourtReport {
     pub execution_failed: u64,
     pub execution_hash: String,
     pub execution_verdict: String,
+    /// Dispatch-court results (the runtime preferred the sealed object).
+    pub dispatch_cases: u64,
+    pub dispatch_native_cases: u64,
+    pub dispatch_fallback_cases: u64,
+    pub dispatch_hash: String,
+    pub dispatch_verdict: String,
 }
 
 /// Observe a target's complete domain through the dialect cage.
@@ -282,6 +292,111 @@ pub fn observe_target(
     auth: &PortingAuthority,
 ) -> Result<Vec<OracleTrace>, PortError> {
     dialect_cage::observe_target(target, cases, auth)
+}
+
+/// A single sealed-native dispatch, as observed at a runtime call site.
+#[derive(Clone, Debug)]
+pub struct NativeCallReport {
+    pub target: String,
+    pub source: String,
+    pub trust: String,
+    pub object_hash: String,
+    pub elf_symbol: String,
+    pub input_hex: String,
+    pub output_hex: String,
+    pub mirror_output_hex: String,
+    pub matches_mirror: bool,
+    pub reason: String,
+    pub promotion: String,
+    pub sealed_package: String,
+}
+
+/// Parse the court's `:`-joined lowercase-hex argument framing.
+pub fn parse_hex_args(framed: &str) -> Result<Vec<Vec<u8>>, PortError> {
+    framed
+        .split(':')
+        .map(|part| {
+            hex::decode(part).map_err(|e| PortError::Io(format!("bad hex argument: {}", e)))
+        })
+        .collect()
+}
+
+/// Publish the target's seal, then perform **one** dispatch through the runtime
+/// dispatcher. This is the call-site path: seal in the store → verify → load the
+/// sealed object → call it (or fall back to the foreign implementation).
+///
+/// `dispatch_auth` is separate so the CLI can demonstrate the fail-closed/
+/// fallback behaviour without capability: the court runs with `PORTING`, but the
+/// runtime call site is only given what it would really have.
+pub fn run_native_call(
+    symbol: &str,
+    args_framed: Option<&str>,
+    court_auth: &PortingAuthority,
+    dispatch_auth: &PortingAuthority,
+    out_dir: &str,
+    phorc: Option<&str>,
+) -> Result<NativeCallReport, PortError> {
+    // Publish (or refresh) the seal through the normal court pipeline.
+    let report = run_port_court(symbol, court_auth, out_dir, PortDepth::Promote, phorc)?;
+    let target =
+        resolve_target(symbol).ok_or_else(|| PortError::UnknownTarget(symbol.to_string()))?;
+
+    let args = match args_framed {
+        Some(framed) => parse_hex_args(framed)?,
+        None => default_args(&target),
+    };
+
+    let entry = SealedPortEntry {
+        target: report.target.clone(),
+        trust: TrustState::Sealed,
+        oracle_hash: report.oracle_hash.clone(),
+        candidate_behavior_hash: report.candidate_behavior_hash.clone(),
+        candidate_source_hash: report.candidate_source_hash.clone(),
+        candidate_object_hash: report.candidate_object_hash.clone(),
+        candidate_object_path: report.candidate_object_path.clone(),
+        sealed_package: report.sealed_package.clone(),
+    };
+
+    let mut dispatcher = dispatch::NativeDispatcher::with_entry(entry);
+    let outcome = dispatcher
+        .dispatch(&target, &args, dispatch_auth)
+        .map_err(|e| PortError::Execution(format!("{}", e)))?;
+
+    let mirror = candidate::run_candidate(target.id, &args).ok();
+    let mirror_output_hex = mirror.as_ref().map(hex::encode).unwrap_or_default();
+    let output_hex = hex::encode(&outcome.output);
+    let matches_mirror = outcome.source.is_native() && mirror_output_hex == output_hex;
+
+    Ok(NativeCallReport {
+        target: report.target,
+        source: outcome.source.as_str().to_string(),
+        trust: outcome.trust,
+        object_hash: outcome.object_hash,
+        elf_symbol: outcome.elf_symbol,
+        input_hex: args
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<String>>()
+            .join(":"),
+        output_hex,
+        matches_mirror,
+        mirror_output_hex,
+        reason: outcome.reason.to_string(),
+        promotion: report.promotion,
+        sealed_package: report.sealed_package,
+    })
+}
+
+fn default_args(target: &PortTarget) -> Vec<Vec<u8>> {
+    match target.id {
+        id if id == target::LIBC_TOUPPER.id => alloc::vec![alloc::vec![0x61]],
+        id if id == target::LIBC_MEMCMP.id => alloc::vec![
+            alloc::vec![0x61, 0x62, 0x63],
+            alloc::vec![0x61, 0x62, 0x64],
+            3u64.to_le_bytes().to_vec(),
+        ],
+        _ => alloc::vec::Vec::new(),
+    }
 }
 
 /// Run the porting court for `symbol`.
@@ -349,19 +464,51 @@ pub fn run_port_court(
     };
     let candidate_sig = CandidateSignature::from_traces(&target, &traces, &artifacts);
 
-    // 6. Promote only on a consistent replay AND a consistent execution.
+    // 6a. Build the prospective sealed store entry — exactly what promotion will
+    //     publish — and run the dispatch court over it. This proves the runtime
+    //     *prefers* the sealed object at a call site for every case (not merely
+    //     that the object executes).
+    let dispatch_verdict = match (depth, &execution) {
+        (PortDepth::Promote, Some((exec_verdict, _))) => {
+            let entry = SealedPortEntry {
+                target: target.id.to_string(),
+                trust: TrustState::Sealed,
+                oracle_hash: verdict.oracle_hash.clone(),
+                candidate_behavior_hash: verdict.candidate_behavior_hash.clone(),
+                candidate_source_hash: artifacts.source_hash.clone(),
+                candidate_object_hash: artifacts.object_hash.clone(),
+                candidate_object_path: compiled
+                    .as_ref()
+                    .map(|c| c.object_path.clone())
+                    .unwrap_or_default(),
+                sealed_package: "sealed_package.json".to_string(),
+            };
+            let _ = exec_verdict;
+            let mut index = SealedPortIndex::new();
+            index.insert(entry);
+            Some(dispatch::run_dispatch_court(&target, &traces, &index, auth))
+        }
+        _ => None,
+    };
+
+    // 7. Promote only on a consistent replay, a consistent execution, and a
+    //    consistent dispatch (the runtime served every case from the sealed object).
     let mut receipt: Option<PromotionReceipt> = None;
     let mut promotion_json: Option<String> = None;
     let mut sealed_json: Option<String> = None;
 
     if depth == PortDepth::Promote {
         let (exec_verdict, _) = execution.as_ref().expect("execution runs at Promote depth");
+        let (disp_verdict, _) = dispatch_verdict
+            .as_ref()
+            .expect("dispatch runs at Promote depth");
         let sealed = evidence::sealed_package_json(
             &target,
             &verdict,
             &signature,
             &candidate_sig,
             exec_verdict,
+            disp_verdict,
         );
         let promotion_evidence = PromotionEvidence {
             sealed_package_written: true,
@@ -372,6 +519,7 @@ pub fn run_port_court(
             &verdict,
             &artifacts,
             exec_verdict,
+            disp_verdict,
             &promotion_evidence,
             auth,
         )
@@ -381,7 +529,7 @@ pub fn run_port_court(
         receipt = Some(r);
     }
 
-    // 7. Write the evidence set (deterministic; the raw court is reproducible).
+    // 8. Write the evidence set (deterministic; the raw court is reproducible).
     let paths = evidence::write_evidence_set(
         out_dir,
         &target,
@@ -392,6 +540,7 @@ pub fn run_port_court(
         &verdict,
         &mismatches,
         execution.as_ref().map(|(v, m)| (v, m.as_slice())),
+        dispatch_verdict.as_ref().map(|(v, m)| (v, m.as_slice())),
         promotion_json.as_deref(),
         sealed_json.as_deref(),
     )
@@ -407,6 +556,7 @@ pub fn run_port_court(
     };
 
     let exec_verdict = execution.map(|(v, _)| v);
+    let disp_verdict = dispatch_verdict.map(|(v, _)| v);
 
     Ok(PortCourtReport {
         symbol: symbol.to_string(),
@@ -448,6 +598,17 @@ pub fn run_port_court(
             .map(|v| v.execution_hash.clone())
             .unwrap_or_default(),
         execution_verdict: exec_verdict
+            .as_ref()
+            .map(|v| v.verdict.as_str().to_string())
+            .unwrap_or_default(),
+        dispatch_cases: disp_verdict.as_ref().map(|v| v.cases_run).unwrap_or(0),
+        dispatch_native_cases: disp_verdict.as_ref().map(|v| v.native_cases).unwrap_or(0),
+        dispatch_fallback_cases: disp_verdict.as_ref().map(|v| v.fallback_cases).unwrap_or(0),
+        dispatch_hash: disp_verdict
+            .as_ref()
+            .map(|v| v.dispatch_hash.clone())
+            .unwrap_or_default(),
+        dispatch_verdict: disp_verdict
             .as_ref()
             .map(|v| v.verdict.as_str().to_string())
             .unwrap_or_default(),
@@ -524,5 +685,94 @@ mod tests {
             oracle_trace::combined_oracle_hash(&a),
             oracle_trace::combined_oracle_hash(&b)
         );
+    }
+
+    // ---- runtime dispatch (end-to-end through a compiled sealed object) ----
+
+    fn phorc_bin() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("PHORC_BIN") {
+            let pb = std::path::PathBuf::from(p);
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+        let root = compiled::workspace_root();
+        for cand in [
+            root.join("target/debug/phorc"),
+            root.join("target/release/phorc"),
+        ] {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    fn tmp_dir(tag: &str) -> String {
+        let d = std::env::temp_dir().join(format!("phost_dispatch_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d.display().to_string()
+    }
+
+    #[test]
+    fn test_native_call_prefers_the_sealed_object() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("native");
+        let r = run_native_call(
+            "toupper",
+            Some("61"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::granted(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "sealed-object");
+        assert_eq!(r.output_hex, "41");
+        assert!(r.matches_mirror);
+        assert_eq!(r.elf_symbol, "_phor_phor_toupper");
+    }
+
+    #[test]
+    fn test_native_call_without_capability_falls_back_to_foreign() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("fallback");
+        let r = run_native_call(
+            "toupper",
+            Some("61"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::none(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "foreign-fallback");
+        assert!(r.output_hex.is_empty());
+        assert!(r.reason.contains("capability"));
+    }
+
+    #[test]
+    fn test_native_call_memcmp_orders_two_buffers() {
+        let Some(phorc) = phorc_bin() else {
+            return;
+        };
+        let out = tmp_dir("memcmp");
+        let r = run_native_call(
+            "memcmp",
+            // "abc" vs "abd", n = 3 (little-endian u64)
+            Some("616263:616264:0300000000000000"),
+            &PortingAuthority::granted(),
+            &PortingAuthority::granted(),
+            &out,
+            Some(&phorc.display().to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.source, "sealed-object");
+        assert_eq!(r.output_hex, "ffffffff"); // less
+        assert!(r.matches_mirror);
     }
 }

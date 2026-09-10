@@ -304,7 +304,8 @@ the **JIT-Porting Court**. It ports behavior at the API boundary:
 ```text
 foreign behavior → dialect cage → oracle traces → behavior signature
 → native candidate → replay court → comparison → promotion → sealed package
-→ execution court (load and call the sealed object) → runtime prefers native
+→ execution court (load and call the sealed object)
+→ dispatch court (runtime serves calls from the sealed object) → runtime prefers native
 ```
 
 - **Dialect cage** — observes a foreign API surface as a black box. Two targets
@@ -318,13 +319,19 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   the seal, locates the ABI entry symbol, rejects any entry with relocations or
   external symbols, maps it executable and replays the same corpus through the
   compiled code. This is what makes the promoted artifact *run*, not just hash.
-- **Promotion** — advances the candidate to `sealed` only when the replay court
-  *and* the execution court both match exactly, with a complete evidence set.
-  Gated by the `PORTING` capability.
+- **Dispatch court** — the runtime path: a call site looks the target up in the
+  capability-gated sealed store and, if a sealed entry is present, verifies the
+  object, maps the entry function once and calls it. With no usable sealed
+  artifact the call falls back to the foreign implementation; a *broken seal* is
+  terminal and never falls back. The court requires every case to be served
+  natively.
+- **Promotion** — advances the candidate to `sealed` only when the replay court,
+  the execution court *and* the dispatch court all match exactly, with a complete
+  evidence set. Gated by the `PORTING` capability.
 - **Runtime preference** — the sealed package (e.g.
   `native:libc:memcmp:c-locale:sign:v1`) binds the compiled ELF64 candidate
   object; that object is the artifact the runtime prefers over the foreign
-  implementation.
+  implementation, and dispatch is the call site that honours it.
 
 This is API-surface porting, not arbitrary binary translation. The execution
 court runs only leaf, pure, relocation-free integer functions (no dynamic linker,

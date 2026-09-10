@@ -24,6 +24,9 @@
 #    * the sealed object EXECUTION court passed: the object that was loaded and
 #      called is the sealed object, every case matched, and the execution hash is
 #      bound into the promotion receipt and the sealed package
+#    * the sealed native DISPATCH court passed: the runtime dispatcher served
+#      every case from the sealed object (zero foreign fallbacks) and the
+#      dispatch hash is bound into the promotion receipt and the sealed package
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
@@ -72,7 +75,7 @@ case "$EVID" in /*) ;; *) EVID="$ROOT/$EVID" ;; esac
 
 PHOST="$ROOT/target/debug/phost"
 PHORC="$ROOT/target/debug/phorc"
-FILES="oracle_traces.json behavior_signature.json candidate_signature.json replay_verdict.json execution_verdict.json promotion_receipt.json sealed_package.json"
+FILES="oracle_traces.json behavior_signature.json candidate_signature.json replay_verdict.json execution_verdict.json dispatch_verdict.json promotion_receipt.json sealed_package.json"
 
 echo "=== Phorensic OS — JIT-Porting Court Verification ==="
 echo "Target:       $TARGET ($TARGET_ID)"
@@ -117,7 +120,7 @@ if [ "$MODE" = "check-committed" ]; then
             FAIL=1
         fi
     done
-    [ "$FAIL" -eq 0 ] && echo "  [PASS] fresh run matches checked-in evidence (7/7 artifacts)"
+    [ "$FAIL" -eq 0 ] && echo "  [PASS] fresh run matches checked-in evidence (8/8 artifacts)"
     [ "$FAIL" -eq 0 ] || { echo "Status: COMMITTED EVIDENCE STALE"; exit 1; }
 else
     echo "--- determinism court (fresh A == fresh B) ---"
@@ -132,7 +135,7 @@ else
             FAIL=1
         fi
     done
-    [ "$FAIL" -eq 0 ] && echo "  [PASS] two fresh runs are byte-identical (7/7 artifacts)"
+    [ "$FAIL" -eq 0 ] && echo "  [PASS] two fresh runs are byte-identical (8/8 artifacts)"
     [ "$FAIL" -eq 0 ] || { echo "Status: NON-DETERMINISTIC"; exit 1; }
 fi
 
@@ -170,6 +173,7 @@ sig = load("behavior_signature.json")
 cand = load("candidate_signature.json")
 verdict = load("replay_verdict.json")
 exec_v = load("execution_verdict.json")
+disp_v = load("dispatch_verdict.json")
 promo = load("promotion_receipt.json")
 sealed = load("sealed_package.json")
 
@@ -331,6 +335,43 @@ if sealed_exec_symbol != exec_v.get("elf_symbol"):
 if sealed.get("execution_verdict") != "consistent":
     errors.append("sealed_package.execution_verdict != consistent")
 
+# ---- dispatch court (the runtime preferred the sealed object) -------------
+dispatch_hash = disp_v.get("dispatch_hash", "")
+if disp_v.get("target") != TARGET_ID:
+    errors.append("dispatch_verdict.target != %s" % TARGET_ID)
+if disp_v.get("cases_run") != EXPECTED:
+    errors.append("dispatch.cases_run != %d" % EXPECTED)
+if disp_v.get("native_cases") != EXPECTED:
+    errors.append("dispatch.native_cases != %d (runtime did not prefer native)" % EXPECTED)
+if disp_v.get("fallback_cases") != 0:
+    errors.append("dispatch.fallback_cases != 0")
+if disp_v.get("cases_passed") != EXPECTED:
+    errors.append("dispatch.cases_passed != %d" % EXPECTED)
+if disp_v.get("cases_failed") != 0:
+    errors.append("dispatch.cases_failed != 0")
+if disp_v.get("verdict") != "consistent":
+    errors.append("dispatch.verdict != consistent")
+if disp_v.get("mismatches"):
+    errors.append("dispatch reported mismatches")
+if not dispatch_hash:
+    errors.append("dispatch_hash is missing")
+if disp_v.get("object_hash") != obj:
+    errors.append("dispatch.object_hash != candidate_signature.candidate_object_hash")
+if disp_v.get("oracle_hash") != oracle:
+    errors.append("dispatch.oracle_hash != behavior_signature.combined_oracle_hash")
+if not disp_v.get("elf_symbol", ""):
+    errors.append("dispatch.elf_symbol is missing")
+if promo.get("dispatch_hash") != dispatch_hash:
+    errors.append("promotion_receipt.dispatch_hash != dispatch_verdict.dispatch_hash")
+if sealed.get("dispatch_hash") != dispatch_hash:
+    errors.append("sealed_package.dispatch_hash != dispatch_verdict.dispatch_hash")
+if sealed.get("dispatch_verdict") != "consistent":
+    errors.append("sealed_package.dispatch_verdict != consistent")
+if sealed.get("dispatch_native_cases") != EXPECTED:
+    errors.append("sealed_package.dispatch_native_cases != %d" % EXPECTED)
+if sealed.get("dispatch_fallback_cases") != 0:
+    errors.append("sealed_package.dispatch_fallback_cases != 0")
+
 # ---- promotion + sealed package -------------------------------------------
 if promo.get("to") != "sealed":
     errors.append("promotion.to != sealed")
@@ -370,6 +411,11 @@ print("Execution failed: %d" % exec_v.get("cases_failed", 0))
 print("Executed symbol: %s" % exec_v.get("elf_symbol", "?"))
 print("Execution object: %s" % ("MATCH" if exec_v.get("object_hash") == obj else "MISMATCH"))
 print("Execution hash bound: %s" % ("yes" if exec_hash else "no"))
+print("Dispatch cases: %d" % disp_v.get("cases_run", 0))
+print("Dispatch native: %d" % disp_v.get("native_cases", 0))
+print("Dispatch fallback: %d" % disp_v.get("fallback_cases", 0))
+print("Dispatch object: %s" % ("MATCH" if disp_v.get("object_hash") == obj else "MISMATCH"))
+print("Dispatch hash bound: %s" % ("yes" if dispatch_hash else "no"))
 
 if errors:
     print("")

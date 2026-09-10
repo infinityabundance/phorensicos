@@ -403,9 +403,10 @@ mutation of a covered field changes the behavior signature.
   fails closed on both.
 - Promotion to `sealed` requires: a non-empty full replay, zero failures, a
   consistent replay verdict, the oracle hash, the candidate behavior hash, the
-  bound candidate source hash, the sealed package + replay residual written, and
-  a **consistent sealed-object execution verdict**. Promotion also requires the
-  `PORTING` capability.
+  bound candidate source hash, the sealed package + replay residual written, a
+  **consistent sealed-object execution verdict**, and a **consistent dispatch
+  verdict with zero foreign fallbacks**. Promotion also requires the `PORTING`
+  capability.
 
 ### Compiled candidate authority
 
@@ -463,16 +464,61 @@ Executed ABI (SysV AMD64):
 | `_phor_phor_toupper` | `(u64 byte) -> u64` | folded byte in the low 8 bits |
 | `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign (`-1`/`0`/`1`); buffers packed big-endian into the word |
 
+### Sealed native dispatch court
+
+Executing the object proves the artifact is *correct*. Dispatch proves the
+runtime **prefers** it. `phost::porting::dispatch` is the call-site path:
+
+1. look the target up in the capability-gated sealed store
+   (`SealedPortIndex::lookup_gated`);
+2. with no usable sealed artifact, return a **foreign fallback** (the caller uses
+   the foreign implementation);
+3. with a **sealed** entry, verify the object's SHA-256 against the seal, map the
+   entry function once, and call it;
+4. `NativeDispatcher` caches the mapped object, so steady-state dispatch is a
+   plain indirect call.
+
+Fail-closed rule: a *broken seal* is never a fallback. If a sealed entry exists
+but its object is missing, stale or malformed, dispatch returns
+`DispatchError::SealBroken` — the runtime must not silently run the foreign
+implementation while believing it is running verified native code.
+
+The **dispatch court** replays the entire corpus through the dispatcher and
+records `dispatch_verdict.json`:
+
+```text
+target  cases_run  native_cases  fallback_cases  cases_passed  cases_failed
+        oracle_hash  object_hash  elf_symbol  dispatch_hash  verdict
+```
+
+`verdict = consistent` only when **every** case was served by the sealed object
+(`native_cases == cases_run`, `fallback_cases == 0`) and every output matched the
+oracle. It is also a promotion precondition, alongside replay and execution, and
+the `dispatch_hash` is bound into the promotion receipt and the sealed package.
+
+`dispatch_hash` is SHA-256 over `case_id:source:output_hex` per case, so a
+fallback (different `source`) changes the hash even if the bytes happened to
+match.
+
+Call site (CLI):
+
+```sh
+phost port native toupper 61                                    # sealed-object → 41
+phost port native memcmp 616263:616264:0300000000000000         # sealed-object → ffffffff
+phost port native toupper 61 --no-capability                    # foreign-fallback
+```
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
 candidate's **behavior** hash (its outputs over the case domain), the compiled
 artifacts: the clean-room **source** hash, the ELF64 **object** hash, the
-**receipt** hash, and the **compiler version** — and now also the execution
-residual: the **ABI symbol**, the **executed ELF symbol**, the
-**execution hash**, and the **execution verdict**. The sealed store entry points
-at the compiled object (`candidate.o`), which is the authoritative implementation,
-and that same object is the one loaded and executed.
+**receipt** hash, and the **compiler version** — and the runtime residuals: the
+**ABI symbol**, the **executed ELF symbol**, the **execution hash**, the
+**execution verdict**, the **dispatch hash**, the native/fallback case counts and
+the **dispatch verdict**. The sealed store entry points at the compiled object
+(`candidate.o`), which is the authoritative implementation, and that same object
+is the one loaded, executed and dispatched.
 
 ### Capability gating
 
@@ -489,7 +535,7 @@ revealed.
 ```text
 phost/src/porting/                target, dialect_cage, oracle_trace,
                                   behavior_signature, candidate, replay_court,
-                                  promotion, evidence, compiled, exec
+                                  promotion, evidence, compiled, exec, dispatch
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
@@ -507,6 +553,7 @@ Reproduce:
 ```sh
 cargo run -p phost -- port promote toupper
 cargo run -p phost -- port promote memcmp
+cargo run -p phost -- port native toupper 61                 # dispatch one call
 ./verify_jit_porting_court.sh --target toupper                 # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in

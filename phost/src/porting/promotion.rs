@@ -10,6 +10,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 
 use crate::porting::candidate::CandidateArtifacts;
+use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::replay_court::{CourtVerdict, ReplayVerdict};
 use crate::porting::target::PortTarget;
@@ -70,6 +71,13 @@ pub enum PromotionError {
     ExecutionMismatch,
     /// The object that was executed is not the object bound into the seal.
     ExecutionObjectMismatch,
+    /// The dispatch court never ran.
+    DispatchNotRun,
+    /// The runtime did not serve every case from the sealed object, or the output
+    /// diverged.
+    DispatchMismatch,
+    /// The dispatched object is not the object bound into the seal.
+    DispatchObjectMismatch,
 }
 
 impl PromotionError {
@@ -90,6 +98,13 @@ impl PromotionError {
             PromotionError::ExecutionMismatch => "execution court verdict is not consistent",
             PromotionError::ExecutionObjectMismatch => {
                 "executed object hash does not match the sealed object hash"
+            }
+            PromotionError::DispatchNotRun => "sealed native dispatch court did not run",
+            PromotionError::DispatchMismatch => {
+                "runtime did not serve every case from the sealed object"
+            }
+            PromotionError::DispatchObjectMismatch => {
+                "dispatched object hash does not match the sealed object hash"
             }
         }
     }
@@ -121,6 +136,10 @@ pub struct PromotionReceipt {
     pub execution_hash: String,
     /// The ELF symbol that was loaded and called.
     pub elf_symbol: String,
+    /// The dispatch court's hash: `case_id:source:output` over the whole corpus.
+    pub dispatch_hash: String,
+    /// Cases the runtime served from the sealed object.
+    pub dispatch_native_cases: u64,
 }
 
 impl PromotionReceipt {
@@ -134,7 +153,7 @@ impl PromotionReceipt {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};candidate_object_hash={};candidate_receipt_hash={};compiler_version={};sealed_package={};replay_residual_hash={};execution_hash={};elf_symbol={}",
+            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};candidate_object_hash={};candidate_receipt_hash={};compiler_version={};sealed_package={};replay_residual_hash={};execution_hash={};elf_symbol={};dispatch_hash={};dispatch_native_cases={}",
             self.target,
             self.from.as_str(),
             self.to.as_str(),
@@ -148,7 +167,9 @@ impl PromotionReceipt {
             self.sealed_package,
             self.replay_residual_hash,
             self.execution_hash,
-            self.elf_symbol
+            self.elf_symbol,
+            self.dispatch_hash,
+            self.dispatch_native_cases
         )
     }
 
@@ -158,7 +179,7 @@ impl PromotionReceipt {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"candidate_object_hash\": \"{}\",\n  \"candidate_receipt_hash\": \"{}\",\n  \"compiler_version\": \"{}\",\n  \"execution_hash\": \"{}\",\n  \"elf_symbol\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"candidate_object_hash\": \"{}\",\n  \"candidate_receipt_hash\": \"{}\",\n  \"compiler_version\": \"{}\",\n  \"execution_hash\": \"{}\",\n  \"elf_symbol\": \"{}\",\n  \"dispatch_hash\": \"{}\",\n  \"dispatch_native_cases\": {},\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
             self.from.as_str(),
             self.to.as_str(),
@@ -171,6 +192,8 @@ impl PromotionReceipt {
             json_escape(&self.compiler_version),
             self.execution_hash,
             json_escape(&self.elf_symbol),
+            self.dispatch_hash,
+            self.dispatch_native_cases,
             json_escape(&self.sealed_package),
             self.replay_residual_hash,
             self.residual_hash()
@@ -185,6 +208,7 @@ pub fn promote(
     verdict: &ReplayVerdict,
     artifacts: &CandidateArtifacts,
     execution: &ExecutionVerdict,
+    dispatch: &DispatchVerdict,
     evidence: &PromotionEvidence,
     auth: &PortingAuthority,
 ) -> Result<PromotionReceipt, PromotionError> {
@@ -235,6 +259,20 @@ pub fn promote(
     if execution.object_hash != artifacts.object_hash {
         return Err(PromotionError::ExecutionObjectMismatch);
     }
+    // The runtime must prefer the sealed object for every case.
+    if dispatch.cases_run == 0 {
+        return Err(PromotionError::DispatchNotRun);
+    }
+    if dispatch.verdict != CourtVerdict::Consistent
+        || dispatch.fallback_cases != 0
+        || dispatch.native_cases != dispatch.cases_run
+        || dispatch.cases_failed != 0
+    {
+        return Err(PromotionError::DispatchMismatch);
+    }
+    if dispatch.object_hash != artifacts.object_hash {
+        return Err(PromotionError::DispatchObjectMismatch);
+    }
 
     Ok(PromotionReceipt {
         target: target.id.to_string(),
@@ -251,6 +289,8 @@ pub fn promote(
         replay_residual_hash: verdict.residual_hash(),
         execution_hash: execution.execution_hash.clone(),
         elf_symbol: execution.elf_symbol.clone(),
+        dispatch_hash: dispatch.dispatch_hash.clone(),
+        dispatch_native_cases: dispatch.native_cases,
     })
 }
 
@@ -315,6 +355,23 @@ mod tests {
         }
     }
 
+    fn agreeing_dispatch() -> DispatchVerdict {
+        let a = artifacts();
+        DispatchVerdict {
+            target: "libc:toupper:c-locale:u8:v1".to_string(),
+            cases_run: 256,
+            native_cases: 256,
+            fallback_cases: 0,
+            cases_passed: 256,
+            cases_failed: 0,
+            object_hash: a.object_hash,
+            elf_symbol: "_phor_phor_toupper".to_string(),
+            oracle_hash: "oracle".to_string(),
+            dispatch_hash: "dispatch".to_string(),
+            verdict: CourtVerdict::Consistent,
+        }
+    }
+
     #[test]
     fn test_promotion_allowed_when_all_pass() {
         let verdict = agreeing_verdict();
@@ -323,6 +380,7 @@ mod tests {
             &verdict,
             &artifacts(),
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         )
@@ -365,6 +423,7 @@ mod tests {
             &verdict,
             &artifacts(),
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -379,6 +438,7 @@ mod tests {
             &verdict,
             &artifacts(),
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::none(),
         );
@@ -394,6 +454,7 @@ mod tests {
             &agreeing_verdict(),
             &a,
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -409,6 +470,7 @@ mod tests {
             &agreeing_verdict(),
             &a,
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -424,6 +486,7 @@ mod tests {
             &agreeing_verdict(),
             &a,
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -442,10 +505,63 @@ mod tests {
             &verdict,
             &artifacts(),
             &agreeing_execution(),
+            &agreeing_dispatch(),
             &partial,
             &PortingAuthority::granted(),
         );
         assert_eq!(refused, Err(PromotionError::SealedPackageNotWritten));
+    }
+
+    #[test]
+    fn test_promotion_denied_when_dispatch_falls_back() {
+        let mut disp = agreeing_dispatch();
+        disp.verdict = CourtVerdict::Inconsistent;
+        disp.native_cases = 255;
+        disp.fallback_cases = 1;
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &artifacts(),
+            &agreeing_execution(),
+            &disp,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::DispatchMismatch));
+    }
+
+    #[test]
+    fn test_promotion_denied_without_dispatch() {
+        let mut disp = agreeing_dispatch();
+        disp.cases_run = 0;
+        disp.native_cases = 0;
+        disp.cases_passed = 0;
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &artifacts(),
+            &agreeing_execution(),
+            &disp,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::DispatchNotRun));
+    }
+
+    #[test]
+    fn test_promotion_denied_when_dispatched_object_is_not_sealed_object() {
+        let mut disp = agreeing_dispatch();
+        disp.object_hash = "different-object".to_string();
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &artifacts(),
+            &agreeing_execution(),
+            &disp,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::DispatchObjectMismatch));
     }
 
     #[test]
@@ -458,6 +574,7 @@ mod tests {
             &agreeing_verdict(),
             &artifacts(),
             &exec,
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -475,6 +592,7 @@ mod tests {
             &agreeing_verdict(),
             &artifacts(),
             &exec,
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -490,6 +608,7 @@ mod tests {
             &agreeing_verdict(),
             &artifacts(),
             &exec,
+            &agreeing_dispatch(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );

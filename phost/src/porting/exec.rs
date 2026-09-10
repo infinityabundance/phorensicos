@@ -546,13 +546,102 @@ impl Drop for ExecutableImage {
 }
 
 // ============================================================================
+// Loaded sealed object
+// ============================================================================
+
+/// A verified, loaded, executable sealed object entry.
+///
+/// The object's SHA-256 is checked against the seal **before** its bytes are
+/// mapped, so a tampered or stale object is never executed. The handle maps once
+/// and can be called repeatedly (this is the shape the runtime dispatcher uses).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub struct SealedObjectHandle {
+    image: ExecutableImage,
+    func_offset: u64,
+    pub target: String,
+    pub elf_symbol: String,
+    pub object_hash: String,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SealedObjectHandle {
+    pub fn load(
+        target: &PortTarget,
+        object_path: &str,
+        expected_object_hash: &str,
+    ) -> Result<Self, ExecError> {
+        // 1. Verify against the seal BEFORE mapping anything.
+        let data = std::fs::read(object_path)
+            .map_err(|_| ExecError::ObjectMissing(object_path.to_string()))?;
+        let actual = sha256_hex(&data);
+        if actual != expected_object_hash {
+            return Err(ExecError::ObjectHashMismatch {
+                expected: expected_object_hash.to_string(),
+                actual,
+            });
+        }
+
+        // 2. Parse the ELF64 object and locate the ABI entry symbol.
+        let sections = parse_sections(&data)?;
+        let shstrndx = u16_at(&data, 0x3E)? as usize;
+        let elf_symbol = format!("_phor_{}", target.abi_symbol);
+        let entry = locate_entry(&data, &sections, shstrndx, &elf_symbol)?;
+
+        // 3. Map .text read-only/executable.
+        let text = data
+            .get(entry.text_offset..entry.text_offset + entry.text_size)
+            .ok_or_else(|| ExecError::Elf(".text extends past EOF".to_string()))?;
+        let image = ExecutableImage::map(text)?;
+
+        Ok(Self {
+            image,
+            func_offset: entry.func_offset,
+            target: target.id.to_string(),
+            elf_symbol: entry.elf_symbol,
+            object_hash: actual,
+        })
+    }
+
+    /// Call the compiled entry point for one case, returning the court-encoded
+    /// output bytes.
+    pub fn call(&self, target: &PortTarget, args: &[Vec<u8>]) -> Result<Vec<u8>, ExecError> {
+        call_target(target, self.image.entry(self.func_offset), args)
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub struct SealedObjectHandle {
+    pub target: String,
+    pub elf_symbol: String,
+    pub object_hash: String,
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+impl SealedObjectHandle {
+    pub fn load(
+        _target: &PortTarget,
+        _object_path: &str,
+        _expected_object_hash: &str,
+    ) -> Result<Self, ExecError> {
+        Err(ExecError::Map(
+            "execution requires linux x86-64".to_string(),
+        ))
+    }
+
+    pub fn call(&self, _target: &PortTarget, _args: &[Vec<u8>]) -> Result<Vec<u8>, ExecError> {
+        Err(ExecError::Map(
+            "execution requires linux x86-64".to_string(),
+        ))
+    }
+}
+
+// ============================================================================
 // Court entry point
 // ============================================================================
 
 /// Load the sealed object at `object_path`, verify it against
 /// `expected_object_hash` (the hash recorded in the sealed package), and replay
 /// every oracle trace through the compiled entry point.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn execute_sealed_candidate(
     target: &PortTarget,
     traces: &[OracleTrace],
@@ -564,29 +653,7 @@ pub fn execute_sealed_candidate(
         return Err(ExecError::CapabilityDenied);
     }
 
-    // 1. Read and verify the object against the seal BEFORE touching it.
-    let data = std::fs::read(object_path)
-        .map_err(|_| ExecError::ObjectMissing(object_path.to_string()))?;
-    let actual = sha256_hex(&data);
-    if actual != expected_object_hash {
-        return Err(ExecError::ObjectHashMismatch {
-            expected: expected_object_hash.to_string(),
-            actual,
-        });
-    }
-
-    // 2. Parse the ELF64 object and locate the entry symbol.
-    let sections = parse_sections(&data)?;
-    let shstrndx = u16_at(&data, 0x3E)? as usize;
-    let elf_symbol = format!("_phor_{}", target.abi_symbol);
-    let entry = locate_entry(&data, &sections, shstrndx, &elf_symbol)?;
-
-    // 3. Map .text and call the entry point through the ABI harness.
-    let text = data
-        .get(entry.text_offset..entry.text_offset + entry.text_size)
-        .ok_or_else(|| ExecError::Elf(".text extends past EOF".to_string()))?;
-    let image = ExecutableImage::map(text)?;
-    let fptr = image.entry(entry.func_offset);
+    let handle = SealedObjectHandle::load(target, object_path, expected_object_hash)?;
 
     let mut passed: u64 = 0;
     let mut failed: u64 = 0;
@@ -595,7 +662,7 @@ pub fn execute_sealed_candidate(
 
     for t in traces {
         let args = t.input_args();
-        match call_target(target, fptr, &args) {
+        match handle.call(target, &args) {
             Ok(out) => {
                 let actual_hex = hex::encode(&out);
                 if actual_hex == t.output_hex && t.status == "ok" {
@@ -635,29 +702,16 @@ pub fn execute_sealed_candidate(
         ExecutionVerdict {
             target: target.id.to_string(),
             abi_symbol: target.abi_symbol.to_string(),
-            elf_symbol: entry.elf_symbol,
+            elf_symbol: handle.elf_symbol,
             cases_run,
             cases_passed: passed,
             cases_failed: failed,
-            object_hash: actual,
+            object_hash: handle.object_hash,
             oracle_hash: combined_oracle_hash(traces),
             execution_hash: execution_behavior_hash(&outputs),
             verdict,
         },
         mismatches,
-    ))
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-pub fn execute_sealed_candidate(
-    _target: &PortTarget,
-    _traces: &[OracleTrace],
-    _object_path: &str,
-    _expected_object_hash: &str,
-    _auth: &PortingAuthority,
-) -> Result<(ExecutionVerdict, Vec<Mismatch>), ExecError> {
-    Err(ExecError::Map(
-        "execution requires linux x86-64".to_string(),
     ))
 }
 

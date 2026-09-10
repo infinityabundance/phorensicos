@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 108 pass, 4 ignored | 112 total: 8 serial + 4 kernel + 49 nucleus + 47 porting (incl. 8 execution-court tests); the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 121 pass, 4 ignored | 125 total: 8 serial + 4 kernel + 49 nucleus + 56 porting (incl. exec + dispatch courts); the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc) | ✅ 48 pass | 44 unit (parser/checker/lower/codegen) + 4 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -34,6 +34,7 @@
 | `pub` visibility tracking | ✅ | FnDecl/StructDecl/EnumDecl/ImplBlock/ConstDecl |
 | Register allocator | ✅ | x86-64 register allocator (deterministic, spill-correct) in codegen |
 | Sealed-object execution | ✅ | `exec.rs` loads the sealed ELF64 object, verifies its hash, maps it and calls the ABI entry |
+| Sealed native dispatch | ✅ | `dispatch.rs`: the runtime prefers the sealed object at a call site; broken seals fail closed, no capability → foreign fallback |
 
 ### Compiler Pipeline
 ```
@@ -107,6 +108,9 @@ GUI compositor → window manager → surface management → inspector
 | Execution court | ✅ 256/256, 0 failed, `consistent` | ✅ 312/312, 0 failed, `consistent` |
 | Execution behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` |
 | Execution residual | `e73092e6e2d112cfd5334d9fa840e22b12056fb3f53b63dfc8b7d38898b970d7` | `9ac82dc7a3872ca8b4e493322f5164d54c9732f1dece88ca8e995d5b7015ab03` |
+| Dispatch court | ✅ 256/256 native, 0 fallback, `consistent` | ✅ 312/312 native, 0 fallback, `consistent` |
+| Dispatch hash | `a3f7c0606ae6b6da6353c1b532957dbe40022e206cb059c1512620ecaa0df90d` | `fb00385a5ecaf78c2031d25d7d6c98b7a040d44c53fd12579fa6931394387231` |
+| Dispatch residual | `d24ddbd4742f3a0d0a01bbc5455751b6195d852555cd77d75d9642cd8185d36c` | `f7a589d70be1c5fd895ccc8ef4e911b5aa69e4774dd092e0f76091b965d307fa` |
 | Promotion | ✅ → `sealed` | ✅ → `sealed` |
 | Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` |
 
@@ -120,10 +124,12 @@ Shared properties (both targets):
 | Compiled candidate authority | ✅ candidate.o is the promoted implementation; object + receipt hashes bound |
 | Independent recompilation | ✅ verifier recompiles the `.phor` source; object/receipt hashes MATCH the seal |
 | Sealed-object execution | ✅ object hash verified against the seal, ELF64 symbol located, executed; every case matched |
+| Sealed native dispatch | ✅ every case served from the sealed object through the runtime dispatcher; 0 foreign fallbacks |
+| Dispatch fail-closed | ✅ a sealed entry whose object does not verify is terminal (`SealBroken`); no capability / no sealed entry → foreign fallback |
 | Leaf/relocation guard | ✅ entry with an undefined symbol or a relocation in its range is rejected (fail closed) |
-| Determinism court | ✅ two fresh runs byte-identical (7/7 artifacts) |
-| Committed-evidence court | ✅ `--check-committed`: fresh run == checked-in evidence (7/7) |
-| Cross-environment | ✅ committed evidence matches a fresh container run (7/7), incl. object hashes |
+| Determinism court | ✅ two fresh runs byte-identical (8/8 artifacts) |
+| Committed-evidence court | ✅ `--check-committed`: fresh run == checked-in evidence (8/8) |
+| Cross-environment | ✅ committed evidence matches a fresh container run (8/8), incl. object hashes |
 | Tamper detection | ✅ editing the `.phor` candidate invalidates the seal; locale is hash-covered; a mutated sealed object fails the pre-execution hash check |
 | Capability gating | ✅ `PORTING` required to observe, to promote, and to execute |
 | Fail-closed candidate | ✅ unknown target id → `UnsupportedTarget`; malformed args → `MalformedArgs`; missing object/receipt hash blocks promotion; inconsistent execution blocks promotion |
@@ -151,8 +157,18 @@ alternating; every first-mismatch position with both orderings; the `n`-boundary
 around a mismatch (`n = j` excludes it, `n = j+1` includes it); and the unsigned
 edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`.
 
+Sealed native dispatch: the runtime call site (`phost::porting::dispatch`) looks
+the target up in the capability-gated sealed store and, if a sealed entry is
+present, verifies the object hash, maps the entry function once and calls it;
+otherwise it reports a foreign fallback. A *broken seal* is terminal and never
+falls back. The dispatch court replays the whole corpus through this path and
+requires 256/256 (`toupper`) and 312/312 (`memcmp`) cases served natively with
+zero fallbacks; `dispatch_hash` is bound into the promotion receipt and the
+sealed package. Try it: `phost port native toupper 61` (native) and
+`phost port native toupper 61 --no-capability` (foreign fallback).
+
 ### Test Results (reproduced on `main`)
-- phost: 108 passed, 0 failed, 4 ignored (112 total). The ignored tests read
+- phost: 121 passed, 0 failed, 4 ignored (125 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 4 integration tests passed (0 warnings). The integration tests
@@ -171,6 +187,7 @@ cargo run -p phorc -- examples/hello.phor /tmp/hello.o --emit-receipts --emit-se
 cargo run -p phorc -- --court-replay /tmp/hello.sealed_package.json
 cargo run -p phost -- port promote toupper       # JIT-porting court (256)
 cargo run -p phost -- port promote memcmp        # JIT-porting court (312)
+cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
 ./verify_jit_porting_court.sh --target toupper                    # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
@@ -188,5 +205,6 @@ docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 
 Boot evidence (hashes, ABI address, commands, toolchain) is committed as
 `phost_kernel/evidence_manifest.json`. The porting evidence set (oracle traces,
-behavior/candidate signatures, replay verdict, promotion receipt, sealed
-package) is committed as `phost/evidence/porting/toupper/`.
+behavior/candidate signatures, replay verdict, execution verdict, dispatch
+verdict, promotion receipt, sealed package) is committed as
+`phost/evidence/porting/{toupper,memcmp}/`.

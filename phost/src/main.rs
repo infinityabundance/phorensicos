@@ -201,10 +201,19 @@ fn port_cli(args: &[String]) -> i32 {
         eprintln!(
             "Usage: phost port <observe|replay|promote|court> <symbol> [--out DIR] [--phorc PATH]"
         );
+        eprintln!(
+            "       phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
+        );
         return 2;
     }
 
     let stage = args[0].as_str();
+
+    // Runtime call-site path: publish the seal, then dispatch one call through
+    // the sealed-native dispatcher.
+    if stage == "native" {
+        return native_cli(&args[1..]);
+    }
     let depth = match PortDepth::parse(stage) {
         Some(d) => d,
         None => {
@@ -269,6 +278,16 @@ fn port_cli(args: &[String]) -> i32 {
                 println!("ABI symbol:     {} ({})", r.abi_symbol, r.elf_symbol);
                 println!("Execution hash: {}", r.execution_hash);
             }
+            if r.dispatch_cases > 0 {
+                println!(
+                    "Dispatch:       {} ({} cases, {} native, {} fallback)",
+                    r.dispatch_verdict,
+                    r.dispatch_cases,
+                    r.dispatch_native_cases,
+                    r.dispatch_fallback_cases
+                );
+                println!("Dispatch hash:  {}", r.dispatch_hash);
+            }
             println!("Promotion:      {}", r.promotion);
             println!("Evidence:       {}", r.evidence_dir);
             if !r.sealed_package.is_empty() {
@@ -278,6 +297,90 @@ fn port_cli(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("port {} {}: {}", stage, symbol, e);
+            1
+        }
+    }
+}
+
+/// `phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
+///
+/// The runtime call-site path: publish/refresh the seal, then dispatch **one**
+/// call through the sealed-native dispatcher. With `--no-capability` the call
+/// site has no `PORTING` authority, so the dispatcher reports a foreign fallback
+/// instead of running the native artifact.
+fn native_cli(args: &[String]) -> i32 {
+    use phost::porting::{self, PortingAuthority};
+
+    if args.is_empty() {
+        eprintln!("Usage: phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]");
+        return 2;
+    }
+
+    let symbol = args[0].as_str();
+    let mut framed: Option<String> = None;
+    let mut out = format!("phost/evidence/porting/{}", symbol);
+    let mut phorc: Option<String> = None;
+    let mut dispatch_auth = PortingAuthority::granted();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-capability" => {
+                dispatch_auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--out" if i + 1 < args.len() => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            "--phorc" if i + 1 < args.len() => {
+                phorc = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                // Remaining positional: the `:`-joined hex argument framing.
+                framed = Some(match framed {
+                    Some(prev) => format!("{}:{}", prev, other),
+                    None => other.to_string(),
+                });
+                i += 1;
+            }
+        }
+    }
+
+    let court_auth = PortingAuthority::granted();
+    match porting::run_native_call(
+        symbol,
+        framed.as_deref(),
+        &court_auth,
+        &dispatch_auth,
+        &out,
+        phorc.as_deref(),
+    ) {
+        Ok(r) => {
+            println!("=== Sealed Native Dispatch: {} ===", symbol);
+            println!("Target:        {}", r.target);
+            println!("Source:        {}", r.source);
+            if r.source == "sealed-object" {
+                println!("Trust:         {}", r.trust);
+                println!("Object hash:   {}", r.object_hash);
+                println!("ELF symbol:    {}", r.elf_symbol);
+            } else {
+                println!("Reason:        {}", r.reason);
+            }
+            println!("Input:         {}", r.input_hex);
+            println!("Output:        {}", r.output_hex);
+            if r.source == "sealed-object" {
+                println!(
+                    "Matches mirror: {}",
+                    if r.matches_mirror { "yes" } else { "no" }
+                );
+            }
+            println!("Sealed package: {}", r.sealed_package);
+            0
+        }
+        Err(e) => {
+            eprintln!("port native {}: {}", symbol, e);
             1
         }
     }

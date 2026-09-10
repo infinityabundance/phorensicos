@@ -6,8 +6,8 @@
 //
 // Artifacts written by `PortDepth::Promote`:
 //   oracle_traces.json  behavior_signature.json  candidate_signature.json
-//   replay_verdict.json execution_verdict.json   promotion_receipt.json
-//   sealed_package.json
+//   replay_verdict.json execution_verdict.json   dispatch_verdict.json
+//   promotion_receipt.json sealed_package.json
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::porting::behavior_signature::BehaviorSignature;
 use crate::porting::candidate::CandidateSignature;
+use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
 use crate::porting::replay_court::{Mismatch, ReplayVerdict};
@@ -32,6 +33,7 @@ pub struct EvidencePaths {
     pub candidate_signature: String,
     pub replay_verdict: String,
     pub execution_verdict: String,
+    pub dispatch_verdict: String,
     pub promotion_receipt: String,
     pub sealed_package: String,
 }
@@ -56,9 +58,10 @@ pub fn sealed_package_json(
     signature: &BehaviorSignature,
     candidate: &CandidateSignature,
     execution: &ExecutionVerdict,
+    dispatch: &DispatchVerdict,
 ) -> String {
     format!(
-        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"candidate_abi_symbol\": \"{abi_symbol}\",\n  \"executed_elf_symbol\": \"{elf_symbol}\",\n  \"candidate_execution_hash\": \"{execution_hash}\",\n  \"execution_verdict\": \"{exec_verdict}\",\n  \"execution_cases\": {exec_cases},\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
+        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"candidate_abi_symbol\": \"{abi_symbol}\",\n  \"executed_elf_symbol\": \"{elf_symbol}\",\n  \"candidate_execution_hash\": \"{execution_hash}\",\n  \"execution_verdict\": \"{exec_verdict}\",\n  \"execution_cases\": {exec_cases},\n  \"dispatch_cases\": {dispatch_cases},\n  \"dispatch_native_cases\": {dispatch_native},\n  \"dispatch_fallback_cases\": {dispatch_fallback},\n  \"dispatch_hash\": \"{dispatch_hash}\",\n  \"dispatch_verdict\": \"{dispatch_verdict}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
         id = json_escape(target.id),
         dialect = json_escape(target.dialect),
         symbol = json_escape(target.symbol),
@@ -78,6 +81,11 @@ pub fn sealed_package_json(
         execution_hash = execution.execution_hash,
         exec_verdict = execution.verdict.as_str(),
         exec_cases = execution.cases_run,
+        dispatch_cases = dispatch.cases_run,
+        dispatch_native = dispatch.native_cases,
+        dispatch_fallback = dispatch.fallback_cases,
+        dispatch_hash = dispatch.dispatch_hash,
+        dispatch_verdict = dispatch.verdict.as_str(),
     )
 }
 
@@ -94,6 +102,7 @@ pub fn write_evidence_set(
     verdict: &ReplayVerdict,
     mismatches: &[Mismatch],
     execution: Option<(&ExecutionVerdict, &[Mismatch])>,
+    dispatch: Option<(&DispatchVerdict, &[Mismatch])>,
     promotion_json: Option<&str>,
     sealed_json: Option<&str>,
 ) -> io::Result<EvidencePaths> {
@@ -136,6 +145,13 @@ pub fn write_evidence_set(
 
     if depth == PortDepth::Replay {
         return Ok(paths);
+    }
+
+    // Stage 2c: dispatch residual — the runtime preferred the sealed object.
+    if let Some((disp_verdict, disp_mismatches)) = dispatch {
+        let disp_path = base.join("dispatch_verdict.json");
+        fs::write(&disp_path, disp_verdict.to_json(disp_mismatches))?;
+        paths.dispatch_verdict = disp_path.display().to_string();
     }
 
     // Stage 3: promotion residual + sealed package.

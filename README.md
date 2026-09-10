@@ -97,12 +97,13 @@ foreign behavior → dialect cage       (observe libc as a black box)
                  → promotion          (only on an exact match)
                  → sealed package     (native:<qualified target id>)
                  → execution court    (load the sealed ELF64 object and call it)
+                 → dispatch court     (the runtime serves calls from the sealed object)
 ```
 
-| Target | Corpus | Replay | Executed object |
-|--------|--------|--------|-----------------|
-| `libc:toupper:c-locale:u8:v1` | exhaustive `0x00..=0xff` (256 cases) | **256/256 pass** | **256/256 pass**, sealed |
-| `libc:memcmp:c-locale:sign:v1` | bounded deterministic corpus (312 cases) | **312/312 pass** | **312/312 pass**, sealed |
+| Target | Corpus | Replay | Executed object | Runtime dispatch |
+|--------|--------|--------|-----------------|------------------|
+| `libc:toupper:c-locale:u8:v1` | exhaustive `0x00..=0xff` (256 cases) | **256/256 pass** | **256/256 pass** | **256/256 native**, 0 fallback |
+| `libc:memcmp:c-locale:sign:v1` | bounded deterministic corpus (312 cases) | **312/312 pass** | **312/312 pass** | **312/312 native**, 0 fallback |
 
 The `memcmp` corpus deliberately forces length, buffers and ordering: lengths
 `0..=8`, five patterns, every first-mismatch position, the `n`-boundary around a
@@ -110,8 +111,11 @@ mismatch, and the unsigned edge bytes `00/01/7f/80/fe/ff`. Its observable is the
 **sign** of the return value (`-1 | 0 | 1`), which is the C contract.
 
 ```sh
-cargo run -p phost -- port promote toupper   # observe → replay → promote
+cargo run -p phost -- port promote toupper   # observe → replay → execute → dispatch → seal
 cargo run -p phost -- port promote memcmp
+cargo run -p phost -- port native toupper 61              # call site: run the sealed object
+cargo run -p phost -- port native memcmp 616263:616264:0300000000000000
+cargo run -p phost -- port native toupper 61 --no-capability   # → foreign fallback
 ./verify_jit_porting_court.sh --target toupper             # determinism court
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
@@ -142,6 +146,15 @@ Executed ABI (SysV AMD64, leaf/pure integer functions only):
 |--------------|-----------|--------|
 | `_phor_phor_toupper` | `(u64 byte) -> u64` | folded byte in the low 8 bits |
 | `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign `-1 \| 0 \| 1`; buffers packed big-endian |
+
+At a call site the **runtime dispatcher** (`phost::porting::dispatch`) looks the
+target up in the capability-gated sealed store and, if a sealed entry is present,
+verifies the object hash, maps the entry function **once** and calls it. With no
+usable sealed artifact the call reports a **foreign fallback** so the caller uses
+the foreign implementation — except when a *sealed* entry exists but fails
+verification, which is terminal (fail closed) and never falls back. The dispatch
+court replays the whole corpus through this path and requires every case to be
+served natively with zero fallbacks.
 
 The verifier has two courts: the default regenerates the evidence twice and
 requires byte-identical runs; `--check-committed` writes only to a temp dir and
@@ -181,7 +194,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **48 / 48 pass** (44 unit + 4 lowering-integration) |
-| `cargo test` (phost) | **108 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **121 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (235), `examples/` (46), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -191,6 +204,7 @@ All numbers below were reproduced on a clean checkout.
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
 | JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
 | Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**; executed object == sealed object |
+| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, **0 fallbacks**; no capability → foreign fallback |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 
