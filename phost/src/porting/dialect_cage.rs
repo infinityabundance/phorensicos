@@ -1,9 +1,10 @@
 // porting/dialect_cage.rs — Foreign observation (the dialect cage)
 //
 // The cage is the clean-room boundary. It runs the *foreign* implementation as
-// an observed black box and records input/output/status/effects — it never
+// an observed black box and records input/output/status/locale/effects — it never
 // reads, copies, or embeds foreign source. For the first milestone the foreign
-// surface is host libc `toupper`, reached through a single narrow FFI shim.
+// surface is host libc `toupper` in the C locale, reached through a single narrow
+// FFI shim.
 //
 // This module is std-only: observing a foreign implementation requires the
 // foreign runtime to be present. Kernel-side replay against already-sealed
@@ -15,13 +16,14 @@ use alloc::vec::Vec;
 use core::ffi::c_int;
 
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, TestCase};
+use crate::porting::target::{PortTarget, TestCase, LIBC_TOUPPER};
 use crate::porting::{PortError, PortingAuthority};
 
 // Foreign implementation under observation. In the "C" locale (the initial
 // locale for a process that never calls setlocale), `toupper` folds ASCII
 // `a`..=`z` and leaves every other byte unchanged, which is exactly what the
-// exhaustive 0..=255 court verifies.
+// exhaustive 0..=255 court verifies. The locale is recorded in every trace as
+// `locale_contract` so this court can never be confused with a locale-aware one.
 extern "C" {
     fn toupper(c: c_int) -> c_int;
 }
@@ -39,34 +41,34 @@ pub fn observe_target(
         return Err(PortError::CapabilityDenied);
     }
 
-    match target.symbol {
-        "toupper" => Ok(cases
-            .iter()
-            .map(|case| {
-                let input_byte = *case.input.first().unwrap_or(&0);
-                let out = unsafe { toupper(input_byte as c_int) };
-                OracleTrace::new(
-                    target.symbol,
-                    &case.case_id,
-                    &case.input,
-                    &[out as u8],
-                    "ok",
-                    &["compute"],
-                )
-            })
-            .collect()),
-        other => Err(PortError::UnsupportedTarget(String::from(other))),
+    if target.id != LIBC_TOUPPER.id {
+        return Err(PortError::UnsupportedTarget(String::from(target.id)));
     }
+
+    Ok(cases
+        .iter()
+        .map(|case| {
+            let input_byte = *case.input.first().unwrap_or(&0);
+            let out = unsafe { toupper(input_byte as c_int) };
+            OracleTrace::new(
+                target,
+                &case.case_id,
+                &case.input,
+                &[out as u8],
+                "ok",
+                &["compute"],
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::porting::target;
 
     #[test]
     fn test_cage_observes_c_locale_toupper() {
-        let target = target::LIBC_TOUPPER;
+        let target = LIBC_TOUPPER;
         let cases = alloc::vec![
             TestCase::byte(b'a'),
             TestCase::byte(b'z'),
@@ -81,22 +83,26 @@ mod tests {
         assert_eq!(traces[3].output_hex, "30"); // 0 -> 0
         assert_eq!(traces[4].output_hex, "e9"); // non-ASCII untouched (C locale)
         assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.locale_contract == "C"));
     }
 
     #[test]
     fn test_cage_rejects_unknown_symbol() {
         let unknown = PortTarget {
+            id: "libc:not_a_real_symbol:c-locale:u8:v1",
             dialect: "libc",
             symbol: "not_a_real_symbol",
             version: "v0",
+            locale_contract: "C",
             input_schema: "u8",
             output_schema: "u8",
+            candidate_source: "none",
         };
         let err = observe_target(&unknown, &[TestCase::byte(0)], &PortingAuthority::granted());
         assert_eq!(
             err,
             Err(PortError::UnsupportedTarget(String::from(
-                "not_a_real_symbol"
+                "libc:not_a_real_symbol:c-locale:u8:v1"
             )))
         );
     }

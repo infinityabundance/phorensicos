@@ -19,7 +19,7 @@ use crate::porting::candidate::CandidateSignature;
 use crate::porting::oracle_trace::{self, OracleTrace};
 use crate::porting::replay_court::{Mismatch, ReplayVerdict};
 use crate::porting::target::PortTarget;
-use crate::porting::{json_escape, PortDepth};
+use crate::porting::{json_escape, sha256_hex, PortDepth};
 
 /// Absolute-ish paths of the artifacts written by a run.
 #[derive(Clone, Debug, Default)]
@@ -33,21 +33,36 @@ pub struct EvidencePaths {
     pub sealed_package: String,
 }
 
+/// SHA-256 (lowercase hex) of a file's bytes — used to bind the clean-room
+/// candidate source into the seal.
+pub fn hash_file(path: &str) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// The sealed package residual: what a promoted native implementation publishes.
+///
+/// It binds the qualified target id, the locale contract, the candidate's
+/// behavior hash, and the clean-room source hash — not just a symbol name.
 pub fn sealed_package_json(
     target: &PortTarget,
     verdict: &ReplayVerdict,
     signature: &BehaviorSignature,
+    candidate: &CandidateSignature,
 ) -> String {
     format!(
-        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{dialect}:{symbol}\",\n  \"target\": \"{symbol}\",\n  \"dialect\": \"{dialect}\",\n  \"version\": \"{version}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_hash\": \"{candidate}\",\n  \"native_symbol\": \"phor_{symbol}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
+        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
+        id = json_escape(target.id),
         dialect = json_escape(target.dialect),
         symbol = json_escape(target.symbol),
         version = json_escape(target.version),
+        locale = json_escape(target.locale_contract),
         verdict = verdict.verdict.as_str(),
         cases = signature.case_count,
         oracle = verdict.oracle_hash,
-        candidate = verdict.candidate_hash,
+        behavior = candidate.candidate_behavior_hash,
+        source = candidate.candidate_source_hash,
+        native_symbol = json_escape(&candidate.symbol),
     )
 }
 
@@ -110,4 +125,9 @@ pub fn write_evidence_set(
     paths.sealed_package = sealed_path.display().to_string();
 
     Ok(paths)
+}
+
+/// Helper for callers that only need the sealed package residual string.
+pub fn package_id(target: &PortTarget) -> String {
+    format!("native:{}", target.id)
 }

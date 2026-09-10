@@ -1,9 +1,9 @@
 // porting/promotion.rs — Trust promotion
 //
 // Promotion advances a candidate along the trust ladder only when the replay
-// court returned an exact, non-empty match and the full evidence set was
-// written. Nothing else promotes. This is the one place a native candidate
-// becomes trusted native law.
+// court returned an exact, non-empty match, the clean-room source is bound, and
+// the full evidence set was written. Nothing else promotes. This is the one
+// place a native candidate becomes trusted native law.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -55,7 +55,8 @@ pub enum PromotionError {
     VerdictNotConsistent,
     CasesFailed,
     MissingOracleHash,
-    MissingCandidateHash,
+    MissingCandidateBehaviorHash,
+    MissingCandidateSourceHash,
     SealedPackageNotWritten,
     ReplayResidualNotWritten,
 }
@@ -68,7 +69,8 @@ impl PromotionError {
             PromotionError::VerdictNotConsistent => "verdict is not consistent",
             PromotionError::CasesFailed => "one or more cases failed",
             PromotionError::MissingOracleHash => "oracle hash missing",
-            PromotionError::MissingCandidateHash => "candidate hash missing",
+            PromotionError::MissingCandidateBehaviorHash => "candidate behavior hash missing",
+            PromotionError::MissingCandidateSourceHash => "candidate source hash missing",
             PromotionError::SealedPackageNotWritten => "sealed package was not written",
             PromotionError::ReplayResidualNotWritten => "replay residual was not written",
         }
@@ -90,7 +92,8 @@ pub struct PromotionReceipt {
     pub to: TrustState,
     pub verdict: String,
     pub oracle_hash: String,
-    pub candidate_hash: String,
+    pub candidate_behavior_hash: String,
+    pub candidate_source_hash: String,
     pub sealed_package: String,
     pub replay_residual_hash: String,
 }
@@ -106,13 +109,14 @@ impl PromotionReceipt {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};from={};to={};verdict={};oracle_hash={};candidate_hash={};sealed_package={};replay_residual_hash={}",
+            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};sealed_package={};replay_residual_hash={}",
             self.target,
             self.from.as_str(),
             self.to.as_str(),
             self.verdict,
             self.oracle_hash,
-            self.candidate_hash,
+            self.candidate_behavior_hash,
+            self.candidate_source_hash,
             self.sealed_package,
             self.replay_residual_hash
         )
@@ -124,13 +128,14 @@ impl PromotionReceipt {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_hash\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
             self.from.as_str(),
             self.to.as_str(),
             json_escape(&self.verdict),
             self.oracle_hash,
-            self.candidate_hash,
+            self.candidate_behavior_hash,
+            self.candidate_source_hash,
             json_escape(&self.sealed_package),
             self.replay_residual_hash,
             self.residual_hash()
@@ -142,6 +147,7 @@ impl PromotionReceipt {
 pub fn promote(
     target: &PortTarget,
     verdict: &ReplayVerdict,
+    candidate_source_hash: &str,
     evidence: &PromotionEvidence,
     auth: &PortingAuthority,
 ) -> Result<PromotionReceipt, PromotionError> {
@@ -161,8 +167,11 @@ pub fn promote(
     if verdict.oracle_hash.is_empty() {
         return Err(PromotionError::MissingOracleHash);
     }
-    if verdict.candidate_hash.is_empty() {
-        return Err(PromotionError::MissingCandidateHash);
+    if verdict.candidate_behavior_hash.is_empty() {
+        return Err(PromotionError::MissingCandidateBehaviorHash);
+    }
+    if candidate_source_hash.is_empty() {
+        return Err(PromotionError::MissingCandidateSourceHash);
     }
     if !evidence.sealed_package_written {
         return Err(PromotionError::SealedPackageNotWritten);
@@ -172,12 +181,13 @@ pub fn promote(
     }
 
     Ok(PromotionReceipt {
-        target: target.symbol.to_string(),
+        target: target.id.to_string(),
         from: TrustState::OracleCompared,
         to: TrustState::Sealed,
         verdict: verdict.verdict.as_str().to_string(),
         oracle_hash: verdict.oracle_hash.clone(),
-        candidate_hash: verdict.candidate_hash.clone(),
+        candidate_behavior_hash: verdict.candidate_behavior_hash.clone(),
+        candidate_source_hash: candidate_source_hash.to_string(),
         sealed_package: "sealed_package.json".to_string(),
         replay_residual_hash: verdict.residual_hash(),
     })
@@ -192,12 +202,14 @@ mod tests {
     use crate::porting::target::{self, byte_domain_cases};
     use alloc::vec::Vec;
 
+    const SOURCE_HASH: &str = "c0ffee00000000000000000000000000000000000000000000000000000000ff";
+
     fn agreeing_verdict() -> ReplayVerdict {
         let traces: Vec<OracleTrace> = byte_domain_cases()
             .iter()
             .map(|c| {
                 OracleTrace::new(
-                    "toupper",
+                    &target::LIBC_TOUPPER,
                     &c.case_id,
                     &c.input,
                     &[phor_toupper(c.input[0])],
@@ -222,15 +234,20 @@ mod tests {
         let receipt = promote(
             &target::LIBC_TOUPPER,
             &verdict,
+            SOURCE_HASH,
             &full_evidence(),
             &PortingAuthority::granted(),
         )
         .unwrap();
         assert_eq!(receipt.to, TrustState::Sealed);
         assert_eq!(receipt.from, TrustState::OracleCompared);
-        assert_eq!(receipt.target, "toupper");
+        assert_eq!(receipt.target, "libc:toupper:c-locale:u8:v1");
         assert_eq!(receipt.oracle_hash, verdict.oracle_hash);
-        assert_eq!(receipt.candidate_hash, verdict.candidate_hash);
+        assert_eq!(
+            receipt.candidate_behavior_hash,
+            verdict.candidate_behavior_hash
+        );
+        assert_eq!(receipt.candidate_source_hash, SOURCE_HASH);
     }
 
     #[test]
@@ -239,7 +256,7 @@ mod tests {
             .iter()
             .map(|c| {
                 OracleTrace::new(
-                    "toupper",
+                    &target::LIBC_TOUPPER,
                     &c.case_id,
                     &c.input,
                     &[phor_toupper(c.input[0])],
@@ -253,6 +270,7 @@ mod tests {
         let refused = promote(
             &target::LIBC_TOUPPER,
             &verdict,
+            SOURCE_HASH,
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -265,10 +283,24 @@ mod tests {
         let refused = promote(
             &target::LIBC_TOUPPER,
             &verdict,
+            SOURCE_HASH,
             &full_evidence(),
             &PortingAuthority::none(),
         );
         assert_eq!(refused, Err(PromotionError::CapabilityDenied));
+    }
+
+    #[test]
+    fn test_promotion_denied_without_candidate_source_hash() {
+        let verdict = agreeing_verdict();
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &verdict,
+            "",
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::MissingCandidateSourceHash));
     }
 
     #[test]
@@ -281,6 +313,7 @@ mod tests {
         let refused = promote(
             &target::LIBC_TOUPPER,
             &verdict,
+            SOURCE_HASH,
             &partial,
             &PortingAuthority::granted(),
         );

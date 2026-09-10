@@ -313,8 +313,9 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   comparisons, not receipt counts, and fails closed.
 - **Promotion** — advances the candidate to `sealed` only on an exact full-domain
   match with a complete evidence set. Gated by the `PORTING` capability.
-- **Runtime preference** — the sealed package (`native:libc:toupper`) is the
-  artifact the runtime prefers over the foreign implementation.
+- **Runtime preference** — the sealed package
+  (`native:libc:toupper:c-locale:u8:v1`) is the artifact the runtime prefers over
+  the foreign implementation.
 
 This is API-surface porting, not arbitrary binary translation. Eager JIT of
 arbitrary foreign binaries is a later phase.

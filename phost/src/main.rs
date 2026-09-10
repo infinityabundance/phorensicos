@@ -195,7 +195,7 @@ fn main() {
 /// and `promote` (alias `court`) writes the full evidence set and seals the
 /// native candidate — but only if every replayed case matched exactly.
 fn port_cli(args: &[String]) -> i32 {
-    use phost::porting::{self, PortDepth, PortingAuthority};
+    use phost::porting::{self, evidence, target, PortDepth, PortingAuthority};
 
     if args.is_empty() {
         eprintln!("Usage: phost port <observe|replay|promote|court> <symbol> [--out DIR]");
@@ -231,16 +231,27 @@ fn port_cli(args: &[String]) -> i32 {
     // court refuses both observation and promotion without it.
     let auth = PortingAuthority::granted();
 
-    match porting::run_port_court(symbol, &auth, &out, depth) {
+    // Bind the clean-room candidate source into the seal (fail closed if absent).
+    let source_path = target::resolve_target(symbol)
+        .map(|t| t.candidate_source)
+        .unwrap_or("");
+    let source_hash = evidence::hash_file(source_path).unwrap_or_default();
+
+    match porting::run_port_court(symbol, &auth, &out, depth, &source_hash) {
         Ok(r) => {
-            println!("=== JIT-Porting Court: {} ===", r.target);
-            println!("Dialect:        {} ({})", r.dialect, r.version);
+            println!("=== JIT-Porting Court: {} ===", r.symbol);
+            println!("Target id:      {}", r.target);
+            println!(
+                "Dialect:        {} ({}, locale {})",
+                r.dialect, r.version, r.locale_contract
+            );
             println!("Observed cases: {}", r.observed_cases);
             println!("Replay cases:   {}", r.replay_cases);
             println!("Passed:         {}", r.passed);
             println!("Failed:         {}", r.failed);
             println!("Oracle hash:    {}", r.oracle_hash);
-            println!("Candidate hash: {}", r.candidate_hash);
+            println!("Candidate behavior hash: {}", r.candidate_behavior_hash);
+            println!("Candidate source hash:   {}", r.candidate_source_hash);
             println!("Verdict:        {}", r.verdict);
             println!("Promotion:      {}", r.promotion);
             println!("Evidence:       {}", r.evidence_dir);

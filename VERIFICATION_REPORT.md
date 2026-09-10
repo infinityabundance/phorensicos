@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 77 pass, 4 ignored | 81 total: 8 serial + 4 kernel + 49 nucleus + 20 porting; the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 81 pass, 4 ignored | 85 total: 8 serial + 4 kernel + 49 nucleus + 24 porting; the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc lib) | ✅ 43/43 pass | Parser/checker/lower/codegen |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -89,17 +89,23 @@ GUI compositor → window manager → surface management → inspector
 ### JIT-Porting Court (first target: libc `toupper`)
 | Aspect | Result |
 |--------|--------|
+| Qualified target id | `libc:toupper:c-locale:u8:v1` (dialect `libc`, locale contract `C`) |
 | Dialect cage observation | ✅ 256/256 cases (exhaustive `0x00..=0xff`), C locale |
 | Replay court | ✅ 256/256 passed, 0 failed, verdict `consistent` |
-| Oracle hash | `23f73cde270bfe5195d906965088ddbf58af7370e05b6f0603d1d828c803fbe3` |
-| Candidate hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` |
+| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` |
+| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` |
+| Candidate source hash | `1d3828469426e3db3d6ae1796db42477552ce922b6570c74883c9c258ecf6d17` |
+| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` |
 | Promotion | ✅ `oracle-compared` → `sealed` |
-| Sealed package | ✅ `native:libc:toupper` (`phost/evidence/porting/toupper/`) |
-| Determinism | ✅ two runs byte-identical (6/6 artifacts) |
+| Sealed package | ✅ `native:libc:toupper:c-locale:u8:v1` (`phost/evidence/porting/toupper/`) |
+| Determinism court | ✅ two fresh runs byte-identical (6/6 artifacts) |
+| Committed-evidence court | ✅ `--check-committed`: fresh run == checked-in evidence (6/6) |
+| Tamper detection | ✅ editing the `.phor` candidate invalidates the seal; locale is hash-covered |
 | Capability gating | ✅ `PORTING` required to observe and to promote |
+| Fail-closed candidate | ✅ unknown target id returns `UnsupportedTarget`, never identity |
 
 ### Test Results (reproduced on `main`)
-- phost: 77 passed, 0 failed, 4 ignored (81 total). The ignored tests read
+- phost: 81 passed, 0 failed, 4 ignored (85 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 43/43 passed (0 warnings).
@@ -115,7 +121,8 @@ cargo test                                       # phorc + phost
 cargo run -p phorc -- examples/hello.phor /tmp/hello.o --emit-receipts --emit-seal
 cargo run -p phorc -- --court-replay /tmp/hello.sealed_package.json
 cargo run -p phost -- port promote toupper       # JIT-porting court
-./verify_jit_porting_court.sh                    # 256/256, hashes MATCH, Sealed
+./verify_jit_porting_court.sh                    # determinism court
+./verify_jit_porting_court.sh --check-committed  # fresh == checked-in evidence
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
 ./verify_evidence.sh evidence                    # 13/13 boot-evidence checks

@@ -146,10 +146,11 @@ impl PortingAuthority {
 /// the store. Lookups are gated: without `PORTING` the entry is invisible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedPortEntry {
-    pub symbol: String,
+    pub target: String,
     pub trust: TrustState,
     pub oracle_hash: String,
-    pub candidate_hash: String,
+    pub candidate_behavior_hash: String,
+    pub candidate_source_hash: String,
     pub sealed_package: String,
 }
 
@@ -170,17 +171,17 @@ impl SealedPortIndex {
         self.entries.push(entry);
     }
 
-    pub fn lookup(&self, symbol: &str) -> Option<&SealedPortEntry> {
-        self.entries.iter().find(|e| e.symbol == symbol)
+    pub fn lookup(&self, target: &str) -> Option<&SealedPortEntry> {
+        self.entries.iter().find(|e| e.target == target)
     }
 
     /// Capability-gated lookup: sealed entries are not revealed without
     /// `PORTING`. There is no ambient authority to read the store.
-    pub fn lookup_gated(&self, symbol: &str, auth: &PortingAuthority) -> Option<&SealedPortEntry> {
+    pub fn lookup_gated(&self, target: &str, auth: &PortingAuthority) -> Option<&SealedPortEntry> {
         if !auth.can_observe() {
             return None;
         }
-        self.lookup(symbol)
+        self.lookup(target)
     }
 
     pub fn len(&self) -> usize {
@@ -217,15 +218,18 @@ impl PortDepth {
 /// Outcome of a court run, suitable for printing.
 #[derive(Clone, Debug)]
 pub struct PortCourtReport {
+    pub symbol: String,
     pub target: String,
     pub dialect: String,
     pub version: String,
+    pub locale_contract: String,
     pub observed_cases: u64,
     pub replay_cases: u64,
     pub passed: u64,
     pub failed: u64,
     pub oracle_hash: String,
-    pub candidate_hash: String,
+    pub candidate_behavior_hash: String,
+    pub candidate_source_hash: String,
     pub verdict: String,
     pub promotion: String,
     pub sealed_package: String,
@@ -246,11 +250,15 @@ pub fn observe_target(
 /// Deterministic: the case domain is enumerated in a fixed order, the cage is
 /// pure black-box observation, and every hash is SHA-256 over a stable
 /// canonical encoding. No wall-clock value participates in the verdict.
+///
+/// `candidate_source_hash` binds the clean-room candidate source into the seal;
+/// an empty value blocks promotion (fail closed).
 pub fn run_port_court(
     symbol: &str,
     auth: &PortingAuthority,
     out_dir: &str,
     depth: PortDepth,
+    candidate_source_hash: &str,
 ) -> Result<PortCourtReport, PortError> {
     // Capability gate: observation requires PORTING.
     if !auth.can_observe() {
@@ -267,9 +275,9 @@ pub fn run_port_court(
     let traces = observe_target(&target, &cases, auth)?;
 
     // 3. Seal the observed behavior as a behavior signature, and the candidate
-    //    residual for the same cases.
+    //    residual (behavior + source binding) for the same cases.
     let signature = BehaviorSignature::from_traces(&target, &traces);
-    let candidate_sig = CandidateSignature::from_traces(&target, &traces);
+    let candidate_sig = CandidateSignature::from_traces(&target, &traces, candidate_source_hash);
 
     // 4. Replay + compare (fail closed).
     let (verdict, mismatches) = replay_court::run_replay_court(&traces);
@@ -280,13 +288,19 @@ pub fn run_port_court(
     let mut sealed_json: Option<String> = None;
 
     if depth == PortDepth::Promote {
-        let sealed = evidence::sealed_package_json(&target, &verdict, &signature);
+        let sealed = evidence::sealed_package_json(&target, &verdict, &signature, &candidate_sig);
         let promotion_evidence = PromotionEvidence {
             sealed_package_written: true,
             replay_residual_written: true,
         };
-        let r = promotion::promote(&target, &verdict, &promotion_evidence, auth)
-            .map_err(PortError::PromotionRefused)?;
+        let r = promotion::promote(
+            &target,
+            &verdict,
+            candidate_source_hash,
+            &promotion_evidence,
+            auth,
+        )
+        .map_err(PortError::PromotionRefused)?;
         promotion_json = Some(r.to_json());
         sealed_json = Some(sealed);
         receipt = Some(r);
@@ -317,15 +331,18 @@ pub fn run_port_court(
     };
 
     Ok(PortCourtReport {
-        target: symbol.to_string(),
+        symbol: symbol.to_string(),
+        target: target.id.to_string(),
         dialect: target.dialect.to_string(),
         version: target.version.to_string(),
+        locale_contract: target.locale_contract.to_string(),
         observed_cases: traces.len() as u64,
         replay_cases: verdict.cases_run,
         passed: verdict.cases_passed,
         failed: verdict.cases_failed,
         oracle_hash: verdict.oracle_hash.clone(),
-        candidate_hash: verdict.candidate_hash.clone(),
+        candidate_behavior_hash: verdict.candidate_behavior_hash.clone(),
+        candidate_source_hash: candidate_source_hash.to_string(),
         verdict: verdict.verdict.as_str().to_string(),
         promotion: promotion_label,
         sealed_package: paths.sealed_package.clone(),
@@ -368,17 +385,17 @@ mod tests {
         // Sealed store lookup is also invisible without the capability.
         let mut index = SealedPortIndex::new();
         index.insert(SealedPortEntry {
-            symbol: "toupper".to_string(),
+            target: "libc:toupper:c-locale:u8:v1".to_string(),
             trust: TrustState::Sealed,
             oracle_hash: "aa".to_string(),
-            candidate_hash: "bb".to_string(),
+            candidate_behavior_hash: "bb".to_string(),
+            candidate_source_hash: "cc".to_string(),
             sealed_package: "sealed_package.json".to_string(),
         });
+        let id = "libc:toupper:c-locale:u8:v1";
+        assert!(index.lookup_gated(id, &PortingAuthority::none()).is_none());
         assert!(index
-            .lookup_gated("toupper", &PortingAuthority::none())
-            .is_none());
-        assert!(index
-            .lookup_gated("toupper", &PortingAuthority::granted())
+            .lookup_gated(id, &PortingAuthority::granted())
             .is_some());
     }
 

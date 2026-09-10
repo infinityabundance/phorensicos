@@ -1,8 +1,9 @@
 // porting/oracle_trace.rs — Sealed oracle traces
 //
 // An oracle trace is one observed case: input bytes in, output bytes out, plus
-// status/effects and a self-describing SHA-256 over a stable canonical encoding.
-// Traces are the sealed evidence a native candidate is replayed against.
+// the observed locale contract, status/effects, and a self-describing SHA-256
+// over a stable canonical encoding. Traces are the sealed evidence a native
+// candidate is replayed against.
 //
 // Determinism rules for court evidence:
 //   * JSON field order is fixed by the writer,
@@ -15,11 +16,13 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::porting::sha256_hex;
+use crate::porting::target::PortTarget;
 
 /// One sealed observation of a foreign API surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OracleTrace {
     pub target: String,
+    pub locale_contract: String,
     pub case_id: String,
     pub input_hex: String,
     pub output_hex: String,
@@ -29,9 +32,9 @@ pub struct OracleTrace {
 }
 
 impl OracleTrace {
-    /// Build a trace and seal its `observed_hash`.
+    /// Build a trace for `target` and seal its `observed_hash`.
     pub fn new(
-        target: &str,
+        target: &PortTarget,
         case_id: &str,
         input: &[u8],
         output: &[u8],
@@ -39,7 +42,8 @@ impl OracleTrace {
         effects: &[&str],
     ) -> Self {
         let mut trace = Self {
-            target: target.to_string(),
+            target: target.id.to_string(),
+            locale_contract: target.locale_contract.to_string(),
             case_id: case_id.to_string(),
             input_hex: hex::encode(input),
             output_hex: hex::encode(output),
@@ -54,8 +58,9 @@ impl OracleTrace {
     /// Canonical, hash-covered encoding (excludes `observed_hash` itself).
     pub fn canonical(&self) -> String {
         format!(
-            "target={};case_id={};input={};output={};status={};effects={}",
+            "target={};locale={};case_id={};input={};output={};status={};effects={}",
             self.target,
+            self.locale_contract,
             self.case_id,
             self.input_hex,
             self.output_hex,
@@ -84,8 +89,9 @@ impl OracleTrace {
             .map(|e| format!("\"{}\"", crate::porting::json_escape(e)))
             .collect();
         format!(
-            "    {{\n      \"target\": \"{}\",\n      \"case_id\": \"{}\",\n      \"input_hex\": \"{}\",\n      \"output_hex\": \"{}\",\n      \"status\": \"{}\",\n      \"effects\": [{}],\n      \"observed_hash\": \"{}\"\n    }}",
+            "    {{\n      \"target\": \"{}\",\n      \"locale_contract\": \"{}\",\n      \"case_id\": \"{}\",\n      \"input_hex\": \"{}\",\n      \"output_hex\": \"{}\",\n      \"status\": \"{}\",\n      \"effects\": [{}],\n      \"observed_hash\": \"{}\"\n    }}",
             crate::porting::json_escape(&self.target),
+            crate::porting::json_escape(&self.locale_contract),
             crate::porting::json_escape(&self.case_id),
             self.input_hex,
             self.output_hex,
@@ -124,34 +130,42 @@ pub fn combined_oracle_hash(traces: &[OracleTrace]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::porting::target;
+
+    fn trace(case_id: &str, input: u8, output: u8) -> OracleTrace {
+        OracleTrace::new(
+            &target::LIBC_TOUPPER,
+            case_id,
+            &[input],
+            &[output],
+            "ok",
+            &["compute"],
+        )
+    }
 
     #[test]
     fn test_trace_hash_is_intact() {
-        let t = OracleTrace::new("toupper", "0x61", &[0x61], &[0x41], "ok", &["compute"]);
+        let t = trace("0x61", 0x61, 0x41);
         assert!(t.is_intact());
         assert_eq!(t.input_hex, "61");
         assert_eq!(t.output_hex, "41");
+        assert_eq!(t.target, "libc:toupper:c-locale:u8:v1");
+        assert_eq!(t.locale_contract, "C");
     }
 
     #[test]
     fn test_trace_serialization_is_stable() {
-        let t = OracleTrace::new("toupper", "0x61", &[0x61], &[0x41], "ok", &["compute"]);
+        let t = trace("0x61", 0x61, 0x41);
         assert_eq!(t.to_json(), t.to_json());
 
-        let set = alloc::vec![
-            OracleTrace::new("toupper", "0x00", &[0x00], &[0x00], "ok", &["compute"]),
-            OracleTrace::new("toupper", "0x61", &[0x61], &[0x41], "ok", &["compute"]),
-        ];
+        let set = alloc::vec![trace("0x00", 0x00, 0x00), trace("0x61", 0x61, 0x41)];
         assert_eq!(traces_to_json(&set), traces_to_json(&set));
         assert_eq!(combined_oracle_hash(&set), combined_oracle_hash(&set));
     }
 
     #[test]
     fn test_evidence_hash_changes_when_trace_mutated() {
-        let cases = alloc::vec![
-            OracleTrace::new("toupper", "0x00", &[0x00], &[0x00], "ok", &["compute"]),
-            OracleTrace::new("toupper", "0x61", &[0x61], &[0x41], "ok", &["compute"]),
-        ];
+        let cases = alloc::vec![trace("0x00", 0x00, 0x00), trace("0x61", 0x61, 0x41)];
         let before = combined_oracle_hash(&cases);
 
         // Mutate one observed output: the combined hash must change, and the
@@ -161,6 +175,12 @@ mod tests {
         mutated[1].output_hex = "42".to_string();
         assert_ne!(before, combined_oracle_hash(&mutated));
         assert!(!mutated[1].is_intact());
+
+        // The locale contract is hash-covered too.
+        let mut relocaled = cases.clone();
+        relocaled[1].locale_contract = "en_US".to_string();
+        assert_ne!(before, combined_oracle_hash(&relocaled));
+        assert!(!relocaled[1].is_intact());
 
         // Re-sealing the mutated trace still yields a different behavior hash
         // (it is a different observed behavior, not a correction).

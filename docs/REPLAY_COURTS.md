@@ -340,13 +340,20 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 ### First target: libc `toupper`
 
 ```text
-dialect: libc   symbol: toupper   version: host-observed-v1
-domain:  exhaustive 0x00..=0xff (256 cases, in order)
+target id: libc:toupper:c-locale:u8:v1
+dialect:   libc   symbol: toupper   version: host-observed-v1
+locale:    C      (recorded in every trace as locale_contract)
+domain:    exhaustive 0x00..=0xff (256 cases, in order)
 ```
 
+The target id is qualified (`dialect:symbol:locale:type:version`) so a future
+locale-aware `toupper` is a *different* target, never a silent redefinition.
+
 The dialect cage calls the foreign `toupper` through a single narrow FFI shim and
-records input/output/status/effects — it never reads or copies foreign source.
-The native candidate is a clean-room `phor_toupper` (ASCII `a`..`z` fold).
+records input/output/locale/status/effects — it never reads or copies foreign
+source. The native candidate is a clean-room `phor_toupper` (ASCII `a`..`z`
+fold). An unknown target id returns `CandidateError::UnsupportedTarget`; there is
+no identity fallback, so an unsupported candidate can never pass by accident.
 
 ### Mapping to court concepts
 
@@ -369,8 +376,16 @@ mutation of a covered field changes the behavior signature.
 - An empty case set is `inconclusive`; any mismatch is `inconsistent`; the court
   fails closed on both.
 - Promotion to `sealed` requires: a non-empty full replay, zero failures, a
-  consistent verdict, both hashes present, and the sealed package + replay
-  residual written. Promotion also requires the `PORTING` capability.
+  consistent verdict, the oracle hash, the candidate behavior hash, the bound
+  candidate source hash, and the sealed package + replay residual written.
+  Promotion also requires the `PORTING` capability.
+
+### Seal contents
+
+The sealed package binds the qualified target id, the locale contract, the
+candidate's **behavior** hash (its outputs over the case domain), and the
+clean-room **source** hash. A future stage adds an emitted-object hash once the
+compiled `.phor` candidate is authoritative.
 
 ### Capability gating
 
@@ -397,5 +412,10 @@ Reproduce:
 
 ```sh
 cargo run -p phost -- port promote toupper
-./verify_jit_porting_court.sh
+./verify_jit_porting_court.sh                  # determinism court
+./verify_jit_porting_court.sh --check-committed   # fresh == checked-in evidence
 ```
+
+`--check-committed` writes only to a temp dir and compares against the checked-in
+evidence without touching it — reviewer-grade proof that the committed seal
+matches a fresh run.

@@ -973,7 +973,7 @@ impl Shell {
     /// the native candidate only after the court seals it (see docs/PHORENSIC_OS.md).
     #[cfg(feature = "std")]
     fn cmd_port(&mut self, args: &str) {
-        use crate::porting::{self, PortDepth, PortingAuthority};
+        use crate::porting::{self, evidence, target, PortDepth, PortingAuthority};
 
         let mut parts = args.split_whitespace();
         let stage = parts.next().unwrap_or("promote");
@@ -984,8 +984,14 @@ impl Shell {
         // Granted PORTING authority; the court fails closed without it.
         let auth = PortingAuthority::granted();
 
+        // Bind the clean-room candidate source into the seal.
+        let source_path = target::resolve_target(symbol)
+            .map(|t| t.candidate_source)
+            .unwrap_or("");
+        let source_hash = evidence::hash_file(source_path).unwrap_or_default();
+
         let _ = writeln!(self.console, "JIT-porting court: {} {}", stage, symbol);
-        match porting::run_port_court(symbol, &auth, &out, depth) {
+        match porting::run_port_court(symbol, &auth, &out, depth, &source_hash) {
             Ok(r) => {
                 let _ = writeln!(self.console, "  observed:  {}", r.observed_cases);
                 let _ = writeln!(self.console, "  replayed:  {}", r.replay_cases);
@@ -994,7 +1000,8 @@ impl Shell {
                 let _ = writeln!(self.console, "  verdict:   {}", r.verdict);
                 let _ = writeln!(self.console, "  promotion: {}", r.promotion);
                 let _ = writeln!(self.console, "  oracle:    {}", r.oracle_hash);
-                let _ = writeln!(self.console, "  candidate: {}", r.candidate_hash);
+                let _ = writeln!(self.console, "  behavior:  {}", r.candidate_behavior_hash);
+                let _ = writeln!(self.console, "  source:    {}", r.candidate_source_hash);
             }
             Err(e) => {
                 let _ = writeln!(self.console, "  error: {}", e);

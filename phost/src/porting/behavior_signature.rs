@@ -1,8 +1,9 @@
 // porting/behavior_signature.rs — Sealed behavior signature
 //
-// Summarizes a sealed oracle trace set: how many cases were observed, the
-// combined oracle hash, and a human-readable description of the input domain.
-// This is the value a replay verdict's `oracle_hash` must match.
+// Summarizes a sealed oracle trace set: the qualified target id, the locale
+// contract, how many cases were observed, the combined oracle hash, and a
+// human-readable description of the input domain. This is the value a replay
+// verdict's `oracle_hash` must match.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -15,6 +16,7 @@ use crate::porting::{json_escape, sha256_hex};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BehaviorSignature {
     pub target: String,
+    pub locale_contract: String,
     pub case_count: u64,
     pub combined_oracle_hash: String,
     pub input_domain_summary: String,
@@ -23,7 +25,8 @@ pub struct BehaviorSignature {
 impl BehaviorSignature {
     pub fn from_traces(target: &PortTarget, traces: &[OracleTrace]) -> Self {
         Self {
-            target: target.symbol.to_string(),
+            target: target.id.to_string(),
+            locale_contract: target.locale_contract.to_string(),
             case_count: traces.len() as u64,
             combined_oracle_hash: combined_oracle_hash(traces),
             input_domain_summary: format!("exhaustive 0..=255 ({})", target.input_schema),
@@ -32,8 +35,12 @@ impl BehaviorSignature {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};case_count={};combined_oracle_hash={};input_domain_summary={}",
-            self.target, self.case_count, self.combined_oracle_hash, self.input_domain_summary
+            "target={};locale={};case_count={};combined_oracle_hash={};input_domain_summary={}",
+            self.target,
+            self.locale_contract,
+            self.case_count,
+            self.combined_oracle_hash,
+            self.input_domain_summary
         )
     }
 
@@ -43,8 +50,9 @@ impl BehaviorSignature {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.behavior_signature.v1\",\n  \"target\": \"{}\",\n  \"case_count\": {},\n  \"combined_oracle_hash\": \"{}\",\n  \"input_domain_summary\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.behavior_signature.v1\",\n  \"target\": \"{}\",\n  \"locale_contract\": \"{}\",\n  \"case_count\": {},\n  \"combined_oracle_hash\": \"{}\",\n  \"input_domain_summary\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
+            json_escape(&self.locale_contract),
             self.case_count,
             self.combined_oracle_hash,
             json_escape(&self.input_domain_summary),
@@ -66,8 +74,22 @@ mod tests {
 
     fn two_traces() -> Vec<OracleTrace> {
         alloc::vec![
-            OracleTrace::new("toupper", "0x00", &[0x00], &[0x00], "ok", &["compute"]),
-            OracleTrace::new("toupper", "0x61", &[0x61], &[0x41], "ok", &["compute"]),
+            OracleTrace::new(
+                &target::LIBC_TOUPPER,
+                "0x00",
+                &[0x00],
+                &[0x00],
+                "ok",
+                &["compute"]
+            ),
+            OracleTrace::new(
+                &target::LIBC_TOUPPER,
+                "0x61",
+                &[0x61],
+                &[0x41],
+                "ok",
+                &["compute"]
+            ),
         ]
     }
 
@@ -76,7 +98,8 @@ mod tests {
         let traces = two_traces();
         let sig = BehaviorSignature::from_traces(&target::LIBC_TOUPPER, &traces);
         assert_eq!(sig.case_count, 2);
-        assert_eq!(sig.target, "toupper");
+        assert_eq!(sig.target, "libc:toupper:c-locale:u8:v1");
+        assert_eq!(sig.locale_contract, "C");
         assert_eq!(sig.combined_oracle_hash, combined_oracle_hash(&traces));
         assert_eq!(sig.residual_hash(), sig.residual_hash());
     }
