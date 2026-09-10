@@ -306,15 +306,17 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → native candidate → replay court → comparison → promotion → sealed package
 ```
 
-- **Dialect cage** — observes a foreign API surface as a black box (first target:
-  libc `toupper`, exhaustive `0x00..=0xff`). No foreign source is read or copied.
+- **Dialect cage** — observes a foreign API surface as a black box. Two targets
+  so far: libc `toupper` (exhaustive `0x00..=0xff`) and libc `memcmp` (a bounded
+  deterministic corpus forcing length, buffers and ordering). No foreign source is
+  read or copied.
 - **Court session** — replays a clean-room native candidate against sealed oracle
   traces and compares exact output/status/effects. The verdict derives from case
   comparisons, not receipt counts, and fails closed.
-- **Promotion** — advances the candidate to `sealed` only on an exact full-domain
+- **Promotion** — advances the candidate to `sealed` only on an exact, non-empty
   match with a complete evidence set. Gated by the `PORTING` capability.
-- **Runtime preference** — the sealed package
-  (`native:libc:toupper:c-locale:u8:v1`) is the artifact the runtime prefers over
+- **Runtime preference** — the sealed package (e.g.
+  `native:libc:memcmp:c-locale:sign:v1`) is the artifact the runtime prefers over
   the foreign implementation.
 
 This is API-surface porting, not arbitrary binary translation. Eager JIT of

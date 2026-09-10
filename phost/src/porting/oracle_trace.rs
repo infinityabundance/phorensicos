@@ -1,13 +1,16 @@
 // porting/oracle_trace.rs — Sealed oracle traces
 //
-// An oracle trace is one observed case: input bytes in, output bytes out, plus
-// the observed locale contract, status/effects, and a self-describing SHA-256
-// over a stable canonical encoding. Traces are the sealed evidence a native
-// candidate is replayed against.
+// An oracle trace is one observed case: an ordered list of byte-slice arguments
+// in, output bytes out, plus the observed locale contract, status/effects, and a
+// self-describing SHA-256 over a stable canonical encoding.
+//
+// Argument framing: `input_hex` is the `:`-joined lowercase hex of each argument
+// (so a single-argument target such as `toupper` keeps the plain `"41"` form,
+// while `memcmp` becomes `a_hex:b_hex:n_hex`). Empty arguments are preserved.
 //
 // Determinism rules for court evidence:
 //   * JSON field order is fixed by the writer,
-//   * cases appear in domain order,
+//   * cases appear in corpus order,
 //   * all hex is lowercase,
 //   * no timestamps or clocks are covered by any hash.
 
@@ -24,6 +27,7 @@ pub struct OracleTrace {
     pub target: String,
     pub locale_contract: String,
     pub case_id: String,
+    /// `:`-joined lowercase hex of the argument list.
     pub input_hex: String,
     pub output_hex: String,
     pub status: String,
@@ -32,11 +36,39 @@ pub struct OracleTrace {
 }
 
 impl OracleTrace {
-    /// Build a trace for `target` and seal its `observed_hash`.
+    /// Build a trace with multiple arguments and seal its `observed_hash`.
     pub fn new(
         target: &PortTarget,
         case_id: &str,
+        args: &[Vec<u8>],
+        output: &[u8],
+        status: &str,
+        effects: &[&str],
+    ) -> Self {
+        let input_hex = args
+            .iter()
+            .map(|a| hex::encode(a))
+            .collect::<Vec<String>>()
+            .join(":");
+        Self::from_parts(target, case_id, input_hex, output, status, effects)
+    }
+
+    /// Convenience for single-argument targets (e.g. `toupper`).
+    pub fn single(
+        target: &PortTarget,
+        case_id: &str,
         input: &[u8],
+        output: &[u8],
+        status: &str,
+        effects: &[&str],
+    ) -> Self {
+        Self::new(target, case_id, &[input.to_vec()], output, status, effects)
+    }
+
+    fn from_parts(
+        target: &PortTarget,
+        case_id: &str,
+        input_hex: String,
         output: &[u8],
         status: &str,
         effects: &[&str],
@@ -45,7 +77,7 @@ impl OracleTrace {
             target: target.id.to_string(),
             locale_contract: target.locale_contract.to_string(),
             case_id: case_id.to_string(),
-            input_hex: hex::encode(input),
+            input_hex,
             output_hex: hex::encode(output),
             status: status.to_string(),
             effects: effects.iter().map(|e| (*e).to_string()).collect(),
@@ -78,8 +110,12 @@ impl OracleTrace {
         self.compute_hash() == self.observed_hash
     }
 
-    pub fn input_bytes(&self) -> Vec<u8> {
-        hex::decode(&self.input_hex).unwrap_or_default()
+    /// Decode the framed argument list.
+    pub fn input_args(&self) -> Vec<Vec<u8>> {
+        self.input_hex
+            .split(':')
+            .map(|s| hex::decode(s).unwrap_or_default())
+            .collect()
     }
 
     pub fn to_json(&self) -> String {
@@ -113,7 +149,7 @@ pub fn traces_to_json(traces: &[OracleTrace]) -> String {
 }
 
 /// Combined oracle behavior hash: SHA-256 over `case_id:canonical_trace` per
-/// case, in domain order. Binding to the full canonical content means any
+/// case, in corpus order. Binding to the full canonical content means any
 /// mutation of a covered field (including a stale seal) changes this hash. This
 /// is the value the court compares a candidate against.
 pub fn combined_oracle_hash(traces: &[OracleTrace]) -> String {
@@ -131,9 +167,10 @@ pub fn combined_oracle_hash(traces: &[OracleTrace]) -> String {
 mod tests {
     use super::*;
     use crate::porting::target;
+    use alloc::vec;
 
     fn trace(case_id: &str, input: u8, output: u8) -> OracleTrace {
-        OracleTrace::new(
+        OracleTrace::single(
             &target::LIBC_TOUPPER,
             case_id,
             &[input],
@@ -154,6 +191,26 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_arg_framing_round_trips() {
+        // (a, b, n) with n = 3 little-endian; empty first buffer preserved.
+        let t = OracleTrace::new(
+            &target::LIBC_MEMCMP,
+            "E.4.1.n2",
+            &[vec![], vec![0xff, 0x00], 3u64.to_le_bytes().to_vec()],
+            &[0u8; 4],
+            "ok",
+            &["compute"],
+        );
+        assert_eq!(t.input_hex, ":ff00:0300000000000000");
+        let args = t.input_args();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], alloc::vec![]);
+        assert_eq!(args[1], alloc::vec![0xff, 0x00]);
+        assert_eq!(args[2], 3u64.to_le_bytes().to_vec());
+        assert!(t.is_intact());
+    }
+
+    #[test]
     fn test_trace_serialization_is_stable() {
         let t = trace("0x61", 0x61, 0x41);
         assert_eq!(t.to_json(), t.to_json());
@@ -168,9 +225,6 @@ mod tests {
         let cases = alloc::vec![trace("0x00", 0x00, 0x00), trace("0x61", 0x61, 0x41)];
         let before = combined_oracle_hash(&cases);
 
-        // Mutate one observed output: the combined hash must change, and the
-        // mutated trace must no longer be self-consistent (two independent
-        // tamper detections).
         let mut mutated = cases.clone();
         mutated[1].output_hex = "42".to_string();
         assert_ne!(before, combined_oracle_hash(&mutated));
@@ -182,8 +236,12 @@ mod tests {
         assert_ne!(before, combined_oracle_hash(&relocaled));
         assert!(!relocaled[1].is_intact());
 
-        // Re-sealing the mutated trace still yields a different behavior hash
-        // (it is a different observed behavior, not a correction).
+        // The argument framing is hash-covered.
+        let mut reframed = cases.clone();
+        reframed[1].input_hex = "62".to_string();
+        assert_ne!(before, combined_oracle_hash(&reframed));
+
+        // Re-sealing the mutated trace still yields a different behavior hash.
         let mut resealed = mutated.clone();
         resealed[1].observed_hash = resealed[1].compute_hash();
         assert!(resealed[1].is_intact());

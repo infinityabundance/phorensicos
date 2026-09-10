@@ -268,8 +268,9 @@ pub fn run_port_court(
     let target =
         resolve_target(symbol).ok_or_else(|| PortError::UnknownTarget(symbol.to_string()))?;
 
-    // 1. Complete input domain (0..=255 for byte-in/byte-out targets).
-    let cases = target::byte_domain_cases();
+    // 1. The target's deterministic case set (exhaustive byte domain for
+    //    byte-in/byte-out targets; bounded corpus for memcmp).
+    let cases = target::cases_for(&target);
 
     // 2. Observe foreign behavior through the cage.
     let traces = observe_target(&target, &cases, auth)?;
@@ -366,12 +367,12 @@ mod tests {
         let cases = target::byte_domain_cases();
         assert_eq!(cases.len(), 256);
         assert_eq!(cases[0].case_id, "0x00");
-        assert_eq!(cases[0].input, vec![0u8]);
+        assert_eq!(cases[0].args, vec![vec![0u8]]);
         assert_eq!(cases[255].case_id, "0xff");
-        assert_eq!(cases[255].input, vec![255u8]);
+        assert_eq!(cases[255].args, vec![vec![255u8]]);
         // Ordering is strictly increasing and stable.
         for (i, c) in cases.iter().enumerate() {
-            assert_eq!(c.input[0] as usize, i);
+            assert_eq!(c.args[0][0] as usize, i);
         }
     }
 

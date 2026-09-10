@@ -208,11 +208,11 @@ mod tests {
         let traces: Vec<OracleTrace> = byte_domain_cases()
             .iter()
             .map(|c| {
-                OracleTrace::new(
+                OracleTrace::single(
                     &target::LIBC_TOUPPER,
                     &c.case_id,
-                    &c.input,
-                    &[phor_toupper(c.input[0])],
+                    &c.args[0],
+                    &[phor_toupper(c.args[0][0])],
                     "ok",
                     &["compute"],
                 )
@@ -255,11 +255,11 @@ mod tests {
         let mut traces: Vec<OracleTrace> = byte_domain_cases()
             .iter()
             .map(|c| {
-                OracleTrace::new(
+                OracleTrace::single(
                     &target::LIBC_TOUPPER,
                     &c.case_id,
-                    &c.input,
-                    &[phor_toupper(c.input[0])],
+                    &c.args[0],
+                    &[phor_toupper(c.args[0][0])],
                     "ok",
                     &["compute"],
                 )

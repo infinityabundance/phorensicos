@@ -13,17 +13,17 @@
 #                       touching the committed files. This is the reviewer-grade
 #                       check: it proves the committed seal matches a fresh run.
 #
-#  Checks (both modes):
+#  Checks (both modes, for the selected target):
 #    * all six evidence artifacts exist and are valid JSON
-#    * case count is 256, all cases passed, no mismatches
+#    * every case in the corpus passed, with no mismatches
 #    * the recorded locale contract is C and the target id is qualified
 #    * oracle hash matches the stored behavior signature
 #    * candidate behavior hash matches the replay verdict
 #    * the candidate source hash is bound (non-empty)
-#    * promotion level is Sealed and the sealed package targets `toupper`
+#    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
-#    ./verify_jit_porting_court.sh [--check-committed] [evidence_dir]
+#    ./verify_jit_porting_court.sh [--target toupper|memcmp] [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -32,21 +32,43 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+TARGET="toupper"
 MODE="regenerate"
 EVID=""
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --check-committed) MODE="check-committed" ;;
-        *) EVID="$arg" ;;
+        --target) TARGET="$2"; shift ;;
+        --target=*) TARGET="${1#--target=}" ;;
+        *) EVID="$1" ;;
     esac
+    shift
 done
-[ -n "$EVID" ] || EVID="phost/evidence/porting/toupper"
+
+# Per-target expectations.
+case "$TARGET" in
+    toupper)
+        TARGET_ID="libc:toupper:c-locale:u8:v1"
+        EXPECTED_COUNT=256
+        ;;
+    memcmp)
+        TARGET_ID="libc:memcmp:c-locale:sign:v1"
+        EXPECTED_COUNT=312
+        ;;
+    *)
+        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp)"
+        exit 2
+        ;;
+esac
+
+[ -n "$EVID" ] || EVID="phost/evidence/porting/$TARGET"
 case "$EVID" in /*) ;; *) EVID="$ROOT/$EVID" ;; esac
 
 BIN="$ROOT/target/debug/phost"
 FILES="oracle_traces.json behavior_signature.json candidate_signature.json replay_verdict.json promotion_receipt.json sealed_package.json"
 
 echo "=== Phorensic OS — JIT-Porting Court Verification ==="
+echo "Target:       $TARGET ($TARGET_ID)"
 echo "Evidence dir: $EVID"
 echo "Mode:         $MODE"
 echo
@@ -65,14 +87,13 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "--- fresh court run (temp) ---"
-if ! "$BIN" port promote toupper --out "$TMP" >/dev/null 2>&1; then
-    echo "ERROR: phost port promote toupper failed"
-    "$BIN" port promote toupper --out "$TMP" || true
+if ! "$BIN" port promote "$TARGET" --out "$TMP" >/dev/null 2>&1; then
+    echo "ERROR: phost port promote $TARGET failed"
+    "$BIN" port promote "$TARGET" --out "$TMP" || true
     exit 2
 fi
 
 if [ "$MODE" = "check-committed" ]; then
-    # --- committed-evidence court ------------------------------------------
     echo "--- committed-evidence court (fresh == checked-in; committed untouched) ---"
     if [ ! -d "$EVID" ]; then
         echo "  [FAIL] committed evidence dir missing: $EVID"
@@ -91,9 +112,8 @@ if [ "$MODE" = "check-committed" ]; then
     [ "$FAIL" -eq 0 ] && echo "  [PASS] fresh run matches checked-in evidence (6/6 artifacts)"
     [ "$FAIL" -eq 0 ] || { echo "Status: COMMITTED EVIDENCE STALE"; exit 1; }
 else
-    # --- determinism court --------------------------------------------------
     echo "--- determinism court (fresh A == fresh B) ---"
-    if ! "$BIN" port promote toupper --out "$EVID" >/dev/null 2>&1; then
+    if ! "$BIN" port promote "$TARGET" --out "$EVID" >/dev/null 2>&1; then
         echo "ERROR: second court run failed"
         exit 2
     fi
@@ -110,11 +130,10 @@ fi
 
 # --- 2. Validate evidence content ------------------------------------------
 echo "--- validating evidence ---"
-python3 - "$EVID" <<'PY'
+python3 - "$EVID" "$TARGET_ID" "$EXPECTED_COUNT" "$TARGET" <<'PY'
 import json, os, sys
 
-d = sys.argv[1]
-TARGET_ID = "libc:toupper:c-locale:u8:v1"
+d, TARGET_ID, EXPECTED, SYMBOL = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 errors = []
 
 def load(name):
@@ -133,16 +152,16 @@ verdict = load("replay_verdict.json")
 promo = load("promotion_receipt.json")
 sealed = load("sealed_package.json")
 
-# Oracle traces: complete, ordered domain, qualified target, C locale.
+# Oracle traces: full corpus, qualified target, C locale, all observed ok.
 traces = traces_doc.get("traces", [])
-expected_ids = ["0x%02x" % i for i in range(256)]
-if traces_doc.get("case_count") != 256:
-    errors.append("oracle_traces.case_count != 256")
-if len(traces) != 256:
-    errors.append("oracle_traces has %d traces, expected 256" % len(traces))
-else:
-    if [t.get("case_id") for t in traces] != expected_ids:
-        errors.append("oracle trace case_ids are not the ordered 0x00..0xff domain")
+if traces_doc.get("case_count") != EXPECTED:
+    errors.append("oracle_traces.case_count != %d" % EXPECTED)
+if len(traces) != EXPECTED:
+    errors.append("oracle_traces has %d traces, expected %d" % (len(traces), EXPECTED))
+if traces:
+    ids = [t.get("case_id") for t in traces]
+    if len(set(ids)) != len(ids):
+        errors.append("oracle trace case_ids are not unique")
     if any(t.get("status") != "ok" for t in traces):
         errors.append("some observed cases are not status=ok")
     if any(t.get("target") != TARGET_ID for t in traces):
@@ -172,16 +191,16 @@ if sig.get("target") != TARGET_ID:
     errors.append("behavior_signature.target != %s" % TARGET_ID)
 if sig.get("locale_contract") != "C":
     errors.append("behavior_signature.locale_contract != C")
-if sig.get("case_count") != 256:
-    errors.append("behavior_signature.case_count != 256")
-if cand.get("case_count") != 256:
-    errors.append("candidate_signature.case_count != 256")
+if sig.get("case_count") != EXPECTED:
+    errors.append("behavior_signature.case_count != %d" % EXPECTED)
+if cand.get("case_count") != EXPECTED:
+    errors.append("candidate_signature.case_count != %d" % EXPECTED)
 
 # Replay verdict: everything passed.
-if verdict.get("cases_run") != 256:
-    errors.append("replay.cases_run != 256")
-if verdict.get("cases_passed") != 256:
-    errors.append("replay.cases_passed != 256")
+if verdict.get("cases_run") != EXPECTED:
+    errors.append("replay.cases_run != %d" % EXPECTED)
+if verdict.get("cases_passed") != EXPECTED:
+    errors.append("replay.cases_passed != %d" % EXPECTED)
 if verdict.get("cases_failed") != 0:
     errors.append("replay.cases_failed != 0")
 if verdict.get("verdict") != "consistent":
@@ -200,19 +219,19 @@ if promo.get("target") != TARGET_ID:
 # Sealed package references the correct target.
 if sealed.get("target") != TARGET_ID:
     errors.append("sealed_package.target != %s" % TARGET_ID)
-if sealed.get("symbol") != "toupper":
-    errors.append("sealed_package.symbol != toupper")
+if sealed.get("symbol") != SYMBOL:
+    errors.append("sealed_package.symbol != %s" % SYMBOL)
 if sealed.get("trust") != "sealed":
     errors.append("sealed_package.trust != sealed")
 if sealed.get("dialect") != "libc":
     errors.append("sealed_package.dialect != libc")
 if sealed.get("locale_contract") != "C":
     errors.append("sealed_package.locale_contract != C")
-if sealed.get("case_count") != 256:
-    errors.append("sealed_package.case_count != 256")
+if sealed.get("case_count") != EXPECTED:
+    errors.append("sealed_package.case_count != %d" % EXPECTED)
 
 # --- report ---------------------------------------------------------------
-print("Target: %s" % sealed.get("symbol", "?"))
+print("Target: %s" % sealed.get("symbol", SYMBOL))
 print("Observed cases: %d" % traces_doc.get("case_count", 0))
 print("Replay cases: %d" % verdict.get("cases_run", 0))
 print("Passed: %d" % verdict.get("cases_passed", 0))

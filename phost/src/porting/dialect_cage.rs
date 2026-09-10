@@ -2,9 +2,8 @@
 //
 // The cage is the clean-room boundary. It runs the *foreign* implementation as
 // an observed black box and records input/output/status/locale/effects — it never
-// reads, copies, or embeds foreign source. For the first milestone the foreign
-// surface is host libc `toupper` in the C locale, reached through a single narrow
-// FFI shim.
+// reads, copies, or embeds foreign source. Foreign functions are reached through
+// a single narrow FFI shim (libc `toupper`, `memcmp`).
 //
 // This module is std-only: observing a foreign implementation requires the
 // foreign runtime to be present. Kernel-side replay against already-sealed
@@ -13,19 +12,21 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
 
+use crate::porting::candidate::{decode_usize, encode_sign};
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, TestCase, LIBC_TOUPPER};
+use crate::porting::target::{PortTarget, TestCase, LIBC_MEMCMP, LIBC_TOUPPER};
 use crate::porting::{PortError, PortingAuthority};
 
-// Foreign implementation under observation. In the "C" locale (the initial
+// Foreign implementations under observation. In the "C" locale (the initial
 // locale for a process that never calls setlocale), `toupper` folds ASCII
-// `a`..=`z` and leaves every other byte unchanged, which is exactly what the
-// exhaustive 0..=255 court verifies. The locale is recorded in every trace as
-// `locale_contract` so this court can never be confused with a locale-aware one.
+// `a`..=`z` and leaves every other byte unchanged; `memcmp` compares unsigned
+// bytes. Both are recorded with `locale_contract` so these courts can never be
+// confused with locale-aware ones.
 extern "C" {
     fn toupper(c: c_int) -> c_int;
+    fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int;
 }
 
 /// Observe `cases` against `target` through the cage.
@@ -41,30 +42,61 @@ pub fn observe_target(
         return Err(PortError::CapabilityDenied);
     }
 
-    if target.id != LIBC_TOUPPER.id {
-        return Err(PortError::UnsupportedTarget(String::from(target.id)));
+    if target.id == LIBC_TOUPPER.id {
+        return Ok(cases
+            .iter()
+            .map(|case| {
+                let input_byte = case
+                    .args
+                    .first()
+                    .and_then(|a| a.first())
+                    .copied()
+                    .unwrap_or(0);
+                let out = unsafe { toupper(input_byte as c_int) };
+                OracleTrace::new(
+                    target,
+                    &case.case_id,
+                    &case.args,
+                    &[out as u8],
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect());
     }
 
-    Ok(cases
-        .iter()
-        .map(|case| {
-            let input_byte = *case.input.first().unwrap_or(&0);
-            let out = unsafe { toupper(input_byte as c_int) };
-            OracleTrace::new(
-                target,
-                &case.case_id,
-                &case.input,
-                &[out as u8],
-                "ok",
-                &["compute"],
-            )
-        })
-        .collect())
+    if target.id == LIBC_MEMCMP.id {
+        return Ok(cases
+            .iter()
+            .map(|case| {
+                let a = case.args.first().cloned().unwrap_or_default();
+                let b = case.args.get(1).cloned().unwrap_or_default();
+                let n = case.args.get(2).map(|x| decode_usize(x)).unwrap_or(0);
+                // n is bounded by both buffers in the corpus; clamp defensively so
+                // a malformed case can never read past its slice.
+                let n = n.min(a.len()).min(b.len());
+                let raw =
+                    unsafe { memcmp(a.as_ptr() as *const c_void, b.as_ptr() as *const c_void, n) };
+                let output = encode_sign(raw);
+                OracleTrace::new(
+                    target,
+                    &case.case_id,
+                    &case.args,
+                    &output,
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect());
+    }
+
+    Err(PortError::UnsupportedTarget(String::from(target.id)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::porting::target::memcmp_corpus;
 
     #[test]
     fn test_cage_observes_c_locale_toupper() {
@@ -87,6 +119,61 @@ mod tests {
     }
 
     #[test]
+    fn test_cage_observes_unsigned_memcmp_ordering() {
+        let target = LIBC_MEMCMP;
+        let cases = alloc::vec![
+            TestCase::new(
+                "eq",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    b"abc".to_vec(),
+                    3u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "lt",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    b"abd".to_vec(),
+                    3u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "gt",
+                alloc::vec![
+                    b"abd".to_vec(),
+                    b"abc".to_vec(),
+                    3u64.to_le_bytes().to_vec()
+                ]
+            ),
+            TestCase::new(
+                "n0",
+                alloc::vec![
+                    b"abc".to_vec(),
+                    b"zzz".to_vec(),
+                    0u64.to_le_bytes().to_vec()
+                ]
+            ),
+            // Unsigned boundary: 0x80 > 0x7f.
+            TestCase::new(
+                "edge",
+                alloc::vec![
+                    alloc::vec![0x80],
+                    alloc::vec![0x7f],
+                    1u64.to_le_bytes().to_vec()
+                ]
+            ),
+        ];
+        let traces = observe_target(&target, &cases, &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces[0].output_hex, "00000000"); // equal
+        assert_eq!(traces[1].output_hex, "ffffffff"); // less
+        assert_eq!(traces[2].output_hex, "01000000"); // greater
+        assert_eq!(traces[3].output_hex, "00000000"); // n = 0
+        assert_eq!(traces[4].output_hex, "01000000"); // 0x80 > 0x7f (unsigned)
+        assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
     fn test_cage_rejects_unknown_symbol() {
         let unknown = PortTarget {
             id: "libc:not_a_real_symbol:c-locale:u8:v1",
@@ -96,6 +183,7 @@ mod tests {
             locale_contract: "C",
             input_schema: "u8",
             output_schema: "u8",
+            domain_summary: "none",
             candidate_source: "none",
         };
         let err = observe_target(&unknown, &[TestCase::byte(0)], &PortingAuthority::granted());
@@ -105,5 +193,14 @@ mod tests {
                 "libc:not_a_real_symbol:c-locale:u8:v1"
             )))
         );
+    }
+
+    #[test]
+    fn test_cage_observes_whole_memcmp_corpus() {
+        let traces =
+            observe_target(&LIBC_MEMCMP, &memcmp_corpus(), &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces.len(), 312);
+        assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 8));
     }
 }

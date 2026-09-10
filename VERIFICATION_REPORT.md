@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 81 pass, 4 ignored | 85 total: 8 serial + 4 kernel + 49 nucleus + 24 porting; the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 91 pass, 4 ignored | 95 total: 8 serial + 4 kernel + 49 nucleus + 34 porting; the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc lib) | ✅ 43/43 pass | Parser/checker/lower/codegen |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -28,7 +28,7 @@
 | `serial` driver | ✅ | UART serial driver with capability model |
 | `status_screen` | ✅ | Boot phase display, progress bar, log messages |
 | `input/keyboard` | ✅ | PS/2 keyboard driver with scancode→ASCII |
-| `.phor` corpus | ✅ 311/311 → ELF64 | `src/` 232 + `examples/` 45 + `tests/` 34, all emit objects (checker diagnostics may be emitted; see Known Gaps) |
+| `.phor` corpus | ✅ 312/312 → ELF64 | `src/` 232 + `examples/` 46 + `tests/` 34, all emit objects (checker diagnostics may be emitted; see Known Gaps) |
 | `compositor` module | ✅ | Window manager, surface blitting to canvas |
 | `phorc_bridge` | ✅ | Compiler invocation from shell with result parsing |
 | `pub` visibility tracking | ✅ | FnDecl/StructDecl/EnumDecl/ImplBlock/ConstDecl |
@@ -84,33 +84,45 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 81 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court |
+| phost reach | 95 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp) |
 
-### JIT-Porting Court (first target: libc `toupper`)
+### JIT-Porting Court
+| Aspect | `toupper` | `memcmp` |
+|--------|-----------|----------|
+| Qualified target id | `libc:toupper:c-locale:u8:v1` | `libc:memcmp:c-locale:sign:v1` |
+| Corpus | exhaustive `0x00..=0xff` (256) | bounded deterministic (312) |
+| Dialect cage observation | ✅ 256/256 | ✅ 312/312 |
+| Replay court | ✅ 256/256, 0 failed, `consistent` | ✅ 312/312, 0 failed, `consistent` |
+| Contract | `u8` (C locale) | sign `(-1 \| 0 \| 1)`, unsigned, n-bounded |
+| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` | `918c86d5302aaa0394a782b68e4aed7494549bcaaf06a82948c6d945ccb43210` |
+| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` |
+| Candidate source hash | `1d3828469426e3db3d6ae1796db42477552ce922b6570c74883c9c258ecf6d17` | `63f0d5b40a7ecef3b3e78e274a0dbd15a94e905c9a4210a070f689ed6bf128e2` |
+| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` | `98843827cbbf97866221127651840eaaee6dbb17dc1bf3e0053476ce30a8290d` |
+| Promotion | ✅ → `sealed` | ✅ → `sealed` |
+| Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` |
+
+Shared properties (both targets):
 | Aspect | Result |
 |--------|--------|
-| Qualified target id | `libc:toupper:c-locale:u8:v1` (dialect `libc`, locale contract `C`) |
-| Dialect cage observation | ✅ 256/256 cases (exhaustive `0x00..=0xff`), C locale |
-| Replay court | ✅ 256/256 passed, 0 failed, verdict `consistent` |
-| Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` |
-| Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` |
-| Candidate source hash | `1d3828469426e3db3d6ae1796db42477552ce922b6570c74883c9c258ecf6d17` |
-| Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` |
-| Promotion | ✅ `oracle-compared` → `sealed` |
-| Sealed package | ✅ `native:libc:toupper:c-locale:u8:v1` (`phost/evidence/porting/toupper/`) |
 | Determinism court | ✅ two fresh runs byte-identical (6/6 artifacts) |
 | Committed-evidence court | ✅ `--check-committed`: fresh run == checked-in evidence (6/6) |
+| Cross-environment | ✅ committed evidence matches a fresh container run (6/6) |
 | Tamper detection | ✅ editing the `.phor` candidate invalidates the seal; locale is hash-covered |
 | Capability gating | ✅ `PORTING` required to observe and to promote |
-| Fail-closed candidate | ✅ unknown target id returns `UnsupportedTarget`, never identity |
+| Fail-closed candidate | ✅ unknown target id → `UnsupportedTarget`; malformed args → `MalformedArgs`; never identity |
+
+`memcmp` corpus axes: lengths `0..=8`; patterns zero/ones/ascending/descending/
+alternating; every first-mismatch position with both orderings; the `n`-boundary
+around a mismatch (`n = j` excludes it, `n = j+1` includes it); and the unsigned
+edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`.
 
 ### Test Results (reproduced on `main`)
-- phost: 81 passed, 0 failed, 4 ignored (85 total). The ignored tests read
+- phost: 91 passed, 0 failed, 4 ignored (95 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 43/43 passed (0 warnings).
-- `.phor` corpus: 311/311 files lower to non-empty ELF64 objects
-  (`src/` 232, `examples/` 45, `tests/` 34). These are bootstrap-stage
+- `.phor` corpus: 312/312 files lower to non-empty ELF64 objects
+  (`src/` 232, `examples/` 46, `tests/` 34). These are bootstrap-stage
   results: the checker still reports diagnostics for constructs outside its
   current subset, but lowering and ELF emission complete for every file.
 - `.ph` compile-pass fixtures: 46/46 files emit objects.
@@ -120,9 +132,11 @@ GUI compositor → window manager → surface management → inspector
 cargo test                                       # phorc + phost
 cargo run -p phorc -- examples/hello.phor /tmp/hello.o --emit-receipts --emit-seal
 cargo run -p phorc -- --court-replay /tmp/hello.sealed_package.json
-cargo run -p phost -- port promote toupper       # JIT-porting court
-./verify_jit_porting_court.sh                    # determinism court
-./verify_jit_porting_court.sh --check-committed  # fresh == checked-in evidence
+cargo run -p phost -- port promote toupper       # JIT-porting court (256)
+cargo run -p phost -- port promote memcmp        # JIT-porting court (312)
+./verify_jit_porting_court.sh --target toupper                    # determinism
+./verify_jit_porting_court.sh --target memcmp
+./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
 ./verify_evidence.sh evidence                    # 13/13 boot-evidence checks

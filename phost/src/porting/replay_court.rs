@@ -3,8 +3,8 @@
 // Replays every sealed oracle case against the native candidate and compares
 // the exact output bytes. The verdict derives from case comparisons only — never
 // from receipt counts — and the court fails closed: an empty case set is
-// `Inconclusive`, any mismatch (including an unsupported candidate) is
-// `Inconsistent`, and both deny promotion.
+// `Inconclusive`, any mismatch (including an unsupported or malformed candidate)
+// is `Inconsistent`, and both deny promotion.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -40,8 +40,7 @@ impl CourtVerdict {
 pub struct Mismatch {
     pub case_id: String,
     pub expected_output_hex: String,
-    /// Candidate output hex, or `!unsupported:<target>` when the candidate
-    /// could not be run for this case.
+    /// Candidate output hex, or `!<reason>` when the candidate could not run.
     pub actual_output_hex: String,
 }
 
@@ -118,7 +117,8 @@ impl ReplayVerdict {
 /// Replay the native candidate against the sealed oracle traces.
 ///
 /// Returns the verdict plus every mismatch record (empty on a consistent run).
-/// An unsupported candidate counts as a failure — it can never pass by accident.
+/// An unsupported or malformed candidate counts as a failure — it can never pass
+/// by accident.
 pub fn run_replay_court(traces: &[OracleTrace]) -> (ReplayVerdict, Vec<Mismatch>) {
     let target = traces.first().map(|t| t.target.clone()).unwrap_or_default();
 
@@ -127,8 +127,8 @@ pub fn run_replay_court(traces: &[OracleTrace]) -> (ReplayVerdict, Vec<Mismatch>
     let mut mismatches: Vec<Mismatch> = Vec::new();
 
     for t in traces {
-        let input = t.input_bytes();
-        match candidate::run_candidate(&t.target, &input) {
+        let args = t.input_args();
+        match candidate::run_candidate(&t.target, &args) {
             Ok(out) => {
                 let actual_hex = hex::encode(&out);
                 if actual_hex == t.output_hex && t.status == "ok" {
@@ -179,19 +179,38 @@ pub fn run_replay_court(traces: &[OracleTrace]) -> (ReplayVerdict, Vec<Mismatch>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::porting::candidate::phor_toupper;
-    use crate::porting::target::{self, byte_domain_cases};
+    use crate::porting::candidate::{encode_sign, phor_memcmp, phor_toupper};
+    use crate::porting::target::{self, byte_domain_cases, memcmp_corpus};
 
-    /// Build a trace set where the oracle agrees with the native candidate.
-    fn agreeing_cases() -> Vec<OracleTrace> {
+    /// toupper traces where the oracle agrees with the native candidate.
+    fn agreeing_toupper_cases() -> Vec<OracleTrace> {
         byte_domain_cases()
             .iter()
             .map(|c| {
-                OracleTrace::new(
+                OracleTrace::single(
                     &target::LIBC_TOUPPER,
                     &c.case_id,
-                    &c.input,
-                    &[phor_toupper(c.input[0])],
+                    &c.args[0],
+                    &[phor_toupper(c.args[0][0])],
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect()
+    }
+
+    /// memcmp traces where the oracle agrees with the native candidate.
+    fn agreeing_memcmp_cases() -> Vec<OracleTrace> {
+        memcmp_corpus()
+            .iter()
+            .map(|c| {
+                let n = u64::from_le_bytes(c.args[2].as_slice().try_into().unwrap()) as usize;
+                let out = encode_sign(phor_memcmp(&c.args[0], &c.args[1], n));
+                OracleTrace::new(
+                    &target::LIBC_MEMCMP,
+                    &c.case_id,
+                    &c.args,
+                    &out,
                     "ok",
                     &["compute"],
                 )
@@ -201,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_replay_court_pass_path() {
-        let traces = agreeing_cases();
+        let traces = agreeing_toupper_cases();
         let (verdict, mismatches) = run_replay_court(&traces);
         assert_eq!(verdict.verdict, CourtVerdict::Consistent);
         assert_eq!(verdict.cases_run, 256);
@@ -212,9 +231,20 @@ mod tests {
     }
 
     #[test]
+    fn test_memcmp_replay_court_pass_path() {
+        let traces = agreeing_memcmp_cases();
+        let (verdict, mismatches) = run_replay_court(&traces);
+        assert_eq!(verdict.verdict, CourtVerdict::Consistent);
+        assert_eq!(verdict.cases_run, 312);
+        assert_eq!(verdict.cases_passed, 312);
+        assert_eq!(verdict.cases_failed, 0);
+        assert!(mismatches.is_empty());
+        assert!(verdict.is_sealed_eligible());
+    }
+
+    #[test]
     fn test_replay_court_mismatch_path() {
-        let mut traces = agreeing_cases();
-        // Corrupt exactly one oracle output ('a' should map to 'A').
+        let mut traces = agreeing_toupper_cases();
         traces[0x61].output_hex = "42".to_string();
         let (verdict, mismatches) = run_replay_court(&traces);
         assert_eq!(verdict.verdict, CourtVerdict::Inconsistent);
@@ -229,9 +259,24 @@ mod tests {
     }
 
     #[test]
+    fn test_memcmp_ordering_mismatch_is_caught() {
+        // Flip one case's expected ordering: the court must catch it.
+        let mut traces = agreeing_memcmp_cases();
+        let idx = traces
+            .iter()
+            .position(|t| t.case_id == "F.7f.80")
+            .expect("F.7f.80 present");
+        // 0x7f vs 0x80 is Less; claim Equal instead.
+        traces[idx].output_hex = "00000000".to_string();
+        let (verdict, mismatches) = run_replay_court(&traces);
+        assert_eq!(verdict.verdict, CourtVerdict::Inconsistent);
+        assert_eq!(verdict.cases_failed, 1);
+        assert_eq!(mismatches[0].case_id, "F.7f.80");
+        assert_eq!(mismatches[0].actual_output_hex, "ffffffff");
+    }
+
+    #[test]
     fn test_unsupported_candidate_is_never_identity() {
-        // Traces for an unsupported target id: the court must fail, not treat
-        // the candidate as identity.
         let unknown = crate::porting::PortTarget {
             id: "libc:identity:c-locale:u8:v1",
             dialect: "libc",
@@ -240,11 +285,21 @@ mod tests {
             locale_contract: "C",
             input_schema: "u8",
             output_schema: "u8",
+            domain_summary: "none",
             candidate_source: "none",
         };
         let traces: Vec<OracleTrace> = byte_domain_cases()
             .iter()
-            .map(|c| OracleTrace::new(&unknown, &c.case_id, &c.input, &c.input, "ok", &["compute"]))
+            .map(|c| {
+                OracleTrace::single(
+                    &unknown,
+                    &c.case_id,
+                    &c.args[0],
+                    &c.args[0],
+                    "ok",
+                    &["compute"],
+                )
+            })
             .collect();
         let (verdict, mismatches) = run_replay_court(&traces);
         assert_eq!(verdict.verdict, CourtVerdict::Inconsistent);

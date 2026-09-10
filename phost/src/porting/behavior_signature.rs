@@ -29,7 +29,7 @@ impl BehaviorSignature {
             locale_contract: target.locale_contract.to_string(),
             case_count: traces.len() as u64,
             combined_oracle_hash: combined_oracle_hash(traces),
-            input_domain_summary: format!("exhaustive 0..=255 ({})", target.input_schema),
+            input_domain_summary: format!("{} cases; {}", traces.len(), target.domain_summary),
         }
     }
 
@@ -74,7 +74,7 @@ mod tests {
 
     fn two_traces() -> Vec<OracleTrace> {
         alloc::vec![
-            OracleTrace::new(
+            OracleTrace::single(
                 &target::LIBC_TOUPPER,
                 "0x00",
                 &[0x00],
@@ -82,7 +82,7 @@ mod tests {
                 "ok",
                 &["compute"]
             ),
-            OracleTrace::new(
+            OracleTrace::single(
                 &target::LIBC_TOUPPER,
                 "0x61",
                 &[0x61],

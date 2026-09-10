@@ -84,40 +84,52 @@ stay gitignored.
 
 ## JIT-Porting Court
 
-Phorensic OS ports *behavior*, not binaries. The first court target is libc
-`toupper`, ported at the API boundary:
+Phorensic OS ports *behavior*, not binaries. Two courts have run end-to-end at
+the API boundary:
 
 ```text
-foreign behavior → dialect cage       (observe libc toupper as a black box)
-                 → oracle traces      (256 sealed cases, 0x00..0xff, locale C)
+foreign behavior → dialect cage       (observe libc as a black box)
+                 → oracle traces      (sealed, ordered, locale-recorded cases)
                  → behavior signature (combined SHA-256 oracle hash)
-                 → native candidate   (clean-room phor_toupper)
-                 → replay court       (replay all 256 cases)
+                 → native candidate   (clean-room phor_*)
+                 → replay court       (replay the full case set)
                  → comparison         (exact output / status / effects)
                  → promotion          (only on an exact match)
-                 → sealed package     (native:libc:toupper:c-locale:u8:v1)
+                 → sealed package     (native:<qualified target id>)
 ```
+
+| Target | Corpus | Result |
+|--------|--------|--------|
+| `libc:toupper:c-locale:u8:v1` | exhaustive `0x00..=0xff` (256 cases) | **256/256 pass**, sealed |
+| `libc:memcmp:c-locale:sign:v1` | bounded deterministic corpus (312 cases) | **312/312 pass**, sealed |
+
+The `memcmp` corpus deliberately forces length, buffers and ordering: lengths
+`0..=8`, five patterns, every first-mismatch position, the `n`-boundary around a
+mismatch, and the unsigned edge bytes `00/01/7f/80/fe/ff`. Its observable is the
+**sign** of the return value (`-1 | 0 | 1`), which is the C contract.
 
 ```sh
 cargo run -p phost -- port promote toupper   # observe → replay → promote
-./verify_jit_porting_court.sh                # determinism court
-./verify_jit_porting_court.sh --check-committed   # fresh == checked-in evidence
+cargo run -p phost -- port promote memcmp
+./verify_jit_porting_court.sh --target toupper             # determinism court
+./verify_jit_porting_court.sh --target memcmp
+./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
 ```
 
-Verified: **256 observed, 256 replayed, 256 passed, 0 failed**, oracle and
-candidate hashes MATCH, promotion `Sealed`. The seal binds the **qualified target
-id** (`libc:toupper:c-locale:u8:v1`), the **locale contract** (`C`), the
-**candidate behavior hash**, and the **clean-room candidate source hash** — so a
-locale change or an edited `.phor` candidate invalidates it. The evidence set is
-committed under `phost/evidence/porting/toupper/`.
+Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
+the **locale contract** (`C`), the **candidate behavior hash**, and the
+**clean-room candidate source hash** — so a locale change or an edited `.phor`
+candidate invalidates the seal. Evidence is committed under
+`phost/evidence/porting/{toupper,memcmp}/`.
 
 The verifier has two courts: the default regenerates the evidence twice and
 requires byte-identical runs; `--check-committed` writes only to a temp dir and
 compares against the checked-in evidence without touching it (reviewer-grade).
-An unsupported candidate fails closed and can never pass as an identity transform.
+An unsupported candidate fails closed (`UnsupportedTarget`) and can never pass as
+an identity transform; malformed arguments fail closed too.
 
-This is **API-surface** JIT-porting (byte-in/byte-out functions), not arbitrary
-binary translation — eager JIT of arbitrary foreign binaries is a later phase.
+This is **API-surface** JIT-porting, not arbitrary binary translation — eager JIT
+of arbitrary foreign binaries is a later phase.
 See `docs/REPLAY_COURTS.md` and `docs/PHORENSIC_OS.md`.
 
 ## Reproducible runs with Docker
@@ -145,15 +157,15 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **43 / 43 pass** |
-| `cargo test` (phost) | **81 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
-| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (45), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
+| `cargo test` (phost) | **91 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (46), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
 | Court replay | 6 / 6 phases **PASS**, verdict `consistent` |
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
-| JIT-porting court | `libc:toupper:c-locale:u8:v1`: **256 observed / 256 replayed / 256 passed / 0 failed**, hashes MATCH, source bound, promotion `Sealed` |
+| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, hashes MATCH, source bound, promotion `Sealed` |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 
 ### Known gaps

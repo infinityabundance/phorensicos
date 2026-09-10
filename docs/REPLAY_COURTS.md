@@ -320,7 +320,7 @@ let obj = store.resolve("editor.phor-spec-key")
 assert(obj.trust_state == TrustState::Promoted)
 ```
 
-## JIT-Porting Court (first implementation)
+## JIT-Porting Court
 
 The first concrete replay court is the **JIT-Porting Court**. It observes a
 foreign API surface as a black box, seals the observed behavior as oracle
@@ -346,14 +346,40 @@ locale:    C      (recorded in every trace as locale_contract)
 domain:    exhaustive 0x00..=0xff (256 cases, in order)
 ```
 
-The target id is qualified (`dialect:symbol:locale:type:version`) so a future
-locale-aware `toupper` is a *different* target, never a silent redefinition.
+### Second target: libc `memcmp`
 
-The dialect cage calls the foreign `toupper` through a single narrow FFI shim and
-records input/output/locale/status/effects — it never reads or copies foreign
-source. The native candidate is a clean-room `phor_toupper` (ASCII `a`..`z`
-fold). An unknown target id returns `CandidateError::UnsupportedTarget`; there is
-no identity fallback, so an unsupported candidate can never pass by accident.
+```text
+target id: libc:memcmp:c-locale:sign:v1
+dialect:   libc   symbol: memcmp   version: host-observed-v1
+locale:    C
+contract:  sign of the return value (-1 | 0 | 1), unsigned comparison, n-bounded
+corpus:    312 bounded deterministic cases
+```
+
+The `memcmp` observable is the **sign** of the return value — the exact integer
+is not part of the C contract. Its corpus deliberately forces memory, length and
+ordering: lengths `0..=8`; five patterns (zero/ones/ascending/descending/
+alternating); every first-mismatch position with both orderings; the `n`-boundary
+around a mismatch (`n = j` excludes it, `n = j+1` includes it); and the unsigned
+edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`,
+so no observation reads past a buffer. Arguments are framed in the trace as
+`a_hex:b_hex:n_hex` (little-endian `n`).
+
+### Target identity is qualified
+
+A target id is `dialect:symbol:locale:contract:version`, so a future
+locale-aware `toupper` (or a raw-value `memcmp`) is a *different* target, never a
+silent redefinition of an existing one.
+
+### The dialect cage and the candidates
+
+The cage calls the foreign functions through a single narrow FFI shim and records
+input/output/locale/status/effects — it never reads or copies foreign source. The
+native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold) and
+`phor_memcmp` (unsigned, `n`-bounded, sign result). Unknown target ids return
+`CandidateError::UnsupportedTarget` and malformed arguments return
+`CandidateError::MalformedArgs`; there is no identity fallback, so an unsupported
+candidate can never pass by accident.
 
 ### Mapping to court concepts
 
@@ -400,20 +426,24 @@ revealed.
 ### Where it lives
 
 ```text
-phost/src/porting/              target, dialect_cage, oracle_trace,
-                                behavior_signature, candidate, replay_court,
-                                promotion, evidence
-examples/jit_port_toupper.phor  native candidate, expressed in Phorensic
-phost/evidence/porting/toupper/ committed evidence set
-verify_jit_porting_court.sh     court verifier
+phost/src/porting/                target, dialect_cage, oracle_trace,
+                                  behavior_signature, candidate, replay_court,
+                                  promotion, evidence
+examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
+examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
+phost/evidence/porting/toupper/   toupper evidence set (256 cases)
+phost/evidence/porting/memcmp/    memcmp evidence set (312 cases)
+verify_jit_porting_court.sh       court verifier (--target toupper|memcmp)
 ```
 
 Reproduce:
 
 ```sh
 cargo run -p phost -- port promote toupper
-./verify_jit_porting_court.sh                  # determinism court
-./verify_jit_porting_court.sh --check-committed   # fresh == checked-in evidence
+cargo run -p phost -- port promote memcmp
+./verify_jit_porting_court.sh --target toupper                 # determinism
+./verify_jit_porting_court.sh --target memcmp
+./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
 ```
 
 `--check-committed` writes only to a temp dir and compares against the checked-in

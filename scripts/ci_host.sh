@@ -17,4 +17,5 @@ cargo test
 echo
 echo "=== JIT-Porting Court ==="
 cargo build -q -p phost
-./verify_jit_porting_court.sh
+./verify_jit_porting_court.sh --target toupper
+./verify_jit_porting_court.sh --target memcmp
