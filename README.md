@@ -78,6 +78,19 @@ framebuffer ABI location (`0x300000`) and the exact commands/toolchain used.
 The committed manifest is `phost_kernel/evidence_manifest.json`; the raw dumps
 stay gitignored.
 
+The manifest is deliberately two-tier, so its claim cannot be misread:
+
+- `asserted_reproducible_evidence` — the five captured boot-evidence artifacts
+  (`serial.log`, `debug.log`, `screen.ppm`, `fb-abi.bin`, `lfb.bin`). These are
+  the court evidence and **are** asserted byte-identical across hosts and
+  containers (the kernel CI checks all five against the committed manifest).
+- `observed_toolchain_bound_build` — the kernel image hash/size, recorded with
+  `asserted_reproducible: false` because image bytes depend on the
+  rustc/nasm/ld.lld/binutils versions. Useful as an observed build fact; **not**
+  a cross-toolchain reproducibility guarantee.
+
+A top-level `manifest_claim` states exactly what is and is not asserted.
+
 > `phost_kernel` is a `no_std` staticlib cross-compiled for
 > `x86_64-unknown-none`, so it is excluded from the default workspace build. Use
 > `build_kernel.sh` (it sets the target via `phost_kernel/.cargo/config.toml`).
@@ -183,9 +196,10 @@ docker compose up --build        # both, one shot
 Multiboot kernel, boots it under QEMU, verifies the boot evidence (13 checks) and
 checks the boot evidence is byte-reproducible against the committed
 `phost_kernel/evidence_manifest.json`. Boot evidence is byte-identical across
-hosts and containers; kernel *image* bytes additionally depend on the linker
-toolchain (`nasm`/`ld.lld`/binutils), which the pinned `docker/Dockerfile.*`
-images record.
+hosts and containers (the manifest's `asserted_reproducible_evidence`); kernel
+*image* bytes additionally depend on the linker toolchain
+(`nasm`/`ld.lld`/binutils), so they are recorded under
+`observed_toolchain_bound_build` with `asserted_reproducible: false`.
 
 ## Current status
 
@@ -194,7 +208,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **48 / 48 pass** (44 unit + 4 lowering-integration) |
-| `cargo test` (phost) | **121 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **122 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (235), `examples/` (46), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -204,7 +218,7 @@ All numbers below were reproduced on a clean checkout.
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
 | JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
 | Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**; executed object == sealed object |
-| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, **0 fallbacks**; no capability → foreign fallback |
+| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 

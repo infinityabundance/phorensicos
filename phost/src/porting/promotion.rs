@@ -265,6 +265,7 @@ pub fn promote(
     }
     if dispatch.verdict != CourtVerdict::Consistent
         || dispatch.fallback_cases != 0
+        || dispatch.broken_seal_cases != 0
         || dispatch.native_cases != dispatch.cases_run
         || dispatch.cases_failed != 0
     {
@@ -362,6 +363,7 @@ mod tests {
             cases_run: 256,
             native_cases: 256,
             fallback_cases: 0,
+            broken_seal_cases: 0,
             cases_passed: 256,
             cases_failed: 0,
             object_hash: a.object_hash,

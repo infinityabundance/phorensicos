@@ -405,8 +405,8 @@ mutation of a covered field changes the behavior signature.
   consistent replay verdict, the oracle hash, the candidate behavior hash, the
   bound candidate source hash, the sealed package + replay residual written, a
   **consistent sealed-object execution verdict**, and a **consistent dispatch
-  verdict with zero foreign fallbacks**. Promotion also requires the `PORTING`
-  capability.
+  verdict with zero foreign fallbacks and zero broken seals**. Promotion also
+  requires the `PORTING` capability.
 
 ### Compiled candidate authority
 
@@ -487,14 +487,21 @@ The **dispatch court** replays the entire corpus through the dispatcher and
 records `dispatch_verdict.json`:
 
 ```text
-target  cases_run  native_cases  fallback_cases  cases_passed  cases_failed
-        oracle_hash  object_hash  elf_symbol  dispatch_hash  verdict
+target  cases_run  native_cases  fallback_cases  broken_seal_cases
+        cases_passed  cases_failed  oracle_hash  object_hash  elf_symbol
+        dispatch_hash  verdict
 ```
 
 `verdict = consistent` only when **every** case was served by the sealed object
-(`native_cases == cases_run`, `fallback_cases == 0`) and every output matched the
-oracle. It is also a promotion precondition, alongside replay and execution, and
-the `dispatch_hash` is bound into the promotion receipt and the sealed package.
+(`native_cases == cases_run`, `fallback_cases == 0`, `broken_seal_cases == 0`) and
+every output matched the oracle. It is also a promotion precondition, alongside
+replay and execution, and the `dispatch_hash` is bound into the promotion receipt
+and the sealed package.
+
+`fallback_cases` counts only legitimate foreign fallbacks (no capability, no
+entry, entry not sealed). A sealed entry that fails verification is counted as
+`broken_seal_cases` — terminal, and never reported as a fallback, so the
+accounting matches the fail-closed philosophy.
 
 `dispatch_hash` is SHA-256 over `case_id:source:output_hex` per case, so a
 fallback (different `source`) changes the hash even if the bytes happened to
@@ -515,10 +522,10 @@ candidate's **behavior** hash (its outputs over the case domain), the compiled
 artifacts: the clean-room **source** hash, the ELF64 **object** hash, the
 **receipt** hash, and the **compiler version** — and the runtime residuals: the
 **ABI symbol**, the **executed ELF symbol**, the **execution hash**, the
-**execution verdict**, the **dispatch hash**, the native/fallback case counts and
-the **dispatch verdict**. The sealed store entry points at the compiled object
-(`candidate.o`), which is the authoritative implementation, and that same object
-is the one loaded, executed and dispatched.
+**execution verdict**, the **dispatch hash**, the native/fallback/broken-seal case
+counts and the **dispatch verdict**. The sealed store entry points at the compiled
+object (`candidate.o`), which is the authoritative implementation, and that same
+object is the one loaded, executed and dispatched.
 
 ### Capability gating
 

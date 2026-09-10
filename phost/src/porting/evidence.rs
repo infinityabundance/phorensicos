@@ -61,7 +61,7 @@ pub fn sealed_package_json(
     dispatch: &DispatchVerdict,
 ) -> String {
     format!(
-        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"candidate_abi_symbol\": \"{abi_symbol}\",\n  \"executed_elf_symbol\": \"{elf_symbol}\",\n  \"candidate_execution_hash\": \"{execution_hash}\",\n  \"execution_verdict\": \"{exec_verdict}\",\n  \"execution_cases\": {exec_cases},\n  \"dispatch_cases\": {dispatch_cases},\n  \"dispatch_native_cases\": {dispatch_native},\n  \"dispatch_fallback_cases\": {dispatch_fallback},\n  \"dispatch_hash\": \"{dispatch_hash}\",\n  \"dispatch_verdict\": \"{dispatch_verdict}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
+        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"candidate_abi_symbol\": \"{abi_symbol}\",\n  \"executed_elf_symbol\": \"{elf_symbol}\",\n  \"candidate_execution_hash\": \"{execution_hash}\",\n  \"execution_verdict\": \"{exec_verdict}\",\n  \"execution_cases\": {exec_cases},\n  \"dispatch_cases\": {dispatch_cases},\n  \"dispatch_native_cases\": {dispatch_native},\n  \"dispatch_fallback_cases\": {dispatch_fallback},\n  \"dispatch_broken_seal_cases\": {dispatch_broken_seal},\n  \"dispatch_hash\": \"{dispatch_hash}\",\n  \"dispatch_verdict\": \"{dispatch_verdict}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
         id = json_escape(target.id),
         dialect = json_escape(target.dialect),
         symbol = json_escape(target.symbol),
@@ -84,6 +84,7 @@ pub fn sealed_package_json(
         dispatch_cases = dispatch.cases_run,
         dispatch_native = dispatch.native_cases,
         dispatch_fallback = dispatch.fallback_cases,
+        dispatch_broken_seal = dispatch.broken_seal_cases,
         dispatch_hash = dispatch.dispatch_hash,
         dispatch_verdict = dispatch.verdict.as_str(),
     )

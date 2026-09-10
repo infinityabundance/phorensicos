@@ -207,8 +207,12 @@ pub struct DispatchVerdict {
     pub cases_run: u64,
     /// Cases served by the sealed compiled object (the preferred native path).
     pub native_cases: u64,
-    /// Cases that fell back to the foreign implementation.
+    /// Cases with no usable sealed artifact, so the caller uses the foreign
+    /// implementation (no capability, no entry, or entry not sealed).
     pub fallback_cases: u64,
+    /// Cases where a *sealed* entry existed but failed verification. This is NOT a
+    /// fallback: the runtime refuses rather than silently running foreign code.
+    pub broken_seal_cases: u64,
     pub cases_passed: u64,
     pub cases_failed: u64,
     pub object_hash: String,
@@ -220,12 +224,13 @@ pub struct DispatchVerdict {
 }
 
 impl DispatchVerdict {
-    /// The runtime preferred the sealed object for *every* case, and every case
-    /// matched the oracle.
+    /// The runtime preferred the sealed object for *every* case, with no foreign
+    /// fallback and no broken seal, and every case matched the oracle.
     pub fn is_sealed_eligible(&self) -> bool {
         self.verdict == CourtVerdict::Consistent
             && self.cases_run > 0
             && self.fallback_cases == 0
+            && self.broken_seal_cases == 0
             && self.cases_failed == 0
             && self.cases_passed == self.cases_run
             && !self.object_hash.is_empty()
@@ -234,11 +239,12 @@ impl DispatchVerdict {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};cases_run={};native_cases={};fallback_cases={};cases_passed={};cases_failed={};object_hash={};elf_symbol={};oracle_hash={};dispatch_hash={};verdict={}",
+            "target={};cases_run={};native_cases={};fallback_cases={};broken_seal_cases={};cases_passed={};cases_failed={};object_hash={};elf_symbol={};oracle_hash={};dispatch_hash={};verdict={}",
             self.target,
             self.cases_run,
             self.native_cases,
             self.fallback_cases,
+            self.broken_seal_cases,
             self.cases_passed,
             self.cases_failed,
             self.object_hash,
@@ -256,11 +262,12 @@ impl DispatchVerdict {
     pub fn to_json(&self, mismatches: &[Mismatch]) -> String {
         let body: Vec<String> = mismatches.iter().map(|m| m.to_json()).collect();
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.dispatch_verdict.v1\",\n  \"target\": \"{}\",\n  \"cases_run\": {},\n  \"native_cases\": {},\n  \"fallback_cases\": {},\n  \"cases_passed\": {},\n  \"cases_failed\": {},\n  \"object_hash\": \"{}\",\n  \"elf_symbol\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"dispatch_hash\": \"{}\",\n  \"verdict\": \"{}\",\n  \"mismatches\": [\n{}\n  ],\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.dispatch_verdict.v1\",\n  \"target\": \"{}\",\n  \"cases_run\": {},\n  \"native_cases\": {},\n  \"fallback_cases\": {},\n  \"broken_seal_cases\": {},\n  \"cases_passed\": {},\n  \"cases_failed\": {},\n  \"object_hash\": \"{}\",\n  \"elf_symbol\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"dispatch_hash\": \"{}\",\n  \"verdict\": \"{}\",\n  \"mismatches\": [\n{}\n  ],\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
             self.cases_run,
             self.native_cases,
             self.fallback_cases,
+            self.broken_seal_cases,
             self.cases_passed,
             self.cases_failed,
             self.object_hash,
@@ -303,6 +310,7 @@ pub fn run_dispatch_court(
 
     let mut native: u64 = 0;
     let mut fallback: u64 = 0;
+    let mut broken_seal: u64 = 0;
     let mut passed: u64 = 0;
     let mut failed: u64 = 0;
     let mut mismatches: Vec<Mismatch> = Vec::new();
@@ -341,9 +349,9 @@ pub fn run_dispatch_court(
                 outputs.push((t.case_id.clone(), outcome.source, outcome.output));
             }
             Err(e) => {
-                // Broken seal: terminal, never a successful fallback.
+                // Broken seal: terminal, never counted as a fallback.
                 failed += 1;
-                fallback += 1;
+                broken_seal += 1;
                 mismatches.push(Mismatch {
                     case_id: t.case_id.clone(),
                     expected_output_hex: t.output_hex.clone(),
@@ -361,7 +369,7 @@ pub fn run_dispatch_court(
     let cases_run = traces.len() as u64;
     let verdict = if cases_run == 0 {
         CourtVerdict::Inconclusive
-    } else if failed == 0 && fallback == 0 && native == cases_run {
+    } else if failed == 0 && fallback == 0 && broken_seal == 0 && native == cases_run {
         CourtVerdict::Consistent
     } else {
         CourtVerdict::Inconsistent
@@ -373,6 +381,7 @@ pub fn run_dispatch_court(
             cases_run,
             native_cases: native,
             fallback_cases: fallback,
+            broken_seal_cases: broken_seal,
             cases_passed: passed,
             cases_failed: failed,
             object_hash,
@@ -500,8 +509,29 @@ mod tests {
         );
         assert_eq!(verdict.verdict, CourtVerdict::Inconsistent);
         assert_eq!(verdict.fallback_cases, 2);
+        assert_eq!(verdict.broken_seal_cases, 0);
         assert_eq!(verdict.native_cases, 0);
         assert_eq!(mismatches.len(), 2);
+        assert!(!verdict.is_sealed_eligible());
+    }
+
+    /// A sealed entry whose object cannot be verified is a *broken seal*, not a
+    /// foreign fallback — the accounting language must match the philosophy.
+    #[test]
+    fn test_dispatch_court_separates_broken_seal_from_fallback() {
+        let traces = vec![
+            OracleTrace::single(&LIBC_TOUPPER, "0x61", &[0x61], &[0x41], "ok", &["compute"]),
+            OracleTrace::single(&LIBC_TOUPPER, "0x62", &[0x62], &[0x42], "ok", &["compute"]),
+        ];
+        let mut index = SealedPortIndex::new();
+        index.insert(entry("/nonexistent/candidate.o", "deadbeef"));
+        let (verdict, _) =
+            run_dispatch_court(&LIBC_TOUPPER, &traces, &index, &PortingAuthority::granted());
+        assert_eq!(verdict.verdict, CourtVerdict::Inconsistent);
+        assert_eq!(verdict.broken_seal_cases, 2);
+        assert_eq!(verdict.fallback_cases, 0);
+        assert_eq!(verdict.native_cases, 0);
+        assert_eq!(verdict.cases_failed, 2);
         assert!(!verdict.is_sealed_eligible());
     }
 

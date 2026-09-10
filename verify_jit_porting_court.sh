@@ -345,6 +345,8 @@ if disp_v.get("native_cases") != EXPECTED:
     errors.append("dispatch.native_cases != %d (runtime did not prefer native)" % EXPECTED)
 if disp_v.get("fallback_cases") != 0:
     errors.append("dispatch.fallback_cases != 0")
+if disp_v.get("broken_seal_cases") != 0:
+    errors.append("dispatch.broken_seal_cases != 0")
 if disp_v.get("cases_passed") != EXPECTED:
     errors.append("dispatch.cases_passed != %d" % EXPECTED)
 if disp_v.get("cases_failed") != 0:
@@ -371,6 +373,8 @@ if sealed.get("dispatch_native_cases") != EXPECTED:
     errors.append("sealed_package.dispatch_native_cases != %d" % EXPECTED)
 if sealed.get("dispatch_fallback_cases") != 0:
     errors.append("sealed_package.dispatch_fallback_cases != 0")
+if sealed.get("dispatch_broken_seal_cases") != 0:
+    errors.append("sealed_package.dispatch_broken_seal_cases != 0")
 
 # ---- promotion + sealed package -------------------------------------------
 if promo.get("to") != "sealed":
@@ -414,6 +418,7 @@ print("Execution hash bound: %s" % ("yes" if exec_hash else "no"))
 print("Dispatch cases: %d" % disp_v.get("cases_run", 0))
 print("Dispatch native: %d" % disp_v.get("native_cases", 0))
 print("Dispatch fallback: %d" % disp_v.get("fallback_cases", 0))
+print("Dispatch broken seal: %d" % disp_v.get("broken_seal_cases", 0))
 print("Dispatch object: %s" % ("MATCH" if disp_v.get("object_hash") == obj else "MISMATCH"))
 print("Dispatch hash bound: %s" % ("yes" if dispatch_hash else "no"))
 

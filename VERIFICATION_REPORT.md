@@ -110,7 +110,7 @@ GUI compositor → window manager → surface management → inspector
 | Execution residual | `e73092e6e2d112cfd5334d9fa840e22b12056fb3f53b63dfc8b7d38898b970d7` | `9ac82dc7a3872ca8b4e493322f5164d54c9732f1dece88ca8e995d5b7015ab03` |
 | Dispatch court | ✅ 256/256 native, 0 fallback, `consistent` | ✅ 312/312 native, 0 fallback, `consistent` |
 | Dispatch hash | `a3f7c0606ae6b6da6353c1b532957dbe40022e206cb059c1512620ecaa0df90d` | `fb00385a5ecaf78c2031d25d7d6c98b7a040d44c53fd12579fa6931394387231` |
-| Dispatch residual | `d24ddbd4742f3a0d0a01bbc5455751b6195d852555cd77d75d9642cd8185d36c` | `f7a589d70be1c5fd895ccc8ef4e911b5aa69e4774dd092e0f76091b965d307fa` |
+| Dispatch residual | `c2c360eb46bc24957b8a88852c7bf9b946b4908efcbebbe3cc6ca3950aa102bd` | `ce74b873d5ec2e652a6ff48cf2b5c7dcec9d45a6d768f649858e17a91f1d1d09` |
 | Promotion | ✅ → `sealed` | ✅ → `sealed` |
 | Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` |
 
@@ -124,8 +124,8 @@ Shared properties (both targets):
 | Compiled candidate authority | ✅ candidate.o is the promoted implementation; object + receipt hashes bound |
 | Independent recompilation | ✅ verifier recompiles the `.phor` source; object/receipt hashes MATCH the seal |
 | Sealed-object execution | ✅ object hash verified against the seal, ELF64 symbol located, executed; every case matched |
-| Sealed native dispatch | ✅ every case served from the sealed object through the runtime dispatcher; 0 foreign fallbacks |
-| Dispatch fail-closed | ✅ a sealed entry whose object does not verify is terminal (`SealBroken`); no capability / no sealed entry → foreign fallback |
+| Sealed native dispatch | ✅ every case served from the sealed object through the runtime dispatcher; 0 foreign fallbacks, 0 broken seals |
+| Dispatch fail-closed | ✅ a sealed entry whose object does not verify is counted as a broken seal (terminal), never as a foreign fallback; no capability / no sealed entry → foreign fallback |
 | Leaf/relocation guard | ✅ entry with an undefined symbol or a relocation in its range is rejected (fail closed) |
 | Determinism court | ✅ two fresh runs byte-identical (8/8 artifacts) |
 | Committed-evidence court | ✅ `--check-committed`: fresh run == checked-in evidence (8/8) |
@@ -160,11 +160,12 @@ edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`.
 Sealed native dispatch: the runtime call site (`phost::porting::dispatch`) looks
 the target up in the capability-gated sealed store and, if a sealed entry is
 present, verifies the object hash, maps the entry function once and calls it;
-otherwise it reports a foreign fallback. A *broken seal* is terminal and never
-falls back. The dispatch court replays the whole corpus through this path and
-requires 256/256 (`toupper`) and 312/312 (`memcmp`) cases served natively with
-zero fallbacks; `dispatch_hash` is bound into the promotion receipt and the
-sealed package. Try it: `phost port native toupper 61` (native) and
+otherwise it reports a foreign fallback. A *broken seal* is counted separately
+(`broken_seal_cases`) and is terminal — it never falls back. The dispatch court
+replays the whole corpus through this path and requires 256/256 (`toupper`) and
+312/312 (`memcmp`) cases served natively with zero fallbacks and zero broken
+seals; `dispatch_hash` is bound into the promotion receipt and the sealed package.
+Try it: `phost port native toupper 61` (native) and
 `phost port native toupper 61 --no-capability` (foreign fallback).
 
 ### Test Results (reproduced on `main`)
@@ -204,7 +205,15 @@ docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 ```
 
 Boot evidence (hashes, ABI address, commands, toolchain) is committed as
-`phost_kernel/evidence_manifest.json`. The porting evidence set (oracle traces,
+`phost_kernel/evidence_manifest.json`. The manifest's claim is two-tier:
+`asserted_reproducible_evidence` holds the five boot-evidence artifacts
+(`serial.log`, `debug.log`, `screen.ppm`, `fb-abi.bin`, `lfb.bin`), which the
+kernel CI asserts byte-identical against the committed manifest, while the kernel
+image hash sits under `observed_toolchain_bound_build` with
+`asserted_reproducible: false` (image bytes depend on the
+rustc/nasm/ld.lld/binutils versions). A top-level `manifest_claim` states this
+explicitly, and the kernel CI verifies the flag is still `false` before checking
+the evidence. The porting evidence set (oracle traces,
 behavior/candidate signatures, replay verdict, execution verdict, dispatch
 verdict, promotion receipt, sealed package) is committed as
 `phost/evidence/porting/{toupper,memcmp}/`.

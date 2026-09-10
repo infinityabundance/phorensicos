@@ -37,25 +37,37 @@ echo "=== verify boot evidence ==="
 
 echo
 echo "=== boot-evidence reproducibility (vs committed manifest) ==="
+# Only the five captured boot-evidence artifacts are asserted. The kernel image
+# hash lives under `observed_toolchain_bound_build` and is explicitly NOT
+# asserted across toolchains — verify the schema still says so.
+CLAIM_OK="$(jq -r '.observed_toolchain_bound_build.asserted_reproducible' evidence_manifest.json)"
+if [ "$CLAIM_OK" = "false" ]; then
+    echo "  [PASS] manifest marks the kernel image as observed-only (not asserted)"
+else
+    echo "  [FAIL] manifest does not mark the kernel image as observed-only"
+    exit 1
+fi
+
 FAIL=0
 check_ev() {
-    # $1 = manifest key, $2 = evidence file
-    committed="$(jq -r ".evidence.$1.sha256" evidence_manifest.json)"
-    actual="$(sha256sum "evidence/$2" | cut -d' ' -f1)"
+    # $1 = key under asserted_reproducible_evidence
+    committed="$(jq -r ".asserted_reproducible_evidence.$1.sha256" evidence_manifest.json)"
+    file="$(jq -r ".asserted_reproducible_evidence.$1.file" evidence_manifest.json)"
+    actual="$(sha256sum "evidence/$file" | cut -d' ' -f1)"
     if [ "$committed" = "$actual" ]; then
-        echo "  [PASS] $2 matches committed manifest"
+        echo "  [PASS] $file matches committed manifest"
     else
-        echo "  [FAIL] $2 mismatch"
+        echo "  [FAIL] $file mismatch"
         echo "         committed: $committed"
         echo "         actual:    $actual"
         FAIL=1
     fi
 }
-check_ev serial_log serial.log
-check_ev debug_log debug.log
-check_ev screen_ppm screen.ppm
-check_ev fb_abi_bin fb-abi.bin
-check_ev lfb_bin lfb.bin
+check_ev serial_log
+check_ev debug_log
+check_ev screen_ppm
+check_ev fb_abi_bin
+check_ev lfb_bin
 [ "$FAIL" -eq 0 ] || { echo "Status: EVIDENCE NOT REPRODUCIBLE"; exit 1; }
 echo "  boot evidence is byte-reproducible: 5/5 artifacts"
 

@@ -281,6 +281,7 @@ pub struct PortCourtReport {
     pub dispatch_cases: u64,
     pub dispatch_native_cases: u64,
     pub dispatch_fallback_cases: u64,
+    pub dispatch_broken_seal_cases: u64,
     pub dispatch_hash: String,
     pub dispatch_verdict: String,
 }
@@ -604,6 +605,10 @@ pub fn run_port_court(
         dispatch_cases: disp_verdict.as_ref().map(|v| v.cases_run).unwrap_or(0),
         dispatch_native_cases: disp_verdict.as_ref().map(|v| v.native_cases).unwrap_or(0),
         dispatch_fallback_cases: disp_verdict.as_ref().map(|v| v.fallback_cases).unwrap_or(0),
+        dispatch_broken_seal_cases: disp_verdict
+            .as_ref()
+            .map(|v| v.broken_seal_cases)
+            .unwrap_or(0),
         dispatch_hash: disp_verdict
             .as_ref()
             .map(|v| v.dispatch_hash.clone())

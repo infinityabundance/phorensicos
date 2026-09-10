@@ -280,11 +280,12 @@ fn port_cli(args: &[String]) -> i32 {
             }
             if r.dispatch_cases > 0 {
                 println!(
-                    "Dispatch:       {} ({} cases, {} native, {} fallback)",
+                    "Dispatch:       {} ({} cases, {} native, {} fallback, {} broken-seal)",
                     r.dispatch_verdict,
                     r.dispatch_cases,
                     r.dispatch_native_cases,
-                    r.dispatch_fallback_cases
+                    r.dispatch_fallback_cases,
+                    r.dispatch_broken_seal_cases
                 );
                 println!("Dispatch hash:  {}", r.dispatch_hash);
             }

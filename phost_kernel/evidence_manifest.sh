@@ -2,11 +2,20 @@
 # ============================================================================
 #  Phorensic OS — Boot Evidence Manifest
 #
-#  Emits a small, committable JSON manifest recording *what* was booted and
-#  *what it proved*: hashes and sizes of the kernel image and each captured
-#  artifact, the framebuffer ABI location, the exact commands used, and the
-#  toolchain versions. The large raw dumps stay gitignored; the manifest is
-#  the durable claim and can be regenerated from any evidence dir.
+#  Emits a small, committable JSON manifest. The schema is deliberately two-tier
+#  so it cannot be misread:
+#
+#    asserted_reproducible_evidence    the five captured boot-evidence artifacts
+#                                      (serial.log, debug.log, screen.ppm,
+#                                      fb-abi.bin, lfb.bin). These are the court
+#                                      evidence and ARE asserted byte-identical
+#                                      across hosts and containers.
+#
+#    observed_toolchain_bound_build    the kernel image hash/size. Recorded as an
+#                                      observed build fact, explicitly NOT
+#                                      asserted across linker/toolchain versions.
+#
+#  A top-level `manifest_claim` states exactly what is and is not asserted.
 #
 #  Usage:
 #    ./evidence_manifest.sh [evidence_dir] [output_json] [--update-screenshot]
@@ -96,33 +105,41 @@ jq -n \
     --arg cargo "$(tool cargo --version)" \
     '{
       generated_utc: $generated,
-      kernel: {
-        image: "phorensic-kernel.elf",
+      manifest_claim: {
+        asserted: "boot evidence artifacts are byte-reproducible (serial.log, debug.log, screen.ppm, fb-abi.bin, lfb.bin)",
+        not_asserted: "kernel image bytes across different linker/toolchain versions"
+      },
+      asserted_reproducible_evidence: {
+        dir: "evidence",
+        serial_log:  { file: "serial.log", sha256: $serial_hash, size_bytes: $serial_size },
+        debug_log:   { file: "debug.log",  sha256: $debug_hash,  size_bytes: $debug_size },
+        screen_ppm:  { file: "screen.ppm", sha256: $ppm_hash,    size_bytes: $ppm_size, dimensions: $dims },
+        fb_abi_bin:  { file: "fb-abi.bin", sha256: $abi_hash,    size_bytes: $abi_size },
+        lfb_bin:     { file: "lfb.bin",    sha256: $lfb_hash,    size_bytes: $lfb_size }
+      },
+      observed_toolchain_bound_build: {
+        kernel_image: "phorensic-kernel.elf",
         sha256: $kernel_hash,
         size_bytes: $kernel_size,
+        asserted_reproducible: false,
+        reason: "kernel image bytes depend on rustc/nasm/ld.lld/binutils versions",
         image_kind: "Multiboot v1 AOUT flat image (32-bit header, 64-bit entry)",
         load_addr: "0x100000",
         multiboot_magic: "0x1BADB002"
+      },
+      observed_derived_artifact: {
+        path: "../assets/screen.png",
+        sha256: $shot_hash,
+        size_bytes: $shot_size,
+        dimensions: $dims,
+        asserted_reproducible: false,
+        reason: "screen.png is a PNG rendering of screen.ppm; the PNG encoder version may affect the bytes",
+        source: "QEMU screendump (boot_qemu.sh screendump → PNG)"
       },
       boot_abi: {
         address: "0x300000",
         fields: ["fb_addr:u64", "width:u32", "height:u32", "pitch:u32", "bpp:u32"],
         expected: { fb_addr: "0xFD000000", width: 1024, height: 768, pitch: 4096, bpp: 32 }
-      },
-      evidence: {
-        dir: "evidence",
-        serial_log:  { sha256: $serial_hash, size_bytes: $serial_size },
-        debug_log:   { sha256: $debug_hash,  size_bytes: $debug_size },
-        screen_ppm:  { sha256: $ppm_hash,    size_bytes: $ppm_size, dimensions: $dims },
-        fb_abi_bin:  { sha256: $abi_hash,    size_bytes: $abi_size },
-        lfb_bin:     { sha256: $lfb_hash,    size_bytes: $lfb_size }
-      },
-      screenshot: {
-        path: "../assets/screen.png",
-        sha256: $shot_hash,
-        size_bytes: $shot_size,
-        dimensions: $dims,
-        source: "QEMU screendump (boot_qemu.sh screendump → PNG)"
       },
       commands: {
         build:  "./build_kernel.sh",
@@ -133,13 +150,14 @@ jq -n \
         qemu: $qemu, nasm: $nasm, "ld.lld": $lld, rustc: $rustc, cargo: $cargo
       },
       reproducibility: {
-        boot_evidence: "deterministic: byte-identical across hosts and containers",
-        kernel_image_bytes: "depends on rustc/nasm/ld.lld/binutils versions; not asserted across toolchains",
+        asserted: "boot evidence artifacts are byte-reproducible across hosts and containers",
+        not_asserted: "kernel image bytes across different linker/toolchain versions",
         container: "docker compose run --rm kernel"
       }
     }' > "$OUT"
 
 echo "Wrote evidence manifest: $OUT"
-echo "  kernel sha256:     $(sha "$KERNEL")"
-echo "  screenshot sha256: $(sha "$SHOT")"
-echo "  dimensions:        $DIMS"
+echo "  asserted evidence:  5 artifacts (serial.log, debug.log, screen.ppm, fb-abi.bin, lfb.bin)"
+echo "  kernel sha256:      $(sha "$KERNEL")  (observed; toolchain-bound, not asserted)"
+echo "  screenshot sha256:  $(sha "$SHOT")  (observed; derived, not asserted)"
+echo "  dimensions:         $DIMS"
