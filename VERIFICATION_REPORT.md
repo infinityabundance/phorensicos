@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 152 pass, 4 ignored | 156 total: 8 serial + 4 kernel + 49 nucleus + 87 porting (incl. exec, dispatch and composition courts); the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 160 pass, 4 ignored | 164 total: 8 serial + 4 kernel + 49 nucleus + 95 porting (incl. the leaf exec/dispatch courts and both composition courts); the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -87,7 +87,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 152 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + sealed composition courts |
+| phost reach | 160 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + both sealed composition courts |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -192,10 +192,13 @@ Try it: `phost port native toupper 61` (native) and
 ### Sealed Composition Dispatch Court
 
 The leaf courts prove a sealed artifact is correct and preferred. The composition
-court proves sealed artifacts are **runtime building blocks**: one composed
-target whose implementation is a chain of already-sealed objects, executed
-entirely through `NativeDispatcher` with **no foreign calls in the sealed path**
-and no Rust mirror consulted.
+courts prove sealed artifacts are **runtime building blocks**: composed targets
+whose implementation is a chain of already-sealed objects, executed entirely
+through `NativeDispatcher` with **no foreign calls in the sealed path** and no Rust
+mirror consulted. Two chains are sealed, and the second one generalizes the
+machinery in a way the first cannot.
+
+#### Chain 1: `toupper ∘ memchr`
 
 | Aspect | `phor:compose:toupper_memchr:c-locale:index:v1` |
 |--------|--------------------------------------------------|
@@ -222,8 +225,44 @@ final index, so a skipped or fallback stage changes it even if the index matches
 The fold cases (`G.*`) only match *after* `toupper` normalizes both sides, so a
 composition that dropped the toupper stage cannot pass.
 
+#### Chain 2: `toupper ∘ strlen ∘ memchr`
+
+The second chain is the proof the machinery generalizes: three stages, and the
+middle stage's **result is consumed as the next stage's argument**. The sealed
+`strlen` derives the search bound `L`, and the sealed `memchr` searches exactly
+that measured prefix instead of the caller's `n`.
+
+| Aspect | `phor:compose:toupper_strlen_memchr:c-locale:index:v1` |
+|--------|--------------------------------------------------------|
+| Stages | `libc:toupper:c-locale:u8:v1` → `libc:strlen:c-locale:u64:v1` → `libc:memchr:c-locale:index:v1` |
+| Oracle | foreign C-locale `toupper` over the haystack, foreign `strlen` → `L`, foreign `toupper` of the needle, foreign `memchr` bounded by `L` |
+| Corpus | 350 cases (NUL-terminated strings: folded match at every index, absent needles, needles only after the terminator, terminator-as-needle, edge bytes, exhaustive 0..=255 needle sweep) |
+| Data flow | the `strlen` stage's u64 result is the `memchr` stage's `n` |
+| toupper (haystack) stage | ✅ 350/350 native |
+| strlen (derived bound) stage | ✅ 350/350 native |
+| toupper (needle) stage | ✅ 350/350 native |
+| memchr stage | ✅ 350/350 native |
+| Foreign fallback | **0** |
+| Broken seal | **0** |
+| Passed / failed | 350 / 0 |
+| Sealed dispatches | 3729 |
+| Dispatched toupper object | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` (= committed leaf seal) |
+| Dispatched strlen object | `ffb0f5699df2455d6f1597c3bb2bbf1d94596cd772d2fd4b84d6036b99967b94` (= committed leaf seal) |
+| Dispatched memchr object | `90d35156eef8b7009352ebb0ac6fa0f9137c95a515ae1a1e760a37147032bbb8` (= committed leaf seal) |
+| Chain hash | `97fa39998f98f99f2bc130ca8eb6ec1b7cd5805d3c75ada3af742d6c34e28899` |
+| Oracle hash | `5f0b62615f9c8fb569de5f6f42e67fb8b7fdc0cdde944497a2683f03a615517f` |
+| Verdict | `consistent` |
+
+The chain is a case-insensitive search of a C string: `strlen` establishes the
+string's length, so the caller only supplies a precondition bound. Its `chain_hash`
+covers the **derived bound** as well as the normalized intermediates, so the hash
+proves the chain, not just the answer. The corpus deliberately places needle-like
+bytes after the terminator (group `D`), so a chain that searched with the caller's
+`n` rather than the derived `L` cannot pass. Bound in
+`phost/evidence/composition/toupper_strlen_memchr/composition_verdict.json`.
+
 ### Test Results (reproduced on `main`)
-- phost: 152 passed, 0 failed, 4 ignored (156 total). The ignored tests read
+- phost: 160 passed, 0 failed, 4 ignored (164 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -248,12 +287,18 @@ cargo run -p phost -- port promote memchr        # JIT-porting court (482)
 cargo run -p phost -- port promote strlen        # JIT-porting court (308)
 cargo run -p phost -- port promote strrchr       # JIT-porting court (336)
 cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
+cargo run -p phost -- port compose               # composition court (560)
+cargo run -p phost -- port compose --target toupper_strlen_memchr   # composition court (350)
 ./verify_jit_porting_court.sh --target toupper                    # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
+./verify_composition_court.sh                                    # composition #1 (560)
+./verify_composition_court.sh --check-committed
+./verify_composition_court.sh --target toupper_strlen_memchr     # composition #2 (350)
+./verify_composition_court.sh --target toupper_strlen_memchr --check-committed
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
 ./verify_evidence.sh evidence                    # 13/13 boot-evidence checks
@@ -279,6 +324,6 @@ the evidence. The porting evidence set (oracle traces,
 behavior/candidate signatures, replay verdict, execution verdict, dispatch
 verdict, promotion receipt, sealed package) is committed as
 `phost/evidence/porting/{toupper,memcmp,memchr,strlen,strrchr}/`, and the
-composition verdict as
-`phost/evidence/composition/toupper_memchr/composition_verdict.json` (the large
-composition oracle traces are regenerable and stay gitignored).
+composition verdicts as
+`phost/evidence/composition/{toupper_memchr,toupper_strlen_memchr}/composition_verdict.json`
+(the large composition oracle traces are regenerable and stay gitignored).

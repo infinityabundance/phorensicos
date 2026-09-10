@@ -12,19 +12,26 @@
 #                       compare it against the checked-in verdict, without
 #                       touching the committed file.
 #
-#  The composition `phor:compose:toupper_memchr:c-locale:index:v1` is built from
-#  two already-sealed leaf ports and executed entirely through the sealed
-#  dispatcher. This verifier checks:
+#  Two compositions are checked, selected with --target:
+#
+#    toupper_memchr         (default)  phor:compose:toupper_memchr:c-locale:index:v1
+#    toupper_strlen_memchr            phor:compose:toupper_strlen_memchr:c-locale:index:v1
+#
+#  Each is built from already-sealed leaf ports and executed entirely through the
+#  sealed dispatcher. This verifier checks:
 #    * the composition verdict exists and is valid JSON
-#    * every stage (toupper-haystack, toupper-needle, memchr) was served by the
-#      SEALED object for every case: zero foreign fallback and zero broken seals
-#    * every case matched the foreign oracle (toupper + memchr)
+#    * every stage was served by the SEALED object for every case: zero foreign
+#      fallback and zero broken seals (a broken seal is never a fallback, and both
+#      are disqualifying)
+#    * every case matched the foreign oracle
 #    * the objects the chain dispatched to are exactly the committed sealed leaf
 #      objects (object hash cross-check against the leaf candidate signatures)
-#    * the chain hash is present (it covers the intermediates, not just the index)
+#    * the chain hash is present (it covers the intermediates — including, for the
+#      three-stage chain, the bound the strlen stage derived — not just the index)
 #
 #  Usage:
-#    ./verify_composition_court.sh [--check-committed] [evidence_dir]
+#    ./verify_composition_court.sh [--target toupper_memchr|toupper_strlen_memchr] \
+#                                  [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -33,27 +40,43 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-TARGET_ID="phor:compose:toupper_memchr:c-locale:index:v1"
-EXPECTED_COUNT=560
-
+TARGET="toupper_memchr"
 MODE="regenerate"
 EVID=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --check-committed) MODE="check-committed" ;;
+        --target) TARGET="$2"; shift ;;
+        --target=*) TARGET="${1#--target=}" ;;
         *) EVID="$1" ;;
     esac
     shift
 done
 
-[ -n "$EVID" ] || EVID="phost/evidence/composition/toupper_memchr"
+# Per-target expectations.
+case "$TARGET" in
+    toupper_memchr)
+        TARGET_ID="phor:compose:toupper_memchr:c-locale:index:v1"
+        EXPECTED_COUNT=560
+        ;;
+    toupper_strlen_memchr)
+        TARGET_ID="phor:compose:toupper_strlen_memchr:c-locale:index:v1"
+        EXPECTED_COUNT=350
+        ;;
+    *)
+        echo "ERROR: unknown composition target '$TARGET' (expected toupper_memchr|toupper_strlen_memchr)"
+        exit 2
+        ;;
+esac
+
+[ -n "$EVID" ] || EVID="phost/evidence/composition/$TARGET"
 case "$EVID" in /*) ;; *) EVID="$ROOT/$EVID" ;; esac
 
 PHOST="$ROOT/target/debug/phost"
 FILE="composition_verdict.json"
 
 echo "=== Phorensic OS — Sealed Composition Dispatch Court Verification ==="
-echo "Target:       $TARGET_ID"
+echo "Target:       $TARGET ($TARGET_ID)"
 echo "Evidence dir: $EVID"
 echo "Mode:         $MODE"
 echo
@@ -73,9 +96,9 @@ trap 'rm -rf "$TMP" "$CMP"' EXIT
 VALIDATE_DIR="$TMP"
 
 echo "--- fresh composition run (temp) ---"
-if ! "$PHOST" port compose --out "$TMP" >/dev/null 2>&1; then
-    echo "ERROR: phost port compose failed"
-    "$PHOST" port compose --out "$TMP" || true
+if ! "$PHOST" port compose --target "$TARGET" --out "$TMP" >/dev/null 2>&1; then
+    echo "ERROR: phost port compose --target $TARGET failed"
+    "$PHOST" port compose --target "$TARGET" --out "$TMP" || true
     exit 2
 fi
 
@@ -93,7 +116,7 @@ if [ "$MODE" = "check-committed" ]; then
     fi
 else
     echo "--- determinism court (fresh A == fresh B) ---"
-    if ! "$PHOST" port compose --out "$EVID" >/dev/null 2>&1; then
+    if ! "$PHOST" port compose --target "$TARGET" --out "$EVID" >/dev/null 2>&1; then
         echo "ERROR: second composition run failed"
         exit 2
     fi
@@ -108,10 +131,16 @@ else
 fi
 
 echo "--- validating the chain evidence ---"
-python3 - "$VALIDATE_DIR" "$ROOT" "$TARGET_ID" "$EXPECTED_COUNT" <<'PY'
+python3 - "$VALIDATE_DIR" "$ROOT" "$TARGET_ID" "$EXPECTED_COUNT" "$TARGET" <<'PY'
 import json, os, sys
 
-d, root, TARGET_ID, EXPECTED = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+d, root, TARGET_ID, EXPECTED, SYMBOL = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    int(sys.argv[4]),
+    sys.argv[5],
+)
 errors = []
 
 def load(path, name):
@@ -124,11 +153,52 @@ def load(path, name):
 
 v = load(os.path.join(d, "composition_verdict.json"), "composition_verdict.json")
 
+# Per-composition expectation tables. Each stage is (label, json field prefix,
+# committed leaf symbol directory).
+SPECS = {
+    "toupper_memchr": {
+        "stages": ["libc:toupper:c-locale:u8:v1", "libc:memchr:c-locale:index:v1"],
+        "native_keys": [
+            "toupper_hay_native_cases",
+            "toupper_needle_native_cases",
+            "memchr_native_cases",
+        ],
+        "objects": [
+            ("toupper(haystack)", "toupper", "toupper"),
+            ("toupper(needle)", "toupper", "toupper"),
+            ("memchr", "memchr", "memchr"),
+        ],
+    },
+    "toupper_strlen_memchr": {
+        "stages": [
+            "libc:toupper:c-locale:u8:v1",
+            "libc:strlen:c-locale:u64:v1",
+            "libc:memchr:c-locale:index:v1",
+        ],
+        "native_keys": [
+            "toupper_hay_native_cases",
+            "strlen_native_cases",
+            "toupper_needle_native_cases",
+            "memchr_native_cases",
+        ],
+        "objects": [
+            ("toupper(haystack)", "toupper", "toupper"),
+            ("strlen(derived bound)", "strlen", "strlen"),
+            ("memchr", "memchr", "memchr"),
+        ],
+    },
+}
+
+spec = SPECS.get(SYMBOL)
+if spec is None:
+    errors.append("no verifier specification for composition %s" % SYMBOL)
+    spec = {"stages": [], "native_keys": [], "objects": []}
+
 if v.get("target") != TARGET_ID:
     errors.append("composition target != %s" % TARGET_ID)
 
 stages = v.get("stages", [])
-for required in ("libc:toupper:c-locale:u8:v1", "libc:memchr:c-locale:index:v1"):
+for required in spec["stages"]:
     if required not in stages:
         errors.append("composition stages do not include %s" % required)
 
@@ -137,9 +207,9 @@ if v.get("cases_run") != EXPECTED:
 
 # Every stage must be sealed-native for every case, with no fallback and no
 # broken seal. A broken seal is not a fallback; both are disqualifying.
-for stage in ("toupper_hay_native_cases", "toupper_needle_native_cases", "memchr_native_cases"):
-    if v.get(stage) != EXPECTED:
-        errors.append("%s != %d (stage was not served by the sealed object)" % (stage, EXPECTED))
+for key in spec["native_keys"]:
+    if v.get(key) != EXPECTED:
+        errors.append("%s != %d (stage was not served by the sealed object)" % (key, EXPECTED))
 if v.get("fallback_cases") != 0:
     errors.append("fallback_cases != 0 (foreign fallback in the sealed path)")
 if v.get("broken_seal_cases") != 0:
@@ -165,30 +235,35 @@ def leaf_object_hash(symbol):
     doc = load(p, "%s candidate_signature.json" % symbol)
     return doc.get("candidate_object_hash", "")
 
-tupper = leaf_object_hash("toupper")
-memchr = leaf_object_hash("memchr")
-if v.get("toupper_object_hash") != tupper:
-    errors.append("toupper_object_hash does not match the committed sealed toupper object")
-if v.get("memchr_object_hash") != memchr:
-    errors.append("memchr_object_hash does not match the committed sealed memchr object")
-if not v.get("toupper_elf_symbol", "").startswith("_phor_"):
-    errors.append("toupper_elf_symbol is missing or unmangled")
-if not v.get("memchr_elf_symbol", "").startswith("_phor_"):
-    errors.append("memchr_elf_symbol is missing or unmangled")
+results = []
+for label, prefix, symbol in spec["objects"]:
+    leaf = leaf_object_hash(symbol)
+    got = v.get("%s_object_hash" % prefix)
+    if got != leaf:
+        errors.append(
+            "%s_object_hash does not match the committed sealed %s object" % (prefix, symbol)
+        )
+    if not v.get("%s_elf_symbol" % prefix, "").startswith("_phor_"):
+        errors.append("%s_elf_symbol is missing or unmangled" % prefix)
+    results.append((label, got, leaf))
 
+# Unique stages, in the order they first appear.
 print("Target: %s" % v.get("target", "?"))
 print("Stages: %s" % " -> ".join(stages))
 print("Cases: %d" % v.get("cases_run", 0))
-print("toupper(haystack) native: %d" % v.get("toupper_hay_native_cases", 0))
-print("toupper(needle) native:   %d" % v.get("toupper_needle_native_cases", 0))
-print("memchr native:            %d" % v.get("memchr_native_cases", 0))
+for key in spec["native_keys"]:
+    print("%s: %d" % (key, v.get(key, 0)))
 print("Foreign fallback: %d" % v.get("fallback_cases", 0))
 print("Broken seal:      %d" % v.get("broken_seal_cases", 0))
 print("Passed: %d" % v.get("cases_passed", 0))
 print("Failed: %d" % v.get("cases_failed", 0))
 print("Dispatches: %d" % v.get("dispatches_run", 0))
-print("toupper object: %s" % ("MATCH" if v.get("toupper_object_hash") == tupper else "MISMATCH"))
-print("memchr object:  %s" % ("MATCH" if v.get("memchr_object_hash") == memchr else "MISMATCH"))
+seen = set()
+for label, got, leaf in results:
+    if leaf in seen:
+        continue
+    seen.add(leaf)
+    print("%s object: %s" % (label, "MATCH" if got == leaf else "MISMATCH"))
 print("Chain hash bound: %s" % ("yes" if v.get("chain_hash") else "no"))
 print("Verdict: %s" % v.get("verdict", "?"))
 

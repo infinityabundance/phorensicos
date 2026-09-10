@@ -33,6 +33,7 @@ pub mod behavior_signature;
 pub mod candidate;
 pub mod compiled;
 pub mod composition;
+pub mod composition_strlen_memchr;
 pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;
@@ -638,16 +639,89 @@ pub fn run_port_court(
     })
 }
 
-/// Build the sealed store index for the composition: the two leaf ports,
-/// compiled fresh (deterministically) and marked sealed.
+/// Which sealed composition court to run.
 ///
-/// The composition adds no new trusted code — its implementation *is* these two
+/// A composition is a qualified target built entirely from already-sealed leaf
+/// ports, so it adds no new trusted code. The two differ in *shape*, not just in
+/// stages: the first chains a map stage into a search stage, the second also feeds
+/// a middle stage's **result** into the next stage's **argument**.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompositionKind {
+    /// `toupper ∘ memchr` — fold the haystack and needle, then search.
+    ToupperMemchr,
+    /// `toupper ∘ strlen ∘ memchr` — fold, derive the bound with `strlen`, search
+    /// within that derived bound.
+    ToupperStrlenMemchr,
+}
+
+const TOUPPER_MEMCHR_LEAVES: [PortTarget; 2] = [target::LIBC_TOUPPER, target::LIBC_MEMCHR];
+const TOUPPER_STRLEN_MEMCHR_LEAVES: [PortTarget; 3] = [
+    target::LIBC_TOUPPER,
+    target::LIBC_STRLEN,
+    target::LIBC_MEMCHR,
+];
+
+impl CompositionKind {
+    /// Parse a short name or a qualified composition id.
+    pub fn parse(name: &str) -> Option<Self> {
+        if name == "toupper_memchr" || name == composition::COMPOSITION_TOUPPER_MEMCHR.id {
+            return Some(CompositionKind::ToupperMemchr);
+        }
+        if name == "toupper_strlen_memchr"
+            || name == composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR.id
+        {
+            return Some(CompositionKind::ToupperStrlenMemchr);
+        }
+        None
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            CompositionKind::ToupperMemchr => "toupper_memchr",
+            CompositionKind::ToupperStrlenMemchr => "toupper_strlen_memchr",
+        }
+    }
+
+    pub fn target_id(&self) -> &'static str {
+        match self {
+            CompositionKind::ToupperMemchr => composition::COMPOSITION_TOUPPER_MEMCHR.id,
+            CompositionKind::ToupperStrlenMemchr => {
+                composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR.id
+            }
+        }
+    }
+
+    /// The default evidence directory for this composition.
+    pub fn evidence_dir(&self) -> &'static str {
+        match self {
+            CompositionKind::ToupperMemchr => "phost/evidence/composition/toupper_memchr",
+            CompositionKind::ToupperStrlenMemchr => {
+                "phost/evidence/composition/toupper_strlen_memchr"
+            }
+        }
+    }
+
+    fn leaf_targets(&self) -> &'static [PortTarget] {
+        match self {
+            CompositionKind::ToupperMemchr => &TOUPPER_MEMCHR_LEAVES,
+            CompositionKind::ToupperStrlenMemchr => &TOUPPER_STRLEN_MEMCHR_LEAVES,
+        }
+    }
+}
+
+/// Build the sealed store index for a composition: the leaf ports it is built
+/// from, compiled fresh (deterministically) and marked sealed.
+///
+/// The composition adds no new trusted code — its implementation *is* these
 /// already-sealed objects.
-fn build_composition_index(phorc: Option<&str>) -> Result<SealedPortIndex, PortError> {
+fn build_composition_index(
+    phorc: Option<&str>,
+    leaves: &[PortTarget],
+) -> Result<SealedPortIndex, PortError> {
     let mut index = SealedPortIndex::new();
-    for target in [target::LIBC_TOUPPER, target::LIBC_MEMCHR] {
+    for target in leaves {
         let dir = format!("phost/evidence/porting/{}", target.symbol);
-        let c = compiled::compile_candidate(&target, &dir, phorc)
+        let c = compiled::compile_candidate(target, &dir, phorc)
             .map_err(|e| PortError::Compile(e.message()))?;
         index.insert(SealedPortEntry {
             target: target.id.to_string(),
@@ -663,24 +737,29 @@ fn build_composition_index(phorc: Option<&str>) -> Result<SealedPortIndex, PortE
     Ok(index)
 }
 
+/// One chain link, as reported to the CLI.
+#[derive(Clone, Debug)]
+pub struct StageReport {
+    pub label: String,
+    /// The qualified leaf id this link dispatches to.
+    pub leaf: String,
+    pub native_cases: u64,
+    pub object_hash: String,
+    pub elf_symbol: String,
+}
+
 /// Outcome of a composition court run, suitable for printing.
 #[derive(Clone, Debug)]
 pub struct CompositionReport {
     pub target: String,
     pub stages: Vec<String>,
     pub cases_run: u64,
-    pub toupper_hay_native_cases: u64,
-    pub toupper_needle_native_cases: u64,
-    pub memchr_native_cases: u64,
+    pub stage_reports: Vec<StageReport>,
     pub fallback_cases: u64,
     pub broken_seal_cases: u64,
     pub cases_passed: u64,
     pub cases_failed: u64,
     pub dispatches_run: u64,
-    pub toupper_object_hash: String,
-    pub toupper_elf_symbol: String,
-    pub memchr_object_hash: String,
-    pub memchr_elf_symbol: String,
     pub oracle_hash: String,
     pub chain_hash: String,
     pub verdict: String,
@@ -688,12 +767,14 @@ pub struct CompositionReport {
     pub evidence_dir: String,
 }
 
-/// Run the Sealed Composition Dispatch Court for `toupper ∘ memchr`.
+/// Run a Sealed Composition Dispatch Court.
 ///
-/// The oracle comes from the foreign runtime (`dialect_cage::observe_composition`);
-/// the implementation is the chain of sealed objects executed through
-/// `NativeDispatcher` — no Rust mirror is consulted.
+/// The oracle comes from the foreign runtime (the cage); the implementation is the
+/// chain of sealed objects executed through `NativeDispatcher` — no Rust mirror is
+/// consulted. Both compositions write the same evidence set into their own
+/// directory, so composition #1's committed evidence is untouched.
 pub fn run_composition_court(
+    kind: CompositionKind,
     auth: &PortingAuthority,
     out_dir: &str,
     phorc: Option<&str>,
@@ -702,51 +783,182 @@ pub fn run_composition_court(
         return Err(PortError::CapabilityDenied);
     }
 
-    let index = build_composition_index(phorc)?;
-    let cases = composition::composition_corpus();
-    let traces = dialect_cage::observe_composition(&cases, auth)?;
-    let (verdict, mismatches) = composition::run_composition_court(&traces, &index, auth);
+    let index = build_composition_index(phorc, kind.leaf_targets())?;
 
-    let verdict_path =
-        evidence::write_composition_evidence(out_dir, &traces, &verdict, &mismatches)
-            .map_err(|e| PortError::Io(format!("{}", e)))?;
+    match kind {
+        CompositionKind::ToupperMemchr => {
+            let cases = composition::composition_corpus();
+            let traces = dialect_cage::observe_composition(&cases, auth)?;
+            let (v, m) = composition::run_composition_court(&traces, &index, auth);
+            let evidence_dir = evidence::write_composition_evidence(out_dir, &traces, &v, &m)
+                .map_err(|e| PortError::Io(format!("{}", e)))?;
 
-    Ok(CompositionReport {
-        target: verdict.target.clone(),
-        stages: verdict.stages.clone(),
-        cases_run: verdict.cases_run,
-        toupper_hay_native_cases: verdict.toupper_hay_native_cases,
-        toupper_needle_native_cases: verdict.toupper_needle_native_cases,
-        memchr_native_cases: verdict.memchr_native_cases,
-        fallback_cases: verdict.fallback_cases,
-        broken_seal_cases: verdict.broken_seal_cases,
-        cases_passed: verdict.cases_passed,
-        cases_failed: verdict.cases_failed,
-        dispatches_run: verdict.dispatches_run,
-        toupper_object_hash: verdict.toupper_object_hash.clone(),
-        toupper_elf_symbol: verdict.toupper_elf_symbol.clone(),
-        memchr_object_hash: verdict.memchr_object_hash.clone(),
-        memchr_elf_symbol: verdict.memchr_elf_symbol.clone(),
-        oracle_hash: verdict.oracle_hash.clone(),
-        chain_hash: verdict.chain_hash.clone(),
-        verdict: verdict.verdict.as_str().to_string(),
-        sealed: verdict.is_sealed_eligible(),
-        evidence_dir: verdict_path,
-    })
+            Ok(CompositionReport {
+                target: v.target.clone(),
+                stages: v.stages.clone(),
+                cases_run: v.cases_run,
+                stage_reports: alloc::vec![
+                    StageReport {
+                        label: String::from("toupper(haystack)"),
+                        leaf: target::LIBC_TOUPPER.id.to_string(),
+                        native_cases: v.toupper_hay_native_cases,
+                        object_hash: v.toupper_object_hash.clone(),
+                        elf_symbol: v.toupper_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("toupper(needle)"),
+                        leaf: target::LIBC_TOUPPER.id.to_string(),
+                        native_cases: v.toupper_needle_native_cases,
+                        object_hash: v.toupper_object_hash.clone(),
+                        elf_symbol: v.toupper_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("memchr"),
+                        leaf: target::LIBC_MEMCHR.id.to_string(),
+                        native_cases: v.memchr_native_cases,
+                        object_hash: v.memchr_object_hash.clone(),
+                        elf_symbol: v.memchr_elf_symbol.clone(),
+                    },
+                ],
+                fallback_cases: v.fallback_cases,
+                broken_seal_cases: v.broken_seal_cases,
+                cases_passed: v.cases_passed,
+                cases_failed: v.cases_failed,
+                dispatches_run: v.dispatches_run,
+                oracle_hash: v.oracle_hash.clone(),
+                chain_hash: v.chain_hash.clone(),
+                verdict: v.verdict.as_str().to_string(),
+                sealed: v.is_sealed_eligible(),
+                evidence_dir,
+            })
+        }
+        CompositionKind::ToupperStrlenMemchr => {
+            let cases = composition_strlen_memchr::composition_corpus();
+            let traces = dialect_cage::observe_composition_strlen_memchr(&cases, auth)?;
+            let (v, m) = composition_strlen_memchr::run_composition_court(&traces, &index, auth);
+            let evidence_dir = evidence::write_composition_evidence(out_dir, &traces, &v, &m)
+                .map_err(|e| PortError::Io(format!("{}", e)))?;
+
+            Ok(CompositionReport {
+                target: v.target.clone(),
+                stages: v.stages.clone(),
+                cases_run: v.cases_run,
+                stage_reports: alloc::vec![
+                    StageReport {
+                        label: String::from("toupper(haystack)"),
+                        leaf: target::LIBC_TOUPPER.id.to_string(),
+                        native_cases: v.toupper_hay_native_cases,
+                        object_hash: v.toupper_object_hash.clone(),
+                        elf_symbol: v.toupper_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("strlen(derived bound)"),
+                        leaf: target::LIBC_STRLEN.id.to_string(),
+                        native_cases: v.strlen_native_cases,
+                        object_hash: v.strlen_object_hash.clone(),
+                        elf_symbol: v.strlen_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("toupper(needle)"),
+                        leaf: target::LIBC_TOUPPER.id.to_string(),
+                        native_cases: v.toupper_needle_native_cases,
+                        object_hash: v.toupper_object_hash.clone(),
+                        elf_symbol: v.toupper_elf_symbol.clone(),
+                    },
+                    StageReport {
+                        label: String::from("memchr"),
+                        leaf: target::LIBC_MEMCHR.id.to_string(),
+                        native_cases: v.memchr_native_cases,
+                        object_hash: v.memchr_object_hash.clone(),
+                        elf_symbol: v.memchr_elf_symbol.clone(),
+                    },
+                ],
+                fallback_cases: v.fallback_cases,
+                broken_seal_cases: v.broken_seal_cases,
+                cases_passed: v.cases_passed,
+                cases_failed: v.cases_failed,
+                dispatches_run: v.dispatches_run,
+                oracle_hash: v.oracle_hash.clone(),
+                chain_hash: v.chain_hash.clone(),
+                verdict: v.verdict.as_str().to_string(),
+                sealed: v.is_sealed_eligible(),
+                evidence_dir,
+            })
+        }
+    }
+}
+
+/// One composed call, as reported to the CLI.
+#[derive(Clone, Debug)]
+pub struct CompositionCallReport {
+    pub target: String,
+    /// `(label, stage status)` per link, in chain order.
+    pub stages: Vec<(String, String)>,
+    pub hay_norm: Vec<u8>,
+    /// The bound a `strlen` stage derived, when the chain has one.
+    pub derived_len: Option<usize>,
+    pub needle_norm: Option<u8>,
+    pub index: Option<i32>,
+    pub dispatches: u64,
 }
 
 /// Run one composed call for the CLI: `hay`, `needle`, `n`.
 pub fn run_composition_call(
+    kind: CompositionKind,
     hay: &[u8],
     needle: u8,
     n: usize,
     auth: &PortingAuthority,
     phorc: Option<&str>,
-) -> Result<composition::CompositionCall, PortError> {
-    let index = build_composition_index(phorc)?;
-    Ok(composition::run_composition_call(
-        &index, hay, needle, n, auth,
-    ))
+) -> Result<CompositionCallReport, PortError> {
+    let index = build_composition_index(phorc, kind.leaf_targets())?;
+
+    match kind {
+        CompositionKind::ToupperMemchr => {
+            let c = composition::run_composition_call(&index, hay, needle, n, auth);
+            Ok(CompositionCallReport {
+                target: composition::COMPOSITION_TOUPPER_MEMCHR.id.to_string(),
+                stages: alloc::vec![
+                    (String::from("toupper(haystack)"), String::from(c.hay_stage)),
+                    (
+                        String::from("toupper(needle)"),
+                        String::from(c.needle_stage)
+                    ),
+                    (String::from("memchr"), String::from(c.memchr_stage)),
+                ],
+                hay_norm: c.hay_norm,
+                derived_len: None,
+                needle_norm: c.needle_norm,
+                index: c.index,
+                dispatches: c.dispatches,
+            })
+        }
+        CompositionKind::ToupperStrlenMemchr => {
+            let c = composition_strlen_memchr::run_composition_call(&index, hay, needle, n, auth);
+            Ok(CompositionCallReport {
+                target: composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR
+                    .id
+                    .to_string(),
+                stages: alloc::vec![
+                    (String::from("toupper(haystack)"), String::from(c.hay_stage)),
+                    (
+                        String::from("strlen(derived bound)"),
+                        String::from(c.strlen_stage)
+                    ),
+                    (
+                        String::from("toupper(needle)"),
+                        String::from(c.needle_stage)
+                    ),
+                    (String::from("memchr"), String::from(c.memchr_stage)),
+                ],
+                hay_norm: c.hay_norm,
+                derived_len: c.derived_len,
+                needle_norm: c.needle_norm,
+                index: c.index,
+                dispatches: c.dispatches,
+            })
+        }
+    }
 }
 
 #[cfg(test)]

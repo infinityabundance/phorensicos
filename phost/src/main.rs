@@ -205,7 +205,7 @@ fn port_cli(args: &[String]) -> i32 {
             "       phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
         );
         eprintln!(
-            "       phost port compose [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
+            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr] [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
         );
         return 2;
     }
@@ -397,15 +397,20 @@ fn native_cli(args: &[String]) -> i32 {
 
 /// `phost port compose [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
 ///
-/// The Sealed Composition Dispatch Court for `toupper ∘ memchr`. With no
-/// positional argument it runs the whole composition corpus through the sealed
-/// chain and writes the composition evidence; with an argument it runs one
-/// composed call and prints each stage.
+/// The Sealed Composition Dispatch Court.
+///
+/// `phost port compose [--target NAME] [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
+///
+/// With no positional argument it runs the whole composition corpus through the
+/// sealed chain and writes the composition evidence; with an argument it runs one
+/// composed call and prints each stage. `--target` selects the chain
+/// (`toupper_memchr`, the default, or `toupper_strlen_memchr`).
 fn compose_cli(args: &[String]) -> i32 {
-    use phost::porting::{self, PortingAuthority};
+    use phost::porting::{self, CompositionKind, PortingAuthority};
 
     let mut call: Option<String> = None;
-    let mut out = String::from("phost/evidence/composition/toupper_memchr");
+    let mut kind = CompositionKind::ToupperMemchr;
+    let mut out: Option<String> = None;
     let mut phorc: Option<String> = None;
     let mut dispatch_auth = PortingAuthority::granted();
 
@@ -416,8 +421,21 @@ fn compose_cli(args: &[String]) -> i32 {
                 dispatch_auth = PortingAuthority::none();
                 i += 1;
             }
+            "--target" if i + 1 < args.len() => {
+                match CompositionKind::parse(&args[i + 1]) {
+                    Some(k) => kind = k,
+                    None => {
+                        eprintln!(
+                            "port compose: unknown --target {} (expected toupper_memchr|toupper_strlen_memchr)",
+                            args[i + 1]
+                        );
+                        return 2;
+                    }
+                }
+                i += 2;
+            }
             "--out" if i + 1 < args.len() => {
-                out = args[i + 1].clone();
+                out = Some(args[i + 1].clone());
                 i += 2;
             }
             "--phorc" if i + 1 < args.len() => {
@@ -433,9 +451,11 @@ fn compose_cli(args: &[String]) -> i32 {
             }
         }
     }
+    let out = out.unwrap_or_else(|| kind.evidence_dir().to_string());
 
     match call {
         None => match porting::run_composition_court(
+            kind,
             &PortingAuthority::granted(),
             &out,
             phorc.as_deref(),
@@ -445,18 +465,14 @@ fn compose_cli(args: &[String]) -> i32 {
                 println!("Target:        {}", r.target);
                 println!("Stages:        {}", r.stages.join(" -> "));
                 println!("Cases:         {}", r.cases_run);
-                println!(
-                    "toupper(hay):  {} native / {} cases",
-                    r.toupper_hay_native_cases, r.cases_run
-                );
-                println!(
-                    "toupper(needle): {} native / {} cases",
-                    r.toupper_needle_native_cases, r.cases_run
-                );
-                println!(
-                    "memchr:        {} native / {} cases",
-                    r.memchr_native_cases, r.cases_run
-                );
+                for s in &r.stage_reports {
+                    println!(
+                        "{:<22} {} native / {} cases",
+                        format!("{}:", s.label),
+                        s.native_cases,
+                        r.cases_run
+                    );
+                }
                 println!(
                     "Fallback:      {}   Broken seal: {}",
                     r.fallback_cases, r.broken_seal_cases
@@ -464,15 +480,24 @@ fn compose_cli(args: &[String]) -> i32 {
                 println!("Passed:        {}", r.cases_passed);
                 println!("Failed:        {}", r.cases_failed);
                 println!("Dispatches:    {}", r.dispatches_run);
-                println!("toupper object: {}", r.toupper_object_hash);
-                println!("memchr object:  {}", r.memchr_object_hash);
+                // Deduplicate the object lines: a leaf used twice in a chain (e.g.
+                // toupper for the haystack and the needle) is one object.
+                let mut seen: Vec<(&str, &str)> = Vec::new();
+                for s in &r.stage_reports {
+                    if s.object_hash.is_empty() {
+                        continue;
+                    }
+                    let key = (s.leaf.as_str(), s.object_hash.as_str());
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.push(key);
+                    println!("{:<22} {}", format!("{} object:", s.label), s.object_hash);
+                }
                 println!("Chain hash:    {}", r.chain_hash);
                 println!("Oracle hash:   {}", r.oracle_hash);
                 println!("Verdict:       {}", r.verdict);
-                println!(
-                    "Sealed:        {}",
-                    if r.sealed { "yes" } else { "no" }
-                );
+                println!("Sealed:        {}", if r.sealed { "yes" } else { "no" });
                 println!("Evidence:      {}", r.evidence_dir);
                 0
             }
@@ -503,19 +528,34 @@ fn compose_cli(args: &[String]) -> i32 {
                 }
             }) as usize;
 
-            match porting::run_composition_call(hay, needle, n, &dispatch_auth, phorc.as_deref()) {
+            match porting::run_composition_call(
+                kind,
+                hay,
+                needle,
+                n,
+                &dispatch_auth,
+                phorc.as_deref(),
+            ) {
                 Ok(c) => {
                     println!("=== Sealed Composition Call ===");
+                    println!("Target:        {}", c.target);
                     println!("Input:         {}", framed);
-                    println!("toupper(hay):  {} -> {}", c.hay_stage, hex_encode(&c.hay_norm));
+                    for (label, status) in &c.stages {
+                        println!("{:<22} {}", format!("{}:", label), status);
+                    }
+                    println!("Haystack norm: {}", hex_encode(&c.hay_norm));
                     println!(
-                        "toupper(needle): {} -> {}",
-                        c.needle_stage,
+                        "Derived bound: {}",
+                        c.derived_len
+                            .map(|l| l.to_string())
+                            .unwrap_or_else(|| String::from("-"))
+                    );
+                    println!(
+                        "Needle norm:   {}",
                         c.needle_norm
                             .map(|b| format!("{:02x}", b))
                             .unwrap_or_else(|| String::from("-"))
                     );
-                    println!("memchr:        {}", c.memchr_stage);
                     println!(
                         "Index:         {}",
                         c.index

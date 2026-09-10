@@ -17,6 +17,7 @@ use core::ffi::{c_char, c_int, c_void};
 
 use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
+use crate::porting::composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
     PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
@@ -253,6 +254,73 @@ pub fn observe_composition(
             OracleTrace::for_target_id(
                 COMPOSITION_TOUPPER_MEMCHR.id,
                 COMPOSITION_TOUPPER_MEMCHR.locale_contract,
+                &case.case_id,
+                &case.args,
+                &encode_index(idx),
+                "ok",
+                &["compute"],
+            )
+        })
+        .collect())
+}
+
+/// Observe the composition `toupper ∘ strlen ∘ memchr` through the **foreign**
+/// runtime: uppercase the haystack with libc `toupper` (C locale), measure it with
+/// libc `strlen` to derive `L`, uppercase the needle with libc `toupper`, then run
+/// libc `memchr` over the folded haystack bounded by `L`.
+///
+/// The middle stage is the point: the oracle's search bound is the foreign
+/// `strlen` result, not the case's `n`. The sealed chain must derive the same bound
+/// from the sealed `strlen` object.
+pub fn observe_composition_strlen_memchr(
+    cases: &[TestCase],
+    auth: &PortingAuthority,
+) -> Result<Vec<OracleTrace>, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+
+    Ok(cases
+        .iter()
+        .map(|case| {
+            let hay = case.args.first().cloned().unwrap_or_default();
+            let needle = case
+                .args
+                .get(1)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(0);
+
+            // Stage 1: foreign C-locale `toupper` over the haystack.
+            let mut folded: Vec<u8> = hay
+                .iter()
+                .map(|&b| unsafe { toupper(b as c_int) as u8 })
+                .collect();
+            // libc `strlen` needs a C string; every corpus case has a terminator
+            // inside its bound, so this is defensive only.
+            if !folded.contains(&0) {
+                folded.push(0x00);
+            }
+
+            // Stage 2: foreign `strlen` of the folded haystack -> the derived bound.
+            let derived = unsafe { strlen(folded.as_ptr() as *const c_char) };
+
+            // Stage 3: foreign C-locale `toupper` of the needle.
+            let folded_needle = unsafe { toupper(needle as c_int) as u8 };
+
+            // Stage 4: foreign `memchr` over the folded haystack, bounded by the
+            // derived length (never by the case's `n`).
+            let base = folded.as_ptr();
+            let found = unsafe { memchr(base as *const c_void, folded_needle as c_int, derived) };
+            let idx: i32 = if found.is_null() {
+                -1
+            } else {
+                (found as usize - base as usize) as i32
+            };
+
+            OracleTrace::for_target_id(
+                COMPOSITION_TOUPPER_STRLEN_MEMCHR.id,
+                COMPOSITION_TOUPPER_STRLEN_MEMCHR.locale_contract,
                 &case.case_id,
                 &case.args,
                 &encode_index(idx),
@@ -522,6 +590,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(traces.len(), 336);
+        assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 8));
+    }
+
+    #[test]
+    fn test_cage_folded_search_derives_the_bound_from_strlen() {
+        let mk = |id: &str, hay: &[u8], needle: u8, n: usize| {
+            TestCase::new(
+                id,
+                alloc::vec![
+                    hay.to_vec(),
+                    alloc::vec![needle],
+                    (n as u64).to_le_bytes().to_vec(),
+                ],
+            )
+        };
+        let cases = alloc::vec![
+            // folded 'A' at index 0 of "aB"
+            mk("fold", b"aB\0", 0x41, 4),
+            // needle only after the terminator: the derived bound excludes it
+            mk("tail", &[0x62, 0x00, 0x61, 0x61], 0x41, 4),
+            // empty string: the derived bound is 0
+            mk("empty", b"\0aaaa", 0x41, 5),
+        ];
+        let traces =
+            observe_composition_strlen_memchr(&cases, &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces[0].output_hex, "00000000"); // folded 'A' found at 0
+        assert_eq!(traces[1].output_hex, "ffffffff"); // tail is outside the string
+        assert_eq!(traces[2].output_hex, "ffffffff"); // no searchable byte
+        assert!(traces
+            .iter()
+            .all(|t| t.target == COMPOSITION_TOUPPER_STRLEN_MEMCHR.id));
+        assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_observes_whole_strlen_memchr_corpus() {
+        let traces = observe_composition_strlen_memchr(
+            &crate::porting::composition_strlen_memchr::composition_corpus(),
+            &PortingAuthority::granted(),
+        )
+        .unwrap();
+        assert_eq!(traces.len(), 350);
         assert!(traces.iter().all(|t| t.is_intact()));
         assert!(traces.iter().all(|t| t.output_hex.len() == 8));
     }

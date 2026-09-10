@@ -335,12 +335,17 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   artifact the call falls back to the foreign implementation; a *broken seal* is
   terminal and never falls back. The court requires every case to be served
   natively.
-- **Composition court** — proves sealed ports compose. One composed target
-  (`phor:compose:toupper_memchr:c-locale:index:v1`) is implemented as `toupper`
-  over the haystack and needle followed by `memchr`, dispatched entirely through
-  the sealed store with no foreign calls and no Rust mirror. The verdict records
-  per-stage native/fallback/broken-seal counts and a chain hash over the
-  intermediates.
+- **Composition court** — proves sealed ports compose. Two composed targets are
+  sealed. `phor:compose:toupper_memchr:c-locale:index:v1` is `toupper` over the
+  haystack and needle followed by `memchr`.
+  `phor:compose:toupper_strlen_memchr:c-locale:index:v1` adds a third stage whose
+  **result becomes the next stage's argument**: the sealed `strlen` derives the
+  search bound and the sealed `memchr` searches exactly that measured prefix, so
+  the chain is a case-insensitive search of a C string. Both are dispatched
+  entirely through the sealed store with no foreign calls and no Rust mirror. Each
+  verdict records per-stage native/fallback/broken-seal counts and a chain hash
+  over the intermediates — for the three-stage chain, including the derived bound —
+  not just the final index.
 - **Promotion** — advances the candidate to `sealed` only when the replay court,
   the execution court *and* the dispatch court all match exactly, with a complete
   evidence set. Gated by the `PORTING` capability.

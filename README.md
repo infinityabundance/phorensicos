@@ -159,7 +159,8 @@ bound. `strrchr` returns a pointer, so the observable is normalized to the index
 
 ### Composition: sealed ports as runtime building blocks
 
-One composed target proves the sealed artifacts are not isolated tricks:
+Two composed targets prove the sealed artifacts are not isolated tricks. The
+first chains a map stage into a search stage:
 
 ```text
 phor:compose:toupper_memchr:c-locale:index:v1
@@ -170,20 +171,44 @@ sealed:  dispatch the sealed toupper once per haystack byte and once for the
          sealed path, no Rust mirror consulted
 ```
 
-Its id is `phor:compose:…`, not `libc:…`: it is a Phorensic composition over
-already-sealed ports, and it adds no new trusted code.
+Their ids are `phor:compose:…`, not `libc:…`: these are Phorensic compositions
+over already-sealed ports, and they add no new trusted code.
 
-| Composition | Cases | toupper(hay) | toupper(needle) | memchr | Fallback | Broken seal |
-|-------------|-------|--------------|-----------------|--------|----------|-------------|
-| `toupper_memchr` | 560 | **560 native** | **560 native** | **560 native** | **0** | **0** |
+| Composition | Cases | Folding | Length stage | Search | Fallback | Broken seal |
+|-------------|-------|---------|--------------|--------|----------|-------------|
+| `toupper_memchr` | 560 | **toupper 560 native** | — | **memchr 560 native** | **0** | **0** |
+| `toupper_strlen_memchr` | 350 | **toupper 350 native** | **strlen 350 native** | **memchr 350 native** | **0** | **0** |
 
-The corpus reuses the `memchr` corpus and adds C-locale fold cases where a needle
-only matches *after* `toupper` normalizes both sides — so a composition that
-skipped the toupper stage would fail. The `composition_verdict.json` records the
-per-stage source, the two sealed object hashes the chain dispatched to (which the
-verifier cross-checks against the committed leaf seals), and a `chain_hash` that
-covers the normalized intermediates and the stage statuses, not just the final
-index.
+The first corpus reuses the `memchr` corpus and adds C-locale fold cases where a
+needle only matches *after* `toupper` normalizes both sides — so a composition
+that skipped the toupper stage would fail. The `composition_verdict.json` records
+the per-stage source, the two sealed object hashes the chain dispatched to (which
+the verifier cross-checks against the committed leaf seals), and a `chain_hash`
+that covers the normalized intermediates and the stage statuses, not just the
+final index.
+
+The second is the generalization: three stages, and the middle stage's **result is
+consumed as the next stage's argument**, not merely carried along.
+
+```text
+phor:compose:toupper_strlen_memchr:c-locale:index:v1
+
+oracle:  foreign toupper over the haystack, foreign strlen of the folded
+         haystack -> L, foreign toupper of the needle, then foreign memchr
+         over the folded haystack bounded by L
+sealed:  dispatch the sealed toupper once per haystack byte, dispatch the sealed
+         strlen once to derive L, dispatch the sealed toupper once for the
+         needle, then dispatch the sealed memchr once with n = L
+```
+
+Read plainly, it is a **case-insensitive search of a C string**: the string's
+length is established by the sealed `strlen` rather than supplied by the caller,
+and the sealed `memchr` searches exactly that measured prefix. That makes the
+middle stage load-bearing, not decorative — its corpus deliberately places
+needle-like bytes *after* the terminator, so a chain that searched with the
+caller's `n` instead of the derived `L` fails. Its `chain_hash` covers the derived
+bound as well as the normalized intermediates, so the hash proves the *chain*, not
+just the answer.
 
 ```sh
 cargo run -p phost -- port promote toupper   # observe → replay → execute → dispatch → seal
@@ -199,14 +224,18 @@ cargo run -p phost -- port native strrchr 616261626300:62:0600000000000000
 cargo run -p phost -- port native toupper 61 --no-capability   # → foreign fallback
 cargo run -p phost -- port compose                             # composition court
 cargo run -p phost -- port compose 614263:62:0300000000000000   # one composed call
+cargo run -p phost -- port compose --target toupper_strlen_memchr   # the 3-stage chain
+cargo run -p phost -- port compose --target toupper_strlen_memchr 62006161:41:0400000000000000
 ./verify_jit_porting_court.sh --target toupper             # determinism court
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
 ./verify_jit_porting_court.sh --target memchr --check-committed   # fresh == checked-in
-./verify_composition_court.sh                              # composition court
+./verify_composition_court.sh                     # composition #1 court
 ./verify_composition_court.sh --check-committed
+./verify_composition_court.sh --target toupper_strlen_memchr              # composition #2
+./verify_composition_court.sh --target toupper_strlen_memchr --check-committed
 ```
 
 Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
@@ -294,7 +323,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **152 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **160 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (47), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -306,6 +335,7 @@ All numbers below were reproduced on a clean checkout.
 | Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**, `strlen` **308/308**, `strrchr` **336/336**; executed object == sealed object |
 | Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, `strrchr` **336/336 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
 | Sealed composition | `toupper ∘ memchr` composed from two sealed ports: **560/560**, all three stages native, **0 fallbacks / 0 broken seals**, 4776 sealed dispatches; dispatched objects match the committed leaf seals |
+| Sealed composition (3-stage) | `toupper ∘ strlen ∘ memchr`, where the sealed `strlen` result becomes the search bound: **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**, 3729 sealed dispatches; dispatched objects match the committed leaf seals |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 

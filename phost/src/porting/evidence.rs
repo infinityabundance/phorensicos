@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use crate::porting::behavior_signature::BehaviorSignature;
 use crate::porting::candidate::CandidateSignature;
 use crate::porting::composition::CompositionVerdict;
+use crate::porting::composition_strlen_memchr::StrlenMemchrVerdict;
 use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
@@ -173,6 +174,27 @@ pub fn package_id(target: &PortTarget) -> String {
     format!("native:{}", target.id)
 }
 
+/// A composition verdict that can be written as court evidence.
+///
+/// Implemented by every composition court, so the evidence writer does not need to
+/// know which chain produced the verdict (composition #1's committed evidence is
+/// unaffected: the trait only names the existing `to_json`).
+pub trait CompositionEvidence {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String;
+}
+
+impl CompositionEvidence for CompositionVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
+impl CompositionEvidence for StrlenMemchrVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
 /// Write the composition evidence set: the sealed oracle traces and the
 /// composition verdict. Returns the verdict path.
 ///
@@ -182,7 +204,7 @@ pub fn package_id(target: &PortTarget) -> String {
 pub fn write_composition_evidence(
     dir: &str,
     traces: &[OracleTrace],
-    verdict: &CompositionVerdict,
+    verdict: &impl CompositionEvidence,
     mismatches: &[Mismatch],
 ) -> io::Result<String> {
     let base = PathBuf::from(dir);
@@ -192,6 +214,6 @@ pub fn write_composition_evidence(
         oracle_trace::traces_to_json(traces),
     )?;
     let verdict_path = base.join("composition_verdict.json");
-    fs::write(&verdict_path, verdict.to_json(mismatches))?;
+    fs::write(&verdict_path, verdict.evidence_json(mismatches))?;
     Ok(verdict_path.display().to_string())
 }

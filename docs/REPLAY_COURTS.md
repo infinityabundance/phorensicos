@@ -602,10 +602,11 @@ phost port native toupper 61 --no-capability                    # foreign-fallba
 ### Sealed composition dispatch court
 
 The leaf courts prove a sealed artifact is correct (`exec`), then preferred
-(`dispatch`). The composition court proves they can be **composed by the
-runtime**: one composed target built from already-sealed ports, executed
-entirely through `NativeDispatcher`, with no foreign calls in the sealed path and
-no Rust mirror consulted.
+(`dispatch`). The composition courts prove they can be **composed by the
+runtime**: composed targets built from already-sealed ports, executed entirely
+through `NativeDispatcher`, with no foreign calls in the sealed path and no Rust
+mirror consulted. Two chains are sealed, and the second shows the machinery
+generalizes.
 
 ```text
 phor:compose:toupper_memchr:c-locale:index:v1
@@ -660,6 +661,54 @@ phost port compose 614263:62:0300000000000000       # one composed call
 ./verify_composition_court.sh --check-committed     # fresh == checked-in
 ```
 
+#### Second composition: `toupper ∘ strlen ∘ memchr`
+
+The first chain is a map stage into a search stage. The second adds the property
+that makes composition more than a pipeline: **the middle stage's result is
+consumed as the next stage's argument**.
+
+```text
+phor:compose:toupper_strlen_memchr:c-locale:index:v1
+
+  input:  haystack, needle, n     (n = precondition bound: a NUL lies inside haystack[..n])
+  oracle: foreign C-locale toupper over the haystack,
+          then foreign strlen of the folded haystack -> L,
+          then foreign C-locale toupper of the needle,
+          then foreign memchr over the folded haystack bounded by L -> index or -1
+  sealed: dispatch sealed toupper once per haystack byte,
+          dispatch sealed strlen once to derive L,
+          dispatch sealed toupper once for the needle,
+          then dispatch sealed memchr once with n = L
+```
+
+Read plainly it is a **case-insensitive search of a C string**: the string's length
+is established by the sealed `strlen` rather than supplied by the caller, and the
+sealed `memchr` searches exactly that measured prefix. The middle stage is
+load-bearing, not decorative — its corpus deliberately places needle-like bytes
+*after* the terminator, so a chain that searched with the caller's `n` instead of
+the derived `L` cannot pass.
+
+Its verdict records four stage accounts (`toupper_hay_native_cases`,
+`strlen_native_cases`, `toupper_needle_native_cases`, `memchr_native_cases`) plus
+the same fallback/broken-seal split, and three object hashes (toupper, strlen,
+memchr). Its `chain_hash` covers the derived bound as well as the normalized
+intermediates and the final index, so the hash proves the chain, not just the
+answer.
+
+Reproduce:
+
+```sh
+phost port compose --target toupper_strlen_memchr                        # 350 cases
+phost port compose --target toupper_strlen_memchr 62006161:41:0400000000000000
+./verify_composition_court.sh --target toupper_strlen_memchr
+./verify_composition_court.sh --target toupper_strlen_memchr --check-committed
+```
+
+The second call above is the decisive demo: the haystack folds to `42 00 41 41`, the
+sealed `strlen` derives the bound `1`, and the sealed `memchr` searches only that
+one byte — so the needle `41` (`A`) that occurs *after* the terminator is correctly
+not found (`Index: -1`).
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
@@ -688,7 +737,7 @@ revealed.
 phost/src/porting/                target, dialect_cage, oracle_trace,
                                   behavior_signature, candidate, replay_court,
                                   promotion, evidence, compiled, exec, dispatch,
-                                  composition
+                                  composition, composition_strlen_memchr
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
@@ -699,9 +748,9 @@ phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
 phost/evidence/porting/memchr/    memchr evidence set (482 cases) + candidate.o
 phost/evidence/porting/strlen/    strlen evidence set (308 cases) + candidate.o
 phost/evidence/porting/strrchr/   strrchr evidence set (336 cases) + candidate.o
-phost/evidence/composition/      composition verdict (chain over sealed ports)
+phost/evidence/composition/      composition verdicts (chains over sealed ports)
 verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr)
-verify_composition_court.sh       composition court verifier
+verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr)
 ```
 
 The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are
