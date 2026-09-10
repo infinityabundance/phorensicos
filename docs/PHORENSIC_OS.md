@@ -309,16 +309,19 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → composition court (sealed ports become runtime building blocks) → runtime prefers native
 ```
 
-- **Dialect cage** — observes a foreign API surface as a black box. Four targets
+- **Dialect cage** — observes a foreign API surface as a black box. Five targets
   so far: libc `toupper` (exhaustive `0x00..=0xff`), libc `memcmp` (a bounded
   deterministic corpus forcing length, buffers and ordering), libc `memchr`
   (a bounded deterministic corpus forcing search: first-match index, absent
   needle, repeated needles, the `n`-boundary, and an exhaustive 256-value needle
-  sweep) and libc `strlen` (a bounded deterministic corpus forcing NUL
-  termination: the complete `(k, n)` terminator-index/scan-bound grid, non-NUL
-  fillers, first-NUL-wins tails, and an exhaustive 256-value non-terminator
-  sweep). `memchr`'s pointer result is normalized to the index, which is the
-  portable part of its contract. No foreign source is read or copied.
+  sweep), libc `strlen` (a bounded deterministic corpus forcing NUL termination:
+  the complete `(k, n)` terminator-index/scan-bound grid, non-NUL fillers,
+  first-NUL-wins tails, and an exhaustive 256-value non-terminator sweep) and libc
+  `strrchr` (a bounded deterministic corpus forcing *last*-match semantics inside
+  the string: unique and repeated occurrences, needles that occur only after the
+  terminator, needles straddling it, and an exhaustive 256-value needle sweep).
+  `memchr`/`strrchr` pointer results are normalized to indexes, which is the
+  portable part of their contracts. No foreign source is read or copied.
 - **Court session** — replays a clean-room native candidate against sealed oracle
   traces and compares exact output/status/effects. The verdict derives from case
   comparisons, not receipt counts, and fails closed.

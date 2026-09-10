@@ -6,7 +6,8 @@
 // Relationship to the compiled artifact: the **authoritative** promoted
 // implementation is the ELF64 object `phorc` emits from
 // examples/jit_port_toupper.phor, examples/jit_port_memcmp.phor,
-// examples/jit_port_memchr.phor and examples/jit_port_strlen.phor, and the
+// examples/jit_port_memchr.phor, examples/jit_port_strlen.phor and
+// examples/jit_port_strrchr.phor, and the
 // execution court (`phost::porting::exec`) loads and calls *that*. The functions
 // here are the behavioral mirror the replay court compares against the oracle;
 // the execution court then proves the compiled object agrees too. They are
@@ -23,7 +24,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::porting::oracle_trace::OracleTrace;
-use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_TOUPPER};
+use crate::porting::target::{
+    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
+};
 use crate::porting::{json_escape, sha256_hex};
 
 /// Why a candidate could not produce a result for a case.
@@ -170,6 +173,37 @@ pub fn phor_strlen(bytes: &[u8], n: usize) -> usize {
     n
 }
 
+// ============================================================================
+// strrchr
+// ============================================================================
+
+/// Native clean-room `strrchr`: the index of the **last** occurrence of `needle`
+/// in the NUL-terminated string held in `bytes` (within the first `n` bytes), or
+/// `-1` when it does not occur.
+///
+/// The search domain is the *string*: it ends at the first NUL, which is itself a
+/// candidate — so a `needle` of `0` yields the terminator index (the length), and
+/// any occurrence after the terminator is ignored. `n` is the ABI precondition
+/// bound: the terminator lies within it.
+#[inline]
+pub fn phor_strrchr(bytes: &[u8], needle: u8, n: usize) -> i32 {
+    let m = n.min(bytes.len());
+    let mut last: i32 = -1;
+    let mut i = 0;
+    while i < m {
+        let b = bytes[i];
+        if b == needle {
+            last = i as i32;
+        }
+        if b == 0 {
+            // The string ends here (inclusive): no later byte can match.
+            break;
+        }
+        i += 1;
+    }
+    last
+}
+
 /// Run the native candidate for a qualified target id over its argument list.
 ///
 /// Returns `Err(UnsupportedTarget)` for unknown ids and `Err(MalformedArgs)` for
@@ -209,6 +243,17 @@ pub fn run_candidate(target_id: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, Candi
         }
         let len = phor_strlen(&args[0], decode_usize(&args[1]));
         return Ok(encode_usize(len));
+    }
+
+    if target_id == LIBC_STRRCHR.id {
+        if args.len() < 3 {
+            return Err(CandidateError::MalformedArgs(target_id.to_string()));
+        }
+        let needle = *args[1]
+            .first()
+            .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
+        let index = phor_strrchr(&args[0], needle, decode_usize(&args[2]));
+        return Ok(encode_index(index));
     }
 
     Err(CandidateError::UnsupportedTarget(target_id.to_string()))
@@ -437,6 +482,41 @@ mod tests {
         for case in crate::porting::target::strlen_corpus() {
             match run_candidate(LIBC_STRLEN.id, &case.args) {
                 Ok(out) => assert_eq!(out.len(), 8, "case {}", case.case_id),
+                Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_native_strrchr_behavior() {
+        // The last occurrence wins.
+        assert_eq!(phor_strrchr(b"ababc\0", b'a', 6), 2);
+        assert_eq!(phor_strrchr(b"ababc\0", b'b', 6), 3);
+        assert_eq!(phor_strrchr(b"ababc\0", b'c', 6), 4);
+        // Absent -> -1.
+        assert_eq!(phor_strrchr(b"ababc\0", b'z', 6), -1);
+        // A NUL needle yields the terminator index (the length).
+        assert_eq!(phor_strrchr(b"ababc\0", 0, 6), 5);
+        assert_eq!(phor_strrchr(b"\0", 0, 1), 0);
+        // The empty string: only a NUL needle occurs.
+        assert_eq!(phor_strrchr(b"\0aaaa", 0, 5), 0);
+        assert_eq!(phor_strrchr(b"\0aaaa", b'a', 5), -1);
+        // Occurrences after the terminator are ignored.
+        assert_eq!(phor_strrchr(b"AB\0AB", b'A', 5), 0);
+        assert_eq!(phor_strrchr(b"AB\0AB\0", 0, 6), 2);
+        assert_eq!(phor_strrchr(&[0x00, 0x41, 0x41], b'A', 3), -1);
+        // Unsigned bytes are just byte values.
+        assert_eq!(phor_strrchr(&[0x7f, 0x80, 0x00, 0x7f, 0x80], 0x80, 5), 1);
+        assert_eq!(phor_strrchr(&[0x7f, 0x80, 0x00, 0x7f, 0x80], 0x7f, 5), 0);
+        // The bound is respected: a match outside it is not observed.
+        assert_eq!(phor_strrchr(b"abc\0", b'c', 2), -1);
+    }
+
+    #[test]
+    fn test_strrchr_candidate_covers_corpus_without_error() {
+        for case in crate::porting::target::strrchr_corpus() {
+            match run_candidate(LIBC_STRRCHR.id, &case.args) {
+                Ok(out) => assert_eq!(out.len(), 4, "case {}", case.case_id),
                 Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
             }
         }

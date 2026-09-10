@@ -3,7 +3,8 @@
 // The cage is the clean-room boundary. It runs the *foreign* implementation as
 // an observed black box and records input/output/status/locale/effects — it never
 // reads, copies, or embeds foreign source. Foreign functions are reached through
-// a single narrow FFI shim (libc `toupper`, `memcmp`, `memchr`, `strlen`).
+// a single narrow FFI shim (libc `toupper`, `memcmp`, `memchr`, `strlen`,
+// `strrchr`).
 //
 // This module is std-only: observing a foreign implementation requires the
 // foreign runtime to be present. Kernel-side replay against already-sealed
@@ -18,20 +19,22 @@ use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_
 use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
-    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_TOUPPER,
+    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
 };
 use crate::porting::{PortError, PortingAuthority};
 
 // Foreign implementations under observation. In the "C" locale (the initial
 // locale for a process that never calls setlocale), `toupper` folds ASCII
 // `a`..=`z` and leaves every other byte unchanged; `memcmp` compares unsigned
-// bytes; `strlen` counts bytes up to the first NUL. All are recorded with
+// bytes; `strlen` counts bytes up to the first NUL; `strrchr` finds the last
+// occurrence of a byte in a NUL-terminated string. All are recorded with
 // `locale_contract` so these courts can never be confused with locale-aware ones.
 extern "C" {
     fn toupper(c: c_int) -> c_int;
     fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int;
     fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void;
     fn strlen(s: *const c_char) -> usize;
+    fn strrchr(s: *const c_char, c: c_int) -> *mut c_char;
 }
 
 /// Observe `cases` against `target` through the cage.
@@ -153,6 +156,47 @@ pub fn observe_target(
                     &case.case_id,
                     &case.args,
                     &encode_usize(len),
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect());
+    }
+
+    if target.id == LIBC_STRRCHR.id {
+        return Ok(cases
+            .iter()
+            .map(|case| {
+                let buf = case.args.first().cloned().unwrap_or_default();
+                let needle = case
+                    .args
+                    .get(1)
+                    .and_then(|a| a.first())
+                    .copied()
+                    .unwrap_or(0);
+                // libc `strrchr` takes a C string, so observe the WHOLE buffer up
+                // to its terminator (the ABI bound `n` only guarantees the
+                // terminator is within the window; it is not a search bound).
+                let mut c_buf = buf.clone();
+                if !c_buf.contains(&0) {
+                    // Defensive only: every corpus case has a terminator inside its
+                    // bound, so this never fires for a sealed case.
+                    c_buf.push(0x00);
+                }
+                let base = c_buf.as_ptr();
+                let found = unsafe { strrchr(base as *const c_char, needle as c_int) };
+                // Normalize the pointer result to the index, or -1 when absent. A
+                // pointer value is not portable behavior; the index is.
+                let idx: i32 = if found.is_null() {
+                    -1
+                } else {
+                    (found as usize - base as usize) as i32
+                };
+                OracleTrace::new(
+                    target,
+                    &case.case_id,
+                    &case.args,
+                    &encode_index(idx),
                     "ok",
                     &["compute"],
                 )
@@ -415,6 +459,71 @@ mod tests {
         assert_eq!(traces.len(), 308);
         assert!(traces.iter().all(|t| t.is_intact()));
         assert!(traces.iter().all(|t| t.output_hex.len() == 16));
+    }
+
+    #[test]
+    fn test_cage_reports_strrchr_last_index() {
+        let target = LIBC_STRRCHR;
+        let c = |b: &[u8]| b.to_vec();
+        let cases = alloc::vec![
+            // last of two 'b's
+            TestCase::new(
+                "last-b",
+                alloc::vec![
+                    c(b"ababc\0"),
+                    alloc::vec![b'b'],
+                    6u64.to_le_bytes().to_vec()
+                ],
+            ),
+            // absent
+            TestCase::new(
+                "absent",
+                alloc::vec![c(b"abc\0"), alloc::vec![b'z'], 4u64.to_le_bytes().to_vec()],
+            ),
+            // NUL needle -> terminator index (the length)
+            TestCase::new(
+                "term",
+                alloc::vec![c(b"abc\0"), alloc::vec![0x00], 4u64.to_le_bytes().to_vec()],
+            ),
+            // only after the terminator -> absent
+            TestCase::new(
+                "tail-only",
+                alloc::vec![
+                    c(b"BC\0AAA"),
+                    alloc::vec![b'A'],
+                    6u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            // unsigned 0x80 at index 1, with a copy after the terminator
+            TestCase::new(
+                "edge",
+                alloc::vec![
+                    c(&[0x7f, 0x80, 0x00, 0x7f, 0x80]),
+                    alloc::vec![0x80],
+                    5u64.to_le_bytes().to_vec(),
+                ],
+            ),
+        ];
+        let traces = observe_target(&target, &cases, &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces[0].output_hex, "03000000"); // last 'b' at 3
+        assert_eq!(traces[1].output_hex, "ffffffff"); // absent
+        assert_eq!(traces[2].output_hex, "03000000"); // terminator at 3
+        assert_eq!(traces[3].output_hex, "ffffffff"); // tail ignored
+        assert_eq!(traces[4].output_hex, "01000000"); // 0x80 at 1, tail ignored
+        assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_observes_whole_strrchr_corpus() {
+        let traces = observe_target(
+            &LIBC_STRRCHR,
+            &crate::porting::target::strrchr_corpus(),
+            &PortingAuthority::granted(),
+        )
+        .unwrap();
+        assert_eq!(traces.len(), 336);
+        assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 8));
     }
 
     #[test]

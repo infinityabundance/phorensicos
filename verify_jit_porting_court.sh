@@ -30,7 +30,7 @@
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
-#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr|strlen] [--check-committed] [evidence_dir]
+#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr|strlen|strrchr] [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -74,8 +74,13 @@ case "$TARGET" in
         EXPECTED_COUNT=308
         SOURCE="examples/jit_port_strlen.phor"
         ;;
+    strrchr)
+        TARGET_ID="libc:strrchr:c-locale:index:v1"
+        EXPECTED_COUNT=336
+        SOURCE="examples/jit_port_strrchr.phor"
+        ;;
     *)
-        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr|strlen)"
+        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr|strlen|strrchr)"
         exit 2
         ;;
 esac
@@ -320,6 +325,63 @@ if SYMBOL == "strlen":
         errors.append("strlen corpus does not have the complete 36-case (k, n) grid")
     if len([i for i in id_set if i.startswith("D.")]) != 256:
         errors.append("strlen corpus does not have the exhaustive 256-value sweep")
+
+if SYMBOL == "strrchr":
+    for t in traces:
+        a = args_of(t)
+        if len(a) != 3:
+            errors.append("strrchr case %s does not have exactly 3 arguments" % t.get("case_id"))
+            break
+        if len(a[1]) != 2:
+            errors.append("strrchr case %s does not have a 1-byte needle" % t.get("case_id"))
+            break
+        if len(a[2]) != 16:
+            errors.append("strrchr case %s has a non-8-byte bound" % t.get("case_id"))
+            break
+        try:
+            buf = bytes.fromhex(a[0])
+            n = int.from_bytes(bytes.fromhex(a[2]), "little")
+        except ValueError:
+            errors.append("strrchr case %s has non-hex arguments" % t.get("case_id"))
+            break
+        if n > len(buf):
+            errors.append("strrchr case %s has n > len(buf)" % t.get("case_id"))
+            break
+        if n > 8 or len(buf) > 8:
+            errors.append("strrchr case %s exceeds the 8-byte packed-word contract" % t.get("case_id"))
+            break
+        # The ABI precondition: a NUL terminator inside the bound.
+        if 0 not in buf[:n]:
+            errors.append("strrchr case %s has no terminator inside its bound" % t.get("case_id"))
+            break
+        if len(t.get("output_hex", "")) != 8:
+            errors.append("strrchr case %s output is not a 4-byte index" % t.get("case_id"))
+            break
+    id_set = set(t.get("case_id") for t in traces)
+    for required in (
+        "A.term.n1",
+        "A.miss.n8",
+        "B.7.6",
+        "C.alt.7.a",
+        "C.rep.7",
+        "D.tail.4",
+        "D.both.2",
+        "E.00",
+        "E.41",
+        "E.7f",
+        "E.80",
+        "F.7f",
+        "F.80",
+    ):
+        if required not in id_set:
+            errors.append("strrchr corpus is missing case %s" % required)
+    for group in ("A.", "B.", "C.", "D.", "E.", "F."):
+        if not any(i.startswith(group) for i in id_set):
+            errors.append("strrchr corpus is missing group %s" % group)
+    if len([i for i in id_set if i.startswith("E.")]) != 256:
+        errors.append("strrchr corpus does not have the exhaustive 256-value needle sweep")
+    if len([i for i in id_set if i.startswith("B.")]) != 28:
+        errors.append("strrchr corpus does not have the complete 28-case unique-occurrence grid")
 
 # ---- hash cross-checks ----------------------------------------------------
 oracle = sig.get("combined_oracle_hash", "")

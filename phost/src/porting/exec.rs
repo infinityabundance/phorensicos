@@ -32,7 +32,9 @@ use core::ffi::c_void;
 use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
-use crate::porting::target::{PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_TOUPPER};
+use crate::porting::target::{
+    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
+};
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
 
 /// Why the execution court could not run (or refused to).
@@ -280,6 +282,37 @@ fn call_target(
         let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
         let len = f(w, n as u64);
         return Ok(encode_usize(len as usize));
+    }
+
+    if target.id == LIBC_STRRCHR.id {
+        if args.len() < 3 {
+            return Err(ExecError::MalformedArgs(target.id.to_string()));
+        }
+        let buf = &args[0];
+        let needle = *args[1]
+            .first()
+            .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
+        let n = decode_usize(&args[2]);
+        if n > 8 || buf.len() < n {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: scanned length {} exceeds the 8-byte packed-word contract or the buffer",
+                target.id, n
+            )));
+        }
+        // The ABI precondition: a NUL terminator lies within the packed window, so
+        // the word encodes the whole C string and the candidate never reads on.
+        if !buf[..n].contains(&0) {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: no NUL terminator within the {}-byte bound",
+                target.id, n
+            )));
+        }
+        // The candidate scans the zero-extended word and finds the last in-string
+        // match, so only the needle crosses the ABI.
+        let w = pack_le_prefix(&buf[..n]);
+        let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
+        let raw = f(w, needle as u64) as u32 as i32;
+        return Ok(encode_index(raw));
     }
 
     Err(ExecError::UnsupportedTarget(target.id.to_string()))

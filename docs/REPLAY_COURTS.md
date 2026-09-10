@@ -328,7 +328,8 @@ traces, replays a clean-room native candidate against them, and promotes the
 candidate only on exact, evidence-backed equivalence.
 
 This is **API-surface** porting (byte-in/byte-out and small buffer functions such
-as `toupper`, `memcmp`, `memchr` and `strlen`), not arbitrary binary translation.
+as `toupper`, `memcmp`, `memchr`, `strlen` and `strrchr`), not arbitrary binary
+translation.
 
 ### Flow
 
@@ -413,6 +414,32 @@ longer than the bound (bytes past `n` are ignored); and an exhaustive sweep of a
 256 byte values proving that only `0x00` terminates. Arguments are framed in the
 trace as `buf_hex:n_hex` (little-endian `n`).
 
+### Fifth target: libc `strrchr`
+
+```text
+target id: libc:strrchr:c-locale:index:v1
+dialect:   libc   symbol: strrchr   version: host-observed-v1
+locale:    C
+contract:  index of the last occurrence in the C string, or -1 when absent
+corpus:    336 bounded deterministic cases
+```
+
+`strrchr` is the mirror image of `memchr`: `memchr` finds the *first* match in a
+*bounded window*, while `strrchr` finds the *last* match in the *string*. It
+returns a pointer, so the observable is normalized to the **index**
+(`result - s`); the search domain ends at (and includes) the first NUL, so bytes
+after the terminator are never matched and a needle of `0` yields the terminator
+index (the string's length). `n` is the ABI precondition bound: the terminator
+lies within the first `n` bytes, which the execution harness enforces, so the
+packed word encodes the whole string. Its corpus forces last-match semantics:
+unique occurrences at every in-string index; repeated occurrences so the *last*
+wins; the empty string; needles that occur only after the terminator (never a
+match); needles that occur both before and after it (the in-string occurrence
+wins); the unsigned edge bytes with copies of `0x7f`/`0x80` after the terminator;
+and an exhaustive sweep of all 256 needle values against a haystack whose tail
+repeats bytes from the string. Arguments are framed in the trace as
+`buf_hex:needle_hex:n_hex` (little-endian `n`).
+
 ### Target identity is qualified
 
 A target id is `dialect:symbol:locale:contract:version`, so a future
@@ -425,8 +452,9 @@ The cage calls the foreign functions through a single narrow FFI shim and record
 input/output/locale/status/effects — it never reads or copies foreign source. The
 native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold),
 `phor_memcmp` (unsigned, `n`-bounded, sign result), `phor_memchr` (unsigned,
-`n`-bounded, first-match index) and `phor_strlen` (first-NUL length, `n`-bounded
-and fail-closed at `n`). Unknown target ids return
+`n`-bounded, first-match index), `phor_strlen` (first-NUL length, `n`-bounded
+and fail-closed at `n`) and `phor_strrchr` (last in-string match index, NUL
+needle → length). Unknown target ids return
 `CandidateError::UnsupportedTarget` and malformed arguments return
 `CandidateError::MalformedArgs`; there is no identity fallback, so an unsupported
 candidate can never pass by accident.
@@ -515,6 +543,7 @@ Executed ABI (SysV AMD64):
 | `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign (`-1`/`0`/`1`); buffers packed big-endian into the word |
 | `_phor_phor_memchr_index` | `(u64 wh, u64 needle, u64 n) -> u64` | `i64` index or `-1`; haystack packed little-endian into the word |
 | `_phor_phor_strlen_len` | `(u64 w, u64 n) -> u64` | `u64` length (first NUL index), `n` when out of contract; buffer packed little-endian |
+| `_phor_phor_strrchr_index` | `(u64 w, u64 needle) -> u64` | `i64` index of the last in-string match or `-1`; buffer packed little-endian and zero-extended |
 
 ### Sealed native dispatch court
 
@@ -566,6 +595,7 @@ phost port native toupper 61                                    # sealed-object 
 phost port native memcmp 616263:616264:0300000000000000         # sealed-object → ffffffff
 phost port native memchr 616263:62:0300000000000000             # sealed-object → 01000000
 phost port native strlen 61626300:0400000000000000              # sealed-object → 0300000000000000
+phost port native strrchr 616261626300:62:0600000000000000      # sealed-object → 03000000
 phost port native toupper 61 --no-capability                    # foreign-fallback
 ```
 
@@ -662,11 +692,15 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
+examples/jit_port_strlen.phor     strlen native candidate, in Phorensic
+examples/jit_port_strrchr.phor    strrchr native candidate, in Phorensic
 phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
 phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
 phost/evidence/porting/memchr/    memchr evidence set (482 cases) + candidate.o
+phost/evidence/porting/strlen/    strlen evidence set (308 cases) + candidate.o
+phost/evidence/porting/strrchr/   strrchr evidence set (336 cases) + candidate.o
 phost/evidence/composition/      composition verdict (chain over sealed ports)
-verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr)
+verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr)
 verify_composition_court.sh       composition court verifier
 ```
 

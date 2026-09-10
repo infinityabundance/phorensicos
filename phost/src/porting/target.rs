@@ -4,11 +4,12 @@
 // identity is qualified (`dialect:symbol:locale:contract:version`) so behavior
 // that depends on locale or ABI can never be silently conflated later.
 //
-// Four targets exist:
+// Five targets exist:
 //   - libc:toupper:c-locale:u8:v1     exhaustive byte domain, 256 cases
 //   - libc:memcmp:c-locale:sign:v1    bounded deterministic corpus, ordering (312)
 //   - libc:memchr:c-locale:index:v1   bounded deterministic corpus, first-match index (482)
 //   - libc:strlen:c-locale:u64:v1     bounded deterministic corpus, NUL-terminated length (308)
+//   - libc:strrchr:c-locale:index:v1  bounded deterministic corpus, last-match index (336)
 //
 // The corpus for a target is deterministic and bounded; it is enumerated in a
 // fixed order so the court is reproducible and the verdict does not depend on
@@ -121,6 +122,33 @@ pub const LIBC_STRLEN: PortTarget = PortTarget {
     // LITTLE-ENDIAN (byte i in bits 8*i). Returns n when no terminator is inside
     // the bound (fail closed).
     abi_symbol: "phor_strlen_len",
+};
+
+/// libc `strrchr` — bounded deterministic corpus, last-match index contract.
+///
+/// The observable is the **index of the last occurrence** of the needle in the C
+/// string, or `-1` when it is absent. `strrchr` returns a pointer, and a pointer
+/// value is not portable behavior, so the court normalizes it to the index — the
+/// actual C contract (`result - s`). Unlike `memchr`, the search domain is the
+/// *string*: it ends at (and includes) the first NUL, so bytes after the
+/// terminator are never matched, and a needle of `0` yields the terminator index
+/// (the string's length). `n` is the ABI precondition bound: the terminator lies
+/// within the first `n` bytes, which makes the buffer packable into one
+/// zero-extended word.
+pub const LIBC_STRRCHR: PortTarget = PortTarget {
+    id: "libc:strrchr:c-locale:index:v1",
+    dialect: "libc",
+    symbol: "strrchr",
+    version: "host-observed-v1",
+    locale_contract: "C",
+    input_schema: "(u8[] bytes, u8 needle, usize n) — a buffer whose NUL terminator lies within the first n bytes, a needle byte, and the bound",
+    output_schema: "i32 index of the last match, or -1 when absent",
+    domain_summary: "bounded deterministic corpus: unique and repeated occurrences (last wins), the empty string, needles that occur only after the terminator, buffers longer than the string, the unsigned edge bytes, and an exhaustive 0..=255 needle sweep",
+    candidate_source: "examples/jit_port_strrchr.phor",
+    // ABI: (w: u64, needle: u64) -> u64 index or -1; the first n bytes are packed
+    // LITTLE-ENDIAN (byte i in bits 8*i) and zero-extended. The packed word must
+    // contain a NUL terminator (the harness enforces n).
+    abi_symbol: "phor_strrchr_index",
 };
 
 /// One input case for a target: an ordered list of byte-slice arguments.
@@ -391,6 +419,129 @@ pub fn strlen_corpus() -> Vec<TestCase> {
     c
 }
 
+/// The `strrchr` corpus — bounded, deterministic, exhaustive over its axes.
+///
+/// Axes: unique occurrences at every in-string index; repeated occurrences so the
+/// *last* wins; the empty string; needles that occur only after the terminator
+/// (which must never match); needles that occur both before and after it (the
+/// in-string occurrence wins); an exhaustive sweep of all 256 needle values
+/// against a haystack whose tail repeats bytes from the string; and the unsigned
+/// edge bytes `00/01/7f/80/fe/ff` with copies of `0x7f`/`0x80` after the
+/// terminator, so the terminator — not the byte value — decides.
+///
+/// Every case satisfies `n <= len(buf)`, `n <= 8`, `len(buf) <= 8` and has a NUL
+/// terminator inside `buf[..n]`, so libc `strrchr` is well defined and the packed
+/// word is a faithful encoding of the string.
+pub fn strrchr_corpus() -> Vec<TestCase> {
+    let mut c: Vec<TestCase> = Vec::new();
+
+    let mk = |cases: &mut Vec<TestCase>, id: &str, buf: &[u8], needle: u8, n: usize| {
+        cases.push(TestCase::new(
+            id,
+            vec![
+                buf.to_vec(),
+                alloc::vec![needle],
+                (n as u64).to_le_bytes().to_vec(),
+            ],
+        ));
+    };
+
+    // Distinct non-NUL content bytes (none is 0x00, 0xff or 0x41-used-as-tail).
+    const S: [u8; 7] = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
+    // Alternating pair for the repeated-occurrence group.
+    const ALT: [u8; 2] = [0x41, 0x42];
+
+    // A — the empty string (terminator at index 0): a NUL needle yields 0, any
+    //     other needle occurs only in the tail and so is absent (-1).
+    for n in 1..=8usize {
+        let mut buf = alloc::vec![0x41u8; n];
+        buf[0] = 0x00;
+        mk(&mut c, &format!("A.term.n{}", n), &buf, 0x00, n);
+        mk(&mut c, &format!("A.miss.n{}", n), &buf, 0x41, n);
+    }
+
+    // B — a single occurrence at index k of a string of length L (k < L),
+    //     terminator at L, tail 0xff. Distinct content bytes, so it is unique.
+    for l in 1..=7usize {
+        for k in 0..l {
+            let mut buf = alloc::vec![0xffu8; 8];
+            buf[..l].copy_from_slice(&S[..l]);
+            buf[l] = 0x00;
+            mk(&mut c, &format!("B.{}.{}", l, k), &buf, S[k], 8);
+        }
+    }
+
+    // C — repeated needle: the LAST in-string occurrence wins.
+    // C1 — alternating content.
+    for l in 1..=7usize {
+        let mut buf = alloc::vec![0xffu8; 8];
+        for i in 0..l {
+            buf[i] = ALT[i % 2];
+        }
+        buf[l] = 0x00;
+        mk(&mut c, &format!("C.alt.{}.a", l), &buf, 0x41, 8);
+        mk(&mut c, &format!("C.alt.{}.b", l), &buf, 0x42, 8);
+    }
+    // C2 — one repeated byte.
+    for l in 1..=7usize {
+        let mut buf = alloc::vec![0xffu8; 8];
+        for i in 0..l {
+            buf[i] = 0x41;
+        }
+        buf[l] = 0x00;
+        mk(&mut c, &format!("C.rep.{}", l), &buf, 0x41, 8);
+    }
+
+    // D — the terminator is respected.
+    // D1 — the needle occurs ONLY after the terminator: -1.
+    for l in 0..=4usize {
+        let mut buf = alloc::vec![0x00u8; l + 4];
+        for i in 0..l {
+            buf[i] = [0x42u8, 0x43, 0x44, 0x45][i];
+        }
+        buf[l] = 0x00;
+        buf[l + 1] = 0x41;
+        buf[l + 2] = 0x41;
+        buf[l + 3] = 0x41;
+        mk(&mut c, &format!("D.tail.{}", l), &buf, 0x41, buf.len());
+    }
+    // D2 — the needle occurs both before and after the terminator: the last
+    //      occurrence inside the string wins (the tail is ignored).
+    for p in 0..=2usize {
+        let mut buf = alloc::vec![0x00u8; p + 3];
+        for i in 0..p {
+            buf[i] = [0x42u8, 0x43][i];
+        }
+        buf[p] = 0x46;
+        buf[p + 1] = 0x00;
+        buf[p + 2] = 0x46;
+        mk(&mut c, &format!("D.both.{}", p), &buf, 0x46, buf.len());
+    }
+
+    // E — exhaustive needle sweep against a fixed haystack whose tail repeats
+    //     bytes from the string: only in-string occurrences may match.
+    //     string = "AB" (terminator at 2); tail = [0x41, 0x42, 0x00, 0x7f, 0x80].
+    const E_BUF: [u8; 8] = [0x41, 0x42, 0x00, 0x41, 0x42, 0x00, 0x7f, 0x80];
+    for needle in 0..=255u16 {
+        mk(
+            &mut c,
+            &format!("E.{:02x}", needle),
+            &E_BUF,
+            needle as u8,
+            8,
+        );
+    }
+
+    // F — the unsigned edge bytes at known indices, with copies of 0x7f/0x80
+    //     after the terminator so the terminator, not the byte value, decides.
+    const F_BUF: [u8; 8] = [0x01, 0x7f, 0x80, 0xfe, 0xff, 0x00, 0x7f, 0x80];
+    for &b in &[0x00u8, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0x5a] {
+        mk(&mut c, &format!("F.{:02x}", b), &F_BUF, b, 8);
+    }
+
+    c
+}
+
 /// The `memchr` corpus — bounded, deterministic, exhaustive over its axes.
 ///
 /// Axes: lengths `0..=8`; the first match at every index (distinct patterns);
@@ -521,6 +672,7 @@ pub fn cases_for(target: &PortTarget) -> Vec<TestCase> {
         id if id == LIBC_MEMCMP.id => memcmp_corpus(),
         id if id == LIBC_MEMCHR.id => memchr_corpus(),
         id if id == LIBC_STRLEN.id => strlen_corpus(),
+        id if id == LIBC_STRRCHR.id => strrchr_corpus(),
         _ => Vec::new(),
     }
 }
@@ -532,6 +684,7 @@ pub fn resolve_target(name: &str) -> Option<PortTarget> {
         "memcmp" | "libc:memcmp:c-locale:sign:v1" => Some(LIBC_MEMCMP),
         "memchr" | "libc:memchr:c-locale:index:v1" => Some(LIBC_MEMCHR),
         "strlen" | "libc:strlen:c-locale:u64:v1" => Some(LIBC_STRLEN),
+        "strrchr" | "libc:strrchr:c-locale:index:v1" => Some(LIBC_STRRCHR),
         _ => None,
     }
 }
@@ -546,6 +699,7 @@ mod tests {
         assert_eq!(resolve_target("memcmp"), Some(LIBC_MEMCMP));
         assert_eq!(resolve_target("memchr"), Some(LIBC_MEMCHR));
         assert_eq!(resolve_target("strlen"), Some(LIBC_STRLEN));
+        assert_eq!(resolve_target("strrchr"), Some(LIBC_STRRCHR));
         assert_eq!(
             resolve_target("libc:memcmp:c-locale:sign:v1"),
             Some(LIBC_MEMCMP)
@@ -557,6 +711,10 @@ mod tests {
         assert_eq!(
             resolve_target("libc:strlen:c-locale:u64:v1"),
             Some(LIBC_STRLEN)
+        );
+        assert_eq!(
+            resolve_target("libc:strrchr:c-locale:index:v1"),
+            Some(LIBC_STRRCHR)
         );
         assert_eq!(resolve_target("strcspn"), None);
     }
@@ -570,6 +728,70 @@ mod tests {
         assert_eq!(LIBC_MEMCMP.locale_contract, "C");
         assert_eq!(LIBC_MEMCHR.locale_contract, "C");
         assert_eq!(LIBC_STRLEN.locale_contract, "C");
+        assert_eq!(LIBC_STRRCHR.locale_contract, "C");
+    }
+
+    #[test]
+    fn test_strrchr_corpus_is_deterministic_and_bounded() {
+        let a = strrchr_corpus();
+        let b = strrchr_corpus();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 336);
+
+        // Case ids are unique.
+        let mut ids: Vec<&str> = a.iter().map(|c| c.case_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), a.len());
+
+        // Every case is well formed: 3 args; a 1-byte needle; an 8-byte bound;
+        // n <= len(buf) <= 8; and a NUL terminator inside buf[..n], so libc
+        // `strrchr` is well defined and the packed word encodes the string.
+        for c in &a {
+            assert_eq!(c.args.len(), 3, "case {} args", c.case_id);
+            assert_eq!(c.args[1].len(), 1, "case {} needle", c.case_id);
+            let n = u64::from_le_bytes(c.args[2].as_slice().try_into().unwrap()) as usize;
+            assert!(n <= c.args[0].len(), "case {}", c.case_id);
+            assert!(n <= 8, "case {}", c.case_id);
+            assert!(c.args[0].len() <= 8, "case {}", c.case_id);
+            assert!(
+                c.args[0][..n].contains(&0x00),
+                "case {} has no terminator inside its bound",
+                c.case_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_strrchr_corpus_covers_required_axes() {
+        let cases = strrchr_corpus();
+        let ids: Vec<&str> = cases.iter().map(|c| c.case_id.as_str()).collect();
+
+        for group in ["A.", "B.", "C.", "D.", "E.", "F."] {
+            assert!(
+                ids.iter().any(|id| id.starts_with(group)),
+                "strrchr corpus is missing group {}",
+                group
+            );
+        }
+
+        // The empty string, a full-length unique occurrence, a repeated needle,
+        // and the terminator-respecting groups are present.
+        assert!(ids.contains(&"A.term.n1"));
+        assert!(ids.contains(&"A.miss.n8"));
+        assert!(ids.contains(&"B.7.6"));
+        assert!(ids.contains(&"C.alt.7.a"));
+        assert!(ids.contains(&"C.rep.7"));
+        assert!(ids.contains(&"D.tail.4"));
+        assert!(ids.contains(&"D.both.2"));
+        // The exhaustive 256-value needle sweep is present, including the
+        // unsigned edge bytes.
+        assert_eq!(ids.iter().filter(|id| id.starts_with("E.")).count(), 256);
+        assert!(ids.contains(&"E.00"));
+        assert!(ids.contains(&"E.7f"));
+        assert!(ids.contains(&"E.80"));
+        assert!(ids.contains(&"F.7f"));
+        assert!(ids.contains(&"F.80"));
     }
 
     #[test]
