@@ -1,9 +1,16 @@
 // porting/candidate.rs — Clean-room native candidates
 //
 // The native Phorensic implementations of the targets, written from the public
-// specification and the observed traces — not from any foreign source. The
-// mirror `.phor` expressions of the same logic live at
-// examples/jit_port_toupper.phor and examples/jit_port_memcmp.phor.
+// specification and the observed traces — not from any foreign source.
+//
+// Relationship to the compiled artifact: the **authoritative** promoted
+// implementation is the ELF64 object `phorc` emits from
+// examples/jit_port_toupper.phor / examples/jit_port_memcmp.phor, and the
+// execution court (`phost::porting::exec`) loads and calls *that*. The functions
+// here are the behavioral mirror the replay court compares against the oracle;
+// the execution court then proves the compiled object agrees too. They are
+// deliberately written in the same spirit (branchless, leaf, exhaustive-domain)
+// but are not the promoted artifact.
 //
 // Fail-closed rule: an unknown target produces `CandidateError::UnsupportedTarget`
 // and malformed arguments produce `CandidateError::MalformedArgs` — never an
@@ -179,7 +186,8 @@ impl CandidateSignature {
     ) -> Self {
         Self {
             target: target.id.to_string(),
-            symbol: format!("phor_{}", target.symbol),
+            // The exact symbol `phorc` emits and the execution court calls.
+            symbol: target.abi_symbol.to_string(),
             case_count: traces.len() as u64,
             candidate_behavior_hash: candidate_behavior_hash(traces),
             candidate_source_hash: artifacts.source_hash.clone(),
@@ -315,7 +323,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let sig = CandidateSignature::from_traces(&target, &traces, &dummy_artifacts());
-        assert_eq!(sig.symbol, "phor_memcmp");
+        assert_eq!(sig.symbol, "phor_memcmp_sign");
         assert_eq!(sig.target, "libc:memcmp:c-locale:sign:v1");
         assert_eq!(sig.case_count, 312);
         assert_eq!(sig.candidate_source_hash, "sourcehash");

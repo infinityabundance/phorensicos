@@ -33,6 +33,12 @@ pub struct PortTarget {
     pub domain_summary: &'static str,
     /// Clean-room candidate source bound into the seal (repo-relative).
     pub candidate_source: &'static str,
+    /// The symbol `phorc` emits for the promoted implementation's entry point.
+    ///
+    /// This is the deliberate ABI boundary the execution court loads and calls.
+    /// `phorc` emits it as `_phor_<abi_symbol>`. It must be a leaf function with
+    /// no calls and no relocations for the execution court to accept it.
+    pub abi_symbol: &'static str,
 }
 
 /// libc `toupper` in the C locale — exhaustive byte domain.
@@ -46,6 +52,8 @@ pub const LIBC_TOUPPER: PortTarget = PortTarget {
     output_schema: "u8 (single byte)",
     domain_summary: "exhaustive 0..=255",
     candidate_source: "examples/jit_port_toupper.phor",
+    // ABI: (u64 byte) -> u64 folded byte, result in the low 8 bits.
+    abi_symbol: "phor_toupper",
 };
 
 /// libc `memcmp` — bounded deterministic two-buffer corpus, ordering contract.
@@ -62,6 +70,8 @@ pub const LIBC_MEMCMP: PortTarget = PortTarget {
     output_schema: "i32 sign (-1 | 0 | 1)",
     domain_summary: "bounded deterministic corpus: lengths 0..=8, 5 patterns, every mismatch position, n-boundary, unsigned edge bytes",
     candidate_source: "examples/jit_port_memcmp.phor",
+    // ABI: (wa: u64, wb: u64, n: u64) -> u64 sign, buffers packed big-endian.
+    abi_symbol: "phor_memcmp_sign",
 };
 
 /// One input case for a target: an ordered list of byte-slice arguments.

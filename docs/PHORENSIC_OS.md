@@ -304,6 +304,7 @@ the **JIT-Porting Court**. It ports behavior at the API boundary:
 ```text
 foreign behavior → dialect cage → oracle traces → behavior signature
 → native candidate → replay court → comparison → promotion → sealed package
+→ execution court (load and call the sealed object) → runtime prefers native
 ```
 
 - **Dialect cage** — observes a foreign API surface as a black box. Two targets
@@ -313,14 +314,21 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 - **Court session** — replays a clean-room native candidate against sealed oracle
   traces and compares exact output/status/effects. The verdict derives from case
   comparisons, not receipt counts, and fails closed.
-- **Promotion** — advances the candidate to `sealed` only on an exact, non-empty
-  match with a complete evidence set. Gated by the `PORTING` capability.
+- **Execution court** — loads the sealed ELF64 object, verifies its hash against
+  the seal, locates the ABI entry symbol, rejects any entry with relocations or
+  external symbols, maps it executable and replays the same corpus through the
+  compiled code. This is what makes the promoted artifact *run*, not just hash.
+- **Promotion** — advances the candidate to `sealed` only when the replay court
+  *and* the execution court both match exactly, with a complete evidence set.
+  Gated by the `PORTING` capability.
 - **Runtime preference** — the sealed package (e.g.
   `native:libc:memcmp:c-locale:sign:v1`) binds the compiled ELF64 candidate
   object; that object is the artifact the runtime prefers over the foreign
   implementation.
 
-This is API-surface porting, not arbitrary binary translation. Eager JIT of
-arbitrary foreign binaries is a later phase.
+This is API-surface porting, not arbitrary binary translation. The execution
+court runs only leaf, pure, relocation-free integer functions (no dynamic linker,
+no relocation patching, no heap, no syscalls). Eager JIT of arbitrary foreign
+binaries is a later phase.
 
 See `docs/REPLAY_COURTS.md` (JIT-Porting Court) and `phost/src/porting/`.

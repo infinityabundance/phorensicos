@@ -1275,7 +1275,7 @@ impl Parser {
     }
 
     fn parse_comparison_expr(&mut self) -> ParseResult<Expr> {
-        let lhs = self.parse_additive_expr()?;
+        let lhs = self.parse_shift_expr()?;
         let loc = self.loc();
         if let Some(op) = match self.peek_kind() {
             Some(TokenKind::EqEq) => Some(BinOp::Eq),
@@ -1287,7 +1287,7 @@ impl Parser {
             _ => None,
         } {
             self.advance();
-            let rhs = self.parse_additive_expr()?;
+            let rhs = self.parse_shift_expr()?;
             Ok(Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -1297,6 +1297,36 @@ impl Parser {
         } else {
             Ok(lhs)
         }
+    }
+
+    /// Shifts bind looser than additive operators: `a + b << c` is `(a + b) << c`.
+    fn parse_shift_expr(&mut self) -> ParseResult<Expr> {
+        let mut lhs = self.parse_additive_expr()?;
+        loop {
+            let loc = self.loc();
+            match self.peek_kind() {
+                Some(TokenKind::Shl) => {
+                    self.advance();
+                    lhs = Expr::Binary {
+                        op: BinOp::Shl,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(self.parse_additive_expr()?),
+                        loc,
+                    };
+                }
+                Some(TokenKind::Shr) => {
+                    self.advance();
+                    lhs = Expr::Binary {
+                        op: BinOp::Shr,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(self.parse_additive_expr()?),
+                        loc,
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(lhs)
     }
 
     fn parse_additive_expr(&mut self) -> ParseResult<Expr> {

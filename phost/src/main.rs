@@ -261,6 +261,14 @@ fn port_cli(args: &[String]) -> i32 {
                 println!("Compiled object:         {}", r.candidate_object_path);
             }
             println!("Verdict:        {}", r.verdict);
+            if r.execution_cases > 0 {
+                println!(
+                    "Execution:      {} ({} cases, {} passed, {} failed)",
+                    r.execution_verdict, r.execution_cases, r.execution_passed, r.execution_failed
+                );
+                println!("ABI symbol:     {} ({})", r.abi_symbol, r.elf_symbol);
+                println!("Execution hash: {}", r.execution_hash);
+            }
             println!("Promotion:      {}", r.promotion);
             println!("Evidence:       {}", r.evidence_dir);
             if !r.sealed_package.is_empty() {

@@ -402,9 +402,10 @@ mutation of a covered field changes the behavior signature.
 - An empty case set is `inconclusive`; any mismatch is `inconsistent`; the court
   fails closed on both.
 - Promotion to `sealed` requires: a non-empty full replay, zero failures, a
-  consistent verdict, the oracle hash, the candidate behavior hash, the bound
-  candidate source hash, and the sealed package + replay residual written.
-  Promotion also requires the `PORTING` capability.
+  consistent replay verdict, the oracle hash, the candidate behavior hash, the
+  bound candidate source hash, the sealed package + replay residual written, and
+  a **consistent sealed-object execution verdict**. Promotion also requires the
+  `PORTING` capability.
 
 ### Compiled candidate authority
 
@@ -427,13 +428,51 @@ the ELF `FILE` symbol is environment-independent and the object hash is stable
 across hosts and containers. (This required making `phorc` register allocation
 deterministic.)
 
+### Sealed object execution court
+
+Binding the compiled object is not the same as running it. The execution court
+(`phost::porting::exec`) closes that loop:
+
+1. it reads the sealed object and verifies its SHA-256 against
+   `candidate_object_hash` **before touching it** (a mismatch fails closed);
+2. it parses the ELF64 sections and symbol table and locates the ABI entry
+   symbol `_phor_<abi_symbol>` (e.g. `_phor_phor_toupper`);
+3. it requires the entry to be a `.text` `STT_FUNC` with no relocation landing
+   inside its byte range — i.e. a self-contained leaf with no calls and no
+   external symbols;
+4. it maps `.text` read-only/executable and calls the function through an
+   explicit SysV integer ABI harness;
+5. it replays the **same** oracle corpus through the compiled object and compares
+   exact output bytes;
+6. it writes `execution_verdict.json` (`cases_run/passed/failed`, `object_hash`,
+   `oracle_hash`, `execution_hash`, `verdict`, `mismatches`).
+
+Promotion to `sealed` now requires **both** courts to be consistent: the replay
+court (Rust mirror vs oracle) and the execution court (compiled object vs oracle).
+A refusal to load or execute is a hard error (`PortError::Execution`), so no seal
+is produced without a verified execution.
+
+Scope is deliberately narrow: leaf, pure, relocation-free integer functions.
+There is no dynamic linker, no relocation patching, no heap and no syscalls. This
+proves the promoted artifact runs; it is not a general execution engine.
+
+Executed ABI (SysV AMD64):
+
+| Entry symbol | Signature | Result |
+|--------------|-----------|--------|
+| `_phor_phor_toupper` | `(u64 byte) -> u64` | folded byte in the low 8 bits |
+| `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign (`-1`/`0`/`1`); buffers packed big-endian into the word |
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
-candidate's **behavior** hash (its outputs over the case domain), and the compiled
+candidate's **behavior** hash (its outputs over the case domain), the compiled
 artifacts: the clean-room **source** hash, the ELF64 **object** hash, the
-**receipt** hash, and the **compiler version**. The sealed store entry points at
-the compiled object (`candidate.o`), which is the authoritative implementation.
+**receipt** hash, and the **compiler version** — and now also the execution
+residual: the **ABI symbol**, the **executed ELF symbol**, the
+**execution hash**, and the **execution verdict**. The sealed store entry points
+at the compiled object (`candidate.o`), which is the authoritative implementation,
+and that same object is the one loaded and executed.
 
 ### Capability gating
 
@@ -450,7 +489,7 @@ revealed.
 ```text
 phost/src/porting/                target, dialect_cage, oracle_trace,
                                   behavior_signature, candidate, replay_court,
-                                  promotion, evidence, compiled
+                                  promotion, evidence, compiled, exec
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
@@ -460,7 +499,8 @@ verify_jit_porting_court.sh       court verifier (--target toupper|memcmp)
 
 The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are
 not committed); only their hashes are sealed. The promoted artifact is the
-compiled object, not the Rust mirror.
+compiled object, not the Rust mirror — and that object is executed, not merely
+hashed.
 
 Reproduce:
 

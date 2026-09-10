@@ -81,7 +81,7 @@ impl CompiledCandidate {
 
 /// Walk up from the current directory to the workspace root (a directory with a
 /// `Cargo.toml` and an `examples/` tree).
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir: PathBuf = cwd.clone();
     loop {

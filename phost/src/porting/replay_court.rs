@@ -288,6 +288,7 @@ mod tests {
             output_schema: "u8",
             domain_summary: "none",
             candidate_source: "none",
+            abi_symbol: "identity",
         };
         let traces: Vec<OracleTrace> = byte_domain_cases()
             .iter()

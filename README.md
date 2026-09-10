@@ -96,12 +96,13 @@ foreign behavior → dialect cage       (observe libc as a black box)
                  → comparison         (exact output / status / effects)
                  → promotion          (only on an exact match)
                  → sealed package     (native:<qualified target id>)
+                 → execution court    (load the sealed ELF64 object and call it)
 ```
 
-| Target | Corpus | Result |
-|--------|--------|--------|
-| `libc:toupper:c-locale:u8:v1` | exhaustive `0x00..=0xff` (256 cases) | **256/256 pass**, sealed |
-| `libc:memcmp:c-locale:sign:v1` | bounded deterministic corpus (312 cases) | **312/312 pass**, sealed |
+| Target | Corpus | Replay | Executed object |
+|--------|--------|--------|-----------------|
+| `libc:toupper:c-locale:u8:v1` | exhaustive `0x00..=0xff` (256 cases) | **256/256 pass** | **256/256 pass**, sealed |
+| `libc:memcmp:c-locale:sign:v1` | bounded deterministic corpus (312 cases) | **312/312 pass** | **312/312 pass**, sealed |
 
 The `memcmp` corpus deliberately forces length, buffers and ordering: lengths
 `0..=8`, five patterns, every first-mismatch position, the `n`-boundary around a
@@ -122,12 +123,25 @@ candidate artifacts — **source hash**, **ELF64 object hash**, **receipt hash**
 and **compiler version**. So a locale change, an edited `.phor` candidate, or a
 recompiled object invalidates the seal.
 
-The **compiled `.phor` object is the authoritative promoted implementation**: the
-court invokes `phorc` on the target's `.phor` source, hashes the emitted object
-and its receipt file, and the verifier independently recompiles and confirms both
-hashes match the committed seal (`Compiled object: MATCH`). Evidence is committed
-under `phost/evidence/porting/{toupper,memcmp}/`; the compiled `candidate.o` and
+The **compiled `.phor` object is the authoritative promoted implementation**, and
+it is **loaded and executed**: the court invokes `phorc` on the target's `.phor`
+source, hashes the emitted object and its receipt file, then maps the sealed ELF64
+object, locates the ABI entry symbol (`_phor_phor_toupper` / `_phor_phor_memcmp_sign`),
+rejects any entry point with relocations or external symbols, and replays the exact
+same corpus through the compiled code. Promotion now requires *both* the replay
+court and the execution court to match. The verifier independently recompiles and
+confirms the object/receipt hashes match the committed seal (`Compiled object:
+MATCH`) and that the executed object is the sealed object (`Execution object:
+MATCH`). Evidence is committed under `phost/evidence/porting/{toupper,memcmp}/`
+including `execution_verdict.json`; the compiled `candidate.o` and
 `candidate.receipts.json` are regenerated, not committed.
+
+Executed ABI (SysV AMD64, leaf/pure integer functions only):
+
+| Entry symbol | Signature | Result |
+|--------------|-----------|--------|
+| `_phor_phor_toupper` | `(u64 byte) -> u64` | folded byte in the low 8 bits |
+| `_phor_phor_memcmp_sign` | `(u64 wa, u64 wb, u64 n) -> u64` | `i64` sign `-1 \| 0 \| 1`; buffers packed big-endian |
 
 The verifier has two courts: the default regenerates the evidence twice and
 requires byte-identical runs; `--check-committed` writes only to a temp dir and
@@ -136,7 +150,10 @@ An unsupported candidate fails closed (`UnsupportedTarget`) and can never pass a
 an identity transform; malformed arguments fail closed too.
 
 This is **API-surface** JIT-porting, not arbitrary binary translation — eager JIT
-of arbitrary foreign binaries is a later phase.
+of arbitrary foreign binaries is a later phase. The execution court deliberately
+executes **only** leaf, pure, relocation-free integer functions: no dynamic
+linker, no heap, no syscalls, no arbitrary binary translation. It is a proof that
+the promoted artifact itself runs, not a general execution engine.
 See `docs/REPLAY_COURTS.md` and `docs/PHORENSIC_OS.md`.
 
 ## Reproducible runs with Docker
@@ -163,9 +180,9 @@ All numbers below were reproduced on a clean checkout.
 
 | Check | Result |
 |-------|--------|
-| `cargo test` (phorc) | **43 / 43 pass** |
-| `cargo test` (phost) | **97 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
-| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (46), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
+| `cargo test` (phorc) | **48 / 48 pass** (44 unit + 4 lowering-integration) |
+| `cargo test` (phost) | **108 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (235), `examples/` (46), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
 | Court replay | 6 / 6 phases **PASS**, verdict `consistent` |
@@ -173,6 +190,7 @@ All numbers below were reproduced on a clean checkout.
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
 | JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
+| Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**; executed object == sealed object |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 

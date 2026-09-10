@@ -189,6 +189,10 @@ pub enum TokenKind {
     CaretEq,
     ShlEq,
     ShrEq,
+    /// `<<` (distinct from `<`; previously collapsed into `Lt`)
+    Shl,
+    /// `>>` (distinct from `>`; previously collapsed into `Gt`)
+    Shr,
     EqEq,
     Neq,
     Le,
@@ -641,7 +645,7 @@ impl Lexer {
                         self.bump();
                         TokenKind::ShlEq
                     } else {
-                        TokenKind::Lt /* << */
+                        TokenKind::Shl
                     }
                 } else if self.peek() == Some('=') {
                     self.bump();
@@ -657,7 +661,7 @@ impl Lexer {
                         self.bump();
                         TokenKind::ShrEq
                     } else {
-                        TokenKind::Gt /* >> */
+                        TokenKind::Shr
                     }
                 } else if self.peek() == Some('=') {
                     self.bump();
@@ -801,5 +805,24 @@ mod tests {
         assert!(matches!(toks[2].kind, TokenKind::DotDot));
         assert!(matches!(toks[3].kind, TokenKind::DotDotEq));
         assert!(matches!(toks[4].kind, TokenKind::DoubleColon));
+    }
+
+    /// Regression: `<<` and `>>` used to be collapsed into a single `Lt`/`Gt`
+    /// token, which silently turned `a << b` into `a < b` and made shifts
+    /// impossible to express.
+    #[test]
+    fn test_shift_operators_are_distinct_from_comparisons() {
+        let mut lex = Lexer::new("<< >> < > <= >= <<= >>=");
+        let toks: Vec<_> = lex.by_ref().collect();
+        assert!(lex.diagnostics().is_empty());
+        let kinds: Vec<&TokenKind> = toks.iter().map(|t| &t.kind).collect();
+        assert!(matches!(kinds[0], TokenKind::Shl));
+        assert!(matches!(kinds[1], TokenKind::Shr));
+        assert!(matches!(kinds[2], TokenKind::Lt));
+        assert!(matches!(kinds[3], TokenKind::Gt));
+        assert!(matches!(kinds[4], TokenKind::Le));
+        assert!(matches!(kinds[5], TokenKind::Ge));
+        assert!(matches!(kinds[6], TokenKind::ShlEq));
+        assert!(matches!(kinds[7], TokenKind::ShrEq));
     }
 }

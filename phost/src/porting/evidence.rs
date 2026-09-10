@@ -6,7 +6,8 @@
 //
 // Artifacts written by `PortDepth::Promote`:
 //   oracle_traces.json  behavior_signature.json  candidate_signature.json
-//   replay_verdict.json promotion_receipt.json   sealed_package.json
+//   replay_verdict.json execution_verdict.json   promotion_receipt.json
+//   sealed_package.json
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::porting::behavior_signature::BehaviorSignature;
 use crate::porting::candidate::CandidateSignature;
+use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
 use crate::porting::replay_court::{Mismatch, ReplayVerdict};
 use crate::porting::target::PortTarget;
@@ -29,6 +31,7 @@ pub struct EvidencePaths {
     pub behavior_signature: String,
     pub candidate_signature: String,
     pub replay_verdict: String,
+    pub execution_verdict: String,
     pub promotion_receipt: String,
     pub sealed_package: String,
 }
@@ -43,16 +46,19 @@ pub fn hash_file(path: &str) -> io::Result<String> {
 /// The sealed package residual: what a promoted native implementation publishes.
 ///
 /// It binds the qualified target id, the locale contract, the candidate's
-/// behavior hash, and the compiled candidate artifacts (source, ELF64 object,
-/// receipts) plus the compiler that produced them.
+/// behavior hash, the compiled candidate artifacts (source, ELF64 object,
+/// receipts) plus the compiler that produced them, and — now that the promotion
+/// gate includes the execution court — the ABI entry symbol and the behavior
+/// hash of the **executed** object.
 pub fn sealed_package_json(
     target: &PortTarget,
     verdict: &ReplayVerdict,
     signature: &BehaviorSignature,
     candidate: &CandidateSignature,
+    execution: &ExecutionVerdict,
 ) -> String {
     format!(
-        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
+        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"candidate_abi_symbol\": \"{abi_symbol}\",\n  \"executed_elf_symbol\": \"{elf_symbol}\",\n  \"candidate_execution_hash\": \"{execution_hash}\",\n  \"execution_verdict\": \"{exec_verdict}\",\n  \"execution_cases\": {exec_cases},\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
         id = json_escape(target.id),
         dialect = json_escape(target.dialect),
         symbol = json_escape(target.symbol),
@@ -67,6 +73,11 @@ pub fn sealed_package_json(
         receipt = candidate.candidate_receipt_hash,
         compiler = json_escape(&candidate.compiler_version),
         native_symbol = json_escape(&candidate.symbol),
+        abi_symbol = json_escape(&execution.abi_symbol),
+        elf_symbol = json_escape(&execution.elf_symbol),
+        execution_hash = execution.execution_hash,
+        exec_verdict = execution.verdict.as_str(),
+        exec_cases = execution.cases_run,
     )
 }
 
@@ -82,6 +93,7 @@ pub fn write_evidence_set(
     candidate_sig: &CandidateSignature,
     verdict: &ReplayVerdict,
     mismatches: &[Mismatch],
+    execution: Option<(&ExecutionVerdict, &[Mismatch])>,
     promotion_json: Option<&str>,
     sealed_json: Option<&str>,
 ) -> io::Result<EvidencePaths> {
@@ -114,6 +126,13 @@ pub fn write_evidence_set(
     let verdict_path = base.join("replay_verdict.json");
     fs::write(&verdict_path, verdict.to_json(mismatches))?;
     paths.replay_verdict = verdict_path.display().to_string();
+
+    // Stage 2b: execution residual — the sealed object was loaded and replayed.
+    if let Some((exec_verdict, exec_mismatches)) = execution {
+        let exec_path = base.join("execution_verdict.json");
+        fs::write(&exec_path, exec_verdict.to_json(exec_mismatches))?;
+        paths.execution_verdict = exec_path.display().to_string();
+    }
 
     if depth == PortDepth::Replay {
         return Ok(paths);

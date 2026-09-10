@@ -185,6 +185,7 @@ mod tests {
             output_schema: "u8",
             domain_summary: "none",
             candidate_source: "none",
+            abi_symbol: "not_a_real_symbol",
         };
         let err = observe_target(&unknown, &[TestCase::byte(0)], &PortingAuthority::granted());
         assert_eq!(

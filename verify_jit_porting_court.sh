@@ -14,13 +14,16 @@
 #                       check: it proves the committed seal matches a fresh run.
 #
 #  Checks (both modes, for the selected target):
-#    * all six evidence artifacts exist and are valid JSON
+#    * all seven evidence artifacts exist and are valid JSON
 #    * the corpus is structurally well-formed (see the target-specific checks)
-#    * every case passed, with no mismatches
+#    * every replay case passed, with no mismatches
 #    * the recorded locale contract is C and the target id is qualified
 #    * oracle / candidate-behavior hashes match across artifacts
 #    * an INDEPENDENT recompilation of the .phor candidate reproduces the
 #      recorded candidate object and receipt hashes
+#    * the sealed object EXECUTION court passed: the object that was loaded and
+#      called is the sealed object, every case matched, and the execution hash is
+#      bound into the promotion receipt and the sealed package
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
@@ -69,7 +72,7 @@ case "$EVID" in /*) ;; *) EVID="$ROOT/$EVID" ;; esac
 
 PHOST="$ROOT/target/debug/phost"
 PHORC="$ROOT/target/debug/phorc"
-FILES="oracle_traces.json behavior_signature.json candidate_signature.json replay_verdict.json promotion_receipt.json sealed_package.json"
+FILES="oracle_traces.json behavior_signature.json candidate_signature.json replay_verdict.json execution_verdict.json promotion_receipt.json sealed_package.json"
 
 echo "=== Phorensic OS — JIT-Porting Court Verification ==="
 echo "Target:       $TARGET ($TARGET_ID)"
@@ -114,7 +117,7 @@ if [ "$MODE" = "check-committed" ]; then
             FAIL=1
         fi
     done
-    [ "$FAIL" -eq 0 ] && echo "  [PASS] fresh run matches checked-in evidence (6/6 artifacts)"
+    [ "$FAIL" -eq 0 ] && echo "  [PASS] fresh run matches checked-in evidence (7/7 artifacts)"
     [ "$FAIL" -eq 0 ] || { echo "Status: COMMITTED EVIDENCE STALE"; exit 1; }
 else
     echo "--- determinism court (fresh A == fresh B) ---"
@@ -129,7 +132,7 @@ else
             FAIL=1
         fi
     done
-    [ "$FAIL" -eq 0 ] && echo "  [PASS] two fresh runs are byte-identical (6/6 artifacts)"
+    [ "$FAIL" -eq 0 ] && echo "  [PASS] two fresh runs are byte-identical (7/7 artifacts)"
     [ "$FAIL" -eq 0 ] || { echo "Status: NON-DETERMINISTIC"; exit 1; }
 fi
 
@@ -166,6 +169,7 @@ traces_doc = load("oracle_traces.json")
 sig = load("behavior_signature.json")
 cand = load("candidate_signature.json")
 verdict = load("replay_verdict.json")
+exec_v = load("execution_verdict.json")
 promo = load("promotion_receipt.json")
 sealed = load("sealed_package.json")
 
@@ -285,6 +289,48 @@ if verdict.get("verdict") != "consistent":
 if verdict.get("mismatches"):
     errors.append("replay reported mismatches")
 
+# ---- execution court (the sealed object was loaded and executed) ----------
+exec_hash = exec_v.get("execution_hash", "")
+if exec_v.get("target") != TARGET_ID:
+    errors.append("execution_verdict.target != %s" % TARGET_ID)
+if exec_v.get("cases_run") != EXPECTED:
+    errors.append("execution.cases_run != %d" % EXPECTED)
+if exec_v.get("cases_passed") != EXPECTED:
+    errors.append("execution.cases_passed != %d" % EXPECTED)
+if exec_v.get("cases_failed") != 0:
+    errors.append("execution.cases_failed != 0")
+if exec_v.get("verdict") != "consistent":
+    errors.append("execution.verdict != consistent")
+if exec_v.get("mismatches"):
+    errors.append("execution reported mismatches")
+if not exec_hash:
+    errors.append("execution_hash is missing")
+if not exec_v.get("abi_symbol", ""):
+    errors.append("execution.abi_symbol is missing")
+if not exec_v.get("elf_symbol", ""):
+    errors.append("execution.elf_symbol is missing")
+# The object that was executed must be exactly the object bound into the seal.
+if exec_v.get("object_hash") != obj:
+    errors.append("execution.object_hash != candidate_signature.candidate_object_hash")
+if exec_v.get("object_hash") != sealed.get("candidate_object_hash"):
+    errors.append("execution.object_hash != sealed_package.candidate_object_hash")
+if exec_v.get("oracle_hash") != oracle:
+    errors.append("execution.oracle_hash != behavior_signature.combined_oracle_hash")
+# The promotion/seal must carry the execution hash and symbol.
+sealed_exec_symbol = "_phor_" + str(sealed.get("candidate_abi_symbol", ""))
+if promo.get("execution_hash") != exec_hash:
+    errors.append("promotion_receipt.execution_hash != execution_verdict.execution_hash")
+if sealed.get("candidate_execution_hash") != exec_hash:
+    errors.append("sealed_package.candidate_execution_hash != execution_verdict.execution_hash")
+if sealed.get("candidate_abi_symbol") != exec_v.get("abi_symbol"):
+    errors.append("sealed_package.candidate_abi_symbol != execution.abi_symbol")
+if sealed.get("executed_elf_symbol") != exec_v.get("elf_symbol"):
+    errors.append("sealed_package.executed_elf_symbol != execution.elf_symbol")
+if sealed_exec_symbol != exec_v.get("elf_symbol"):
+    errors.append("sealed_package candidate_abi_symbol does not mangle to the executed ELF symbol")
+if sealed.get("execution_verdict") != "consistent":
+    errors.append("sealed_package.execution_verdict != consistent")
+
 # ---- promotion + sealed package -------------------------------------------
 if promo.get("to") != "sealed":
     errors.append("promotion.to != sealed")
@@ -318,6 +364,12 @@ print("Target id: %s" % TARGET_ID)
 print("Source hash bound: %s" % ("yes" if source else "no"))
 print("Compiled object: %s" % ("MATCH" if compiled_match else "MISMATCH"))
 print("Compiler: %s" % compiler)
+print("Execution cases: %d" % exec_v.get("cases_run", 0))
+print("Execution passed: %d" % exec_v.get("cases_passed", 0))
+print("Execution failed: %d" % exec_v.get("cases_failed", 0))
+print("Executed symbol: %s" % exec_v.get("elf_symbol", "?"))
+print("Execution object: %s" % ("MATCH" if exec_v.get("object_hash") == obj else "MISMATCH"))
+print("Execution hash bound: %s" % ("yes" if exec_hash else "no"))
 
 if errors:
     print("")

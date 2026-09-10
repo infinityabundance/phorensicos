@@ -3,8 +3,8 @@
 // Every expression returns a Value. No values are discarded.
 
 use crate::ast::{
-    ArraySize, BinOp, Block, Expr, FnDecl, Item, Literal, Pattern, PrimType, SourceFile, Stmt,
-    StructDecl, TypeExpr,
+    ArraySize, BinOp, Block, ConstDecl, Expr, FnDecl, Item, Literal, Pattern, PrimType, SourceFile,
+    Stmt, StructDecl, TypeExpr, UnOp,
 };
 use crate::check::MethodOwner;
 use crate::ir::*;
@@ -151,6 +151,73 @@ fn build_struct_registry(source: &SourceFile) -> std::collections::HashMap<Strin
     registry
 }
 
+/// Resolve the literal value of a module-level `const` initializer.
+///
+/// Only constant-foldable forms are supported by the bootstrap lowerer: integer,
+/// bool and char literals, negation of an integer literal, and references to an
+/// already-resolved const. Anything else is left unresolved (the identifier then
+/// falls back to the existing zero-valued global behaviour).
+fn const_literal_value(
+    expr: &Expr,
+    resolved: &std::collections::HashMap<String, Value>,
+) -> Option<Value> {
+    match expr {
+        Expr::Literal(Literal::Int(v, _)) => Some(Value::Const(Constant::Int(*v, 64))),
+        Expr::Literal(Literal::Bool(b, _)) => Some(Value::Const(Constant::Bool(*b))),
+        Expr::Literal(Literal::Char(c, _)) => Some(Value::Const(Constant::Int(*c as u64, 32))),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr: inner,
+            ..
+        } => match const_literal_value(inner, resolved) {
+            Some(Value::Const(Constant::Int(v, w))) => Some(Value::Const(Constant::Int(
+                (v as i64).wrapping_neg() as u64,
+                w,
+            ))),
+            _ => None,
+        },
+        Expr::Ident(id) => resolved.get(&id.name).cloned(),
+        _ => None,
+    }
+}
+
+/// Scan source items for `const` declarations and resolve them to literals.
+/// Declarations are visited repeatedly so a const may refer to one declared
+/// earlier in the file; unresolved consts are skipped.
+fn build_const_registry(source: &SourceFile) -> std::collections::HashMap<String, Value> {
+    let mut resolved: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut pending: Vec<&ConstDecl> = source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Const(decl) => Some(decl),
+            _ => None,
+        })
+        .collect();
+
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        let mut still: Vec<&ConstDecl> = Vec::new();
+        for decl in pending {
+            let value = decl
+                .value
+                .as_ref()
+                .and_then(|expr| const_literal_value(expr, &resolved));
+            match value {
+                Some(v) => {
+                    resolved.insert(decl.name.name.clone(), v);
+                    progressed = true;
+                }
+                None => still.push(decl),
+            }
+        }
+        pending = still;
+    }
+
+    resolved
+}
+
 // ============================================================================
 // Lowering context — tracks temporaries, locals, and struct bindings
 // ============================================================================
@@ -176,6 +243,10 @@ struct LowerCtx<'a> {
     struct_vars: std::collections::HashMap<String, StructBinding>,
     /// Struct layout registry (type_name → layout)
     struct_layouts: std::collections::HashMap<String, StructLayout>,
+    /// Module-level `const` values, resolved to literals at lowering time.
+    /// Before this existed every const identifier lowered to a `Global` load that
+    /// materialized as 0, so `if b >= FIRST_LOWER` compared against 0.
+    consts: std::collections::HashMap<String, Value>,
     /// The source items, for looking up struct declarations
     #[allow(dead_code)]
     source_items: &'a [Item],
@@ -187,6 +258,7 @@ impl<'a> LowerCtx<'a> {
     fn new(
         block: &'a mut BasicBlock,
         struct_layouts: std::collections::HashMap<String, StructLayout>,
+        consts: std::collections::HashMap<String, Value>,
         source_items: &'a [Item],
         method_owners: &'a [MethodOwner],
     ) -> Self {
@@ -198,6 +270,7 @@ impl<'a> LowerCtx<'a> {
             locals: std::collections::HashMap::new(),
             struct_vars: std::collections::HashMap::new(),
             struct_layouts,
+            consts,
             source_items,
             method_owners,
         }
@@ -292,12 +365,19 @@ pub fn lower(source: &SourceFile, source_name: &str, method_owners: &[MethodOwne
 
     // Pre-scan struct declarations and compute layouts
     let struct_layouts = build_struct_registry(source);
+    // Pre-resolve module-level constants to literals.
+    let consts = build_const_registry(source);
 
     for item in &source.items {
         match item {
             Item::Fn(fdecl) => {
-                let func =
-                    lower_function(fdecl, struct_layouts.clone(), &source.items, method_owners);
+                let func = lower_function(
+                    fdecl,
+                    struct_layouts.clone(),
+                    consts.clone(),
+                    &source.items,
+                    method_owners,
+                );
                 module.functions.push(func);
             }
             Item::Impl(impl_block) => {
@@ -306,6 +386,7 @@ pub fn lower(source: &SourceFile, source_name: &str, method_owners: &[MethodOwne
                     let mut func = lower_function(
                         method,
                         struct_layouts.clone(),
+                        consts.clone(),
                         &source.items,
                         method_owners,
                     );
@@ -332,6 +413,7 @@ pub fn lower(source: &SourceFile, source_name: &str, method_owners: &[MethodOwne
 fn lower_function(
     fdecl: &FnDecl,
     struct_layouts: std::collections::HashMap<String, StructLayout>,
+    consts: std::collections::HashMap<String, Value>,
     source_items: &[Item],
     method_owners: &[MethodOwner],
 ) -> PhirFunction {
@@ -358,6 +440,7 @@ fn lower_function(
         let mut ctx = LowerCtx::new(
             &mut entry_block,
             struct_layouts,
+            consts,
             source_items,
             method_owners,
         );
@@ -513,6 +596,10 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Value {
         Expr::Literal(lit) => lower_literal(lit),
 
         Expr::Ident(id) => {
+            // Module-level `const` declarations resolve to their literal value.
+            if let Some(v) = ctx.consts.get(&id.name) {
+                return v.clone();
+            }
             // Resolve against function parameters first
             if let Some(arg_val) = ctx.resolve_ident(&id.name) {
                 return arg_val;
@@ -557,16 +644,32 @@ fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Value {
         }
 
         Expr::Unary {
-            op: _, expr: inner, ..
+            op, expr: inner, ..
         } => {
             let inner_val = lower_expr(inner, ctx);
-            let out = ctx.fresh_temp(PhirType::Prim(PrimType::U64));
-            ctx.emit(Op::Cast {
-                val: inner_val,
-                to: PhirType::Prim(PrimType::U64),
-                out: out.clone(),
-            });
-            out
+            // Deref/Ref are pointer-level no-ops at this stage; negation is a real
+            // arithmetic operation and must not be silently dropped.
+            match op {
+                UnOp::Neg => {
+                    let out = ctx.fresh_temp(PhirType::Prim(PrimType::U64));
+                    ctx.emit(Op::UnOp {
+                        op: UnOpKind::Neg,
+                        val: inner_val,
+                        ty: PhirType::Prim(PrimType::U64),
+                        out: out.clone(),
+                    });
+                    out
+                }
+                _ => {
+                    let out = ctx.fresh_temp(PhirType::Prim(PrimType::U64));
+                    ctx.emit(Op::Cast {
+                        val: inner_val,
+                        to: PhirType::Prim(PrimType::U64),
+                        out: out.clone(),
+                    });
+                    out
+                }
+            }
         }
 
         Expr::Call { callee, args, .. } => {
@@ -1000,6 +1103,13 @@ fn lower_binop(op: BinOp) -> BinOpKind {
         BinOp::Le => BinOpKind::Le,
         BinOp::Gt => BinOpKind::Gt,
         BinOp::Ge => BinOpKind::Ge,
+        // Boolean conjunction/disjunction. The bootstrap code generator has no
+        // short-circuit control flow yet, so these lower to bitwise And/Or, which
+        // is equivalent when both operands are boolean (0/1) — as in the porting
+        // candidates. `_` previously collapsed these to `Add`, silently turning
+        // `a && b` into `a + b`.
+        BinOp::AndAnd => BinOpKind::And,
+        BinOp::OrOr => BinOpKind::Or,
         _ => BinOpKind::Add,
     }
 }

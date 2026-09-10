@@ -10,6 +10,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 
 use crate::porting::candidate::CandidateArtifacts;
+use crate::porting::exec::ExecutionVerdict;
 use crate::porting::replay_court::{CourtVerdict, ReplayVerdict};
 use crate::porting::target::PortTarget;
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
@@ -63,6 +64,12 @@ pub enum PromotionError {
     MissingCandidateReceiptHash,
     SealedPackageNotWritten,
     ReplayResidualNotWritten,
+    /// The sealed object was never executed.
+    ExecutionNotRun,
+    /// The compiled object diverged from the oracle, or could not be replayed.
+    ExecutionMismatch,
+    /// The object that was executed is not the object bound into the seal.
+    ExecutionObjectMismatch,
 }
 
 impl PromotionError {
@@ -79,6 +86,11 @@ impl PromotionError {
             PromotionError::MissingCandidateReceiptHash => "candidate receipt hash missing",
             PromotionError::SealedPackageNotWritten => "sealed package was not written",
             PromotionError::ReplayResidualNotWritten => "replay residual was not written",
+            PromotionError::ExecutionNotRun => "sealed object was not executed",
+            PromotionError::ExecutionMismatch => "execution court verdict is not consistent",
+            PromotionError::ExecutionObjectMismatch => {
+                "executed object hash does not match the sealed object hash"
+            }
         }
     }
 }
@@ -105,6 +117,10 @@ pub struct PromotionReceipt {
     pub compiler_version: String,
     pub sealed_package: String,
     pub replay_residual_hash: String,
+    /// The execution court's behavior hash of the compiled object.
+    pub execution_hash: String,
+    /// The ELF symbol that was loaded and called.
+    pub elf_symbol: String,
 }
 
 impl PromotionReceipt {
@@ -118,7 +134,7 @@ impl PromotionReceipt {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};candidate_object_hash={};candidate_receipt_hash={};compiler_version={};sealed_package={};replay_residual_hash={}",
+            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};candidate_object_hash={};candidate_receipt_hash={};compiler_version={};sealed_package={};replay_residual_hash={};execution_hash={};elf_symbol={}",
             self.target,
             self.from.as_str(),
             self.to.as_str(),
@@ -130,7 +146,9 @@ impl PromotionReceipt {
             self.candidate_receipt_hash,
             self.compiler_version,
             self.sealed_package,
-            self.replay_residual_hash
+            self.replay_residual_hash,
+            self.execution_hash,
+            self.elf_symbol
         )
     }
 
@@ -140,7 +158,7 @@ impl PromotionReceipt {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"candidate_object_hash\": \"{}\",\n  \"candidate_receipt_hash\": \"{}\",\n  \"compiler_version\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"candidate_object_hash\": \"{}\",\n  \"candidate_receipt_hash\": \"{}\",\n  \"compiler_version\": \"{}\",\n  \"execution_hash\": \"{}\",\n  \"elf_symbol\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
             self.from.as_str(),
             self.to.as_str(),
@@ -151,6 +169,8 @@ impl PromotionReceipt {
             self.candidate_object_hash,
             self.candidate_receipt_hash,
             json_escape(&self.compiler_version),
+            self.execution_hash,
+            json_escape(&self.elf_symbol),
             json_escape(&self.sealed_package),
             self.replay_residual_hash,
             self.residual_hash()
@@ -158,11 +178,13 @@ impl PromotionReceipt {
     }
 }
 
-/// Promote a candidate to `Sealed` iff the court permits it.
+/// Promote a candidate to `Sealed` iff the replay court *and* the sealed-object
+/// execution court permit it.
 pub fn promote(
     target: &PortTarget,
     verdict: &ReplayVerdict,
     artifacts: &CandidateArtifacts,
+    execution: &ExecutionVerdict,
     evidence: &PromotionEvidence,
     auth: &PortingAuthority,
 ) -> Result<PromotionReceipt, PromotionError> {
@@ -200,6 +222,19 @@ pub fn promote(
     if !evidence.replay_residual_written {
         return Err(PromotionError::ReplayResidualNotWritten);
     }
+    // The sealed object must have been executed and matched the oracle exactly.
+    if execution.cases_run == 0 {
+        return Err(PromotionError::ExecutionNotRun);
+    }
+    if execution.verdict != CourtVerdict::Consistent
+        || execution.cases_failed != 0
+        || execution.cases_passed != execution.cases_run
+    {
+        return Err(PromotionError::ExecutionMismatch);
+    }
+    if execution.object_hash != artifacts.object_hash {
+        return Err(PromotionError::ExecutionObjectMismatch);
+    }
 
     Ok(PromotionReceipt {
         target: target.id.to_string(),
@@ -214,6 +249,8 @@ pub fn promote(
         compiler_version: artifacts.compiler_version.clone(),
         sealed_package: "sealed_package.json".to_string(),
         replay_residual_hash: verdict.residual_hash(),
+        execution_hash: execution.execution_hash.clone(),
+        elf_symbol: execution.elf_symbol.clone(),
     })
 }
 
@@ -262,6 +299,22 @@ mod tests {
         }
     }
 
+    fn agreeing_execution() -> ExecutionVerdict {
+        let a = artifacts();
+        ExecutionVerdict {
+            target: "libc:toupper:c-locale:u8:v1".to_string(),
+            abi_symbol: "phor_toupper".to_string(),
+            elf_symbol: "_phor_phor_toupper".to_string(),
+            cases_run: 256,
+            cases_passed: 256,
+            cases_failed: 0,
+            object_hash: a.object_hash,
+            oracle_hash: "oracle".to_string(),
+            execution_hash: "execution".to_string(),
+            verdict: CourtVerdict::Consistent,
+        }
+    }
+
     #[test]
     fn test_promotion_allowed_when_all_pass() {
         let verdict = agreeing_verdict();
@@ -269,6 +322,7 @@ mod tests {
             &target::LIBC_TOUPPER,
             &verdict,
             &artifacts(),
+            &agreeing_execution(),
             &full_evidence(),
             &PortingAuthority::granted(),
         )
@@ -285,6 +339,8 @@ mod tests {
         assert_eq!(receipt.candidate_object_hash, artifacts().object_hash);
         assert_eq!(receipt.candidate_receipt_hash, artifacts().receipt_hash);
         assert_eq!(receipt.compiler_version, "phorc 0.1.0");
+        assert_eq!(receipt.execution_hash, "execution");
+        assert_eq!(receipt.elf_symbol, "_phor_phor_toupper");
     }
 
     #[test]
@@ -308,6 +364,7 @@ mod tests {
             &target::LIBC_TOUPPER,
             &verdict,
             &artifacts(),
+            &agreeing_execution(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -321,6 +378,7 @@ mod tests {
             &target::LIBC_TOUPPER,
             &verdict,
             &artifacts(),
+            &agreeing_execution(),
             &full_evidence(),
             &PortingAuthority::none(),
         );
@@ -335,6 +393,7 @@ mod tests {
             &target::LIBC_TOUPPER,
             &agreeing_verdict(),
             &a,
+            &agreeing_execution(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -349,6 +408,7 @@ mod tests {
             &target::LIBC_TOUPPER,
             &agreeing_verdict(),
             &a,
+            &agreeing_execution(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -363,6 +423,7 @@ mod tests {
             &target::LIBC_TOUPPER,
             &agreeing_verdict(),
             &a,
+            &agreeing_execution(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -380,9 +441,58 @@ mod tests {
             &target::LIBC_TOUPPER,
             &verdict,
             &artifacts(),
+            &agreeing_execution(),
             &partial,
             &PortingAuthority::granted(),
         );
         assert_eq!(refused, Err(PromotionError::SealedPackageNotWritten));
+    }
+
+    #[test]
+    fn test_promotion_denied_without_execution() {
+        let mut exec = agreeing_execution();
+        exec.cases_run = 0;
+        exec.cases_passed = 0;
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &artifacts(),
+            &exec,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::ExecutionNotRun));
+    }
+
+    #[test]
+    fn test_promotion_denied_when_execution_mismatches() {
+        let mut exec = agreeing_execution();
+        exec.verdict = CourtVerdict::Inconsistent;
+        exec.cases_passed = 255;
+        exec.cases_failed = 1;
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &artifacts(),
+            &exec,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::ExecutionMismatch));
+    }
+
+    #[test]
+    fn test_promotion_denied_when_executed_object_is_not_sealed_object() {
+        let mut exec = agreeing_execution();
+        exec.object_hash = "different-object".to_string();
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &artifacts(),
+            &exec,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::ExecutionObjectMismatch));
     }
 }

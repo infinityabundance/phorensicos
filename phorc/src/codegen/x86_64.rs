@@ -72,7 +72,13 @@ fn local_mem_access(idx: usize) -> MemoryOperand {
     )
 }
 
-/// Create a memory operand for taking a local's address via LEA (size=0, not a real access)
+/// Create a memory operand for taking a local's address via LEA.
+///
+/// `displ_size` must describe the actual displacement width (8) — passing 0 with
+/// a nonzero displacement produces a memory operand the encoder rejects
+/// ("Displacement must be 0 if displ_size == 0"). This only surfaced when a
+/// local's *address* was materialized (struct/array base), e.g. returning a
+/// struct literal.
 fn local_mem_addr(idx: usize) -> MemoryOperand {
     let disp = local_stack_offset(idx);
     MemoryOperand::new(
@@ -80,12 +86,12 @@ fn local_mem_addr(idx: usize) -> MemoryOperand {
         Register::None,
         1,
         disp,
-        0,
+        8,
         false,
         Register::None,
     )
 }
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // Helper to unwrap Instruction::with* Result
 macro_rules! i0 {
@@ -107,6 +113,30 @@ macro_rules! ib {
     ($c:ident, $t:expr) => {
         Instruction::with_branch(Code::$c, $t).unwrap()
     };
+}
+
+/// Map a 64-bit register to its low 8-bit form (AL..R15L). SETcc requires an
+/// 8-bit register operand; passing the 64-bit register is an encoding error.
+fn low8(reg: Register) -> Register {
+    match reg {
+        Register::RAX => Register::AL,
+        Register::RCX => Register::CL,
+        Register::RDX => Register::DL,
+        Register::RBX => Register::BL,
+        Register::RSP => Register::SPL,
+        Register::RBP => Register::BPL,
+        Register::RSI => Register::SIL,
+        Register::RDI => Register::DIL,
+        Register::R8 => Register::R8L,
+        Register::R9 => Register::R9L,
+        Register::R10 => Register::R10L,
+        Register::R11 => Register::R11L,
+        Register::R12 => Register::R12L,
+        Register::R13 => Register::R13L,
+        Register::R14 => Register::R14L,
+        Register::R15 => Register::R15L,
+        other => other,
+    }
 }
 
 // ============================================================================
@@ -241,19 +271,46 @@ struct RegAlloc {
     // made emitted object bytes non-reproducible.
     map: BTreeMap<String, Register>,
     free: Vec<Register>,
-    spill_next: i32,
+    /// Values that currently live in a stack spill slot: key → [rbp + slot].
     spills: BTreeMap<String, i32>,
+    /// Next free spill slot. Slots are placed *below* the local-variable area so
+    /// they can never alias a local's `[rbp - 8*(idx+1)]` slot.
+    spill_next: i32,
+    spill_slots: usize,
+    /// Values whose register must not be reused while the current operation is
+    /// being emitted (source operands that were already loaded).
+    pinned: BTreeSet<String>,
+    /// Registers an instruction in flight uses implicitly (CL for shifts,
+    /// RAX/RDX for division). They are not handed out as scratch registers and
+    /// are not chosen as eviction victims during the current operation.
+    reserved: BTreeSet<Register>,
+}
+
+/// Memory operand for a spill slot: `[rbp + slot]`.
+fn spill_mem(slot: i32) -> MemoryOperand {
+    MemoryOperand::new(
+        Register::RBP,
+        Register::None,
+        1,
+        slot as i64,
+        8,
+        false,
+        Register::None,
+    )
 }
 
 impl RegAlloc {
-    fn new() -> Self {
+    fn new(local_frame: i32) -> Self {
         let mut free = GP_REGS.to_vec();
         free.reverse();
         Self {
             map: BTreeMap::new(),
             free,
-            spill_next: -8,
             spills: BTreeMap::new(),
+            spill_next: -local_frame - 8,
+            spill_slots: 0,
+            pinned: BTreeSet::new(),
+            reserved: BTreeSet::new(),
         }
     }
 
@@ -267,103 +324,88 @@ impl RegAlloc {
         }
     }
 
-    fn get(&self, val: &Value) -> Option<Register> {
-        self.map.get(&Self::key(val)).copied()
+    /// Acquire a scratch register, spilling the first unpinned value when none
+    /// is free. The spill store is emitted immediately, so the value survives in
+    /// memory and is reloaded on demand by `load`.
+    fn acquire(&mut self, ins: &mut Vec<Instruction>) -> Register {
+        if let Some(pos) = self.free.iter().rposition(|r| !self.reserved.contains(r)) {
+            return self.free.remove(pos);
+        }
+        let victim = self
+            .map
+            .iter()
+            .find(|(k, r)| !self.pinned.contains(*k) && !self.reserved.contains(r))
+            .map(|(k, _)| k.clone());
+        if let Some(name) = victim {
+            let reg = self.map.remove(&name).unwrap();
+            let slot = self.spill_next;
+            self.spill_next -= 8;
+            self.spill_slots += 1;
+            ins.push(i2!(Mov_rm64_r64, spill_mem(slot), reg));
+            self.spills.insert(name, slot);
+            reg
+        } else {
+            // Every register is pinned by the operation in flight. Free R11 (it is
+            // never an argument register) and spill whatever it held.
+            let name = self
+                .map
+                .iter()
+                .find(|(_, r)| **r == Register::R11)
+                .map(|(k, _)| k.clone());
+            if let Some(name) = name {
+                let slot = self.spill_next;
+                self.spill_next -= 8;
+                self.spill_slots += 1;
+                ins.push(i2!(Mov_rm64_r64, spill_mem(slot), Register::R11));
+                self.spills.insert(name.clone(), slot);
+                self.map.remove(&name);
+            }
+            self.free.retain(|r| *r != Register::R11);
+            Register::R11
+        }
     }
 
-    /// Allocate a register for a value. Spills to stack if none free.
-    fn alloc(&mut self, val: &Value) -> Register {
+    /// Reserve a register for an instruction in flight (CL for shifts, RAX/RDX
+    /// for division). If a value currently occupies it, the value is spilled so
+    /// the implicit use cannot corrupt it; the register is then off-limits to
+    /// allocation and eviction for the rest of this operation.
+    fn reserve(&mut self, ins: &mut Vec<Instruction>, reg: Register) {
+        let occupant = self
+            .map
+            .iter()
+            .find(|(_, r)| **r == reg)
+            .map(|(k, _)| k.clone());
+        if let Some(name) = occupant {
+            let slot = self.spill_next;
+            self.spill_next -= 8;
+            self.spill_slots += 1;
+            ins.push(i2!(Mov_rm64_r64, spill_mem(slot), reg));
+            self.spills.insert(name.clone(), slot);
+            self.map.remove(&name);
+        }
+        self.free.retain(|r| *r != reg);
+        self.reserved.insert(reg);
+    }
+
+    /// Allocate the destination register for a value, spilling if necessary.
+    fn alloc(&mut self, ins: &mut Vec<Instruction>, val: &Value) -> Register {
         let k = Self::key(val);
         if let Some(&r) = self.map.get(&k) {
             return r;
         }
-        if let Some(r) = self.free.pop() {
-            self.map.insert(k, r);
-            return r;
-        }
-        // No free registers — evict the first allocated value to make room.
-        // NOTE: This reserves the stack slot (`spill_next`) but does NOT emit
-        // the `mov [rbp+slot], reg` store instruction. To complete spilling,
-        // the caller must emit the store before the register is reused.
-        let evict_name = self.map.keys().next().unwrap().clone();
-        let evict_reg = self.map.remove(&evict_name).unwrap();
-        self.spills.insert(evict_name, self.spill_next);
-        self.spill_next -= 8;
-        self.map.insert(k, evict_reg);
-        evict_reg
+        let r = self.acquire(ins);
+        self.map.insert(k, r);
+        r
     }
 
-    fn frame_size(&self) -> i32 {
-        let raw = (-self.spill_next - 8).max(0);
-        ((raw + 15) / 16) * 16
+    /// Stack bytes required for the spill slots allocated so far.
+    fn spill_bytes(&self) -> i32 {
+        (self.spill_slots as i32) * 8
     }
 
-    /// Number of values that have been spilled to the stack.
-    #[allow(dead_code)]
-    pub fn spill_count(&self) -> usize {
-        self.spills.len()
-    }
-
-    /// Allocate a register for a named value. Spills to stack if none free.
-    /// This is an alternative to the Value-based alloc for use by name-based APIs.
-    #[allow(dead_code)]
-    pub fn alloc_name(&mut self, name: &str) -> Register {
-        if let Some(&reg) = self.map.get(name) {
-            return reg;
-        }
-        if let Some(reg) = self.free.pop() {
-            self.map.insert(name.to_string(), reg);
-            return reg;
-        }
-        // Spill: evict the least recently used register
-        let evict_name = self.map.keys().next().unwrap().clone();
-        let evict_reg = self.map.remove(&evict_name).unwrap();
-        let spill_slot = self.spill_next;
-        self.spill_next -= 8;
-        self.spills.insert(evict_name, spill_slot);
-        self.map.insert(name.to_string(), evict_reg);
-        evict_reg
-    }
-
-    /// Get a register for a value, re-loading from stack if it was spilled.
-    ///
-    /// NOTE: This allocates stack space for the spill slot but does NOT emit
-    /// the actual `mov [rbp+offset], reg` (store) or `mov reg, [rbp+offset]`
-    /// (reload) instructions. Full spilling requires integrating `RegAlloc`
-    /// with the per-function instruction stream so that:
-    ///   1. On eviction:  `mov [rbp + slot], reg` is emitted before reusing the register
-    ///   2. On reload:     `mov reg, [rbp + slot]` is emitted before the register is used
-    ///
-    /// Current implementation: slot reservation / bookkeeping only.
-    #[allow(dead_code)]
-    pub fn get_or_spill(&mut self, name: &str) -> Register {
-        if let Some(&reg) = self.map.get(name) {
-            return reg;
-        }
-        // Check if it was spilled
-        if self.spills.contains_key(name) {
-            // TODO: emit `mov reg, [rbp + spill_slot]` to reload from stack
-            self.alloc_name(name)
-        } else {
-            self.alloc_name(name)
-        }
-    }
-
-    /// Free a register, making it available for re-use.
-    #[allow(dead_code)]
-    pub fn free_name(&mut self, name: &str) {
-        if let Some(reg) = self.map.remove(name) {
-            self.free.push(reg);
-        }
-    }
-
-    /// Get the stack offset for a spilled variable, if any.
-    #[allow(dead_code)]
-    pub fn spill_slot(&self, name: &str) -> Option<i32> {
-        self.spills.get(name).copied()
-    }
-
-    fn spill_caller(&mut self) {
+    /// Spill every caller-saved register that currently holds a value, so the
+    /// values survive across a call. The stores are emitted here.
+    fn spill_caller(&mut self, ins: &mut Vec<Instruction>) {
         let caller = [
             Register::RAX,
             Register::RCX,
@@ -375,16 +417,19 @@ impl RegAlloc {
             Register::R10,
             Register::R11,
         ];
-        let mut to_remove: Vec<String> = Vec::new();
-        for (k, r) in &self.map {
-            if caller.contains(r) {
-                to_remove.push(k.clone());
-            }
-        }
-        for k in to_remove {
+        let to_spill: Vec<String> = self
+            .map
+            .iter()
+            .filter(|(_, r)| caller.contains(r))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in to_spill {
             if let Some(r) = self.map.remove(&k) {
-                self.spills.insert(k, self.spill_next);
+                let slot = self.spill_next;
                 self.spill_next -= 8;
+                self.spill_slots += 1;
+                ins.push(i2!(Mov_rm64_r64, spill_mem(slot), r));
+                self.spills.insert(k, slot);
                 self.free.push(r);
             }
         }
@@ -726,17 +771,28 @@ pub fn generate_entry_point(
 
 pub fn compile_function(
     func: &PhirFunction,
-) -> (Vec<u8>, Vec<ByteAttribution>, u64, Vec<RelocationEntry>) {
+) -> (
+    Vec<u8>,
+    Vec<ByteAttribution>,
+    u64,
+    Vec<RelocationEntry>,
+    bool,
+) {
     let mut ins: Vec<Instruction> = Vec::new();
-    let mut alloc = RegAlloc::new();
+    // Local variables occupy [rbp-8] onward; spill slots are placed below them.
+    let local_frame = (func.local_count * 8) as i32;
+    let mut alloc = RegAlloc::new(local_frame);
     let mut relocs: Vec<RelocationEntry> = Vec::new();
 
-    // Pre-assign arg registers
+    // Pre-assign arg registers. These must ALSO be removed from the free list:
+    // otherwise a later temp can be allocated the same register and clobber the
+    // still-live argument (observed as `Add{Arg(0),..}` reading a temp copy).
     for (i, (_name, ty)) in func.params.iter().enumerate() {
         if i < ARG_REGS.len() {
             alloc
                 .map
                 .insert(RegAlloc::key(&Value::Arg(i, ty.clone())), ARG_REGS[i]);
+            alloc.free.retain(|r| *r != ARG_REGS[i]);
         }
     }
 
@@ -764,9 +820,8 @@ pub fn compile_function(
         ins.push(i0!(Retnq));
     }
 
-    // Fix frame size: spills + locals
-    let local_frame = (func.local_count * 8) as i32;
-    let spill_frame = alloc.frame_size();
+    // Fix frame size: locals + spill slots
+    let spill_frame = alloc.spill_bytes();
     let total_frame = local_frame + spill_frame;
     ins[frame_pos] = if total_frame <= 127 {
         i2!(Sub_rm64_imm8, Register::RSP, total_frame)
@@ -774,16 +829,21 @@ pub fn compile_function(
         i2!(Sub_rm64_imm32, Register::RSP, total_frame)
     };
 
-    // Encode
     let block = InstructionBlock::new(&ins, 0);
-    let code = match BlockEncoder::encode(64, block, BlockEncoderOptions::NONE) {
-        Ok(r) => r.code_buffer,
-        Err(_) => {
-            let mut buf = Vec::new();
-            for _ in &ins {
-                buf.push(0x90u8);
+    // Encode. On failure we emit a non-executable placeholder and report it:
+    // silently substituting NOPs previously hid real codegen defects from every
+    // downstream consumer (including the JIT-porting court).
+    let (code, encoded_ok) = match BlockEncoder::encode(64, block, BlockEncoderOptions::NONE) {
+        Ok(r) => (r.code_buffer, true),
+        Err(e) => {
+            if std::env::var("PHORC_DEBUG_ENCODE").is_ok() {
+                eprintln!("[phorc] encode error in function {}: {}", func.name, e);
+                for (i, instr) in ins.iter().enumerate() {
+                    eprintln!("  [{:02}] {:?}", i, instr);
+                }
             }
-            buf
+            let buf = ins.iter().map(|_| 0x90u8).collect();
+            (buf, false)
         }
     };
     let size = code.len() as u64;
@@ -828,7 +888,7 @@ pub fn compile_function(
         }
     }
 
-    (code, attrs, size, relocs)
+    (code, attrs, size, relocs, encoded_ok)
 }
 
 // ============================================================================
@@ -842,6 +902,9 @@ fn emit(
     op: &Op,
     _func: &PhirFunction,
 ) {
+    // Operand registers pinned during the previous operation may be reused now.
+    alloc.pinned.clear();
+    alloc.reserved.clear();
     match op {
         Op::Nop => ins.push(i0!(Nopd)),
 
@@ -852,9 +915,23 @@ fn emit(
             ty: _,
             out,
         } => {
+            // Reserve the registers this instruction uses implicitly so neither
+            // the operands nor the destination can collide with them:
+            //   shift/rotate -> CL
+            //   div/rem      -> RAX (dividend/quotient) and RDX (remainder)
+            match kind {
+                BinOpKind::Shl | BinOpKind::Shr => {
+                    alloc.reserve(ins, Register::RCX);
+                }
+                BinOpKind::Div | BinOpKind::Rem => {
+                    alloc.reserve(ins, Register::RAX);
+                    alloc.reserve(ins, Register::RDX);
+                }
+                _ => {}
+            }
             let l = load(alloc, ins, lhs);
             let r = load(alloc, ins, rhs);
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             match kind {
                 BinOpKind::Add => {
                     ins.push(i2!(Mov_rm64_r64, o, l));
@@ -883,7 +960,9 @@ fn emit(
                 BinOpKind::Shl => {
                     ins.push(i2!(Mov_r64_rm64, Register::RCX, r));
                     ins.push(i2!(Mov_rm64_r64, o, l));
-                    ins.push(i1!(Shl_rm64_CL, o));
+                    // iced models `shl r/m64, cl` as two operands (the r/m and the
+                    // implicit CL); `with1` panics its operand-count assertion.
+                    ins.push(i2!(Shl_rm64_CL, o, Register::CL));
                 }
                 BinOpKind::Shr => {
                     ins.push(i2!(Mov_r64_rm64, Register::RCX, r));
@@ -891,9 +970,9 @@ fn emit(
                     // Use arithmetic shift right for signed types, logical for unsigned
                     let signed = value_is_signed(lhs);
                     if signed {
-                        ins.push(i1!(Sar_rm64_CL, o));
+                        ins.push(i2!(Sar_rm64_CL, o, Register::CL));
                     } else {
-                        ins.push(i1!(Shr_rm64_CL, o));
+                        ins.push(i2!(Shr_rm64_CL, o, Register::CL));
                     }
                 }
                 BinOpKind::Div | BinOpKind::Rem => {
@@ -954,8 +1033,12 @@ fn emit(
                         }
                         _ => unreachable!(),
                     };
-                    ins.push(i2!(Xor_rm64_r64, o, o));
-                    ins.push(Instruction::with1(setcc, o).unwrap());
+                    // Zero the full destination WITHOUT touching the flags set by
+                    // CMP: `mov reg, 0` does not affect EFLAGS, whereas `xor reg, reg`
+                    // clears CF/ZF and made every comparison yield 0.
+                    ins.push(i2!(Mov_rm64_imm32, o, 0i32));
+                    // SETcc requires an 8-bit register operand (AL..R15L).
+                    ins.push(Instruction::with1(setcc, low8(o)).unwrap());
                 }
             }
         }
@@ -967,7 +1050,7 @@ fn emit(
             out,
         } => {
             let v = load(alloc, ins, val);
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             ins.push(i2!(Mov_rm64_r64, o, v));
             match kind {
                 UnOpKind::Neg => ins.push(i1!(Neg_rm64, o)),
@@ -980,13 +1063,25 @@ fn emit(
             ty: _,
             out,
         } => {
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             let mem = local_mem_access(*idx);
             ins.push(i2!(Mov_r64_rm64, o, mem));
         }
+        Op::Load {
+            addr: Value::Global(_, _),
+            ty: _,
+            out,
+        } => {
+            // A module-level name with no runtime storage resolves to 0 (bootstrap
+            // behaviour). It is NOT an address, so it must not be dereferenced:
+            // doing so emitted a malformed `mov reg, [reg]` that both failed to
+            // encode and would have read address 0.
+            let o = alloc.alloc(ins, out);
+            ins.push(i2!(Mov_rm64_imm32, o, 0i32));
+        }
         Op::Load { addr, ty: _, out } => {
             let a = load(alloc, ins, addr);
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             ins.push(i2!(Mov_r64_rm64, o, a));
         }
 
@@ -1022,7 +1117,7 @@ fn emit(
             effects: _,
             out,
         } => {
-            alloc.spill_caller();
+            alloc.spill_caller(ins);
             for (i, arg) in args.iter().enumerate() {
                 let r = load(alloc, ins, arg);
                 if i < ARG_REGS.len() {
@@ -1046,14 +1141,14 @@ fn emit(
                 addend: -4, // x86 relative call: target = next_ip + disp32, so addend = -4
             });
             ins.push(Instruction::with_branch(Code::Call_rel32_64, 0u64).unwrap());
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             if o != Register::RAX {
                 ins.push(i2!(Mov_rm64_r64, o, Register::RAX));
             }
         }
 
         Op::CallIndirect { callee, args, out } => {
-            alloc.spill_caller();
+            alloc.spill_caller(ins);
             let callee_r = load(alloc, ins, callee);
             for (i, arg) in args.iter().enumerate() {
                 let r = load(alloc, ins, arg);
@@ -1066,7 +1161,7 @@ fn emit(
                 }
             }
             ins.push(i1!(Call_rm64, callee_r));
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             if o != Register::RAX {
                 ins.push(i2!(Mov_rm64_r64, o, Register::RAX));
             }
@@ -1089,27 +1184,27 @@ fn emit(
 
         Op::Cast { val, to: _, out } => {
             let v = load(alloc, ins, val);
-            let o = alloc.alloc(out);
+            let o = alloc.alloc(ins, out);
             ins.push(i2!(Mov_rm64_r64, o, v));
         }
 
         Op::Phi { incoming, out } => {
             if let Some((v, _)) = incoming.first() {
                 let s = load(alloc, ins, v);
-                let o = alloc.alloc(out);
+                let o = alloc.alloc(ins, out);
                 ins.push(i2!(Mov_rm64_r64, o, s));
             }
         }
 
         Op::CapMove { src, dst } => {
             let s = load(alloc, ins, src);
-            let d = alloc.alloc(dst);
+            let d = alloc.alloc(ins, dst);
             ins.push(i2!(Mov_rm64_r64, d, s));
         }
 
         Op::HandleCreate { obj, out } => {
             let o = load(alloc, ins, obj);
-            let r = alloc.alloc(out);
+            let r = alloc.alloc(ins, out);
             ins.push(i2!(Mov_rm64_r64, r, o));
         }
 
@@ -1119,7 +1214,7 @@ fn emit(
             out,
         } => {
             let h = load(alloc, ins, handle);
-            let r = alloc.alloc(out);
+            let r = alloc.alloc(ins, out);
             ins.push(i2!(Mov_rm64_r64, r, h));
         }
 
@@ -1134,10 +1229,21 @@ fn emit(
 // ============================================================================
 
 fn load(alloc: &mut RegAlloc, ins: &mut Vec<Instruction>, val: &Value) -> Register {
-    if let Some(r) = alloc.get(val) {
+    let key = RegAlloc::key(val);
+    if let Some(&r) = alloc.map.get(&key) {
+        alloc.pinned.insert(key);
         return r;
     }
-    let r = alloc.alloc(val);
+    // The value was spilled: bring it back into a register.
+    if let Some(slot) = alloc.spills.get(&key).copied() {
+        let r = alloc.acquire(ins);
+        ins.push(i2!(Mov_r64_rm64, r, spill_mem(slot)));
+        alloc.spills.remove(&key);
+        alloc.map.insert(key.clone(), r);
+        alloc.pinned.insert(key);
+        return r;
+    }
+    let r = alloc.acquire(ins);
     match val {
         Value::Const(c) => match c {
             Constant::Int(v, _) => {
@@ -1164,5 +1270,7 @@ fn load(alloc: &mut RegAlloc, ins: &mut Vec<Instruction>, val: &Value) -> Regist
             ins.push(i2!(Xor_rm64_r64, r, r));
         }
     }
+    alloc.map.insert(key.clone(), r);
+    alloc.pinned.insert(key);
     r
 }

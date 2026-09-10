@@ -34,6 +34,7 @@ pub mod candidate;
 pub mod compiled;
 pub mod dialect_cage;
 pub mod evidence;
+pub mod exec;
 pub mod oracle_trace;
 pub mod promotion;
 pub mod replay_court;
@@ -41,6 +42,7 @@ pub mod target;
 
 pub use behavior_signature::BehaviorSignature;
 pub use candidate::{CandidateArtifacts, CandidateSignature};
+pub use exec::{ExecError, ExecutionVerdict};
 pub use oracle_trace::OracleTrace;
 pub use promotion::{PromotionError, PromotionEvidence, PromotionReceipt, TrustState};
 pub use replay_court::{CourtVerdict, Mismatch, ReplayVerdict};
@@ -84,6 +86,8 @@ pub enum PortError {
     UnsupportedTarget(String),
     /// Compiling the clean-room candidate failed.
     Compile(String),
+    /// The sealed object could not be loaded/executed (execution court).
+    Execution(String),
     /// Evidence I/O failed (the court never proceeds on I/O error).
     Io(String),
     /// Promotion was refused by the court.
@@ -97,6 +101,7 @@ impl fmt::Display for PortError {
             PortError::UnknownTarget(t) => write!(f, "unknown port target: {}", t),
             PortError::UnsupportedTarget(t) => write!(f, "target not observable by cage: {}", t),
             PortError::Compile(m) => write!(f, "candidate compilation failed: {}", m),
+            PortError::Execution(m) => write!(f, "execution court failed: {}", m),
             PortError::Io(m) => write!(f, "evidence I/O error: {}", m),
             PortError::PromotionRefused(e) => write!(f, "promotion refused: {}", e.as_str()),
         }
@@ -260,6 +265,14 @@ pub struct PortCourtReport {
     pub promotion: String,
     pub sealed_package: String,
     pub evidence_dir: String,
+    /// Execution-court results (the sealed object was loaded and replayed).
+    pub abi_symbol: String,
+    pub elf_symbol: String,
+    pub execution_cases: u64,
+    pub execution_passed: u64,
+    pub execution_failed: u64,
+    pub execution_hash: String,
+    pub execution_verdict: String,
 }
 
 /// Observe a target's complete domain through the dialect cage.
@@ -278,8 +291,10 @@ pub fn observe_target(
 /// canonical encoding. No wall-clock value participates in the verdict.
 ///
 /// From `Replay` depth up, the clean-room candidate is *compiled* with `phorc`
-/// and its object/receipt hashes are bound into the signature and seal. A
-/// missing artifact blocks promotion (fail closed).
+/// and then **executed**: this module loads the emitted ELF64 object, verifies its
+/// hash against the seal, locates the ABI entry symbol and replays the corpus
+/// through the compiled code. Promotion additionally requires that execution to
+/// match the oracle exactly.
 pub fn run_port_court(
     symbol: &str,
     auth: &PortingAuthority,
@@ -304,19 +319,25 @@ pub fn run_port_court(
     // 3. Seal the observed behavior as a behavior signature.
     let signature = BehaviorSignature::from_traces(&target, &traces);
 
-    // 4. Replay + compare (fail closed).
+    // 4. Replay + compare the Rust mirror of the candidate (fail closed).
     let (verdict, mismatches) = replay_court::run_replay_court(&traces);
 
-    // 5. Compiled candidate authority: compile the clean-room `.phor` candidate
-    //    and hash the emitted object and receipts (from Replay depth up).
-    let compiled = if depth == PortDepth::Observe {
-        None
+    // 5. Compiled candidate authority + sealed-object execution (from Replay
+    //    depth up): compile the clean-room `.phor` candidate, hash the emitted
+    //    object/receipts, then load and execute the sealed object.
+    let (compiled, execution) = if depth == PortDepth::Observe {
+        (None, None)
     } else {
-        Some(
-            compiled::compile_candidate(&target, out_dir, phorc)
-                .map_err(|e| PortError::Compile(e.message()))?,
-        )
+        let c = compiled::compile_candidate(&target, out_dir, phorc)
+            .map_err(|e| PortError::Compile(e.message()))?;
+        // The execution court verifies the object hash against the seal before
+        // mapping anything, and refuses non-leaf or relocated entry points.
+        let (exec_verdict, exec_mismatches) =
+            exec::execute_sealed_candidate(&target, &traces, &c.object_path, &c.object_hash, auth)
+                .map_err(|e| PortError::Execution(format!("{}", e)))?;
+        (Some(c), Some((exec_verdict, exec_mismatches)))
     };
+
     let artifacts = match &compiled {
         Some(c) => c.artifacts(),
         None => CandidateArtifacts {
@@ -328,19 +349,33 @@ pub fn run_port_court(
     };
     let candidate_sig = CandidateSignature::from_traces(&target, &traces, &artifacts);
 
-    // 6. Promote only on a consistent verdict with a complete evidence set.
+    // 6. Promote only on a consistent replay AND a consistent execution.
     let mut receipt: Option<PromotionReceipt> = None;
     let mut promotion_json: Option<String> = None;
     let mut sealed_json: Option<String> = None;
 
     if depth == PortDepth::Promote {
-        let sealed = evidence::sealed_package_json(&target, &verdict, &signature, &candidate_sig);
+        let (exec_verdict, _) = execution.as_ref().expect("execution runs at Promote depth");
+        let sealed = evidence::sealed_package_json(
+            &target,
+            &verdict,
+            &signature,
+            &candidate_sig,
+            exec_verdict,
+        );
         let promotion_evidence = PromotionEvidence {
             sealed_package_written: true,
             replay_residual_written: true,
         };
-        let r = promotion::promote(&target, &verdict, &artifacts, &promotion_evidence, auth)
-            .map_err(PortError::PromotionRefused)?;
+        let r = promotion::promote(
+            &target,
+            &verdict,
+            &artifacts,
+            exec_verdict,
+            &promotion_evidence,
+            auth,
+        )
+        .map_err(PortError::PromotionRefused)?;
         promotion_json = Some(r.to_json());
         sealed_json = Some(sealed);
         receipt = Some(r);
@@ -356,6 +391,7 @@ pub fn run_port_court(
         &candidate_sig,
         &verdict,
         &mismatches,
+        execution.as_ref().map(|(v, m)| (v, m.as_slice())),
         promotion_json.as_deref(),
         sealed_json.as_deref(),
     )
@@ -369,6 +405,8 @@ pub fn run_port_court(
             PortDepth::Promote => TrustState::Unknown.as_str().to_string(),
         },
     };
+
+    let exec_verdict = execution.map(|(v, _)| v);
 
     Ok(PortCourtReport {
         symbol: symbol.to_string(),
@@ -394,6 +432,25 @@ pub fn run_port_court(
         promotion: promotion_label,
         sealed_package: paths.sealed_package.clone(),
         evidence_dir: paths.dir.clone(),
+        abi_symbol: exec_verdict
+            .as_ref()
+            .map(|v| v.abi_symbol.clone())
+            .unwrap_or_default(),
+        elf_symbol: exec_verdict
+            .as_ref()
+            .map(|v| v.elf_symbol.clone())
+            .unwrap_or_default(),
+        execution_cases: exec_verdict.as_ref().map(|v| v.cases_run).unwrap_or(0),
+        execution_passed: exec_verdict.as_ref().map(|v| v.cases_passed).unwrap_or(0),
+        execution_failed: exec_verdict.as_ref().map(|v| v.cases_failed).unwrap_or(0),
+        execution_hash: exec_verdict
+            .as_ref()
+            .map(|v| v.execution_hash.clone())
+            .unwrap_or_default(),
+        execution_verdict: exec_verdict
+            .as_ref()
+            .map(|v| v.verdict.as_str().to_string())
+            .unwrap_or_default(),
     })
 }
 

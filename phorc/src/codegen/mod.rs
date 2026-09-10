@@ -139,6 +139,24 @@ pub fn compile(module: &PhirModule, entry_point: Option<&str>) -> CompileOutput 
     // Derive module prefix for owner-aware symbol mangling
     let mod_prefix = module_prefix(&module.source_name);
 
+    // Emit a concise PHIR dump when PHORC_DEBUG_IR is set (diagnostics).
+    if std::env::var("PHORC_DEBUG_IR").is_ok() {
+        for f in &module.functions {
+            eprintln!(
+                "fn {} params={} locals={}",
+                f.name,
+                f.params.len(),
+                f.local_count
+            );
+            for (bi, b) in f.blocks.iter().enumerate() {
+                eprintln!("  block {}:", bi);
+                for op in &b.ops {
+                    eprintln!("    {:?}", op);
+                }
+            }
+        }
+    }
+
     // Phase 1: Instruction selection & register allocation per function
     // func_sections stores: (mangled_name, code, attribs, size)
     let mut func_sections: Vec<(String, Vec<u8>, Vec<ByteAttribution>, u64)> = Vec::new();
@@ -194,8 +212,12 @@ pub fn compile(module: &PhirModule, entry_point: Option<&str>) -> CompileOutput 
     }
 
     // Phase 1b: User functions (appended after entry point)
+    let mut encode_failures: Vec<String> = Vec::new();
     for func in &module.functions {
-        let (code, attribs, size, func_relocs) = x86_64::compile_function(func);
+        let (code, attribs, size, func_relocs, encoded_ok) = x86_64::compile_function(func);
+        if !encoded_ok {
+            encode_failures.push(func.name.clone());
+        }
 
         // Adjust per-function relocation offsets by the function's text section offset
         for mut r in func_relocs {
@@ -214,7 +236,7 @@ pub fn compile(module: &PhirModule, entry_point: Option<&str>) -> CompileOutput 
             byte_offset: text_offset,
             byte_len: size,
             effect_set: func.effects.clone(),
-            verified: false,
+            verified: encoded_ok,
         });
         text_offset = align_up(text_offset + size, ALIGN);
 
@@ -223,6 +245,27 @@ pub fn compile(module: &PhirModule, entry_point: Option<&str>) -> CompileOutput 
             linkage: AbiLinkage::Global,
             calling_convention: "SystemV".to_string(),
             stack_frame_size: 0,
+        });
+    }
+
+    // Report any functions that failed to encode. These were emitted as
+    // non-executable NOP placeholders; the receipt `verified` flag is false for
+    // them. This is deliberately loud: it is the signal that a compiled artifact
+    // is not executable (the JIT-porting court gates execution on it).
+    if !encode_failures.is_empty() {
+        let names = encode_failures.join(", ");
+        eprintln!(
+            "phorc: warning: {} function(s) failed instruction encoding and were emitted as non-executable placeholders: {}",
+            encode_failures.len(),
+            names
+        );
+        output.residuals.push(CompileResidual {
+            stage: format!("encode_failed:{}functions", encode_failures.len()),
+            input_hash: hash_bytes(module.source_name.as_bytes()),
+            output_hash: hash_bytes(names.as_bytes()),
+            timestamp: 0,
+            function_count: encode_failures.len(),
+            total_bytes: 0,
         });
     }
 
