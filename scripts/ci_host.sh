@@ -17,5 +17,9 @@ cargo test
 echo
 echo "=== JIT-Porting Court ==="
 cargo build -q -p phost
+# Validate the committed evidence against a fresh run FIRST (writes only to temp),
+# so the check is not vacuous, then prove generation is deterministic.
+./verify_jit_porting_court.sh --target toupper --check-committed
+./verify_jit_porting_court.sh --target memcmp --check-committed
 ./verify_jit_porting_court.sh --target toupper
 ./verify_jit_porting_court.sh --target memcmp
