@@ -159,7 +159,7 @@ bound. `strrchr` returns a pointer, so the observable is normalized to the index
 
 ### Composition: sealed ports as runtime building blocks
 
-Two composed targets prove the sealed artifacts are not isolated tricks. The
+Three composed targets prove the sealed artifacts are not isolated tricks. The
 first chains a map stage into a search stage:
 
 ```text
@@ -178,6 +178,7 @@ over already-sealed ports, and they add no new trusted code.
 |-------------|-------|---------|--------------|--------|----------|-------------|
 | `toupper_memchr` | 560 | **toupper 560 native** | — | **memchr 560 native** | **0** | **0** |
 | `toupper_strlen_memchr` | 350 | **toupper 350 native** | **strlen 350 native** | **memchr 350 native** | **0** | **0** |
+| `toupper_strlen_memchr_pair` | 474 | **toupper 474 native** | **strlen 474 native** | **2× memchr 474 native** | **0** | **0** |
 
 The first corpus reuses the `memchr` corpus and adds C-locale fold cases where a
 needle only matches *after* `toupper` normalizes both sides — so a composition
@@ -210,6 +211,32 @@ caller's `n` instead of the derived `L` fails. Its `chain_hash` covers the deriv
 bound as well as the normalized intermediates, so the hash proves the *chain*, not
 just the answer.
 
+The third shows the dependency pattern is not a one-off **pipe**: one derived value
+is consumed by **two** stages, and the second consumer is deliberately **not
+adjacent** to the producer.
+
+```text
+phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1
+
+oracle:  foreign toupper over the haystack, foreign strlen of the folded
+         haystack -> L, then foreign memchr of folded needleA bounded by L -> iA,
+         then foreign memchr of folded needleB bounded by L -> iB
+sealed:  dispatch sealed toupper per haystack byte, sealed strlen once -> L,
+         sealed toupper+memchr for needleA (n = L) -> iA, then
+         sealed toupper+memchr for needleB (n = L) -> iB
+
+notice:  the sixth stage consumes L, which stage two produced — stages three,
+         four and five sit between them
+```
+
+Its observable is the pair `(iA, iB)`, so the runner performs no combining logic of
+its own: it holds a derived value and feeds it to every stage that needs it, in any
+order. That is what makes it a dataflow graph rather than a pipeline. The corpus
+pins both indexes independently (every ordered pair of in-string match positions,
+one-present/one-absent, identical needles, and occurrences that exist only after
+the terminator — which the shared bound must exclude *for both* searches), and its
+`chain_hash` covers the derived bound and both indexes.
+
 ```sh
 cargo run -p phost -- port promote toupper   # observe → replay → execute → dispatch → seal
 cargo run -p phost -- port promote memcmp
@@ -226,6 +253,8 @@ cargo run -p phost -- port compose                             # composition cou
 cargo run -p phost -- port compose 614263:62:0300000000000000   # one composed call
 cargo run -p phost -- port compose --target toupper_strlen_memchr   # the 3-stage chain
 cargo run -p phost -- port compose --target toupper_strlen_memchr 62006161:41:0400000000000000
+cargo run -p phost -- port compose --target toupper_strlen_memchr_pair   # the 2-search chain
+cargo run -p phost -- port compose --target toupper_strlen_memchr_pair 61006262:41:42:0400000000000000
 ./verify_jit_porting_court.sh --target toupper             # determinism court
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
@@ -236,6 +265,8 @@ cargo run -p phost -- port compose --target toupper_strlen_memchr 62006161:41:04
 ./verify_composition_court.sh --check-committed
 ./verify_composition_court.sh --target toupper_strlen_memchr              # composition #2
 ./verify_composition_court.sh --target toupper_strlen_memchr --check-committed
+./verify_composition_court.sh --target toupper_strlen_memchr_pair         # composition #3
+./verify_composition_court.sh --target toupper_strlen_memchr_pair --check-committed
 ```
 
 Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
@@ -323,7 +354,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **160 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **168 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (47), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -336,6 +367,7 @@ All numbers below were reproduced on a clean checkout.
 | Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, `strrchr` **336/336 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
 | Sealed composition | `toupper ∘ memchr` composed from two sealed ports: **560/560**, all three stages native, **0 fallbacks / 0 broken seals**, 4776 sealed dispatches; dispatched objects match the committed leaf seals |
 | Sealed composition (3-stage) | `toupper ∘ strlen ∘ memchr`, where the sealed `strlen` result becomes the search bound: **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**, 3729 sealed dispatches; dispatched objects match the committed leaf seals |
+| Sealed composition (dataflow) | `toupper ∘ strlen ∘ memchr ∘ toupper ∘ memchr`, where **one derived bound is consumed by two searches**, the second non-adjacent to the stage that produced it: **474/474**, all six stage-accounts native, **0 fallbacks / 0 broken seals**, 6102 sealed dispatches; dispatched objects match the committed leaf seals |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 

@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use crate::porting::behavior_signature::BehaviorSignature;
 use crate::porting::candidate::CandidateSignature;
 use crate::porting::composition::CompositionVerdict;
+use crate::porting::composition_pair::PairVerdict;
 use crate::porting::composition_strlen_memchr::StrlenMemchrVerdict;
 use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
@@ -190,6 +191,12 @@ impl CompositionEvidence for CompositionVerdict {
 }
 
 impl CompositionEvidence for StrlenMemchrVerdict {
+    fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
+        self.to_json(mismatches)
+    }
+}
+
+impl CompositionEvidence for PairVerdict {
     fn evidence_json(&self, mismatches: &[Mismatch]) -> String {
         self.to_json(mismatches)
     }

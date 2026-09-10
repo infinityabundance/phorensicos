@@ -12,10 +12,11 @@
 #                       compare it against the checked-in verdict, without
 #                       touching the committed file.
 #
-#  Two compositions are checked, selected with --target:
+#  Three compositions are checked, selected with --target:
 #
 #    toupper_memchr         (default)  phor:compose:toupper_memchr:c-locale:index:v1
 #    toupper_strlen_memchr            phor:compose:toupper_strlen_memchr:c-locale:index:v1
+#    toupper_strlen_memchr_pair       phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1
 #
 #  Each is built from already-sealed leaf ports and executed entirely through the
 #  sealed dispatcher. This verifier checks:
@@ -27,10 +28,11 @@
 #    * the objects the chain dispatched to are exactly the committed sealed leaf
 #      objects (object hash cross-check against the leaf candidate signatures)
 #    * the chain hash is present (it covers the intermediates — including, for the
-#      three-stage chain, the bound the strlen stage derived — not just the index)
+#      chains with a length stage, the bound the strlen stage derived, and for the
+#      pair chain both indexes — not just the answer)
 #
 #  Usage:
-#    ./verify_composition_court.sh [--target toupper_memchr|toupper_strlen_memchr] \
+#    ./verify_composition_court.sh [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair] \
 #                                  [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
@@ -63,8 +65,12 @@ case "$TARGET" in
         TARGET_ID="phor:compose:toupper_strlen_memchr:c-locale:index:v1"
         EXPECTED_COUNT=350
         ;;
+    toupper_strlen_memchr_pair)
+        TARGET_ID="phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1"
+        EXPECTED_COUNT=474
+        ;;
     *)
-        echo "ERROR: unknown composition target '$TARGET' (expected toupper_memchr|toupper_strlen_memchr)"
+        echo "ERROR: unknown composition target '$TARGET' (expected toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair)"
         exit 2
         ;;
 esac
@@ -185,6 +191,26 @@ SPECS = {
             ("toupper(haystack)", "toupper", "toupper"),
             ("strlen(derived bound)", "strlen", "strlen"),
             ("memchr", "memchr", "memchr"),
+        ],
+    },
+    "toupper_strlen_memchr_pair": {
+        "stages": [
+            "libc:toupper:c-locale:u8:v1",
+            "libc:strlen:c-locale:u64:v1",
+            "libc:memchr:c-locale:index:v1",
+        ],
+        "native_keys": [
+            "toupper_hay_native_cases",
+            "strlen_native_cases",
+            "toupper_needle_a_native_cases",
+            "memchr_a_native_cases",
+            "toupper_needle_b_native_cases",
+            "memchr_b_native_cases",
+        ],
+        "objects": [
+            ("toupper(haystack)", "toupper", "toupper"),
+            ("strlen(derived bound)", "strlen", "strlen"),
+            ("memchr(needle A)", "memchr", "memchr"),
         ],
     },
 }

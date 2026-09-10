@@ -22,6 +22,13 @@
 //
 // which adds a stage whose *result* is the next stage's *argument*.
 //
+// Third composition (see `composition_pair`):
+//
+//   phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1
+//
+// which shows the runner is a dataflow graph, not a pipe: one derived bound is
+// consumed by two searches, the second non-adjacent to the stage that produced it.
+//
 // A composition adds no new trusted code: its implementation *is* the
 // already-sealed objects. Each court records the per-stage native/fallback/
 // broken-seal accounting and hashes the whole chain (normalized intermediates

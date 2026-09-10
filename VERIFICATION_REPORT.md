@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 160 pass, 4 ignored | 164 total: 8 serial + 4 kernel + 49 nucleus + 95 porting (incl. the leaf exec/dispatch courts and both composition courts); the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 168 pass, 4 ignored | 172 total: 111 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -87,7 +87,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 160 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + both sealed composition courts |
+| phost reach | 168 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + three sealed composition courts |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -261,8 +261,45 @@ bytes after the terminator (group `D`), so a chain that searched with the caller
 `n` rather than the derived `L` cannot pass. Bound in
 `phost/evidence/composition/toupper_strlen_memchr/composition_verdict.json`.
 
+#### Chain 3: `toupper ∘ strlen ∘ memchr ∘ toupper ∘ memchr` (dataflow, not a pipe)
+
+Chains 1 and 2 are pipelines: each derived value has exactly one consumer, and it is
+the stage immediately after the producer. Chain 3 shows the dependency pattern is
+not a one-off: **one derived bound is consumed by two searches**, and the second
+consumer is deliberately **non-adjacent** to the producer.
+
+| Aspect | `phor:compose:toupper_strlen_memchr_pair:c-locale:index_pair:v1` |
+|--------|------------------------------------------------------------------|
+| Stages | `libc:toupper:c-locale:u8:v1` → `libc:strlen:c-locale:u64:v1` → `libc:memchr:c-locale:index:v1` (dispatched twice) |
+| Oracle | foreign `toupper` over the haystack, foreign `strlen` → `L`, then foreign `memchr` per needle, **both** bounded by `L` |
+| Corpus | 474 cases (every ordered pair of in-string match positions, one-present/one-absent, identical needles, tail-only occurrences, edge bytes, exhaustive 0..=255 sweep of needleA) |
+| Data flow | `L` (stage 2) is consumed by stage 4 **and by stage 6** — stages 3, 4 and 5 sit between them |
+| Observable | the pair `(iA, iB)`, so the runner performs no combining logic of its own |
+| toupper (haystack) stage | ✅ 474/474 native |
+| strlen (derived bound) stage | ✅ 474/474 native |
+| toupper (needle A) stage | ✅ 474/474 native |
+| memchr (needle A) stage | ✅ 474/474 native |
+| toupper (needle B) stage | ✅ 474/474 native |
+| memchr (needle B) stage | ✅ 474/474 native |
+| Foreign fallback | **0** |
+| Broken seal | **0** |
+| Passed / failed | 474 / 0 |
+| Sealed dispatches | 6102 |
+| Dispatched toupper object | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` (= committed leaf seal) |
+| Dispatched strlen object | `ffb0f5699df2455d6f1597c3bb2bbf1d94596cd772d2fd4b84d6036b99967b94` (= committed leaf seal) |
+| Dispatched memchr object | `90d35156eef8b7009352ebb0ac6fa0f9137c95a515ae1a1e760a37147032bbb8` (= committed leaf seal) |
+| Chain hash | `9bdf4605bcd7fbac85d8bef9bd10050278e6074ff605a4434bcbe0ebad50bfb8` |
+| Oracle hash | `5a5c015ee9f6a64e84674cfbbc90be796bb65c22bf11118d3b792d3b5039074d` |
+| Verdict | `consistent` |
+
+The decisive case is group `F`: both needles occur **only after the terminator**, so
+the single derived bound must exclude the tail for *both* searches — a runner that
+kept one search's bound live but re-derived or reused the caller's `n` for the other
+cannot pass. `chain_hash` covers the derived bound and both indexes. Bound in
+`phost/evidence/composition/toupper_strlen_memchr_pair/composition_verdict.json`.
+
 ### Test Results (reproduced on `main`)
-- phost: 160 passed, 0 failed, 4 ignored (164 total). The ignored tests read
+- phost: 168 passed, 0 failed, 4 ignored (172 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -289,6 +326,7 @@ cargo run -p phost -- port promote strrchr       # JIT-porting court (336)
 cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
 cargo run -p phost -- port compose               # composition court (560)
 cargo run -p phost -- port compose --target toupper_strlen_memchr   # composition court (350)
+cargo run -p phost -- port compose --target toupper_strlen_memchr_pair  # composition court (474)
 ./verify_jit_porting_court.sh --target toupper                    # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
@@ -299,6 +337,8 @@ cargo run -p phost -- port compose --target toupper_strlen_memchr   # compositio
 ./verify_composition_court.sh --check-committed
 ./verify_composition_court.sh --target toupper_strlen_memchr     # composition #2 (350)
 ./verify_composition_court.sh --target toupper_strlen_memchr --check-committed
+./verify_composition_court.sh --target toupper_strlen_memchr_pair     # composition #3 (474)
+./verify_composition_court.sh --target toupper_strlen_memchr_pair --check-committed
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
 ./verify_evidence.sh evidence                    # 13/13 boot-evidence checks
@@ -325,5 +365,5 @@ behavior/candidate signatures, replay verdict, execution verdict, dispatch
 verdict, promotion receipt, sealed package) is committed as
 `phost/evidence/porting/{toupper,memcmp,memchr,strlen,strrchr}/`, and the
 composition verdicts as
-`phost/evidence/composition/{toupper_memchr,toupper_strlen_memchr}/composition_verdict.json`
+`phost/evidence/composition/{toupper_memchr,toupper_strlen_memchr,toupper_strlen_memchr_pair}/composition_verdict.json`
 (the large composition oracle traces are regenerable and stay gitignored).

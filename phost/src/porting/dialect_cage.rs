@@ -17,6 +17,7 @@ use core::ffi::{c_char, c_int, c_void};
 
 use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
+use crate::porting::composition_pair::COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR;
 use crate::porting::composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
@@ -331,6 +332,83 @@ pub fn observe_composition_strlen_memchr(
         .collect())
 }
 
+/// Observe the composition `toupper ∘ strlen ∘ (memchr ∘ memchr)` through the
+/// **foreign** runtime: uppercase the haystack with libc `toupper` (C locale),
+/// measure it with libc `strlen` to derive `L`, then run libc `memchr` **twice** —
+/// once per needle — both bounded by the same `L`.
+///
+/// The shared `L` is the point: the oracle runs two independent foreign searches
+/// against one derived length, and the sealed chain must do the same.
+pub fn observe_composition_pair(
+    cases: &[TestCase],
+    auth: &PortingAuthority,
+) -> Result<Vec<OracleTrace>, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+
+    Ok(cases
+        .iter()
+        .map(|case| {
+            let hay = case.args.first().cloned().unwrap_or_default();
+            let needle_a = case
+                .args
+                .get(1)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(0);
+            let needle_b = case
+                .args
+                .get(2)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(0);
+
+            // Stage 1: foreign C-locale `toupper` over the haystack.
+            let mut folded: Vec<u8> = hay
+                .iter()
+                .map(|&b| unsafe { toupper(b as c_int) as u8 })
+                .collect();
+            // libc `strlen` needs a C string; every corpus case has a terminator
+            // inside its bound, so this is defensive only.
+            if !folded.contains(&0) {
+                folded.push(0x00);
+            }
+
+            // Stage 2: foreign `strlen` of the folded haystack -> the shared bound.
+            let derived = unsafe { strlen(folded.as_ptr() as *const c_char) };
+
+            // Stages 3-6: fold each needle and search for it, both bounded by the
+            // same derived length.
+            let base = folded.as_ptr();
+            let mut indexes = [0i32; 2];
+            for (slot, needle) in indexes.iter_mut().zip([needle_a, needle_b]) {
+                let folded_needle = unsafe { toupper(needle as c_int) as u8 };
+                let found =
+                    unsafe { memchr(base as *const c_void, folded_needle as c_int, derived) };
+                *slot = if found.is_null() {
+                    -1
+                } else {
+                    (found as usize - base as usize) as i32
+                };
+            }
+
+            let mut output = encode_index(indexes[0]);
+            output.extend_from_slice(&encode_index(indexes[1]));
+
+            OracleTrace::for_target_id(
+                COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id,
+                COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.locale_contract,
+                &case.case_id,
+                &case.args,
+                &output,
+                "ok",
+                &["compute"],
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +713,52 @@ mod tests {
         assert_eq!(traces.len(), 350);
         assert!(traces.iter().all(|t| t.is_intact()));
         assert!(traces.iter().all(|t| t.output_hex.len() == 8));
+    }
+
+    #[test]
+    fn test_cage_pair_shares_one_derived_bound() {
+        let mk = |id: &str, hay: &[u8], a: u8, b: u8, n: usize| {
+            TestCase::new(
+                id,
+                alloc::vec![
+                    hay.to_vec(),
+                    alloc::vec![a],
+                    alloc::vec![b],
+                    (n as u64).to_le_bytes().to_vec(),
+                ],
+            )
+        };
+        let cases = alloc::vec![
+            // both needles present (uppercase probes force the fold)
+            mk("both", b"ab\0", 0x41, 0x42, 3),
+            // B occurs only after the terminator: the shared bound excludes it
+            mk("tail-b", &[0x61, 0x00, 0x62, 0x62], 0x41, 0x42, 4),
+            // match order swapped
+            mk("swapped", b"ba\0", 0x41, 0x42, 3),
+            // empty string
+            mk("empty", b"\0ab", 0x41, 0x42, 3),
+        ];
+        let traces = observe_composition_pair(&cases, &PortingAuthority::granted()).unwrap();
+        assert_eq!(traces[0].output_hex, "0000000001000000"); // (0, 1)
+        assert_eq!(traces[1].output_hex, "00000000ffffffff"); // (0, -1)
+        assert_eq!(traces[2].output_hex, "0100000000000000"); // (1, 0)
+        assert_eq!(traces[3].output_hex, "ffffffffffffffff"); // (-1, -1)
+        assert!(traces
+            .iter()
+            .all(|t| t.target == COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id));
+        assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_observes_whole_pair_corpus() {
+        let traces = observe_composition_pair(
+            &crate::porting::composition_pair::composition_corpus(),
+            &PortingAuthority::granted(),
+        )
+        .unwrap();
+        assert_eq!(traces.len(), 474);
+        assert!(traces.iter().all(|t| t.is_intact()));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 16));
     }
 
     #[test]
