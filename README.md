@@ -115,6 +115,7 @@ foreign behavior → dialect cage       (observe libc as a black box)
                  → dispatch court     (the runtime serves calls from the sealed object)
                  → composition court  (sealed ports become runtime building blocks)
                  → persistent store   (the seal is committed; the runtime loads, not re-derives)
+                 → sealed native service (one verified load, many consumers)
 ```
 
 | Target | Corpus | Replay | Executed object | Runtime dispatch |
@@ -341,6 +342,43 @@ the committed index alone, and its `chain_hash` must equal the committed one. Th
 single composed **call** (`port compose <args>`) always runs from the store — that is
 the runtime path.
 
+### Sealed native service: one verified load, many consumers
+
+Loading the store per call is right for a one-shot CLI and wrong for a running
+system. `SealedNativeService` (`phost/src/porting/service.rs`) owns **one verified
+index** for its whole lifetime. The type is the proof that the store is loaded
+once: `open` is the only place with a path to `store`, and `call` has access to
+nothing but the dispatcher it already holds.
+
+A **session** is a deterministic plan that serves every sealed port in the store —
+five leaves and five compositions — through that one service, with a recorded
+expected result for each. Ten ports, one load, **five mapped objects**, and the
+same leaf reused by every chain that consumes it:
+
+```text
+store loads:     1        ports in store: 10
+calls:          10        native:        10        fallback: 0   broken seal: 0
+objects mapped:  5        dispatches:    43
+fan-in (resolutions, nested stages included):
+toupper 24   memchr 6   strlen 4   memcmp 1   strrchr 1
+toupper_each 3 (its own call + the nested chain's two fold stages)   others 1
+```
+
+Every composition in the store is also a **dispatchable port**, not just a court
+result: `composition_runner` resolves all five chain ids, so `dispatch_port` on
+`phor:compose:toupper_memchr:…` runs the sealed chain — and the nested chain
+resolves the sealed composition `toupper_each` through the same index.
+
+```sh
+cargo run -p phost -- port session                 # one load, ten ports, five objects
+cargo run -p phost -- port session --no-capability  # store never read (capability denied)
+./verify_session.sh                                # the session verifier
+```
+
+The store index is also checked for **composition cycles** when it loads: the
+runtime resolves a chain by recursing through the index, so a cyclic index is
+rejected as data rather than followed.
+
 ```sh
 cargo run -p phost -- port promote toupper   # observe → replay → execute → dispatch → seal
 cargo run -p phost -- port promote memcmp
@@ -380,6 +418,7 @@ cargo run -p phost -- port compose --target toupper_each_strlen_memchr 62006161:
 ./verify_composition_court.sh --target toupper_each_strlen_memchr         # composition #5 (nested)
 ./verify_composition_court.sh --target toupper_each_strlen_memchr --check-committed
 ./verify_store.sh                                                          # persistent store
+./verify_session.sh                                                        # sealed native service
 ```
 
 Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
@@ -440,13 +479,14 @@ See `docs/REPLAY_COURTS.md` and `docs/PHORENSIC_OS.md`.
 Two minimal, resource-capped containers (QEMU boots inside the kernel one):
 
 ```sh
-docker compose run --rm host     # cargo test + the store, court and composition verifiers
+docker compose run --rm host     # cargo test + the store, session, court and composition verifiers
 docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 docker compose up --build        # both, one shot
 ```
 
 `host` runs the compiler/runtime tests and the court verifiers (`verify_store.sh`,
-`verify_jit_porting_court.sh`, `verify_composition_court.sh`). `kernel` builds the
+`verify_session.sh`, `verify_jit_porting_court.sh`, `verify_composition_court.sh`).
+`kernel` builds the
 Multiboot kernel, boots it under QEMU, verifies the boot evidence (13 checks) and
 checks the boot evidence is byte-reproducible against the committed
 `phost_kernel/evidence_manifest.json`. Boot evidence is byte-identical across
@@ -468,7 +508,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **197 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **207 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (47), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -484,7 +524,8 @@ All numbers below were reproduced on a clean checkout.
 | Sealed composition (dataflow) | `toupper ∘ strlen ∘ memchr ∘ toupper ∘ memchr`, where **one derived bound is consumed by two searches**, the second non-adjacent to the stage that produced it: **474/474**, all six stage-accounts native, **0 fallbacks / 0 broken seals**, 6102 sealed dispatches; dispatched objects match the committed leaf seals |
 | Composition as a sealed port | the store publishes two artifact kinds (`LeafObject` and `Composition`); a nested chain resolves the sealed **composition** `toupper_each` from the store, checks its seal and recurses: `toupper_each` **267/267** (311 dispatches) and `toupper_each_strlen_memchr` **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**; the recorded nested seal matches the committed `toupper_each` chain hash |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
-| Persistent sealed port store | `phost/evidence/store/index.json` commits all **10** sealed ports (5 leaf object hashes + 5 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
+| Persistent sealed port store | `phost/evidence/store/index.json` commits all **10** sealed ports (5 leaf object hashes + 5 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry, and rejects a composition cycle; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
+| Sealed native service | one verified store load serves many consumers: **10 ports from 5 mapped objects**, **43** sealed-port resolutions including nested stages, **0 fallbacks / 0 broken seals**; `toupper` fan-in 24, `memchr` 6, `strlen` 4, `toupper_each` 3; the session reproduces from a copy of the store at another path, a missing store fails closed, and without `PORTING` the store is never read |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
 
 ### Known gaps

@@ -119,6 +119,11 @@ pub struct NativeDispatcher {
     /// Composition port ids actually dispatched through this dispatcher, so a nested
     /// stage's seal is only reported once it has really been used.
     dispatched_compositions: BTreeSet<String>,
+    /// Every `dispatch_port` call, per port id — leaf or composition, including the
+    /// calls a chain makes from inside its own runner. This is the fan-in of one
+    /// seal into many consumers.
+    per_port_dispatches: BTreeMap<String, u64>,
+    dispatches: u64,
 }
 
 impl NativeDispatcher {
@@ -127,6 +132,8 @@ impl NativeDispatcher {
             index,
             loaded: BTreeMap::new(),
             dispatched_compositions: BTreeSet::new(),
+            per_port_dispatches: BTreeMap::new(),
+            dispatches: 0,
         }
     }
 
@@ -139,6 +146,16 @@ impl NativeDispatcher {
 
     pub fn index(&self) -> &SealedPortIndex {
         &self.index
+    }
+
+    /// Total `dispatch_port` calls, including the stages a chain dispatches.
+    pub fn dispatches(&self) -> u64 {
+        self.dispatches
+    }
+
+    /// `dispatch_port` calls per port id (fan-in), in ascending id order.
+    pub fn per_port_dispatches(&self) -> &BTreeMap<String, u64> {
+        &self.per_port_dispatches
     }
 
     /// Number of native objects currently loaded and mapped.
@@ -191,6 +208,14 @@ impl NativeDispatcher {
         args: &[Vec<u8>],
         auth: &PortingAuthority,
     ) -> Result<DispatchOutcome, DispatchError> {
+        // Fan-in accounting: every resolution, however deep, is counted against
+        // the port it asked for.
+        self.dispatches += 1;
+        *self
+            .per_port_dispatches
+            .entry(port_id.to_string())
+            .or_insert(0) += 1;
+
         // No ambient authority: without PORTING the sealed store reveals nothing.
         if !auth.can_observe() {
             return Ok(DispatchOutcome::fallback(

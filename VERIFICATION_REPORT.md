@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 197 pass, 4 ignored | 201 total: 140 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
+| All tests (phost) | ✅ 207 pass, 4 ignored | 211 total: 150 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -87,7 +87,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 197 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + five sealed composition courts (incl. a nested one) + persistent sealed port store |
+| phost reach | 207 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + five sealed composition courts (incl. a nested one) + persistent sealed port store + sealed native service |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -360,10 +360,36 @@ Store residual hash: `81fa3b3a74fab1d9cd9865b5ab7ca4e459312562e0be50e07bed85f3c4
 
 ```sh
 ./verify_store.sh
+./verify_session.sh
+```
+
+### Sealed Native Service
+
+The courts derive a seal and the store commits one; the **service** is where many
+consumers share it. `phost/src/porting/service.rs` owns one verified index for its
+lifetime, so no call re-reads the store.
+
+| Aspect | Result |
+|--------|--------|
+| Store loads | **1** for the whole session (the type has no store access after `open`) |
+| Ports served | **10** — the five leaves and the five compositions, each once |
+| Calls | 10 native, **0** foreign fallback, **0** broken seals |
+| Objects mapped | **5** — the leaf objects are mapped once and reused by every chain |
+| Sealed-port resolutions | **43**, including the stages a chain dispatches from inside its runner |
+| Fan-in | `toupper` **24**, `memchr` **6**, `strlen` **4**, `memcmp` **1**, `strrchr` **1**; `toupper_each` **3** (its own call plus the nested chain's two fold stages); the other chains **1** |
+| Every port dispatchable | `composition_runner` resolves all five chain ids, so `dispatch_port` on a composition runs the sealed chain — and the nested chain resolves the sealed composition `toupper_each` through the same index |
+| Cycle safety | a composition cycle in the index is rejected at load (recurring through the index could never terminate) |
+| Independent of path | the same verdict reproduces from a copy of the store at another path |
+
+Session hash: `04fd6affd7ac1a332cdb30a39e224be89df73c75c09ce054ea1e3937105ab80f`.
+Evidence: `phost/evidence/session/session_verdict.json`.
+
+```sh
+./verify_session.sh
 ```
 
 ### Test Results (reproduced on `main`)
-- phost: 197 passed, 0 failed, 4 ignored (201 total). The ignored tests read
+- phost: 207 passed, 0 failed, 4 ignored (211 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -389,6 +415,8 @@ cargo run -p phost -- port promote strlen        # JIT-porting court (308)
 cargo run -p phost -- port promote strrchr       # JIT-porting court (336)
 cargo run -p phost -- port store                # load + verify the committed store
 cargo run -p phost -- port store --write        # regenerate it from committed evidence
+cargo run -p phost -- port session              # one load, ten ports, five objects
+cargo run -p phost -- port session --no-capability   # store never read
 cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
 cargo run -p phost -- port native memchr 616263:62:0300000000000000
 cargo run -p phost -- port native toupper 61 --no-capability   # foreign fallback
@@ -417,6 +445,7 @@ cargo run -p phost -- port compose --target toupper_each_strlen_memchr  # nested
 cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
 cargo run -p phost -- port compose --target toupper_each_strlen_memchr --store --phorc /nonexistent/phorc
 ./verify_store.sh                                # persistent store verifier
+./verify_session.sh                              # sealed native service verifier
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
 ./verify_evidence.sh evidence                    # 13/13 boot-evidence checks
@@ -425,7 +454,7 @@ cd phost_kernel && ./build_kernel.sh             # Multiboot image
 
 Everything above also runs in containers:
 ```sh
-docker compose run --rm host     # cargo test + store, court and composition verifiers
+docker compose run --rm host     # cargo test + store, session, court and composition verifiers
 docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 ```
 

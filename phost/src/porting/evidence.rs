@@ -26,6 +26,7 @@ use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
 use crate::porting::replay_court::{Mismatch, ReplayVerdict};
+use crate::porting::service::SessionVerdict;
 use crate::porting::target::PortTarget;
 use crate::porting::{json_escape, sha256_hex, PortDepth};
 
@@ -237,4 +238,17 @@ pub fn write_composition_evidence(
     let verdict_path = base.join("composition_verdict.json");
     fs::write(&verdict_path, verdict.evidence_json(mismatches))?;
     Ok(verdict_path.display().to_string())
+}
+
+/// Write the sealed native **session** evidence: many consumers served from one
+/// verified store load. Returns the verdict path.
+///
+/// A session has no oracle of its own — every result it checks is the sealed
+/// port's own recorded expectation — so the residual is the session verdict.
+pub fn write_session_evidence(dir: &str, verdict: &SessionVerdict) -> io::Result<String> {
+    let base = PathBuf::from(dir);
+    fs::create_dir_all(&base)?;
+    let path = base.join("session_verdict.json");
+    fs::write(&path, verdict.to_json())?;
+    Ok(path.display().to_string())
 }

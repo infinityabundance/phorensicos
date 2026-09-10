@@ -23,6 +23,7 @@ cargo build -q -p phost -p phorc
 # Validate the committed store against committed evidence FIRST, before any
 # regenerating pass touches the evidence dirs.
 ./verify_store.sh
+./verify_session.sh
 
 echo
 echo "=== JIT-Porting Court ==="

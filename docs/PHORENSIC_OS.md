@@ -308,6 +308,7 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → dispatch court (runtime serves calls from the sealed object)
 → composition court (sealed ports become runtime building blocks)
 → persistent store (the seal is committed; the runtime loads it, not re-derives it)
+→ sealed native service (one verified load, many consumers)
 → runtime prefers native
 ```
 
@@ -372,6 +373,20 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   verifier independently recompiles each `.phor` source and requires
   byte-equality. `--store` runs the composition court from the index instead of
   deriving it, so the committed verdict reproduces with no compiler at all.
+
+  verifier independently recompiles each `.phor` source and requires
+  byte-equality. `--store` runs the composition court from the index instead of
+  deriving it, so the committed verdict reproduces with no compiler at all.
+
+- **Sealed native service** — one verified load, many consumers. The service owns
+  an index for its lifetime; `open` is the only place with a store path, so a call
+  cannot re-read it. A deterministic session serves every sealed port in the store
+  (five leaves, five compositions) through that one service: ten ports from five
+  mapped objects, with `per_port` resolution counts that make the fan-in explicit
+  (`toupper` serves 24 resolutions once nested stages are counted, `memchr` 6) and
+  `toupper_each` consumed three times. Every composition in the index is a
+  dispatchable port, and a composition cycle is rejected at load, since resolving a
+  chain recurses through the index.
 
 - **Runtime preference** — the sealed package (e.g.
   `native:libc:memcmp:c-locale:sign:v1`) binds the compiled ELF64 candidate

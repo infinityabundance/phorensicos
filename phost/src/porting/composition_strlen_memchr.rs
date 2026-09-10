@@ -31,9 +31,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::porting::candidate::{decode_index, decode_usize};
+use crate::porting::candidate::{decode_index, decode_usize, encode_index};
 use crate::porting::composition::{CompositionTarget, Stage};
-use crate::porting::dispatch::{DispatchSource, NativeDispatcher};
+use crate::porting::dispatch::{DispatchError, DispatchSource, NativeDispatcher};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
 use crate::porting::target::{TestCase, LIBC_MEMCHR, LIBC_STRLEN, LIBC_TOUPPER};
@@ -301,6 +301,39 @@ fn run_chain(
     }
 
     out
+}
+
+/// Run this composition as a **stage of another chain** (or from a call site):
+/// `(haystack, needle, n) -> i32 index` (little-endian).
+///
+/// Every stage must be served by a sealed object; a fallback or a broken seal
+/// inside the chain is a broken seal, never a silent foreign fallback.
+pub fn run_chain_encoded(
+    dispatcher: &mut NativeDispatcher,
+    args: &[Vec<u8>],
+    auth: &PortingAuthority,
+) -> Result<Vec<u8>, DispatchError> {
+    let hay = args.first().cloned().unwrap_or_default();
+    let needle = args.get(1).and_then(|a| a.first()).copied().unwrap_or(0);
+    let n = args.get(2).map(|x| decode_usize(x)).unwrap_or(0);
+    let out = run_chain(dispatcher, &hay, needle, n, auth);
+    if out.hay != Stage::Native
+        || out.strlen != Stage::Native
+        || out.needle != Stage::Native
+        || out.memchr != Stage::Native
+    {
+        return Err(DispatchError::SealBroken(format!(
+            "{}: a stage was not served by a sealed object",
+            COMPOSITION_TOUPPER_STRLEN_MEMCHR.id
+        )));
+    }
+    match out.index {
+        Some(i) => Ok(encode_index(i)),
+        None => Err(DispatchError::SealBroken(format!(
+            "{}: no index after a native search stage",
+            COMPOSITION_TOUPPER_STRLEN_MEMCHR.id
+        ))),
+    }
 }
 
 // ============================================================================

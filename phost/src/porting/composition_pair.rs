@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 
 use crate::porting::candidate::{decode_index, decode_usize, encode_index};
 use crate::porting::composition::{CompositionTarget, Stage};
-use crate::porting::dispatch::{DispatchSource, NativeDispatcher};
+use crate::porting::dispatch::{DispatchError, DispatchSource, NativeDispatcher};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
 use crate::porting::target::{TestCase, LIBC_MEMCHR, LIBC_STRLEN, LIBC_TOUPPER};
@@ -446,6 +446,43 @@ fn run_chain(
     }
 
     out
+}
+
+/// Run this composition as a **stage of another chain** (or from a call site):
+/// `(haystack, needleA, needleB, n) -> i32 indexA || i32 indexB` (little-endian).
+///
+/// Both searches must be served by a sealed object from the one derived bound; a
+/// fallback or a broken seal inside the chain is a broken seal, never a silent
+/// foreign fallback.
+pub fn run_chain_encoded(
+    dispatcher: &mut NativeDispatcher,
+    args: &[Vec<u8>],
+    auth: &PortingAuthority,
+) -> Result<Vec<u8>, DispatchError> {
+    let hay = args.first().cloned().unwrap_or_default();
+    let needle_a = args.get(1).and_then(|a| a.first()).copied().unwrap_or(0);
+    let needle_b = args.get(2).and_then(|a| a.first()).copied().unwrap_or(0);
+    let n = args.get(3).map(|x| decode_usize(x)).unwrap_or(0);
+    let out = run_chain(dispatcher, &hay, needle_a, needle_b, n, auth);
+    if out.hay != Stage::Native
+        || out.strlen != Stage::Native
+        || out.needle_a != Stage::Native
+        || out.memchr_a != Stage::Native
+        || out.needle_b != Stage::Native
+        || out.memchr_b != Stage::Native
+    {
+        return Err(DispatchError::SealBroken(format!(
+            "{}: a stage was not served by a sealed object",
+            COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id
+        )));
+    }
+    match (out.index_a, out.index_b) {
+        (Some(a), Some(b)) => Ok(encode_pair(a, b)),
+        _ => Err(DispatchError::SealBroken(format!(
+            "{}: a search stage produced no index",
+            COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id
+        ))),
+    }
 }
 
 // ============================================================================

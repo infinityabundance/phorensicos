@@ -26,7 +26,7 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -81,6 +81,8 @@ pub enum StoreError {
     },
     /// A composition names a stage that is not itself in the store.
     DanglingLeaf { composition: String, leaf: String },
+    /// The composition graph has a cycle: resolving it could never terminate.
+    CompositionCycle(String),
     /// The document's recorded residual hash does not cover its entries.
     ResidualMismatch { expected: String, found: String },
     /// The committed evidence a generated entry is built from is missing or
@@ -112,6 +114,9 @@ impl core::fmt::Display for StoreError {
                 "composition {} names a stage that is not in the store: {}",
                 composition, leaf
             ),
+            StoreError::CompositionCycle(path) => {
+                write!(f, "composition cycle in the store: {}", path)
+            }
             StoreError::ResidualMismatch { expected, found } => write!(
                 f,
                 "store residual hash mismatch: recorded {}, computed {}",
@@ -374,6 +379,20 @@ impl StoreDocument {
         }
 
         let mut index = SealedPortIndex::new();
+
+        // A composition graph must be acyclic. The runtime resolves a chain by
+        // recursing through the index, so a cycle is a store that can never
+        // finish — reject it as data, not as a hang.
+        let mut edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in &self.entries {
+            if let StoreEntry::Composition { target, leaves, .. } = entry {
+                edges.insert(target.clone(), leaves.clone());
+            }
+        }
+        if let Some(path) = composition_cycle(&edges) {
+            return Err(StoreError::CompositionCycle(path.join(" -> ")));
+        }
+
         for entry in &self.entries {
             match entry {
                 StoreEntry::Leaf {
@@ -617,6 +636,51 @@ fn is_hex64(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Detect a cycle in the composition dependency graph (three-colour DFS).
+///
+/// Only composition → composition edges matter: a leaf object terminates a chain.
+/// Returns the cycle as a path (`a -> b -> a`) for the error message.
+fn composition_cycle(edges: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
+    fn visit(
+        node: &str,
+        edges: &BTreeMap<String, Vec<String>>,
+        color: &mut BTreeMap<String, u8>,
+        stack: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        match color.get(node).copied() {
+            Some(2) => return None,
+            Some(1) => {
+                let start = stack.iter().position(|n| n == node).unwrap_or(0);
+                let mut path = stack[start..].to_vec();
+                path.push(node.to_string());
+                return Some(path);
+            }
+            _ => {}
+        }
+        color.insert(node.to_string(), 1);
+        stack.push(node.to_string());
+        if let Some(children) = edges.get(node) {
+            for child in children {
+                if let Some(path) = visit(child, edges, color, stack) {
+                    return Some(path);
+                }
+            }
+        }
+        stack.pop();
+        color.insert(node.to_string(), 2);
+        None
+    }
+
+    let mut color: BTreeMap<String, u8> = BTreeMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    for node in edges.keys() {
+        if let Some(path) = visit(node, edges, &mut color, &mut stack) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn read_json(base: &Path, rel: &str) -> Result<Json, StoreError> {
     let abs = base.join(rel);
     let text = fs::read_to_string(&abs)
@@ -802,6 +866,25 @@ mod tests {
         ]);
         let err = doc.verify_into_index(Path::new("/tmp")).unwrap_err();
         assert!(matches!(err, StoreError::DuplicateTarget(_)));
+    }
+
+    #[test]
+    fn test_verify_rejects_a_composition_cycle() {
+        // The runtime resolves a chain by recursing through the index, so a cycle
+        // is rejected as data rather than followed.
+        let doc = StoreDocument::new(vec![
+            composition("phor:compose:a", &["phor:compose:b"]),
+            composition("phor:compose:b", &["phor:compose:a"]),
+        ]);
+        let err = doc.verify_into_index(Path::new("/tmp")).unwrap_err();
+        assert!(matches!(err, StoreError::CompositionCycle(_)));
+    }
+
+    #[test]
+    fn test_verify_rejects_a_self_referential_composition() {
+        let doc = StoreDocument::new(vec![composition("phor:compose:a", &["phor:compose:a"])]);
+        let err = doc.verify_into_index(Path::new("/tmp")).unwrap_err();
+        assert!(matches!(err, StoreError::CompositionCycle(_)));
     }
 
     #[test]

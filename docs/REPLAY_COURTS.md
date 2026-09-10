@@ -867,6 +867,42 @@ impossible `--phorc` path it proves no compiler is invoked. Loads fail closed:
 a missing store is an error, never a silent fallback, and without `PORTING` the
 store is not read at all.
 
+### Sealed native service: one verified load, many consumers
+
+The store is committed; the **service** is where it is shared. `SealedNativeService`
+(`phost/src/porting/service.rs`) owns one verified index for its lifetime:
+
+```text
+SealedNativeService::open(path, auth) -> verify + load the store ONCE
+SealedNativeService::call(port_id, args, auth) -> dispatch_port(..)
+                                                   (no store access at all)
+```
+
+`open` requires `PORTING`; without it the store is never read. The type is the
+proof that no call re-reads the store: `call` can only reach the dispatcher the
+service already holds.
+
+A **session** is the deterministic plan — `session_plan()` — that serves every
+sealed port in the store once, with a recorded expected result:
+
+```text
+five leaves          five compositions
+store loads:     1   ports: 10   calls: 10 native   fallback: 0   broken: 0
+objects mapped:  5   dispatches: 43
+fan-in:  toupper 24  memchr 6  strlen 4  memcmp 1  strrchr 1
+         toupper_each 3 (own call + nested chain's two fold stages)
+```
+
+`dispatches` and `per_port` count every `dispatch_port` resolution, including the
+stages a chain dispatches from inside its own runner — that is what makes the
+fan-in visible rather than just "ten calls".
+
+Every composition in the store is also a **dispatchable port**: `composition_runner`
+resolves all five chain ids, so `dispatch_port` on `phor:compose:toupper_memchr:…`
+returns its chain output. A cycle in the composition graph is rejected when the
+store loads (`StoreError::CompositionCycle`), because resolving a chain recurses
+through the index and a cycle could never terminate.
+
 ### Where it lives
 
 ```text
@@ -875,11 +911,14 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   promotion, evidence, compiled, exec, dispatch,
                                   composition, composition_strlen_memchr,
                                   composition_pair, composition_toupper_each,
-                                  composition_nested, store, json
+                                  composition_nested, store, json, service
 phost/evidence/store/index.json   persistent store: every sealed port (leaf objects
                                   + composition chain hashes), committed
+phost/evidence/session/           session verdict (one load, many consumers)
 verify_store.sh                   persistent store verifier (load, regenerate,
                                   independent recompilation, no-compiler runtime)
+verify_session.sh                 sealed native service verifier (one load, ten
+                                  ports, five objects, fan-in, fail-closed)
 ```
 
 The examples and evidence:
@@ -911,10 +950,12 @@ Reproduce:
 ```sh
 cargo run -p phost -- port store                            # load + verify the store
 cargo run -p phost -- port store --write                    # regenerate it
+cargo run -p phost -- port session                          # one load, many consumers
 cargo run -p phost -- port promote toupper
 cargo run -p phost -- port native toupper 61                # dispatch one call (from the store)
 cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
 ./verify_store.sh                                           # persistent store
+./verify_session.sh                                         # sealed native service
 ./verify_jit_porting_court.sh --target toupper                 # determinism
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in

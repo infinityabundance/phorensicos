@@ -206,10 +206,16 @@ fn port_cli(args: &[String]) -> i32 {
             "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr] [ARGS_HEX] [--no-capability] [--store|--derive] [--out DIR] [--phorc PATH]"
         );
         eprintln!("       phost port store [--check|--write] [PATH]");
+        eprintln!("       phost port session [--out DIR] [--no-capability]");
         return 2;
     }
 
     let stage = args[0].as_str();
+
+    // The long-lived sealed native service: one verified store load, many consumers.
+    if stage == "session" {
+        return session_cli(&args[1..]);
+    }
 
     // The persistent sealed port store: load and verify the committed index, or
     // regenerate it from committed evidence.
@@ -610,6 +616,96 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// `phost port session [--out DIR] [--no-capability] [PATH]`
+///
+/// The long-lived sealed native service: the committed store is loaded and
+/// verified **once**, then a deterministic plan serves every sealed port in the
+/// store (five leaves, five compositions) through that one service. Proves the
+/// seal is loaded once and reused — ten ports from five mapped objects — and
+/// writes the session residual.
+fn session_cli(args: &[String]) -> i32 {
+    use phost::porting::{self, store, PortingAuthority};
+
+    let mut out = String::from("phost/evidence/session");
+    let mut store_path = store::STORE_PATH.to_string();
+    let mut auth = PortingAuthority::granted();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-capability" => {
+                auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--out" if i + 1 < args.len() => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            other => {
+                store_path = other.to_string();
+                i += 1;
+            }
+        }
+    }
+
+    match porting::service::run_session(&store_path, &auth) {
+        Ok((verdict, mismatches, _service)) => {
+            println!("=== Sealed Native Session ===");
+            println!("Target:         {}", verdict.target());
+            println!("Store:          {}", verdict.store_path);
+            println!("Store residual: {}", verdict.store_residual_hash);
+            println!("Store loads:    {}", verdict.store_loads);
+            println!("Ports in store: {}", verdict.ports_in_store);
+            println!("Calls:          {}", verdict.calls);
+            println!("Native calls:   {}", verdict.native_calls);
+            println!(
+                "Foreign fallback: {}   Broken seal: {}",
+                verdict.fallback_calls, verdict.broken_seal_calls
+            );
+            println!("Objects mapped: {}", verdict.objects_mapped);
+            println!("Dispatches:     {}", verdict.dispatches);
+            println!();
+            println!("Fan-in (sealed-port resolutions, nested stages included):");
+            for (port, count) in &verdict.per_port {
+                println!("  {:<58} {}", port, count);
+            }
+            if !mismatches.is_empty() {
+                println!();
+                for m in &mismatches {
+                    println!(
+                        "  [MISMATCH] {}: expected {} got {} ({})",
+                        m.label, m.expected_hex, m.actual_hex, m.reason
+                    );
+                }
+            }
+            println!();
+            println!("Session hash:   {}", verdict.session_hash);
+            println!("Verdict:        {}", verdict.verdict_str());
+
+            if !out.is_empty() {
+                match phost::porting::evidence::write_session_evidence(&out, &verdict) {
+                    Ok(p) => println!("Evidence:       {}", p),
+                    Err(e) => {
+                        eprintln!("port session: writing evidence failed: {}", e);
+                        return 1;
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("port session: {}", e);
+            // A capability denial is the expected, fail-closed outcome of
+            // `--no-capability`: the store was never read.
+            if e == phost::porting::PortError::CapabilityDenied {
+                0
+            } else {
+                1
+            }
+        }
+    }
 }
 
 /// `phost port store [--check|--write] [PATH]`

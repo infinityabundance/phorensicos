@@ -45,6 +45,7 @@ pub mod json;
 pub mod oracle_trace;
 pub mod promotion;
 pub mod replay_court;
+pub mod service;
 pub mod store;
 pub mod target;
 
@@ -58,6 +59,7 @@ pub use exec::{ExecError, ExecutionVerdict};
 pub use oracle_trace::OracleTrace;
 pub use promotion::{PromotionError, PromotionEvidence, PromotionReceipt, TrustState};
 pub use replay_court::{CourtVerdict, Mismatch, ReplayVerdict};
+pub use service::{SealedNativeService, SessionVerdict};
 pub use target::{resolve_target, PortTarget, TestCase};
 
 /// A chain runner, callable with the raw stage arguments and returning the encoded
@@ -69,8 +71,18 @@ pub type CompositionRunner =
 /// Resolve the runner for a sealed composition id.
 ///
 /// The runtime knows how to run the compositions it ships; an unknown id is a broken
-/// seal, never an implicit fallback.
+/// seal, never an implicit fallback. Every composition the store publishes is here,
+/// so each sealed port in the index is actually dispatchable.
 pub fn composition_runner(id: &str) -> Option<CompositionRunner> {
+    if id == composition::COMPOSITION_TOUPPER_MEMCHR.id {
+        return Some(composition::run_chain_encoded);
+    }
+    if id == composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR.id {
+        return Some(composition_strlen_memchr::run_chain_encoded);
+    }
+    if id == composition_pair::COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id {
+        return Some(composition_pair::run_chain_encoded);
+    }
     if id == composition_toupper_each::COMPOSITION_TOUPPER_EACH.id {
         return Some(composition_toupper_each::run_chain_encoded);
     }
