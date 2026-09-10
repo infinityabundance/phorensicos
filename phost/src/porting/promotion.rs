@@ -1,13 +1,15 @@
 // porting/promotion.rs — Trust promotion
 //
 // Promotion advances a candidate along the trust ladder only when the replay
-// court returned an exact, non-empty match, the clean-room source is bound, and
-// the full evidence set was written. Nothing else promotes. This is the one
-// place a native candidate becomes trusted native law.
+// court returned an exact, non-empty match, the compiled candidate artifact is
+// bound (source + object + receipt hashes), and the full evidence set was
+// written. Nothing else promotes. This is the one place a native candidate
+// becomes trusted native law.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 
+use crate::porting::candidate::CandidateArtifacts;
 use crate::porting::replay_court::{CourtVerdict, ReplayVerdict};
 use crate::porting::target::PortTarget;
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
@@ -57,6 +59,8 @@ pub enum PromotionError {
     MissingOracleHash,
     MissingCandidateBehaviorHash,
     MissingCandidateSourceHash,
+    MissingCandidateObjectHash,
+    MissingCandidateReceiptHash,
     SealedPackageNotWritten,
     ReplayResidualNotWritten,
 }
@@ -71,6 +75,8 @@ impl PromotionError {
             PromotionError::MissingOracleHash => "oracle hash missing",
             PromotionError::MissingCandidateBehaviorHash => "candidate behavior hash missing",
             PromotionError::MissingCandidateSourceHash => "candidate source hash missing",
+            PromotionError::MissingCandidateObjectHash => "candidate object hash missing",
+            PromotionError::MissingCandidateReceiptHash => "candidate receipt hash missing",
             PromotionError::SealedPackageNotWritten => "sealed package was not written",
             PromotionError::ReplayResidualNotWritten => "replay residual was not written",
         }
@@ -94,6 +100,9 @@ pub struct PromotionReceipt {
     pub oracle_hash: String,
     pub candidate_behavior_hash: String,
     pub candidate_source_hash: String,
+    pub candidate_object_hash: String,
+    pub candidate_receipt_hash: String,
+    pub compiler_version: String,
     pub sealed_package: String,
     pub replay_residual_hash: String,
 }
@@ -109,7 +118,7 @@ impl PromotionReceipt {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};sealed_package={};replay_residual_hash={}",
+            "target={};from={};to={};verdict={};oracle_hash={};candidate_behavior_hash={};candidate_source_hash={};candidate_object_hash={};candidate_receipt_hash={};compiler_version={};sealed_package={};replay_residual_hash={}",
             self.target,
             self.from.as_str(),
             self.to.as_str(),
@@ -117,6 +126,9 @@ impl PromotionReceipt {
             self.oracle_hash,
             self.candidate_behavior_hash,
             self.candidate_source_hash,
+            self.candidate_object_hash,
+            self.candidate_receipt_hash,
+            self.compiler_version,
             self.sealed_package,
             self.replay_residual_hash
         )
@@ -128,7 +140,7 @@ impl PromotionReceipt {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.promotion_receipt.v1\",\n  \"target\": \"{}\",\n  \"from\": \"{}\",\n  \"to\": \"{}\",\n  \"verdict\": \"{}\",\n  \"oracle_hash\": \"{}\",\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"candidate_object_hash\": \"{}\",\n  \"candidate_receipt_hash\": \"{}\",\n  \"compiler_version\": \"{}\",\n  \"sealed_package\": \"{}\",\n  \"replay_residual_hash\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
             self.from.as_str(),
             self.to.as_str(),
@@ -136,6 +148,9 @@ impl PromotionReceipt {
             self.oracle_hash,
             self.candidate_behavior_hash,
             self.candidate_source_hash,
+            self.candidate_object_hash,
+            self.candidate_receipt_hash,
+            json_escape(&self.compiler_version),
             json_escape(&self.sealed_package),
             self.replay_residual_hash,
             self.residual_hash()
@@ -147,7 +162,7 @@ impl PromotionReceipt {
 pub fn promote(
     target: &PortTarget,
     verdict: &ReplayVerdict,
-    candidate_source_hash: &str,
+    artifacts: &CandidateArtifacts,
     evidence: &PromotionEvidence,
     auth: &PortingAuthority,
 ) -> Result<PromotionReceipt, PromotionError> {
@@ -170,8 +185,14 @@ pub fn promote(
     if verdict.candidate_behavior_hash.is_empty() {
         return Err(PromotionError::MissingCandidateBehaviorHash);
     }
-    if candidate_source_hash.is_empty() {
+    if artifacts.source_hash.is_empty() {
         return Err(PromotionError::MissingCandidateSourceHash);
+    }
+    if artifacts.object_hash.is_empty() {
+        return Err(PromotionError::MissingCandidateObjectHash);
+    }
+    if artifacts.receipt_hash.is_empty() {
+        return Err(PromotionError::MissingCandidateReceiptHash);
     }
     if !evidence.sealed_package_written {
         return Err(PromotionError::SealedPackageNotWritten);
@@ -187,7 +208,10 @@ pub fn promote(
         verdict: verdict.verdict.as_str().to_string(),
         oracle_hash: verdict.oracle_hash.clone(),
         candidate_behavior_hash: verdict.candidate_behavior_hash.clone(),
-        candidate_source_hash: candidate_source_hash.to_string(),
+        candidate_source_hash: artifacts.source_hash.clone(),
+        candidate_object_hash: artifacts.object_hash.clone(),
+        candidate_receipt_hash: artifacts.receipt_hash.clone(),
+        compiler_version: artifacts.compiler_version.clone(),
         sealed_package: "sealed_package.json".to_string(),
         replay_residual_hash: verdict.residual_hash(),
     })
@@ -202,7 +226,17 @@ mod tests {
     use crate::porting::target::{self, byte_domain_cases};
     use alloc::vec::Vec;
 
-    const SOURCE_HASH: &str = "c0ffee00000000000000000000000000000000000000000000000000000000ff";
+    fn artifacts() -> CandidateArtifacts {
+        CandidateArtifacts {
+            source_hash: "c0ffee00000000000000000000000000000000000000000000000000000000ff"
+                .to_string(),
+            object_hash: "0b1ec700000000000000000000000000000000000000000000000000000000ff"
+                .to_string(),
+            receipt_hash: "rece1p7000000000000000000000000000000000000000000000000000000ff"
+                .to_string(),
+            compiler_version: "phorc 0.1.0".to_string(),
+        }
+    }
 
     fn agreeing_verdict() -> ReplayVerdict {
         let traces: Vec<OracleTrace> = byte_domain_cases()
@@ -234,7 +268,7 @@ mod tests {
         let receipt = promote(
             &target::LIBC_TOUPPER,
             &verdict,
-            SOURCE_HASH,
+            &artifacts(),
             &full_evidence(),
             &PortingAuthority::granted(),
         )
@@ -247,7 +281,10 @@ mod tests {
             receipt.candidate_behavior_hash,
             verdict.candidate_behavior_hash
         );
-        assert_eq!(receipt.candidate_source_hash, SOURCE_HASH);
+        assert_eq!(receipt.candidate_source_hash, artifacts().source_hash);
+        assert_eq!(receipt.candidate_object_hash, artifacts().object_hash);
+        assert_eq!(receipt.candidate_receipt_hash, artifacts().receipt_hash);
+        assert_eq!(receipt.compiler_version, "phorc 0.1.0");
     }
 
     #[test]
@@ -270,7 +307,7 @@ mod tests {
         let refused = promote(
             &target::LIBC_TOUPPER,
             &verdict,
-            SOURCE_HASH,
+            &artifacts(),
             &full_evidence(),
             &PortingAuthority::granted(),
         );
@@ -283,7 +320,7 @@ mod tests {
         let refused = promote(
             &target::LIBC_TOUPPER,
             &verdict,
-            SOURCE_HASH,
+            &artifacts(),
             &full_evidence(),
             &PortingAuthority::none(),
         );
@@ -292,15 +329,44 @@ mod tests {
 
     #[test]
     fn test_promotion_denied_without_candidate_source_hash() {
-        let verdict = agreeing_verdict();
+        let mut a = artifacts();
+        a.source_hash = String::new();
         let refused = promote(
             &target::LIBC_TOUPPER,
-            &verdict,
-            "",
+            &agreeing_verdict(),
+            &a,
             &full_evidence(),
             &PortingAuthority::granted(),
         );
         assert_eq!(refused, Err(PromotionError::MissingCandidateSourceHash));
+    }
+
+    #[test]
+    fn test_promotion_denied_without_candidate_object_hash() {
+        let mut a = artifacts();
+        a.object_hash = String::new();
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &a,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::MissingCandidateObjectHash));
+    }
+
+    #[test]
+    fn test_promotion_denied_without_candidate_receipt_hash() {
+        let mut a = artifacts();
+        a.receipt_hash = String::new();
+        let refused = promote(
+            &target::LIBC_TOUPPER,
+            &agreeing_verdict(),
+            &a,
+            &full_evidence(),
+            &PortingAuthority::granted(),
+        );
+        assert_eq!(refused, Err(PromotionError::MissingCandidateReceiptHash));
     }
 
     #[test]
@@ -313,7 +379,7 @@ mod tests {
         let refused = promote(
             &target::LIBC_TOUPPER,
             &verdict,
-            SOURCE_HASH,
+            &artifacts(),
             &partial,
             &PortingAuthority::granted(),
         );

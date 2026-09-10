@@ -195,10 +195,12 @@ fn main() {
 /// and `promote` (alias `court`) writes the full evidence set and seals the
 /// native candidate — but only if every replayed case matched exactly.
 fn port_cli(args: &[String]) -> i32 {
-    use phost::porting::{self, evidence, target, PortDepth, PortingAuthority};
+    use phost::porting::{self, PortDepth, PortingAuthority};
 
     if args.is_empty() {
-        eprintln!("Usage: phost port <observe|replay|promote|court> <symbol> [--out DIR]");
+        eprintln!(
+            "Usage: phost port <observe|replay|promote|court> <symbol> [--out DIR] [--phorc PATH]"
+        );
         return 2;
     }
 
@@ -217,13 +219,19 @@ fn port_cli(args: &[String]) -> i32 {
     let symbol = args.get(1).map(|s| s.as_str()).unwrap_or("toupper");
 
     let mut out = format!("phost/evidence/porting/{}", symbol);
+    let mut phorc: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
-        if args[i] == "--out" && i + 1 < args.len() {
-            out = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
+        match args[i].as_str() {
+            "--out" if i + 1 < args.len() => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            "--phorc" if i + 1 < args.len() => {
+                phorc = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => i += 1,
         }
     }
 
@@ -231,13 +239,7 @@ fn port_cli(args: &[String]) -> i32 {
     // court refuses both observation and promotion without it.
     let auth = PortingAuthority::granted();
 
-    // Bind the clean-room candidate source into the seal (fail closed if absent).
-    let source_path = target::resolve_target(symbol)
-        .map(|t| t.candidate_source)
-        .unwrap_or("");
-    let source_hash = evidence::hash_file(source_path).unwrap_or_default();
-
-    match porting::run_port_court(symbol, &auth, &out, depth, &source_hash) {
+    match porting::run_port_court(symbol, &auth, &out, depth, phorc.as_deref()) {
         Ok(r) => {
             println!("=== JIT-Porting Court: {} ===", r.symbol);
             println!("Target id:      {}", r.target);
@@ -252,6 +254,12 @@ fn port_cli(args: &[String]) -> i32 {
             println!("Oracle hash:    {}", r.oracle_hash);
             println!("Candidate behavior hash: {}", r.candidate_behavior_hash);
             println!("Candidate source hash:   {}", r.candidate_source_hash);
+            println!("Candidate object hash:   {}", r.candidate_object_hash);
+            println!("Candidate receipt hash:  {}", r.candidate_receipt_hash);
+            println!("Compiler:                {}", r.compiler_version);
+            if !r.candidate_object_path.is_empty() {
+                println!("Compiled object:         {}", r.candidate_object_path);
+            }
             println!("Verdict:        {}", r.verdict);
             println!("Promotion:      {}", r.promotion);
             println!("Evidence:       {}", r.evidence_dir);

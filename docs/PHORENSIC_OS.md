@@ -316,8 +316,9 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 - **Promotion** — advances the candidate to `sealed` only on an exact, non-empty
   match with a complete evidence set. Gated by the `PORTING` capability.
 - **Runtime preference** — the sealed package (e.g.
-  `native:libc:memcmp:c-locale:sign:v1`) is the artifact the runtime prefers over
-  the foreign implementation.
+  `native:libc:memcmp:c-locale:sign:v1`) binds the compiled ELF64 candidate
+  object; that object is the artifact the runtime prefers over the foreign
+  implementation.
 
 This is API-surface porting, not arbitrary binary translation. Eager JIT of
 arbitrary foreign binaries is a later phase.

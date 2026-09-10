@@ -15,11 +15,12 @@
 #
 #  Checks (both modes, for the selected target):
 #    * all six evidence artifacts exist and are valid JSON
-#    * every case in the corpus passed, with no mismatches
+#    * the corpus is structurally well-formed (see the target-specific checks)
+#    * every case passed, with no mismatches
 #    * the recorded locale contract is C and the target id is qualified
-#    * oracle hash matches the stored behavior signature
-#    * candidate behavior hash matches the replay verdict
-#    * the candidate source hash is bound (non-empty)
+#    * oracle / candidate-behavior hashes match across artifacts
+#    * an INDEPENDENT recompilation of the .phor candidate reproduces the
+#      recorded candidate object and receipt hashes
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
@@ -50,10 +51,12 @@ case "$TARGET" in
     toupper)
         TARGET_ID="libc:toupper:c-locale:u8:v1"
         EXPECTED_COUNT=256
+        SOURCE="examples/jit_port_toupper.phor"
         ;;
     memcmp)
         TARGET_ID="libc:memcmp:c-locale:sign:v1"
         EXPECTED_COUNT=312
+        SOURCE="examples/jit_port_memcmp.phor"
         ;;
     *)
         echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp)"
@@ -64,7 +67,8 @@ esac
 [ -n "$EVID" ] || EVID="phost/evidence/porting/$TARGET"
 case "$EVID" in /*) ;; *) EVID="$ROOT/$EVID" ;; esac
 
-BIN="$ROOT/target/debug/phost"
+PHOST="$ROOT/target/debug/phost"
+PHORC="$ROOT/target/debug/phorc"
 FILES="oracle_traces.json behavior_signature.json candidate_signature.json replay_verdict.json promotion_receipt.json sealed_package.json"
 
 echo "=== Phorensic OS — JIT-Porting Court Verification ==="
@@ -73,23 +77,24 @@ echo "Evidence dir: $EVID"
 echo "Mode:         $MODE"
 echo
 
-# --- 0. Build the runtime if needed ----------------------------------------
-if [ ! -x "$BIN" ]; then
-    echo "--- building phost ---"
-    if ! cargo build -q -p phost; then
-        echo "ERROR: cargo build -p phost failed"
+# --- 0. Build the runtime + compiler if needed -----------------------------
+if [ ! -x "$PHOST" ] || [ ! -x "$PHORC" ]; then
+    echo "--- building phost + phorc ---"
+    if ! cargo build -q -p phost -p phorc; then
+        echo "ERROR: cargo build failed"
         exit 2
     fi
 fi
 
 # --- 1. Produce a fresh run in a temp dir (never touches EVID) -------------
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+CMP="$(mktemp -d)"
+trap 'rm -rf "$TMP" "$CMP"' EXIT
 
 echo "--- fresh court run (temp) ---"
-if ! "$BIN" port promote "$TARGET" --out "$TMP" >/dev/null 2>&1; then
+if ! "$PHOST" port promote "$TARGET" --out "$TMP" >/dev/null 2>&1; then
     echo "ERROR: phost port promote $TARGET failed"
-    "$BIN" port promote "$TARGET" --out "$TMP" || true
+    "$PHOST" port promote "$TARGET" --out "$TMP" || true
     exit 2
 fi
 
@@ -113,7 +118,7 @@ if [ "$MODE" = "check-committed" ]; then
     [ "$FAIL" -eq 0 ] || { echo "Status: COMMITTED EVIDENCE STALE"; exit 1; }
 else
     echo "--- determinism court (fresh A == fresh B) ---"
-    if ! "$BIN" port promote "$TARGET" --out "$EVID" >/dev/null 2>&1; then
+    if ! "$PHOST" port promote "$TARGET" --out "$EVID" >/dev/null 2>&1; then
         echo "ERROR: second court run failed"
         exit 2
     fi
@@ -128,12 +133,24 @@ else
     [ "$FAIL" -eq 0 ] || { echo "Status: NON-DETERMINISTIC"; exit 1; }
 fi
 
-# --- 2. Validate evidence content ------------------------------------------
+# --- 2. Independent recompilation of the .phor candidate -------------------
+# Compile from the workspace root with the repo-relative source, exactly as the
+# court does, and hash the artifacts. These must match the committed seal.
+echo "--- independent recompilation ---"
+if ! (cd "$ROOT" && "$PHORC" "$SOURCE" "$CMP/candidate.o" --emit-receipts) >/dev/null 2>&1; then
+    echo "  [FAIL] independent phorc compilation failed"
+    exit 1
+fi
+OBJ_HASH="$(sha256sum "$CMP/candidate.o" | cut -d' ' -f1)"
+RCP_HASH="$(sha256sum "$CMP/candidate.receipts.json" | cut -d' ' -f1)"
+
+# --- 3. Validate evidence content ------------------------------------------
 echo "--- validating evidence ---"
-python3 - "$EVID" "$TARGET_ID" "$EXPECTED_COUNT" "$TARGET" <<'PY'
+python3 - "$EVID" "$TARGET_ID" "$EXPECTED_COUNT" "$TARGET" "$OBJ_HASH" "$RCP_HASH" <<'PY'
 import json, os, sys
 
 d, TARGET_ID, EXPECTED, SYMBOL = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+OBJ_HASH, RCP_HASH = sys.argv[5], sys.argv[6]
 errors = []
 
 def load(name):
@@ -152,8 +169,9 @@ verdict = load("replay_verdict.json")
 promo = load("promotion_receipt.json")
 sealed = load("sealed_package.json")
 
-# Oracle traces: full corpus, qualified target, C locale, all observed ok.
 traces = traces_doc.get("traces", [])
+
+# ---- oracle traces: completeness, identity, locale ------------------------
 if traces_doc.get("case_count") != EXPECTED:
     errors.append("oracle_traces.case_count != %d" % EXPECTED)
 if len(traces) != EXPECTED:
@@ -162,31 +180,90 @@ if traces:
     ids = [t.get("case_id") for t in traces]
     if len(set(ids)) != len(ids):
         errors.append("oracle trace case_ids are not unique")
-    if any(t.get("status") != "ok" for t in traces):
-        errors.append("some observed cases are not status=ok")
-    if any(t.get("target") != TARGET_ID for t in traces):
+    if any((t.get("target") != TARGET_ID) for t in traces):
         errors.append("some traces are not for the qualified target id")
     if any(t.get("locale_contract") != "C" for t in traces):
         errors.append("some traces do not record locale_contract=C")
+    if any(t.get("status") != "ok" for t in traces):
+        errors.append("some observed cases are not status=ok")
 
-# Hash cross-checks.
+# ---- target-specific corpus structure -------------------------------------
+def args_of(t):
+    return t.get("input_hex", "").split(":")
+
+if SYMBOL == "toupper":
+    expected_ids = ["0x%02x" % i for i in range(256)]
+    if [t.get("case_id") for t in traces] != expected_ids:
+        errors.append("toupper case_ids are not the ordered 0x00..0xff domain")
+    for t in traces:
+        a = args_of(t)
+        if len(a) != 1 or len(a[0]) != 2:
+            errors.append("toupper case %s is not a single 1-byte argument" % t.get("case_id"))
+            break
+
+if SYMBOL == "memcmp":
+    for t in traces:
+        a = args_of(t)
+        if len(a) != 3:
+            errors.append("memcmp case %s does not have exactly 3 arguments" % t.get("case_id"))
+            break
+        if len(a[2]) != 16:
+            errors.append("memcmp case %s has a non-8-byte length" % t.get("case_id"))
+            break
+        try:
+            buflen_a = len(bytes.fromhex(a[0]))
+            buflen_b = len(bytes.fromhex(a[1]))
+            n = int.from_bytes(bytes.fromhex(a[2]), "little")
+        except ValueError:
+            errors.append("memcmp case %s has non-hex arguments" % t.get("case_id"))
+            break
+        if n > min(buflen_a, buflen_b):
+            errors.append("memcmp case %s has n > min(len(a), len(b))" % t.get("case_id"))
+            break
+    id_set = set(t.get("case_id") for t in traces)
+    for required in ("F.7f.80", "F.80.7f"):
+        if required not in id_set:
+            errors.append("memcmp corpus is missing case %s" % required)
+    for group in ("A.", "B.", "C.", "D.", "E.", "F.", "G."):
+        if not any(i.startswith(group) for i in id_set):
+            errors.append("memcmp corpus is missing group %s" % group)
+
+# ---- hash cross-checks ----------------------------------------------------
 oracle = sig.get("combined_oracle_hash", "")
 behavior = cand.get("candidate_behavior_hash", "")
 source = cand.get("candidate_source_hash", "")
+obj = cand.get("candidate_object_hash", "")
+rcp = cand.get("candidate_receipt_hash", "")
+compiler = cand.get("compiler_version", "")
+
 oracle_match = bool(oracle) and oracle == verdict.get("oracle_hash") and oracle == promo.get("oracle_hash") and oracle == sealed.get("oracle_hash")
 behavior_match = bool(behavior) and behavior == verdict.get("candidate_behavior_hash") and behavior == promo.get("candidate_behavior_hash") and behavior == sealed.get("candidate_behavior_hash")
 if not oracle_match:
     errors.append("oracle hash does not match across signature/verdict/promotion/sealed")
 if not behavior_match:
     errors.append("candidate behavior hash does not match across signature/verdict/promotion/sealed")
-if not source:
-    errors.append("candidate source hash is missing (seal does not bind candidate source)")
-if source and source != promo.get("candidate_source_hash"):
-    errors.append("candidate source hash does not match promotion receipt")
-if source and source != sealed.get("candidate_source_hash"):
-    errors.append("candidate source hash does not match sealed package")
 
-# Signature identity + counts.
+# ---- compiled candidate authority -----------------------------------------
+if not source:
+    errors.append("candidate source hash is missing")
+if not obj:
+    errors.append("candidate object hash is missing")
+if not rcp:
+    errors.append("candidate receipt hash is missing")
+if not compiler:
+    errors.append("compiler version is missing")
+for name, doc in (("promotion_receipt", promo), ("sealed_package", sealed)):
+    if doc.get("candidate_source_hash") != source:
+        errors.append("%s.candidate_source_hash != candidate_signature" % name)
+    if doc.get("candidate_object_hash") != obj:
+        errors.append("%s.candidate_object_hash != candidate_signature" % name)
+    if doc.get("candidate_receipt_hash") != rcp:
+        errors.append("%s.candidate_receipt_hash != candidate_signature" % name)
+compiled_match = (obj == OBJ_HASH and rcp == RCP_HASH)
+if not compiled_match:
+    errors.append("independent recompilation does not reproduce the sealed object/receipt hashes")
+
+# ---- identity + counts ----------------------------------------------------
 if sig.get("target") != TARGET_ID:
     errors.append("behavior_signature.target != %s" % TARGET_ID)
 if sig.get("locale_contract") != "C":
@@ -196,7 +273,7 @@ if sig.get("case_count") != EXPECTED:
 if cand.get("case_count") != EXPECTED:
     errors.append("candidate_signature.case_count != %d" % EXPECTED)
 
-# Replay verdict: everything passed.
+# ---- replay verdict -------------------------------------------------------
 if verdict.get("cases_run") != EXPECTED:
     errors.append("replay.cases_run != %d" % EXPECTED)
 if verdict.get("cases_passed") != EXPECTED:
@@ -208,15 +285,13 @@ if verdict.get("verdict") != "consistent":
 if verdict.get("mismatches"):
     errors.append("replay reported mismatches")
 
-# Promotion sealed.
+# ---- promotion + sealed package -------------------------------------------
 if promo.get("to") != "sealed":
     errors.append("promotion.to != sealed")
 if promo.get("verdict") != "consistent":
     errors.append("promotion.verdict != consistent")
 if promo.get("target") != TARGET_ID:
     errors.append("promotion.target != %s" % TARGET_ID)
-
-# Sealed package references the correct target.
 if sealed.get("target") != TARGET_ID:
     errors.append("sealed_package.target != %s" % TARGET_ID)
 if sealed.get("symbol") != SYMBOL:
@@ -241,6 +316,8 @@ print("Candidate hash: %s" % ("MATCH" if behavior_match else "MISMATCH"))
 print("Promotion: %s" % (str(promo.get("to", "?")).capitalize()))
 print("Target id: %s" % TARGET_ID)
 print("Source hash bound: %s" % ("yes" if source else "no"))
+print("Compiled object: %s" % ("MATCH" if compiled_match else "MISMATCH"))
+print("Compiler: %s" % compiler)
 
 if errors:
     print("")

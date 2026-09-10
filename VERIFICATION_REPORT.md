@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 91 pass, 4 ignored | 95 total: 8 serial + 4 kernel + 49 nucleus + 34 porting; the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 97 pass, 4 ignored | 101 total: 8 serial + 4 kernel + 49 nucleus + 40 porting; the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc lib) | ✅ 43/43 pass | Parser/checker/lower/codegen |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -97,6 +97,9 @@ GUI compositor → window manager → surface management → inspector
 | Oracle hash | `8daf25ed2482b1258bdef6b618ea2c2ef17c22ef45b47ba3a45ded2cfc05ac91` | `918c86d5302aaa0394a782b68e4aed7494549bcaaf06a82948c6d945ccb43210` |
 | Candidate behavior hash | `777f11a0264a69b20f5c8a87d9c0687768d3e11216a43dd95698b5dd119fefc2` | `e7fcf296920ea7a179a218202a059665dab2ee6cd38ade094696b44b19553033` |
 | Candidate source hash | `1d3828469426e3db3d6ae1796db42477552ce922b6570c74883c9c258ecf6d17` | `63f0d5b40a7ecef3b3e78e274a0dbd15a94e905c9a4210a070f689ed6bf128e2` |
+| Candidate object hash | `3e64eeb126d38140b1a80a2f6bc71e250155bb771a08ec12dd3ce4970e7e0f46` | `47ed32d69955162fbb66f0d23099260b65e70017d3606aa65b65d6eb226f9a7f` |
+| Candidate receipt hash | `861f8e782575c0d7d4df9f5dbd6a37324145d98b0bff2dcd6a865a12fe96a404` | `06fa179e5d4b4b977bf0f3e4bc1bf94b5eab6f83dadd5800480bd2f71cfec0bd` |
+| Compiler | `phorc 0.1.0` | `phorc 0.1.0` |
 | Replay residual | `c5a4a2b88a72e56c3a7ea6d1a248723a337a38cca9f001e50f868e37abaed349` | `98843827cbbf97866221127651840eaaee6dbb17dc1bf3e0053476ce30a8290d` |
 | Promotion | ✅ → `sealed` | ✅ → `sealed` |
 | Sealed package | `native:libc:toupper:c-locale:u8:v1` | `native:libc:memcmp:c-locale:sign:v1` |
@@ -104,12 +107,21 @@ GUI compositor → window manager → surface management → inspector
 Shared properties (both targets):
 | Aspect | Result |
 |--------|--------|
+| Compiled candidate authority | ✅ candidate.o is the promoted implementation; object + receipt hashes bound |
+| Independent recompilation | ✅ verifier recompiles the `.phor` source; object/receipt hashes MATCH the seal |
 | Determinism court | ✅ two fresh runs byte-identical (6/6 artifacts) |
 | Committed-evidence court | ✅ `--check-committed`: fresh run == checked-in evidence (6/6) |
-| Cross-environment | ✅ committed evidence matches a fresh container run (6/6) |
+| Cross-environment | ✅ committed evidence matches a fresh container run (6/6), incl. object hashes |
 | Tamper detection | ✅ editing the `.phor` candidate invalidates the seal; locale is hash-covered |
 | Capability gating | ✅ `PORTING` required to observe and to promote |
-| Fail-closed candidate | ✅ unknown target id → `UnsupportedTarget`; malformed args → `MalformedArgs`; never identity |
+| Fail-closed candidate | ✅ unknown target id → `UnsupportedTarget`; malformed args → `MalformedArgs`; missing object/receipt hash blocks promotion |
+
+Compiled candidate: the court invokes `phorc` on the target's `.phor` source (from
+the workspace root, with the repo-relative path so the ELF `FILE` symbol is
+environment-independent), then binds SHA-256 of the emitted ELF64 object and of
+its receipt file. To make this possible, `phorc` register allocation was made
+deterministic (it iterated a `HashMap`; now a `BTreeMap`), so object bytes are
+reproducible across runs and environments.
 
 `memcmp` corpus axes: lengths `0..=8`; patterns zero/ones/ascending/descending/
 alternating; every first-mismatch position with both orderings; the `n`-boundary
@@ -117,7 +129,7 @@ around a mismatch (`n = j` excludes it, `n = j+1` includes it); and the unsigned
 edge bytes `00/01/7f/80/fe/ff`. Every case satisfies `n <= min(len(a), len(b))`.
 
 ### Test Results (reproduced on `main`)
-- phost: 91 passed, 0 failed, 4 ignored (95 total). The ignored tests read
+- phost: 97 passed, 0 failed, 4 ignored (101 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 43/43 passed (0 warnings).

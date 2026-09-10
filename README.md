@@ -117,10 +117,17 @@ cargo run -p phost -- port promote memcmp
 ```
 
 Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
-the **locale contract** (`C`), the **candidate behavior hash**, and the
-**clean-room candidate source hash** — so a locale change or an edited `.phor`
-candidate invalidates the seal. Evidence is committed under
-`phost/evidence/porting/{toupper,memcmp}/`.
+the **locale contract** (`C`), the **candidate behavior hash**, and the compiled
+candidate artifacts — **source hash**, **ELF64 object hash**, **receipt hash**,
+and **compiler version**. So a locale change, an edited `.phor` candidate, or a
+recompiled object invalidates the seal.
+
+The **compiled `.phor` object is the authoritative promoted implementation**: the
+court invokes `phorc` on the target's `.phor` source, hashes the emitted object
+and its receipt file, and the verifier independently recompiles and confirms both
+hashes match the committed seal (`Compiled object: MATCH`). Evidence is committed
+under `phost/evidence/porting/{toupper,memcmp}/`; the compiled `candidate.o` and
+`candidate.receipts.json` are regenerated, not committed.
 
 The verifier has two courts: the default regenerates the evidence twice and
 requires byte-identical runs; `--check-committed` writes only to a temp dir and
@@ -157,7 +164,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **43 / 43 pass** |
-| `cargo test` (phost) | **91 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **97 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (46), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -165,7 +172,8 @@ All numbers below were reproduced on a clean checkout.
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
-| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, hashes MATCH, source bound, promotion `Sealed` |
+| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
+| Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 
 ### Known gaps

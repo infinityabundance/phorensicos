@@ -85,7 +85,7 @@ fn local_mem_addr(idx: usize) -> MemoryOperand {
         Register::None,
     )
 }
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // Helper to unwrap Instruction::with* Result
 macro_rules! i0 {
@@ -235,10 +235,14 @@ const ARG_REGS: &[Register] = &[
 ];
 
 struct RegAlloc {
-    map: HashMap<String, Register>,
+    // BTreeMap (not HashMap): register allocation must be deterministic, and
+    // both the low register pool (`free`) and spill slots are assigned in
+    // iteration order. HashMap iteration order is not stable across runs, which
+    // made emitted object bytes non-reproducible.
+    map: BTreeMap<String, Register>,
     free: Vec<Register>,
     spill_next: i32,
-    spills: HashMap<String, i32>,
+    spills: BTreeMap<String, i32>,
 }
 
 impl RegAlloc {
@@ -246,10 +250,10 @@ impl RegAlloc {
         let mut free = GP_REGS.to_vec();
         free.reverse();
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
             free,
             spill_next: -8,
-            spills: HashMap::new(),
+            spills: BTreeMap::new(),
         }
     }
 

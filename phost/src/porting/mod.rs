@@ -3,9 +3,9 @@
 // Observe a foreign API surface as a black box through a dialect cage, seal the
 // observed behavior as oracle traces, replay a clean-room native candidate
 // against those traces, and promote the candidate to `sealed` only when every
-// case matches exactly.
+// case matches exactly and the compiled candidate artifact is bound.
 //
-// Scope: **API-surface** porting (byte-in/byte-out functions such as `toupper`).
+// Scope: **API-surface** porting (byte-in/byte-out and small buffer functions).
 // This is NOT arbitrary binary translation. The cage observes a foreign
 // implementation; it does not copy it.
 //
@@ -20,6 +20,7 @@
 //   replay + comparison         → replay_verdict.json
 //   promotion                   → promotion_receipt.json
 //   sealed package              → sealed_package.json
+//   compiled candidate          → candidate.o + candidate.receipts.json (hashed)
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -30,6 +31,7 @@ use crate::kernel::CapabilitySet;
 
 pub mod behavior_signature;
 pub mod candidate;
+pub mod compiled;
 pub mod dialect_cage;
 pub mod evidence;
 pub mod oracle_trace;
@@ -38,7 +40,7 @@ pub mod replay_court;
 pub mod target;
 
 pub use behavior_signature::BehaviorSignature;
-pub use candidate::CandidateSignature;
+pub use candidate::{CandidateArtifacts, CandidateSignature};
 pub use oracle_trace::OracleTrace;
 pub use promotion::{PromotionError, PromotionEvidence, PromotionReceipt, TrustState};
 pub use replay_court::{CourtVerdict, Mismatch, ReplayVerdict};
@@ -80,6 +82,8 @@ pub enum PortError {
     UnknownTarget(String),
     /// The dialect cage cannot observe this symbol.
     UnsupportedTarget(String),
+    /// Compiling the clean-room candidate failed.
+    Compile(String),
     /// Evidence I/O failed (the court never proceeds on I/O error).
     Io(String),
     /// Promotion was refused by the court.
@@ -92,6 +96,7 @@ impl fmt::Display for PortError {
             PortError::CapabilityDenied => write!(f, "capability denied: PORTING required"),
             PortError::UnknownTarget(t) => write!(f, "unknown port target: {}", t),
             PortError::UnsupportedTarget(t) => write!(f, "target not observable by cage: {}", t),
+            PortError::Compile(m) => write!(f, "candidate compilation failed: {}", m),
             PortError::Io(m) => write!(f, "evidence I/O error: {}", m),
             PortError::PromotionRefused(e) => write!(f, "promotion refused: {}", e.as_str()),
         }
@@ -144,6 +149,8 @@ impl PortingAuthority {
 
 /// A sealed port entry — the artifact a promoted native implementation leaves in
 /// the store. Lookups are gated: without `PORTING` the entry is invisible.
+///
+/// The entry points at the *compiled* candidate object, not just the Rust mirror.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedPortEntry {
     pub target: String,
@@ -151,6 +158,9 @@ pub struct SealedPortEntry {
     pub oracle_hash: String,
     pub candidate_behavior_hash: String,
     pub candidate_source_hash: String,
+    pub candidate_object_hash: String,
+    /// Path to the compiled ELF64 object that is the authoritative implementation.
+    pub candidate_object_path: String,
     pub sealed_package: String,
 }
 
@@ -182,6 +192,18 @@ impl SealedPortIndex {
             return None;
         }
         self.lookup(target)
+    }
+
+    /// The compiled artifact the runtime would prefer, if sealed and authorized.
+    pub fn native_artifact(&self, target: &str, auth: &PortingAuthority) -> Option<(&str, &str)> {
+        self.lookup_gated(target, auth)
+            .filter(|e| e.trust == TrustState::Sealed)
+            .map(|e| {
+                (
+                    e.candidate_object_path.as_str(),
+                    e.candidate_object_hash.as_str(),
+                )
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -230,6 +252,10 @@ pub struct PortCourtReport {
     pub oracle_hash: String,
     pub candidate_behavior_hash: String,
     pub candidate_source_hash: String,
+    pub candidate_object_hash: String,
+    pub candidate_receipt_hash: String,
+    pub compiler_version: String,
+    pub candidate_object_path: String,
     pub verdict: String,
     pub promotion: String,
     pub sealed_package: String,
@@ -251,14 +277,15 @@ pub fn observe_target(
 /// pure black-box observation, and every hash is SHA-256 over a stable
 /// canonical encoding. No wall-clock value participates in the verdict.
 ///
-/// `candidate_source_hash` binds the clean-room candidate source into the seal;
-/// an empty value blocks promotion (fail closed).
+/// From `Replay` depth up, the clean-room candidate is *compiled* with `phorc`
+/// and its object/receipt hashes are bound into the signature and seal. A
+/// missing artifact blocks promotion (fail closed).
 pub fn run_port_court(
     symbol: &str,
     auth: &PortingAuthority,
     out_dir: &str,
     depth: PortDepth,
-    candidate_source_hash: &str,
+    phorc: Option<&str>,
 ) -> Result<PortCourtReport, PortError> {
     // Capability gate: observation requires PORTING.
     if !auth.can_observe() {
@@ -268,22 +295,40 @@ pub fn run_port_court(
     let target =
         resolve_target(symbol).ok_or_else(|| PortError::UnknownTarget(symbol.to_string()))?;
 
-    // 1. The target's deterministic case set (exhaustive byte domain for
-    //    byte-in/byte-out targets; bounded corpus for memcmp).
+    // 1. The target's deterministic case set.
     let cases = target::cases_for(&target);
 
     // 2. Observe foreign behavior through the cage.
     let traces = observe_target(&target, &cases, auth)?;
 
-    // 3. Seal the observed behavior as a behavior signature, and the candidate
-    //    residual (behavior + source binding) for the same cases.
+    // 3. Seal the observed behavior as a behavior signature.
     let signature = BehaviorSignature::from_traces(&target, &traces);
-    let candidate_sig = CandidateSignature::from_traces(&target, &traces, candidate_source_hash);
 
     // 4. Replay + compare (fail closed).
     let (verdict, mismatches) = replay_court::run_replay_court(&traces);
 
-    // 5. Promote only on a consistent verdict with a complete evidence set.
+    // 5. Compiled candidate authority: compile the clean-room `.phor` candidate
+    //    and hash the emitted object and receipts (from Replay depth up).
+    let compiled = if depth == PortDepth::Observe {
+        None
+    } else {
+        Some(
+            compiled::compile_candidate(&target, out_dir, phorc)
+                .map_err(|e| PortError::Compile(e.message()))?,
+        )
+    };
+    let artifacts = match &compiled {
+        Some(c) => c.artifacts(),
+        None => CandidateArtifacts {
+            source_hash: String::new(),
+            object_hash: String::new(),
+            receipt_hash: String::new(),
+            compiler_version: String::new(),
+        },
+    };
+    let candidate_sig = CandidateSignature::from_traces(&target, &traces, &artifacts);
+
+    // 6. Promote only on a consistent verdict with a complete evidence set.
     let mut receipt: Option<PromotionReceipt> = None;
     let mut promotion_json: Option<String> = None;
     let mut sealed_json: Option<String> = None;
@@ -294,20 +339,14 @@ pub fn run_port_court(
             sealed_package_written: true,
             replay_residual_written: true,
         };
-        let r = promotion::promote(
-            &target,
-            &verdict,
-            candidate_source_hash,
-            &promotion_evidence,
-            auth,
-        )
-        .map_err(PortError::PromotionRefused)?;
+        let r = promotion::promote(&target, &verdict, &artifacts, &promotion_evidence, auth)
+            .map_err(PortError::PromotionRefused)?;
         promotion_json = Some(r.to_json());
         sealed_json = Some(sealed);
         receipt = Some(r);
     }
 
-    // 6. Write the evidence set (deterministic; the raw court is reproducible).
+    // 7. Write the evidence set (deterministic; the raw court is reproducible).
     let paths = evidence::write_evidence_set(
         out_dir,
         &target,
@@ -343,7 +382,14 @@ pub fn run_port_court(
         failed: verdict.cases_failed,
         oracle_hash: verdict.oracle_hash.clone(),
         candidate_behavior_hash: verdict.candidate_behavior_hash.clone(),
-        candidate_source_hash: candidate_source_hash.to_string(),
+        candidate_source_hash: artifacts.source_hash.clone(),
+        candidate_object_hash: artifacts.object_hash.clone(),
+        candidate_receipt_hash: artifacts.receipt_hash.clone(),
+        compiler_version: artifacts.compiler_version.clone(),
+        candidate_object_path: compiled
+            .as_ref()
+            .map(|c| c.object_path.clone())
+            .unwrap_or_default(),
         verdict: verdict.verdict.as_str().to_string(),
         promotion: promotion_label,
         sealed_package: paths.sealed_package.clone(),
@@ -370,7 +416,6 @@ mod tests {
         assert_eq!(cases[0].args, vec![vec![0u8]]);
         assert_eq!(cases[255].case_id, "0xff");
         assert_eq!(cases[255].args, vec![vec![255u8]]);
-        // Ordering is strictly increasing and stable.
         for (i, c) in cases.iter().enumerate() {
             assert_eq!(c.args[0][0] as usize, i);
         }
@@ -382,8 +427,10 @@ mod tests {
         let cases = target::byte_domain_cases();
         let denied = dialect_cage::observe_target(&target, &cases, &PortingAuthority::none());
         assert_eq!(denied, Err(PortError::CapabilityDenied));
+    }
 
-        // Sealed store lookup is also invisible without the capability.
+    #[test]
+    fn test_sealed_index_is_gated_and_points_at_compiled_artifact() {
         let mut index = SealedPortIndex::new();
         index.insert(SealedPortEntry {
             target: "libc:toupper:c-locale:u8:v1".to_string(),
@@ -391,13 +438,24 @@ mod tests {
             oracle_hash: "aa".to_string(),
             candidate_behavior_hash: "bb".to_string(),
             candidate_source_hash: "cc".to_string(),
+            candidate_object_hash: "dd".to_string(),
+            candidate_object_path: "phost/evidence/porting/toupper/candidate.o".to_string(),
             sealed_package: "sealed_package.json".to_string(),
         });
         let id = "libc:toupper:c-locale:u8:v1";
+
+        // No ambient authority: invisible without PORTING.
         assert!(index.lookup_gated(id, &PortingAuthority::none()).is_none());
         assert!(index
-            .lookup_gated(id, &PortingAuthority::granted())
-            .is_some());
+            .native_artifact(id, &PortingAuthority::none())
+            .is_none());
+
+        // With authority, the runtime artifact is the compiled object.
+        let (path, hash) = index
+            .native_artifact(id, &PortingAuthority::granted())
+            .unwrap();
+        assert!(path.ends_with("candidate.o"));
+        assert_eq!(hash, "dd");
     }
 
     #[test]

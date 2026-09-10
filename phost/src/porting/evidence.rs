@@ -43,7 +43,8 @@ pub fn hash_file(path: &str) -> io::Result<String> {
 /// The sealed package residual: what a promoted native implementation publishes.
 ///
 /// It binds the qualified target id, the locale contract, the candidate's
-/// behavior hash, and the clean-room source hash — not just a symbol name.
+/// behavior hash, and the compiled candidate artifacts (source, ELF64 object,
+/// receipts) plus the compiler that produced them.
 pub fn sealed_package_json(
     target: &PortTarget,
     verdict: &ReplayVerdict,
@@ -51,7 +52,7 @@ pub fn sealed_package_json(
     candidate: &CandidateSignature,
 ) -> String {
     format!(
-        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
+        "{{\n  \"schema\": \"phorensic.porting.sealed_package.v1\",\n  \"package\": \"native:{id}\",\n  \"target\": \"{id}\",\n  \"dialect\": \"{dialect}\",\n  \"symbol\": \"{symbol}\",\n  \"version\": \"{version}\",\n  \"locale_contract\": \"{locale}\",\n  \"trust\": \"sealed\",\n  \"court_verdict\": \"{verdict}\",\n  \"case_count\": {cases},\n  \"oracle_hash\": \"{oracle}\",\n  \"candidate_behavior_hash\": \"{behavior}\",\n  \"candidate_source_hash\": \"{source}\",\n  \"candidate_object_hash\": \"{object}\",\n  \"candidate_receipt_hash\": \"{receipt}\",\n  \"compiler_version\": \"{compiler}\",\n  \"native_symbol\": \"{native_symbol}\",\n  \"sealed_by\": \"phorensic:porting-court:v1\"\n}}\n",
         id = json_escape(target.id),
         dialect = json_escape(target.dialect),
         symbol = json_escape(target.symbol),
@@ -62,6 +63,9 @@ pub fn sealed_package_json(
         oracle = verdict.oracle_hash,
         behavior = candidate.candidate_behavior_hash,
         source = candidate.candidate_source_hash,
+        object = candidate.candidate_object_hash,
+        receipt = candidate.candidate_receipt_hash,
+        compiler = json_escape(&candidate.compiler_version),
         native_symbol = json_escape(&candidate.symbol),
     )
 }

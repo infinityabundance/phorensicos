@@ -14,6 +14,13 @@ use phorc::parse::Parser;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // Compiler provenance for court evidence (`phost port` records this).
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("phorc {}", env!("CARGO_PKG_VERSION"));
+        process::exit(0);
+    }
+
     if args.len() < 2 {
         eprintln!(
             "Usage: phorc <input.ph> [output.o] [--emit-receipts] [--emit-kernel [entry_fn]] [--emit-seal] [--verify-seal <file>] [--court-replay <file>]\n"

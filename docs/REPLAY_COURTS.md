@@ -406,12 +406,34 @@ mutation of a covered field changes the behavior signature.
   candidate source hash, and the sealed package + replay residual written.
   Promotion also requires the `PORTING` capability.
 
+### Compiled candidate authority
+
+The promoted implementation is the **compiled** clean-room candidate, not just a
+Rust mirror of it:
+
+1. the court invokes `phorc` on the target's `.phor` source;
+2. it hashes the emitted ELF64 object (`candidate.o`) and its receipt file
+   (`candidate.receipts.json`);
+3. it records the compiler provenance (`phorc 0.1.0`);
+4. the candidate signature, promotion receipt and sealed package bind
+   `candidate_source_hash`, `candidate_object_hash`, `candidate_receipt_hash`
+   and `compiler_version`;
+5. promotion requires all three hashes (a missing one fails closed);
+6. the verifier independently recompiles the source and confirms the object and
+   receipt hashes match the committed seal.
+
+Compilation runs from the workspace root with the repo-relative source path, so
+the ELF `FILE` symbol is environment-independent and the object hash is stable
+across hosts and containers. (This required making `phorc` register allocation
+deterministic.)
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
-candidate's **behavior** hash (its outputs over the case domain), and the
-clean-room **source** hash. A future stage adds an emitted-object hash once the
-compiled `.phor` candidate is authoritative.
+candidate's **behavior** hash (its outputs over the case domain), and the compiled
+artifacts: the clean-room **source** hash, the ELF64 **object** hash, the
+**receipt** hash, and the **compiler version**. The sealed store entry points at
+the compiled object (`candidate.o`), which is the authoritative implementation.
 
 ### Capability gating
 
@@ -428,13 +450,17 @@ revealed.
 ```text
 phost/src/porting/                target, dialect_cage, oracle_trace,
                                   behavior_signature, candidate, replay_court,
-                                  promotion, evidence
+                                  promotion, evidence, compiled
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
-phost/evidence/porting/toupper/   toupper evidence set (256 cases)
-phost/evidence/porting/memcmp/    memcmp evidence set (312 cases)
+phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
+phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
 verify_jit_porting_court.sh       court verifier (--target toupper|memcmp)
 ```
+
+The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are
+not committed); only their hashes are sealed. The promoted artifact is the
+compiled object, not the Rust mirror.
 
 Reproduce:
 

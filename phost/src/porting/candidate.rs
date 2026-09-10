@@ -139,12 +139,25 @@ pub fn candidate_behavior_hash(traces: &[OracleTrace]) -> String {
     sha256_hex(buf.as_bytes())
 }
 
+/// The compiled-candidate hashes bound into the seal.
+///
+/// Produced by `porting::compiled::compile_candidate`; kept as a plain value so
+/// the pure-logic modules (candidate, promotion) do not depend on the compiler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateArtifacts {
+    pub source_hash: String,
+    pub object_hash: String,
+    pub receipt_hash: String,
+    pub compiler_version: String,
+}
+
 /// A native candidate, described as a residual.
 ///
 /// `candidate_behavior_hash` covers the candidate's *behavior* over the case
-/// domain. `candidate_source_hash` binds the clean-room `.phor` source. An
-/// emitted-object hash will be added once the compiled `.phor` candidate is
-/// authoritative.
+/// domain. `candidate_source_hash`, `candidate_object_hash` and
+/// `candidate_receipt_hash` bind the clean-room `.phor` source, the ELF64 object
+/// `phorc` emits from it, and that object's receipt file. The compiled `.phor`
+/// object is the authoritative promoted implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateSignature {
     pub target: String,
@@ -152,6 +165,9 @@ pub struct CandidateSignature {
     pub case_count: u64,
     pub candidate_behavior_hash: String,
     pub candidate_source_hash: String,
+    pub candidate_object_hash: String,
+    pub candidate_receipt_hash: String,
+    pub compiler_version: String,
     pub source: String,
 }
 
@@ -159,14 +175,17 @@ impl CandidateSignature {
     pub fn from_traces(
         target: &PortTarget,
         traces: &[OracleTrace],
-        candidate_source_hash: &str,
+        artifacts: &CandidateArtifacts,
     ) -> Self {
         Self {
             target: target.id.to_string(),
             symbol: format!("phor_{}", target.symbol),
             case_count: traces.len() as u64,
             candidate_behavior_hash: candidate_behavior_hash(traces),
-            candidate_source_hash: candidate_source_hash.to_string(),
+            candidate_source_hash: artifacts.source_hash.clone(),
+            candidate_object_hash: artifacts.object_hash.clone(),
+            candidate_receipt_hash: artifacts.receipt_hash.clone(),
+            compiler_version: artifacts.compiler_version.clone(),
             source: format!(
                 "clean-room native (phost::porting::candidate + {})",
                 target.candidate_source
@@ -176,12 +195,15 @@ impl CandidateSignature {
 
     pub fn canonical(&self) -> String {
         format!(
-            "target={};symbol={};case_count={};candidate_behavior_hash={};candidate_source_hash={};source={}",
+            "target={};symbol={};case_count={};candidate_behavior_hash={};candidate_source_hash={};candidate_object_hash={};candidate_receipt_hash={};compiler_version={};source={}",
             self.target,
             self.symbol,
             self.case_count,
             self.candidate_behavior_hash,
             self.candidate_source_hash,
+            self.candidate_object_hash,
+            self.candidate_receipt_hash,
+            self.compiler_version,
             self.source
         )
     }
@@ -192,12 +214,15 @@ impl CandidateSignature {
 
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"schema\": \"phorensic.porting.candidate_signature.v1\",\n  \"target\": \"{}\",\n  \"symbol\": \"{}\",\n  \"case_count\": {},\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"source\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": \"phorensic.porting.candidate_signature.v1\",\n  \"target\": \"{}\",\n  \"symbol\": \"{}\",\n  \"case_count\": {},\n  \"candidate_behavior_hash\": \"{}\",\n  \"candidate_source_hash\": \"{}\",\n  \"candidate_object_hash\": \"{}\",\n  \"candidate_receipt_hash\": \"{}\",\n  \"compiler_version\": \"{}\",\n  \"source\": \"{}\",\n  \"residual_hash\": \"{}\"\n}}\n",
             json_escape(&self.target),
             json_escape(&self.symbol),
             self.case_count,
             self.candidate_behavior_hash,
             self.candidate_source_hash,
+            self.candidate_object_hash,
+            self.candidate_receipt_hash,
+            json_escape(&self.compiler_version),
             json_escape(&self.source),
             self.residual_hash()
         )
@@ -270,8 +295,17 @@ mod tests {
         }
     }
 
+    fn dummy_artifacts() -> CandidateArtifacts {
+        CandidateArtifacts {
+            source_hash: "sourcehash".to_string(),
+            object_hash: "objecthash".to_string(),
+            receipt_hash: "receipthash".to_string(),
+            compiler_version: "phorc 0.1.0".to_string(),
+        }
+    }
+
     #[test]
-    fn test_candidate_source_binding() {
+    fn test_candidate_source_object_receipt_binding() {
         let target = LIBC_MEMCMP;
         let traces = memcmp_corpus()
             .iter()
@@ -280,11 +314,15 @@ mod tests {
                 OracleTrace::new(&target, &c.case_id, &c.args, &out, "ok", &["compute"])
             })
             .collect::<Vec<_>>();
-        let sig = CandidateSignature::from_traces(&target, &traces, "sourcehash");
+        let sig = CandidateSignature::from_traces(&target, &traces, &dummy_artifacts());
         assert_eq!(sig.symbol, "phor_memcmp");
         assert_eq!(sig.target, "libc:memcmp:c-locale:sign:v1");
         assert_eq!(sig.case_count, 312);
         assert_eq!(sig.candidate_source_hash, "sourcehash");
+        assert_eq!(sig.candidate_object_hash, "objecthash");
+        assert_eq!(sig.candidate_receipt_hash, "receipthash");
+        assert_eq!(sig.compiler_version, "phorc 0.1.0");
         assert!(!sig.candidate_behavior_hash.is_empty());
+        assert!(sig.to_json().contains("candidate_object_hash"));
     }
 }
