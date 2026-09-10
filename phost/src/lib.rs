@@ -52,3 +52,9 @@ pub mod status_screen;
 pub mod loader;
 #[cfg(feature = "std")]
 pub mod phorc_bridge;
+// JIT-Porting Court — observes foreign API behavior through a dialect cage,
+// replays a clean-room native candidate against sealed oracle traces, and
+// promotes only on exact, evidence-backed equivalence. std-only: observation
+// needs the foreign runtime, and the court writes evidence artifacts.
+#[cfg(feature = "std")]
+pub mod porting;

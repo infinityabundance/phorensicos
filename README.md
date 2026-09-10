@@ -82,6 +82,53 @@ stay gitignored.
 > `x86_64-unknown-none`, so it is excluded from the default workspace build. Use
 > `build_kernel.sh` (it sets the target via `phost_kernel/.cargo/config.toml`).
 
+## JIT-Porting Court
+
+Phorensic OS ports *behavior*, not binaries. The first court target is libc
+`toupper`, ported at the API boundary:
+
+```text
+foreign behavior → dialect cage       (observe libc toupper as a black box)
+                 → oracle traces      (256 sealed cases, 0x00..0xff)
+                 → behavior signature (combined SHA-256 oracle hash)
+                 → native candidate   (clean-room phor_toupper)
+                 → replay court       (replay all 256 cases)
+                 → comparison         (exact output / status / effects)
+                 → promotion          (only on an exact match)
+                 → sealed package     (native:libc:toupper)
+```
+
+```sh
+cargo run -p phost -- port promote toupper   # observe → replay → promote
+./verify_jit_porting_court.sh                # 256/256, hashes MATCH, Sealed
+```
+
+Verified: **256 observed, 256 replayed, 256 passed, 0 failed**, oracle and
+candidate hashes MATCH, promotion `Sealed`. The evidence set is committed under
+`phost/evidence/porting/toupper/`.
+
+This is **API-surface** JIT-porting (byte-in/byte-out functions), not arbitrary
+binary translation — eager JIT of arbitrary foreign binaries is a later phase.
+See `docs/REPLAY_COURTS.md` and `docs/PHORENSIC_OS.md`.
+
+## Reproducible runs with Docker
+
+Two minimal, resource-capped containers (QEMU boots inside the kernel one):
+
+```sh
+docker compose run --rm host     # cargo test + the JIT-porting court verifier
+docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
+docker compose up --build        # both, one shot
+```
+
+`host` runs the compiler/runtime tests and the court verifier. `kernel` builds the
+Multiboot kernel, boots it under QEMU, verifies the boot evidence (13 checks) and
+checks the boot evidence is byte-reproducible against the committed
+`phost_kernel/evidence_manifest.json`. Boot evidence is byte-identical across
+hosts and containers; kernel *image* bytes additionally depend on the linker
+toolchain (`nasm`/`ld.lld`/binutils), which the pinned `docker/Dockerfile.*`
+images record.
+
 ## Current status
 
 All numbers below were reproduced on a clean checkout.
@@ -89,14 +136,16 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **43 / 43 pass** |
-| `cargo test` (phost) | **57 pass, 0 fail, 4 ignored** (ignored: privileged CR0/CR2/CR3/CR4 reads that require ring 0) |
-| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (44), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
+| `cargo test` (phost) | **77 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (45), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
 | Court replay | 6 / 6 phases **PASS**, verdict `consistent` |
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
-| Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass** (proof bytes, ABI at `0x300000`, screendump palette, LFB content); manifest committed |
+| Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
+| JIT-porting court | `toupper`: **256 observed / 256 replayed / 256 passed / 0 failed**, hashes MATCH, promotion `Sealed` |
+| Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the court, and the QEMU boot |
 
 ### Known gaps
 
@@ -110,6 +159,11 @@ All numbers below were reproduced on a clean checkout.
   the interactive shell/presentation loop is future work.
 - **`.phor` ↔ Rust convergence.** Drivers/compositor exist both as `.phor`
   sources and as `phost` Rust modules; unifying them is in progress.
+- **Porting scope.** The JIT-porting court covers API-surface (byte-in/byte-out)
+  targets only; arbitrary binary translation is not implemented.
+- **Kernel image bytes.** Boot evidence is byte-reproducible, but kernel image
+  bytes depend on the linker toolchain; cross-toolchain bit-reproducibility is
+  not yet asserted.
 
 ## Documentation
 
@@ -117,6 +171,7 @@ All numbers below were reproduced on a clean checkout.
 - `docs/PHORENSIC_COMPILER.md` — pipeline and artifact tiers.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.
+- `docker-compose.yml`, `docker/` — reproducible host + kernel containers.
 - `docs/REVIEWER_PROTOCOL.md` — how to review claims in this repo.
 - `VERIFICATION_REPORT.md` — detailed build/boot verification notes.
 

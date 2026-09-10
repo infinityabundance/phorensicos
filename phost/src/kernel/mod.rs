@@ -162,6 +162,10 @@ impl CapabilitySet {
     pub const ROLLBACK: u64 = 1 << 13;
     pub const IO_PORT: u64 = 1 << 14;
     pub const IRQ_LINE: u64 = 1 << 15;
+    /// Authority to observe a foreign API surface through a dialect cage and to
+    /// promote a verified native candidate to sealed. Porting has no ambient
+    /// authority: both observation and promotion require this bit.
+    pub const PORTING: u64 = 1 << 16;
 
     pub const fn empty() -> Self {
         Self { bits: 0 }

@@ -319,3 +319,83 @@ session.close()?
 let obj = store.resolve("editor.phor-spec-key")
 assert(obj.trust_state == TrustState::Promoted)
 ```
+
+## JIT-Porting Court (first implementation)
+
+The first concrete replay court is the **JIT-Porting Court**. It observes a
+foreign API surface as a black box, seals the observed behavior as oracle
+traces, replays a clean-room native candidate against them, and promotes the
+candidate only on exact, evidence-backed equivalence.
+
+This is **API-surface** porting (byte-in/byte-out functions such as `toupper`),
+not arbitrary binary translation.
+
+### Flow
+
+```text
+foreign behavior → dialect cage → oracle traces → behavior signature
+→ native candidate → replay court → comparison → promotion → sealed package
+```
+
+### First target: libc `toupper`
+
+```text
+dialect: libc   symbol: toupper   version: host-observed-v1
+domain:  exhaustive 0x00..=0xff (256 cases, in order)
+```
+
+The dialect cage calls the foreign `toupper` through a single narrow FFI shim and
+records input/output/status/effects — it never reads or copies foreign source.
+The native candidate is a clean-room `phor_toupper` (ASCII `a`..`z` fold).
+
+### Mapping to court concepts
+
+| Court concept | Artifact |
+|---------------|----------|
+| Observation / oracle traces | `oracle_traces.json` |
+| Behavior signature | `behavior_signature.json` |
+| Candidate residual | `candidate_signature.json` |
+| Comparison / replay residual | `replay_verdict.json` |
+| Promotion residual | `promotion_receipt.json` |
+| Sealed package | `sealed_package.json` |
+
+Each artifact carries a `residual_hash` (SHA-256 over its canonical encoding).
+The combined oracle hash binds to the full canonical trace content, so any
+mutation of a covered field changes the behavior signature.
+
+### Verdict and promotion rules
+
+- The verdict derives from exact case comparisons, never from receipt counts.
+- An empty case set is `inconclusive`; any mismatch is `inconsistent`; the court
+  fails closed on both.
+- Promotion to `sealed` requires: a non-empty full replay, zero failures, a
+  consistent verdict, both hashes present, and the sealed package + replay
+  residual written. Promotion also requires the `PORTING` capability.
+
+### Capability gating
+
+`PORTING` (capability bit 16) gates both ends:
+
+- observation of foreign behavior (no ambient authority to observe), and
+- promotion of a native candidate (no ambient authority to seal).
+
+Sealed store lookups are gated: without `PORTING`, sealed port entries are not
+revealed.
+
+### Where it lives
+
+```text
+phost/src/porting/              target, dialect_cage, oracle_trace,
+                                behavior_signature, candidate, replay_court,
+                                promotion, evidence
+examples/jit_port_toupper.phor  native candidate, expressed in Phorensic
+phost/evidence/porting/toupper/ committed evidence set
+verify_jit_porting_court.sh     court verifier
+```
+
+Reproduce:
+
+```sh
+cargo run -p phost -- port promote toupper
+./verify_jit_porting_court.sh
+```

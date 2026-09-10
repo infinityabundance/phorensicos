@@ -2,9 +2,9 @@
 // Provides a command-line interface rendered on the text console.
 // Polls the PS/2 keyboard driver for real input and processes commands.
 
-use alloc::vec::Vec;
 use crate::console::Console;
 use crate::input::KEYBOARD;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 /// The Phorensic OS boot-time shell.
@@ -125,6 +125,10 @@ impl Shell {
             "store" => {
                 self.cmd_store(args);
             }
+            #[cfg(feature = "std")]
+            "port" => {
+                self.cmd_port(args);
+            }
             "shutdown" | "exit" => {
                 let _ = writeln!(self.console, "Shutting down...");
                 return false;
@@ -169,6 +173,11 @@ impl Shell {
         let _ = writeln!(
             self.console,
             "  phor      - Run a .phor program through the compositor bridge"
+        );
+        #[cfg(feature = "std")]
+        let _ = writeln!(
+            self.console,
+            "  port      - Run the JIT-porting court (port promote toupper)"
         );
         let _ = writeln!(
             self.console,
@@ -441,7 +450,10 @@ impl Shell {
     #[cfg(not(feature = "std"))]
     fn cmd_compile(&mut self, _args: &str) {
         self.console.set_fg(0xCC, 0xCC, 0xCC);
-        let _ = writeln!(self.console, "compile: not available in kernel runtime (requires filesystem + phorc binary)");
+        let _ = writeln!(
+            self.console,
+            "compile: not available in kernel runtime (requires filesystem + phorc binary)"
+        );
     }
 
     fn cmd_test(&mut self) {
@@ -511,7 +523,10 @@ impl Shell {
     #[cfg(not(feature = "std"))]
     fn cmd_run(&mut self, _args: &str) {
         self.console.set_fg(0xCC, 0xCC, 0xCC);
-        let _ = writeln!(self.console, "run: not available in kernel runtime (requires filesystem-backed program loader)");
+        let _ = writeln!(
+            self.console,
+            "run: not available in kernel runtime (requires filesystem-backed program loader)"
+        );
     }
 
     fn cmd_gui(&mut self) {
@@ -632,7 +647,10 @@ impl Shell {
     #[cfg(not(feature = "std"))]
     fn cmd_dispatch(&mut self, _args: &str) {
         self.console.set_fg(0xCC, 0xCC, 0xCC);
-        let _ = writeln!(self.console, "dispatch: not available in kernel runtime (requires program loader)");
+        let _ = writeln!(
+            self.console,
+            "dispatch: not available in kernel runtime (requires program loader)"
+        );
     }
 
     fn cmd_phor(&mut self, args: &str) {
@@ -780,7 +798,10 @@ impl Shell {
     #[cfg(not(feature = "std"))]
     fn cmd_call(&mut self, _args: &str) {
         self.console.set_fg(0xCC, 0xCC, 0xCC);
-        let _ = writeln!(self.console, "call: not available in kernel runtime (requires program loader)");
+        let _ = writeln!(
+            self.console,
+            "call: not available in kernel runtime (requires program loader)"
+        );
     }
 
     #[cfg(feature = "std")]
@@ -794,8 +815,14 @@ impl Shell {
 
         let store = SealedStore::new();
         // Use shell's capabilities (simulated)
-        let caps = CapabilitySet { bits: CapabilitySet::DRIVER_LOAD | CapabilitySet::CONSOLE };
-        let _ = writeln!(self.console, "  Capability: DRIVER_LOAD={}", caps.has(CapabilitySet::DRIVER_LOAD));
+        let caps = CapabilitySet {
+            bits: CapabilitySet::DRIVER_LOAD | CapabilitySet::CONSOLE,
+        };
+        let _ = writeln!(
+            self.console,
+            "  Capability: DRIVER_LOAD={}",
+            caps.has(CapabilitySet::DRIVER_LOAD)
+        );
 
         let query = args.trim();
         if query.is_empty() || query == "--all" {
@@ -811,10 +838,17 @@ impl Shell {
                             1 => "[OBSERVED]",
                             _ => "[UNKNOWN]",
                         };
-                        let _ = writeln!(self.console, "  [{}/{}] {} {} — rcpts:{} trust:{} verdict:{}",
-                            i + 1, store.entry_count,
-                            trust_icon, entry.name_str(),
-                            entry.receipt_count, entry.trust_level, entry.verdict_str());
+                        let _ = writeln!(
+                            self.console,
+                            "  [{}/{}] {} {} — rcpts:{} trust:{} verdict:{}",
+                            i + 1,
+                            store.entry_count,
+                            trust_icon,
+                            entry.name_str(),
+                            entry.receipt_count,
+                            entry.trust_level,
+                            entry.verdict_str()
+                        );
                     }
                 }
             }
@@ -829,17 +863,26 @@ impl Shell {
                     let _ = writeln!(self.console, "  Verdict:  {}", entry.verdict_str());
                 }
                 None => {
-                    let _ = writeln!(self.console, "  Access denied or package not found (need DRIVER_LOAD)");
+                    let _ = writeln!(
+                        self.console,
+                        "  Access denied or package not found (need DRIVER_LOAD)"
+                    );
                 }
             }
         }
-        let _ = writeln!(self.console, "\n  Use 'call <name> <func> [args]' to dispatch");
+        let _ = writeln!(
+            self.console,
+            "\n  Use 'call <name> <func> [args]' to dispatch"
+        );
     }
 
     #[cfg(not(feature = "std"))]
     fn cmd_store(&mut self, _args: &str) {
         self.console.set_fg(0xCC, 0xCC, 0xCC);
-        let _ = writeln!(self.console, "store: not available in kernel runtime (requires sealed package store)");
+        let _ = writeln!(
+            self.console,
+            "store: not available in kernel runtime (requires sealed package store)"
+        );
     }
 
     fn cmd_windows(&mut self) {
@@ -903,12 +946,21 @@ impl Shell {
 
             // Render with z-order compositing through damage
             let damage = compositor.render_damaged(self.console.canvas());
-            let _ = writeln!(self.console, "  Frame {}: {} surfaces, {} damage regions",
-                f, compositor.surface_count(), damage.len());
+            let _ = writeln!(
+                self.console,
+                "  Frame {}: {} surfaces, {} damage regions",
+                f,
+                compositor.surface_count(),
+                damage.len()
+            );
         }
 
         self.console.set_fg(0x00, 0xFF, 0x66);
-        let _ = writeln!(self.console, "  Rendered {} frames with damage-aware compositing", frames);
+        let _ = writeln!(
+            self.console,
+            "  Rendered {} frames with damage-aware compositing",
+            frames
+        );
         self.console.set_fg(0xCC, 0xCC, 0xCC);
         let _ = writeln!(self.console, "  Press ENTER to return to shell...");
     }
@@ -917,6 +969,39 @@ impl Shell {
 
     /// Run the shell main loop.
     ///
+    /// Run the JIT-Porting Court and print the report. The runtime path prefers
+    /// the native candidate only after the court seals it (see docs/PHORENSIC_OS.md).
+    #[cfg(feature = "std")]
+    fn cmd_port(&mut self, args: &str) {
+        use crate::porting::{self, PortDepth, PortingAuthority};
+
+        let mut parts = args.split_whitespace();
+        let stage = parts.next().unwrap_or("promote");
+        let symbol = parts.next().unwrap_or("toupper");
+        let depth = PortDepth::parse(stage).unwrap_or(PortDepth::Promote);
+        let out = alloc::format!("phost/evidence/porting/{}", symbol);
+
+        // Granted PORTING authority; the court fails closed without it.
+        let auth = PortingAuthority::granted();
+
+        let _ = writeln!(self.console, "JIT-porting court: {} {}", stage, symbol);
+        match porting::run_port_court(symbol, &auth, &out, depth) {
+            Ok(r) => {
+                let _ = writeln!(self.console, "  observed:  {}", r.observed_cases);
+                let _ = writeln!(self.console, "  replayed:  {}", r.replay_cases);
+                let _ = writeln!(self.console, "  passed:    {}", r.passed);
+                let _ = writeln!(self.console, "  failed:    {}", r.failed);
+                let _ = writeln!(self.console, "  verdict:   {}", r.verdict);
+                let _ = writeln!(self.console, "  promotion: {}", r.promotion);
+                let _ = writeln!(self.console, "  oracle:    {}", r.oracle_hash);
+                let _ = writeln!(self.console, "  candidate: {}", r.candidate_hash);
+            }
+            Err(e) => {
+                let _ = writeln!(self.console, "  error: {}", e);
+            }
+        }
+    }
+
     /// Polls the PS/2 keyboard driver for real input and processes commands.
     #[allow(static_mut_refs)]
     pub fn run(&mut self) {

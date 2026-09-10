@@ -12,6 +12,14 @@ use phost::shell;
 use phost::status_screen;
 
 fn main() {
+    // JIT-Porting Court CLI:
+    //   phost port <observe|replay|promote|court> <symbol> [--out DIR]
+    // Handled before the boot path so it runs on a plain host process.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "port" {
+        std::process::exit(port_cli(&args[2..]));
+    }
+
     // Try to read boot info from the kernel boot page at 0x108000.
     // The ASM stub writes a compact 5-field framebuffer layout there.
     // If no real boot page is present (e.g., running as a test binary), fall back
@@ -176,5 +184,74 @@ fn main() {
     } else {
         serial::serial_init();
         serial::serial_write_line("Phorensic OS v0.1.0 \u{2014} Headless boot");
+    }
+}
+
+/// JIT-Porting Court CLI.
+///
+/// Usage: `phost port <observe|replay|promote|court> <symbol> [--out DIR]`
+///
+/// `observe` seals oracle traces, `replay` adds the candidate/replay residuals,
+/// and `promote` (alias `court`) writes the full evidence set and seals the
+/// native candidate — but only if every replayed case matched exactly.
+fn port_cli(args: &[String]) -> i32 {
+    use phost::porting::{self, PortDepth, PortingAuthority};
+
+    if args.is_empty() {
+        eprintln!("Usage: phost port <observe|replay|promote|court> <symbol> [--out DIR]");
+        return 2;
+    }
+
+    let stage = args[0].as_str();
+    let depth = match PortDepth::parse(stage) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "unknown port stage: {} (expected observe|replay|promote|court)",
+                stage
+            );
+            return 2;
+        }
+    };
+
+    let symbol = args.get(1).map(|s| s.as_str()).unwrap_or("toupper");
+
+    let mut out = format!("phost/evidence/porting/{}", symbol);
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--out" && i + 1 < args.len() {
+            out = args[i + 1].clone();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    // A granted PORTING capability: there is no ambient authority, and the
+    // court refuses both observation and promotion without it.
+    let auth = PortingAuthority::granted();
+
+    match porting::run_port_court(symbol, &auth, &out, depth) {
+        Ok(r) => {
+            println!("=== JIT-Porting Court: {} ===", r.target);
+            println!("Dialect:        {} ({})", r.dialect, r.version);
+            println!("Observed cases: {}", r.observed_cases);
+            println!("Replay cases:   {}", r.replay_cases);
+            println!("Passed:         {}", r.passed);
+            println!("Failed:         {}", r.failed);
+            println!("Oracle hash:    {}", r.oracle_hash);
+            println!("Candidate hash: {}", r.candidate_hash);
+            println!("Verdict:        {}", r.verdict);
+            println!("Promotion:      {}", r.promotion);
+            println!("Evidence:       {}", r.evidence_dir);
+            if !r.sealed_package.is_empty() {
+                println!("Sealed package: {}", r.sealed_package);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("port {} {}: {}", stage, symbol, e);
+            1
+        }
     }
 }

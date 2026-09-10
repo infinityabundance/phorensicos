@@ -295,3 +295,28 @@ Security decisions depend on behavioral evidence:
 6. User performs operation → operation produces ResidualRecord
 7. Session closes → SessionManager.close_session(session)
 ```
+
+## JIT-Porting Court
+
+The first implementation of the Dialect Cage Manager + Court Session Manager is
+the **JIT-Porting Court**. It ports behavior at the API boundary:
+
+```text
+foreign behavior → dialect cage → oracle traces → behavior signature
+→ native candidate → replay court → comparison → promotion → sealed package
+```
+
+- **Dialect cage** — observes a foreign API surface as a black box (first target:
+  libc `toupper`, exhaustive `0x00..=0xff`). No foreign source is read or copied.
+- **Court session** — replays a clean-room native candidate against sealed oracle
+  traces and compares exact output/status/effects. The verdict derives from case
+  comparisons, not receipt counts, and fails closed.
+- **Promotion** — advances the candidate to `sealed` only on an exact full-domain
+  match with a complete evidence set. Gated by the `PORTING` capability.
+- **Runtime preference** — the sealed package (`native:libc:toupper`) is the
+  artifact the runtime prefers over the foreign implementation.
+
+This is API-surface porting, not arbitrary binary translation. Eager JIT of
+arbitrary foreign binaries is a later phase.
+
+See `docs/REPLAY_COURTS.md` (JIT-Porting Court) and `phost/src/porting/`.

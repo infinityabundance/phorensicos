@@ -131,6 +131,11 @@ jq -n \
       },
       toolchain: {
         qemu: $qemu, nasm: $nasm, "ld.lld": $lld, rustc: $rustc, cargo: $cargo
+      },
+      reproducibility: {
+        boot_evidence: "deterministic: byte-identical across hosts and containers",
+        kernel_image_bytes: "depends on rustc/nasm/ld.lld/binutils versions; not asserted across toolchains",
+        container: "docker compose run --rm kernel"
       }
     }' > "$OUT"
 

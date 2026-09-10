@@ -38,6 +38,12 @@ echo ""
 
 # --- Stage 1: staticlib (host) ---
 echo "--- Stage 1: Build libphost_kernel.a (staticlib) ---"
+# Reproducibility: remap the source root to a fixed token so the image does not
+# depend on where the tree is checked out. With a pinned toolchain this makes the
+# kernel image bit-reproducible across hosts and containers. (Setting RUSTFLAGS
+# replaces the per-target rustflags in .cargo/config.toml, so repeat the link flag.)
+SRC_ROOT="$(cd "$PHORC_DIR" && pwd)"
+export RUSTFLAGS="-C link-arg=-no-pie --remap-path-prefix=$SRC_ROOT=/src"
 cargo build --release --target "$TARGET_TRIPLE" 2>&1 | tail -2 || true
 RUST_LIB=$(ls -t "$RELEASE_DIR/libphost_kernel.a" 2>/dev/null | head -1)
 if [ -z "$RUST_LIB" ] || [ ! -f "$RUST_LIB" ]; then
