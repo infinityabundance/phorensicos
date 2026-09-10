@@ -7,7 +7,7 @@
 // is `Inconsistent`, and both deny promotion.
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::porting::candidate;
@@ -181,6 +181,7 @@ mod tests {
     use super::*;
     use crate::porting::candidate::{encode_sign, phor_memcmp, phor_toupper};
     use crate::porting::target::{self, byte_domain_cases, memcmp_corpus};
+    use alloc::string::ToString;
 
     /// toupper traces where the oracle agrees with the native candidate.
     fn agreeing_toupper_cases() -> Vec<OracleTrace> {
