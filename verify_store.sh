@@ -155,6 +155,7 @@ EXPECTED_LEAVES = {
     "libc:memchr:c-locale:index:v1": "memchr",
     "libc:strlen:c-locale:u64:v1": "strlen",
     "libc:strrchr:c-locale:index:v1": "strrchr",
+    "posix:strspn:c-locale:u64:v1": "strspn",
 }
 EXPECTED_COMPOSITIONS = {
     "toupper_memchr": "phor:compose:toupper_memchr:c-locale:index:v1",

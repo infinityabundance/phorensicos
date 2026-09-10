@@ -30,7 +30,7 @@
 #    * promotion level is Sealed and the sealed package targets the right symbol
 #
 #  Usage:
-#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr|strlen|strrchr] [--check-committed] [evidence_dir]
+#    ./verify_jit_porting_court.sh [--target toupper|memcmp|memchr|strlen|strrchr|strspn] [--check-committed] [evidence_dir]
 #
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
@@ -79,8 +79,14 @@ case "$TARGET" in
         EXPECTED_COUNT=336
         SOURCE="examples/jit_port_strrchr.phor"
         ;;
+    strspn)
+        # The second dialect: `strspn` is POSIX, not ISO C.
+        TARGET_ID="posix:strspn:c-locale:u64:v1"
+        EXPECTED_COUNT=578
+        SOURCE="examples/jit_port_strspn.phor"
+        ;;
     *)
-        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr|strlen|strrchr)"
+        echo "ERROR: unknown target '$TARGET' (expected toupper|memcmp|memchr|strlen|strrchr|strspn)"
         exit 2
         ;;
 esac
@@ -383,6 +389,68 @@ if SYMBOL == "strrchr":
     if len([i for i in id_set if i.startswith("B.")]) != 28:
         errors.append("strrchr corpus does not have the complete 28-case unique-occurrence grid")
 
+if SYMBOL == "strspn":
+    # The POSIX dialect's corpus: (s, accept, n) with the terminator of `s` inside
+    # the bound and a NUL-free accept set of at most 8 bytes.
+    for t in traces:
+        a = args_of(t)
+        if len(a) != 3:
+            errors.append("strspn case %s does not have exactly 3 arguments" % t.get("case_id"))
+            break
+        if len(a[2]) != 16:
+            errors.append("strspn case %s has a non-8-byte bound" % t.get("case_id"))
+            break
+        try:
+            s = bytes.fromhex(a[0])
+            accept = bytes.fromhex(a[1])
+            n = int.from_bytes(bytes.fromhex(a[2]), "little")
+        except ValueError:
+            errors.append("strspn case %s has non-hex arguments" % t.get("case_id"))
+            break
+        if n > len(s):
+            errors.append("strspn case %s has n > len(s)" % t.get("case_id"))
+            break
+        if n > 8 or len(s) > 8 or len(accept) > 8:
+            errors.append("strspn case %s exceeds the 8-byte packed-word contract" % t.get("case_id"))
+            break
+        if 0 not in s[:n]:
+            errors.append("strspn case %s has no terminator inside its bound" % t.get("case_id"))
+            break
+        if 0 in accept:
+            errors.append("strspn case %s has a NUL inside the accept set" % t.get("case_id"))
+            break
+        if len(t.get("output_hex", "")) != 16:
+            errors.append("strspn case %s output is not an 8-byte span" % t.get("case_id"))
+            break
+    id_set = set(t.get("case_id") for t in traces)
+    for required in (
+        "A.0.1",
+        "A.7.8",
+        "B.empty_set",
+        "B.empty_string",
+        "C.0",
+        "C.6",
+        "D.1",
+        "D.8",
+        "E.1",
+        "F.bound.1",
+        "G.00",
+        "G.41",
+        "H.00",
+        "H.41",
+    ):
+        if required not in id_set:
+            errors.append("strspn corpus is missing case %s" % required)
+    for group in ("A.", "B.", "C.", "D.", "E.", "F.", "G.", "H."):
+        if not any(i.startswith(group) for i in id_set):
+            errors.append("strspn corpus is missing group %s" % group)
+    if len([i for i in id_set if i.startswith("A.")]) != 36:
+        errors.append("strspn corpus does not have the complete 36-case (span, n) grid")
+    if len([i for i in id_set if i.startswith("G.")]) != 256:
+        errors.append("strspn corpus does not have the exhaustive 256-value accepted-byte sweep")
+    if len([i for i in id_set if i.startswith("H.")]) != 256:
+        errors.append("strspn corpus does not have the exhaustive 256-value stopping-byte sweep")
+
 # ---- hash cross-checks ----------------------------------------------------
 oracle = sig.get("combined_oracle_hash", "")
 behavior = cand.get("candidate_behavior_hash", "")
@@ -536,8 +604,8 @@ if sealed.get("symbol") != SYMBOL:
     errors.append("sealed_package.symbol != %s" % SYMBOL)
 if sealed.get("trust") != "sealed":
     errors.append("sealed_package.trust != sealed")
-if sealed.get("dialect") != "libc":
-    errors.append("sealed_package.dialect != libc")
+if sealed.get("dialect") != TARGET_ID.split(":", 1)[0]:
+    errors.append("sealed_package.dialect != the target id's namespace")
 if sealed.get("locale_contract") != "C":
     errors.append("sealed_package.locale_contract != C")
 if sealed.get("case_count") != EXPECTED:

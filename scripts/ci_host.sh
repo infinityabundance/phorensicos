@@ -35,6 +35,7 @@ cargo build -q -p phost -p phorc
 ./verify_jit_porting_court.sh --target memchr --check-committed
 ./verify_jit_porting_court.sh --target strlen --check-committed
 ./verify_jit_porting_court.sh --target strrchr --check-committed
+./verify_jit_porting_court.sh --target strspn --check-committed
 ./verify_composition_court.sh --check-committed
 ./verify_composition_court.sh --target toupper_strlen_memchr --check-committed
 ./verify_composition_court.sh --target toupper_strlen_memchr_pair --check-committed
@@ -46,6 +47,7 @@ cargo build -q -p phost -p phorc
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
+./verify_jit_porting_court.sh --target strspn
 ./verify_composition_court.sh
 ./verify_composition_court.sh --target toupper_strlen_memchr
 ./verify_composition_court.sh --target toupper_strlen_memchr_pair

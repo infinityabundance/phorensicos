@@ -25,6 +25,7 @@ use crate::porting::composition_toupper_each::COMPOSITION_TOUPPER_EACH;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
     PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
+    POSIX_STRSPN,
 };
 use crate::porting::{PortError, PortingAuthority};
 
@@ -40,6 +41,7 @@ extern "C" {
     fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void;
     fn strlen(s: *const c_char) -> usize;
     fn strrchr(s: *const c_char, c: c_int) -> *mut c_char;
+    fn strspn(s: *const c_char, accept: *const c_char) -> usize;
 }
 
 /// Observe `cases` against `target` through the cage.
@@ -161,6 +163,47 @@ pub fn observe_target(
                     &case.case_id,
                     &case.args,
                     &encode_usize(len),
+                    "ok",
+                    &["compute"],
+                )
+            })
+            .collect());
+    }
+
+    if target.id == POSIX_STRSPN.id {
+        return Ok(cases
+            .iter()
+            .map(|case| {
+                let s = case.args.first().cloned().unwrap_or_default();
+                let accept = case.args.get(1).cloned().unwrap_or_default();
+                // The ABI precondition is that a NUL terminator lies within the first
+                // n bytes of `s`. libc `strspn` takes no bound, so observe the WHOLE
+                // buffer: a terminator outside the window stays visible and is a real
+                // mismatch, not a silently clamped observation.
+                let mut c_s = s.clone();
+                if !c_s.contains(&0) {
+                    // Defensive only: every corpus case has a terminator inside its
+                    // bound. It exists so a hand-written case can never make the cage
+                    // read out of bounds.
+                    c_s.push(0x00);
+                }
+                // `accept` is a C string: the set ends at its first NUL. The corpus
+                // keeps it NUL-free, and a NUL inside it would be an invalid set.
+                let mut c_accept = accept.clone();
+                if !c_accept.contains(&0) {
+                    c_accept.push(0x00);
+                }
+                let span = unsafe {
+                    strspn(
+                        c_s.as_ptr() as *const c_char,
+                        c_accept.as_ptr() as *const c_char,
+                    )
+                };
+                OracleTrace::new(
+                    target,
+                    &case.case_id,
+                    &case.args,
+                    &encode_usize(span),
                     "ok",
                     &["compute"],
                 )
@@ -740,6 +783,87 @@ mod tests {
         assert_eq!(traces[2].output_hex, "0100000000000000"); // first NUL wins -> 1
         assert_eq!(traces[3].output_hex, "0300000000000000"); // only 0x00 terminates
         assert!(traces.iter().all(|t| t.is_intact()));
+    }
+
+    #[test]
+    fn test_cage_observes_posix_strspn_span() {
+        let cases = alloc::vec![
+            TestCase::new(
+                "span2",
+                alloc::vec![
+                    alloc::vec![0x61, 0x62, 0x63, 0x00],
+                    alloc::vec![0x61, 0x62],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            TestCase::new(
+                "empty_set",
+                alloc::vec![
+                    alloc::vec![0x61, 0x62, 0x63, 0x00],
+                    alloc::vec![],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            TestCase::new(
+                "empty_string",
+                alloc::vec![
+                    alloc::vec![0x00, 0x61, 0x62],
+                    alloc::vec![0x61, 0x62],
+                    3u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            // Accepted bytes after the terminator: the span still stops at the NUL.
+            TestCase::new(
+                "tail",
+                alloc::vec![
+                    alloc::vec![0x61, 0x00, 0x61, 0x61],
+                    alloc::vec![0x61],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+            // The unsigned edge bytes are set members like any other byte.
+            TestCase::new(
+                "edge",
+                alloc::vec![
+                    alloc::vec![0x7f, 0x80, 0xff, 0x00],
+                    alloc::vec![0x7f, 0x80, 0xff],
+                    4u64.to_le_bytes().to_vec(),
+                ],
+            ),
+        ];
+        let traces = observe_target(&POSIX_STRSPN, &cases, &PortingAuthority::granted()).unwrap();
+        let got: Vec<String> = traces.iter().map(|t| t.output_hex.clone()).collect();
+        assert_eq!(
+            got,
+            alloc::vec![
+                hex::encode(crate::porting::candidate::encode_usize(2)),
+                hex::encode(crate::porting::candidate::encode_usize(0)),
+                hex::encode(crate::porting::candidate::encode_usize(0)),
+                hex::encode(crate::porting::candidate::encode_usize(1)),
+                hex::encode(crate::porting::candidate::encode_usize(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cage_observes_whole_strspn_corpus() {
+        let traces = observe_target(
+            &POSIX_STRSPN,
+            &crate::porting::target::strspn_corpus(),
+            &PortingAuthority::granted(),
+        )
+        .unwrap();
+        assert_eq!(traces.len(), 578);
+        assert!(traces.iter().all(|t| t.status == "ok"));
+        assert!(traces.iter().all(|t| t.output_hex.len() == 16));
+        // The span never exceeds the bound, and every case has one.
+        for t in &traces {
+            let args = t.input_args();
+            let n = crate::porting::candidate::decode_usize(&args[2]);
+            let span =
+                crate::porting::candidate::decode_usize(&hex::decode(&t.output_hex).unwrap());
+            assert!(span <= n, "case {} spans {} > n {}", t.case_id, span, n);
+        }
     }
 
     #[test]

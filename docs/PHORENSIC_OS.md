@@ -385,9 +385,9 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 - **Sealed native service** — one verified load, many consumers. The service owns
   an index for its lifetime; `open` is the only place with a store path, so a call
   cannot re-read it. A deterministic session serves every sealed port in the store
-  (five leaves, six compositions) through that one service: eleven ports from five
+  (six leaves, six compositions) through that one service: twelve ports from six
   mapped objects, with `per_port` resolution counts that make the fan-in explicit
-  (`toupper` serves 24 resolutions once nested stages are counted, `memchr` 6) and
+  (`toupper` serves 30 resolutions once nested stages are counted, `memchr` 8) and
   `toupper_each` consumed three times. Every composition in the index is a
   dispatchable port, and a composition cycle is rejected at load, since resolving a
   chain recurses through the index.

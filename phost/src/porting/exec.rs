@@ -33,7 +33,7 @@ use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
 use crate::porting::target::{
-    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
+    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER, POSIX_STRSPN,
 };
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
 
@@ -313,6 +313,43 @@ fn call_target(
         let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
         let raw = f(w, needle as u64) as u32 as i32;
         return Ok(encode_index(raw));
+    }
+
+    if target.id == POSIX_STRSPN.id {
+        if args.len() < 3 {
+            return Err(ExecError::MalformedArgs(target.id.to_string()));
+        }
+        let s = &args[0];
+        let accept = &args[1];
+        let n = decode_usize(&args[2]);
+        if n > 8 || s.len() < n {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: scanned length {} exceeds the 8-byte packed-word contract or the string",
+                target.id, n
+            )));
+        }
+        // The ABI precondition: a NUL terminator lies within the packed window, so
+        // the word encodes the whole C string and the candidate never reads on.
+        if !s[..n].contains(&0) {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: no NUL terminator within the {}-byte bound",
+                target.id, n
+            )));
+        }
+        // The accept set travels as its own packed word. A C string set cannot
+        // contain NUL, and an interior NUL would silently change the set, so it is
+        // rejected rather than normalized.
+        if accept.len() > 8 || accept.contains(&0) {
+            return Err(ExecError::MalformedArgs(format!(
+                "{}: the accept set must be at most 8 NUL-free bytes",
+                target.id
+            )));
+        }
+        let ws = pack_le_prefix(&s[..n]);
+        let wa = pack_le_prefix(accept);
+        let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
+        let span = f(ws, wa, n as u64);
+        return Ok(encode_usize(span as usize));
     }
 
     Err(ExecError::UnsupportedTarget(target.id.to_string()))

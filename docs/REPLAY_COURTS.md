@@ -328,8 +328,14 @@ traces, replays a clean-room native candidate against them, and promotes the
 candidate only on exact, evidence-backed equivalence.
 
 This is **API-surface** porting (byte-in/byte-out and small buffer functions such
-as `toupper`, `memcmp`, `memchr`, `strlen` and `strrchr`), not arbitrary binary
-translation.
+as `toupper`, `memcmp`, `memchr`, `strlen` and `strrchr`, plus the POSIX `strspn`),
+not arbitrary binary translation.
+
+A target's identity is qualified — `dialect:symbol:locale:contract:version`. The
+`dialect` names the **specification the contract is drawn from**, not the library
+that implements it: the first five targets are ISO C surfaces (`dialect: libc`), and
+`strspn` is POSIX (`dialect: posix`) because ISO C does not specify it. See
+`docs/DIALECT_QUALIFICATION.md` for what that qualification does and does not claim.
 
 ### Flow
 
@@ -440,6 +446,22 @@ and an exhaustive sweep of all 256 needle values against a haystack whose tail
 repeats bytes from the string. Arguments are framed in the trace as
 `buf_hex:needle_hex:n_hex` (little-endian `n`).
 
+### Sixth target: POSIX `strspn`
+
+```text
+target id: posix:strspn:c-locale:u64:v1
+dialect:   posix  symbol: strspn  version: host-observed-v1
+locale:    C
+contract:  length of the initial segment of s consisting only of bytes in accept
+corpus:    578 bounded deterministic cases
+```
+
+A second dialect and a new observable shape. `dialect: posix` is earned, not chosen:
+ISO C does not specify `strspn`, so recording it as `libc:strspn:…` would conflate two
+standards (`docs/DIALECT_QUALIFICATION.md`). The observable is a **prefix length
+decided by set membership** — different from ordering, match index and
+length-to-terminator. Arguments are framed as `s_hex:accept_hex:n_hex`.
+
 ### Target identity is qualified
 
 A target id is `dialect:symbol:locale:contract:version`, so a future
@@ -453,11 +475,45 @@ input/output/locale/status/effects — it never reads or copies foreign source. 
 native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold),
 `phor_memcmp` (unsigned, `n`-bounded, sign result), `phor_memchr` (unsigned,
 `n`-bounded, first-match index), `phor_strlen` (first-NUL length, `n`-bounded
-and fail-closed at `n`) and `phor_strrchr` (last in-string match index, NUL
-needle → length). Unknown target ids return
+and fail-closed at `n`), `phor_strrchr` (last in-string match index, NUL
+needle → length) and `phor_strspn` (POSIX: set-membership span, `n`-bounded, the
+terminator always ending the span because a C string set cannot contain NUL).
+Unknown target ids return
 `CandidateError::UnsupportedTarget` and malformed arguments return
 `CandidateError::MalformedArgs`; there is no identity fallback, so an unsupported
 candidate can never pass by accident.
+
+### Second dialect: `posix:strspn`
+
+The five ISO C targets carry `dialect: libc`. `strspn` carries `dialect: posix`
+because **ISO C does not specify it** — it is a POSIX function, like `strcspn`,
+`strpbrk`, `strtok`, `strcasecmp` and `strdup`. The `dialect` field names the
+specification the contract is drawn from, so a POSIX-only contract cannot be recorded
+as a C-library contract without conflating two standards.
+
+The observable is a new shape next to ordering, match index and length-to-terminator:
+
+```text
+posix:strspn:c-locale:u64:v1
+
+  input:  s (terminator inside the first n bytes), accept (NUL-free, <= 8 bytes), n
+  output: the length of the initial segment of s whose bytes are all in accept
+  ABI:    _phor_phor_strspn_len(ws: u64, wa: u64, n: u64) -> u64 span
+```
+
+The corpus (578 cases) is built so a plausible wrong implementation fails: set sizes
+1..=8 make a single-byte compare impossible, accepted bytes placed after the
+terminator make a scan that ignores the terminator fail, and the two exhaustive
+0..=255 sweeps cover the accepted byte and the stopping byte. The candidate is
+branchless and unrolled over the 8 packed lanes (membership is an 8-term OR written
+as `m + t - m*t`), emits a 25072-byte ELF64 object with **0 relocations**, and is
+loaded and called by the execution court for every case.
+
+The qualification is checked, not asserted: the leaf verifier requires the sealed
+package's `dialect` to equal the namespace of the target id. The honest limit — the
+implementation observed is still the host C library, so this binds the POSIX contract
+*as observed* rather than implementation-independent behavior — is documented in
+`docs/DIALECT_QUALIFICATION.md`.
 
 ### Mapping to court concepts
 
@@ -870,7 +926,7 @@ revealed.
 
 Deriving a seal is the court's job; **loading** one is the runtime's. The store
 index `phost/evidence/store/index.json` is a committed artifact that names every
-sealed port — five leaf object hashes and six composition chain hashes — so a
+sealed port — six leaf object hashes and six composition chain hashes — so a
 call site can resolve a seal without invoking `phorc` and without replaying an
 oracle.
 
@@ -922,8 +978,8 @@ sealed port in the store once, with a recorded expected result:
 
 ```text
 five leaves          six compositions
-store loads:     1   ports: 11   calls: 11 native   fallback: 0   broken: 0
-objects mapped:  5   dispatches: 52
+store loads:     1   ports: 12   calls: 12 native   fallback: 0   broken: 0
+objects mapped:  6   dispatches: 53
 fan-in:  toupper 30  memchr 8  strlen 4  memcmp 1  strrchr 1
          toupper_each 3 (own call + nested chain's two fold stages)
 ```
@@ -965,11 +1021,13 @@ examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
 examples/jit_port_strlen.phor     strlen native candidate, in Phorensic
 examples/jit_port_strrchr.phor    strrchr native candidate, in Phorensic
+examples/jit_port_strspn.phor     POSIX strspn native candidate, in Phorensic
 phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
 phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
 phost/evidence/porting/memchr/    memchr evidence set (482 cases) + candidate.o
 phost/evidence/porting/strlen/    strlen evidence set (308 cases) + candidate.o
 phost/evidence/porting/strrchr/   strrchr evidence set (336 cases) + candidate.o
+phost/evidence/porting/strspn/    strspn evidence set (578 cases, POSIX) + candidate.o
 phost/evidence/composition/      composition verdicts (chains over sealed ports)
 verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr)
 verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr)

@@ -30,7 +30,7 @@ purpose-built language (`.ph` / `.phor`).
 | `phost/` | **Host / runtime library** — canvas, console, compositor, shell, status screen, serial + PS/2 keyboard drivers, and the kernel `nucleus` (GDT/IDT/TSS/paging, assembly shims). Builds with `std`, `alloc`, or `no_std`. |
 | `phost_kernel/` | **`no_std` kernel staticlib** — links the boot stub into a Multiboot image that renders a GUI to the QEMU VGA framebuffer. |
 | `src/` | **Phorensic OS system source** (~232 `.phor` modules): kernel, memory, drivers, forensic store, courts, dialect cages, GUI, package system, porting engine, … |
-| `examples/` | 44 runnable `.phor` examples (shell, compositor, drivers, courts, porting). |
+| `examples/` | 51 runnable `.phor`/`.ph` examples (shell, compositor, drivers, courts, porting). |
 | `tests/` | `.phor` test suites plus `compile-pass/` fixtures. |
 | `fixtures/` | Golden residual/oracle/court fixtures and package specs. |
 | `docs/` | Language, compiler, kernel, store, courts, GUI and reviewer specifications. |
@@ -99,11 +99,11 @@ A top-level `manifest_claim` states exactly what is and is not asserted.
 
 ## JIT-Porting Court
 
-Phorensic OS ports *behavior*, not binaries. Five leaf courts have run
-end-to-end at the API boundary:
+Phorensic OS ports *behavior*, not binaries. Six leaf courts have run
+end-to-end at the API boundary — five ISO C surfaces and one POSIX surface:
 
 ```text
-foreign behavior → dialect cage       (observe libc as a black box)
+foreign behavior → dialect cage       (observe a named specification as a black box)
                  → oracle traces      (sealed, ordered, locale-recorded cases)
                  → behavior signature (combined SHA-256 oracle hash)
                  → native candidate   (clean-room phor_*)
@@ -125,6 +125,7 @@ foreign behavior → dialect cage       (observe libc as a black box)
 | `libc:memchr:c-locale:index:v1` | bounded deterministic corpus (482 cases) | **482/482 pass** | **482/482 pass** | **482/482 native**, 0 fallback |
 | `libc:strlen:c-locale:u64:v1` | bounded deterministic corpus (308 cases) | **308/308 pass** | **308/308 pass** | **308/308 native**, 0 fallback |
 | `libc:strrchr:c-locale:index:v1` | bounded deterministic corpus (336 cases) | **336/336 pass** | **336/336 pass** | **336/336 native**, 0 fallback |
+| `posix:strspn:c-locale:u64:v1` | bounded deterministic corpus (578 cases) | **578/578 pass** | **578/578 pass** | **578/578 native**, 0 fallback |
 
 The `memcmp` corpus deliberately forces length, buffers and ordering: lengths
 `0..=8`, five patterns, every first-mismatch position, the `n`-boundary around a
@@ -158,6 +159,45 @@ values against a haystack whose tail repeats bytes from the string. A needle of
 `0` yields the terminator index (the length), and every case has a NUL inside its
 bound. `strrchr` returns a pointer, so the observable is normalized to the index;
 `n` is the ABI precondition bound.
+
+### A second dialect: `posix`
+
+The five ISO C targets all carry `dialect: libc`. The sixth does not:
+
+```text
+posix:strspn:c-locale:u64:v1
+```
+
+**ISO C does not specify `strspn`** — it is POSIX (so are `strcspn`, `strpbrk`,
+`strtok`, `strcasecmp`, `strdup`). Recording it as `libc:strspn:…` would conflate two
+standards, which is exactly what the qualified id exists to prevent. The `dialect`
+field names the **specification the contract is drawn from**, not the library that
+implements it.
+
+The observable is also a new shape next to ordering (`memcmp`), first/last match
+(`memchr`/`strrchr`) and length-to-terminator (`strlen`):
+
+```text
+input:  s (a buffer whose NUL terminator lies within the first n bytes),
+        accept (a NUL-free set of at most 8 bytes), n
+output: the length of the initial segment of s whose bytes are all in accept
+```
+
+A prefix length decided by **set membership** — so the corpus pins every set size
+1..=8 (a single-byte compare cannot pass), the empty set, the empty string, a stop
+byte before the terminator, and both exhaustive 0..=255 sweeps. Because a C string
+set can never contain NUL, the terminator always ends the span, which is what keeps
+the scan inside one packed word.
+
+The honest limit is stated in the qualification review, `docs/DIALECT_QUALIFICATION.md`:
+`posix:` records the *specification namespace*; the *implementation* observed is still
+the host C library, and the seal binds the observed behavior by oracle hash, so a
+different implementation with different behavior cannot pass silently. Making the
+result implementation-independent would mean observing a second implementation (e.g.
+a musl container) and promoting only on agreement — a separate axis, future work.
+
+The verifier now requires the sealed package's `dialect` to equal the namespace of
+the target id, so this cannot drift back into an unqualified claim.
 
 ### Composition: sealed ports as runtime building blocks
 
@@ -354,11 +394,11 @@ leaf:  object_path exists and SHA-256(object bytes) == object_hash
 composition: chain_hash is a SHA-256, and every leaf is itself a sealed entry
 ```
 
-One store holds eleven ports:
+One store holds twelve ports:
 
 | Kind | Ports |
 |------|-------|
-| Leaf objects | the five compiled `.phor` candidates (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`) |
+| Leaf objects | the six compiled `.phor` candidates (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr` — ISO C — and `strspn` — POSIX) |
 | Compositions | `toupper_memchr`, `toupper_strlen_memchr`, `toupper_strlen_memchr_pair`, `toupper_each`, `toupper_each_strlen_memchr`, `toupper_memchr_suffix` |
 
 This is what makes the store a real artifact rather than a cache: the committed leaf
@@ -390,16 +430,16 @@ once: `open` is the only place with a path to `store`, and `call` has access to
 nothing but the dispatcher it already holds.
 
 A **session** is a deterministic plan that serves every sealed port in the store —
-five leaves and six compositions — through that one service, with a recorded
+six leaves (one of them POSIX) and six compositions — through that one service, with a recorded
 expected result for each. Ten ports, one load, **five mapped objects**, and the
 same leaf reused by every chain that consumes it:
 
 ```text
-store loads:     1        ports in store: 11
-calls:          11        native:        11        fallback: 0   broken seal: 0
-objects mapped:  5        dispatches:    52
+store loads:     1        ports in store: 12
+calls:          12        native:        12        fallback: 0   broken seal: 0
+objects mapped:  6        dispatches:    53
 fan-in (resolutions, nested stages included):
-toupper 30   memchr 8   strlen 4   memcmp 1   strrchr 1
+toupper 30   memchr 8   strlen 4   memcmp 1   strrchr 1   strspn 1
 toupper_each 3 (its own call + the nested chain's two fold stages)   others 1
 ```
 
@@ -409,7 +449,7 @@ result: `composition_runner` resolves all five chain ids, so `dispatch_port` on
 resolves the sealed composition `toupper_each` through the same index.
 
 ```sh
-cargo run -p phost -- port session                 # one load, ten ports, five objects
+cargo run -p phost -- port session                 # one load, twelve ports, six objects
 cargo run -p phost -- port session --no-capability  # store never read (capability denied)
 ./verify_session.sh                                # the session verifier
 ```
@@ -424,6 +464,7 @@ cargo run -p phost -- port promote memcmp
 cargo run -p phost -- port promote memchr
 cargo run -p phost -- port promote strlen
 cargo run -p phost -- port promote strrchr
+cargo run -p phost -- port promote strspn     # the POSIX dialect
 cargo run -p phost -- port native toupper 61              # call site: run the sealed object
 cargo run -p phost -- port native memcmp 616263:616264:0300000000000000
 cargo run -p phost -- port native memchr 616263:62:0300000000000000
@@ -447,6 +488,7 @@ cargo run -p phost -- port compose --target toupper_memchr_suffix 62617862:61:62
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
+./verify_jit_porting_court.sh --target strspn                 # the POSIX dialect
 ./verify_jit_porting_court.sh --target memchr --check-committed   # fresh == checked-in
 ./verify_composition_court.sh                     # composition #1 court
 ./verify_composition_court.sh --check-committed
@@ -551,25 +593,26 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **217 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
-| `.phor` / `.ph` → ELF64 | all corpus sources emit objects: `src/` (232), `examples/` (47), `tests/` (34 `.phor`), `tests/compile-pass/` (46) |
+| `cargo test` (phost) | **223 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `.phor` / `.ph` → ELF64 | every corpus source emits a non-empty object: **369 / 369, 0 failures** (`src/` 232, `examples/` 51, `tests/` 83 incl. 46 `compile-pass`, `fixtures/` 2, `README.phor`) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
 | Court replay | 6 / 6 phases **PASS**, verdict `consistent` |
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
-| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, `strlen`: **308/308**, `strrchr`: **336/336**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
-| Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**, `strlen` **308/308**, `strrchr` **336/336**; executed object == sealed object |
-| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, `strrchr` **336/336 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
+| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, `strlen`: **308/308**, `strrchr`: **336/336**, `strspn` (POSIX): **578/578**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
+| Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**, `strlen` **308/308**, `strrchr` **336/336**, `strspn` **578/578**; executed object == sealed object |
+| Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, `strrchr` **336/336 native**, `strspn` **578/578 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
+| Second dialect | `posix:strspn:c-locale:u64:v1` — a POSIX contract (ISO C does not specify `strspn`) and a new observable shape (a prefix length decided by set membership); the verifier requires the sealed package's `dialect` to match the target id's namespace; see `docs/DIALECT_QUALIFICATION.md` |
 | Sealed composition | `toupper ∘ memchr` composed from two sealed ports: **560/560**, all three stages native, **0 fallbacks / 0 broken seals**, 4776 sealed dispatches; dispatched objects match the committed leaf seals |
 | Sealed composition (3-stage) | `toupper ∘ strlen ∘ memchr`, where the sealed `strlen` result becomes the search bound: **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**, 3729 sealed dispatches; dispatched objects match the committed leaf seals |
 | Sealed composition (dataflow) | `toupper ∘ strlen ∘ memchr ∘ toupper ∘ memchr`, where **one derived bound is consumed by two searches**, the second non-adjacent to the stage that produced it: **474/474**, all six stage-accounts native, **0 fallbacks / 0 broken seals**, 6102 sealed dispatches; dispatched objects match the committed leaf seals |
 | Composition as a sealed port | the store publishes two artifact kinds (`LeafObject` and `Composition`); a nested chain resolves the sealed **composition** `toupper_each` from the store, checks its seal and recurses: `toupper_each` **267/267** (311 dispatches) and `toupper_each_strlen_memchr` **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**; the recorded nested seal matches the committed `toupper_each` chain hash |
 | Derived value selects a buffer | `toupper ∘ memchr ∘ slice ∘ memchr`: the folded haystack is sliced at the origin the first `memchr` derived, and the second search reads that slice — **688/688**, 0 fallbacks / 0 broken seals, 7654 dispatches; the second search is data-dependent (ran 434, never reached 254, the two accounts covering every case); the `B.` group of 28 cases has needleB **before** the origin and must return -1; `chain_hash` covers the origin and the suffix offset |
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
-| Persistent sealed port store | `phost/evidence/store/index.json` commits all **11** sealed ports (5 leaf object hashes + 6 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry, and rejects a composition cycle; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
-| Sealed native service | one verified store load serves many consumers: **11 ports from 5 mapped objects**, **52** sealed-port resolutions including nested stages, **0 fallbacks / 0 broken seals**; `toupper` fan-in 30, `memchr` 8, `strlen` 4, `toupper_each` 3; the session reproduces from a copy of the store at another path, a missing store fails closed, and without `PORTING` the store is never read |
+| Persistent sealed port store | `phost/evidence/store/index.json` commits all **12** sealed ports (6 leaf object hashes + 6 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry, and rejects a composition cycle; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
+| Sealed native service | one verified store load serves many consumers: **12 ports from 6 mapped objects**, **53** sealed-port resolutions including nested stages, **0 fallbacks / 0 broken seals**; `toupper` fan-in 30, `memchr` 8, `strlen` 4, `toupper_each` 3; the session reproduces from a copy of the store at another path, a missing store fails closed, and without `PORTING` the store is never read |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
 
 ### Known gaps
@@ -598,6 +641,7 @@ All numbers below were reproduced on a clean checkout.
 ## Documentation
 
 - `docs/PHORENSIC_LANGUAGE.md`, `docs/PHORENSIC_GRAMMAR.md` — the language.
+- `docs/DIALECT_QUALIFICATION.md` — how a `dialect:` namespace is earned (`posix` vs `libc`).
 - `docs/PHORENSIC_COMPILER.md` — pipeline and artifact tiers.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.

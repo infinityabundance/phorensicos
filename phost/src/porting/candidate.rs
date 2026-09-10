@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
-    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
+    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER, POSIX_STRSPN,
 };
 use crate::porting::{json_escape, sha256_hex};
 
@@ -208,6 +208,23 @@ pub fn phor_strrchr(bytes: &[u8], needle: u8, n: usize) -> i32 {
 ///
 /// Returns `Err(UnsupportedTarget)` for unknown ids and `Err(MalformedArgs)` for
 /// known ids with the wrong shape — there is no identity fallback.
+/// The `posix:strspn` clean-room candidate: the length of the initial segment of
+/// `s` whose bytes are all in `accept`. The terminator is never in `accept` (a C
+/// string set cannot contain NUL), so it always stops the span; a byte outside the
+/// window stops it too. Out of contract (no stop inside `n`) fails closed at `n`.
+pub fn phor_strspn(s: &[u8], accept: &[u8], n: usize) -> usize {
+    let m = n.min(s.len());
+    let mut i = 0;
+    while i < m {
+        let b = s[i];
+        if b == 0 || !accept.contains(&b) {
+            return i;
+        }
+        i += 1;
+    }
+    n
+}
+
 pub fn run_candidate(target_id: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
     if target_id == LIBC_TOUPPER.id {
         let b = args
@@ -254,6 +271,14 @@ pub fn run_candidate(target_id: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, Candi
             .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
         let index = phor_strrchr(&args[0], needle, decode_usize(&args[2]));
         return Ok(encode_index(index));
+    }
+
+    if target_id == POSIX_STRSPN.id {
+        if args.len() < 3 {
+            return Err(CandidateError::MalformedArgs(target_id.to_string()));
+        }
+        let span = phor_strspn(&args[0], &args[1], decode_usize(&args[2]));
+        return Ok(encode_usize(span));
     }
 
     Err(CandidateError::UnsupportedTarget(target_id.to_string()))
@@ -510,6 +535,34 @@ mod tests {
         assert_eq!(phor_strrchr(&[0x7f, 0x80, 0x00, 0x7f, 0x80], 0x7f, 5), 0);
         // The bound is respected: a match outside it is not observed.
         assert_eq!(phor_strrchr(b"abc\0", b'c', 2), -1);
+    }
+
+    #[test]
+    fn test_strspn_candidate_span_semantics() {
+        // Set membership, not a single-byte compare.
+        assert_eq!(phor_strspn(b"abc\0", b"ab", 4), 2);
+        assert_eq!(phor_strspn(b"aabb\0", b"ab", 5), 4);
+        assert_eq!(phor_strspn(b"abc\0", b"bc", 4), 0);
+        // An empty set (and an empty string) span 0.
+        assert_eq!(phor_strspn(b"abc\0", b"", 4), 0);
+        assert_eq!(phor_strspn(b"\0abc", b"ab", 4), 0);
+        // The terminator is never in the set, so it always ends the span, even when
+        // accepted bytes follow it and even when they sit inside the bound.
+        assert_eq!(phor_strspn(b"aaa\0aaa", b"a", 7), 3);
+        // The set may hold high bytes and the unsigned edge values.
+        assert_eq!(phor_strspn(b"\x7f\x80\xff\0", b"\x7f\x80\xff", 4), 3);
+        // Out of contract (no stop inside n) fails closed at n rather than reading on.
+        assert_eq!(phor_strspn(b"aaaa", b"a", 4), 4);
+    }
+
+    #[test]
+    fn test_strspn_candidate_covers_corpus_without_error() {
+        for case in crate::porting::target::strspn_corpus() {
+            match run_candidate(POSIX_STRSPN.id, &case.args) {
+                Ok(out) => assert_eq!(out.len(), 8, "case {}", case.case_id),
+                Err(e) => panic!("case {} errored: {:?}", case.case_id, e),
+            }
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 217 pass, 4 ignored | 221 total: 160 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
+| All tests (phost) | ✅ 223 pass, 4 ignored | 227 total: 166 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -28,7 +28,7 @@
 | `serial` driver | ✅ | UART serial driver with capability model |
 | `status_screen` | ✅ | Boot phase display, progress bar, log messages |
 | `input/keyboard` | ✅ | PS/2 keyboard driver with scancode→ASCII |
-| `.phor` corpus | ✅ 316/316 → ELF64 | `src/` 232 + `examples/` 47 + `tests/` 34 + `fixtures/` 2 + `README.phor`, all emit objects (checker diagnostics may be emitted; see Known Gaps) |
+| `.phor` corpus | ✅ 369/369 → ELF64 | `src/` 232 + `examples/` 51 + `tests/` 83 (incl. 46 `compile-pass`) + `fixtures/` 2 + `README.phor`, all emit non-empty objects (checker diagnostics may be emitted; see Known Gaps) |
 | `compositor` module | ✅ | Window manager, surface blitting to canvas |
 | `phorc_bridge` | ✅ | Compiler invocation from shell with result parsing |
 | `pub` visibility tracking | ✅ | FnDecl/StructDecl/EnumDecl/ImplBlock/ConstDecl |
@@ -83,11 +83,11 @@ GUI compositor → window manager → surface management → inspector
 | Single-surface render | `render_surface_to_canvas()` for independent surface redrawing |
 | `.phor` live revocation | Driver with periodic trust checks, drift detection, bounded recovery |
 | `.phor` full port demo | 6-stage toupper port: observe->analyze->spec->implement->verify->promote |
-| `.phor` corpus | 315/315 files lower to non-empty ELF64 objects |
+| `.phor` corpus | 369/369 files lower to non-empty ELF64 objects |
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 217 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr) + sealed-object execution + sealed native dispatch + six sealed composition courts (incl. a nested one and a buffer-slicing one) + persistent sealed port store + sealed native service |
+| phost reach | 223 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + six sealed composition courts (incl. a nested one and a buffer-slicing one) + persistent sealed port store + sealed native service |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -391,7 +391,7 @@ loads and verifies it.
 
 | Aspect | Result |
 |--------|--------|
-| Ports covered | 11 — 5 leaf objects (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`) and 6 compositions (incl. the nested `toupper_each_strlen_memchr` and the buffer-slicing `toupper_memchr_suffix`) |
+| Ports covered | 12 — 6 leaf objects (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr` — ISO C — plus POSIX `strspn`) and 6 compositions (incl. the nested `toupper_each_strlen_memchr` and the buffer-slicing `toupper_memchr_suffix`) |
 | Leaf artifact | the committed `candidate.o` bytes; its SHA-256 equals the recorded `object_hash` and the committed `candidate_signature.json` object hash |
 | Composition artifact | the `chain_hash` read from the committed `composition_verdict.json` — not re-derived by re-running the inner court |
 | Load verification | schema + residual hash; unique sealed targets; object bytes hashed against the seal; composition stages resolved in the same store; **fails closed** on any failure |
@@ -400,7 +400,7 @@ loads and verifies it.
 | Independent recompilation | `verify_store.sh` recompiles each `.phor` candidate with `phorc` and requires byte-equality with the committed object |
 | Commit policy | the leaf `candidate.o` files are committed (the seal *is* the object's bytes); `candidate.receipts.json` and the large composition oracle traces stay generated |
 
-Store residual hash: `8277a1d52a5bacf80b95656aad01ac0b4b003d5595e7593796ad11ff6b6a0290`.
+Store residual hash: `b0ec3afd0ee252d696cf621a8358d7ff8bd55a0ef8028901b0109cc994320045`.
 
 ```sh
 ./verify_store.sh
@@ -416,24 +416,60 @@ lifetime, so no call re-reads the store.
 | Aspect | Result |
 |--------|--------|
 | Store loads | **1** for the whole session (the type has no store access after `open`) |
-| Ports served | **11** — the five leaves and the six compositions, each once |
-| Calls | 11 native, **0** foreign fallback, **0** broken seals |
-| Objects mapped | **5** — the leaf objects are mapped once and reused by every chain |
-| Sealed-port resolutions | **52**, including the stages a chain dispatches from inside its runner |
-| Fan-in | `toupper` **30**, `memchr` **8**, `strlen` **4**, `memcmp` **1**, `strrchr` **1**; `toupper_each` **3** (its own call plus the nested chain's two fold stages); the other chains **1** |
+| Ports served | **12** — the six leaves and the six compositions, each once |
+| Calls | 12 native, **0** foreign fallback, **0** broken seals |
+| Objects mapped | **6** — the leaf objects are mapped once and reused by every chain |
+| Sealed-port resolutions | **53**, including the stages a chain dispatches from inside its runner |
+| Fan-in | `toupper` **30**, `memchr` **8**, `strlen` **4**, `memcmp` **1**, `strrchr` **1**, `strspn` **1**; `toupper_each` **3** (its own call plus the nested chain's two fold stages); the other chains **1** |
 | Every port dispatchable | `composition_runner` resolves all five chain ids, so `dispatch_port` on a composition runs the sealed chain — and the nested chain resolves the sealed composition `toupper_each` through the same index |
 | Cycle safety | a composition cycle in the index is rejected at load (recurring through the index could never terminate) |
 | Independent of path | the same verdict reproduces from a copy of the store at another path |
 
-Session hash: `878f67066341a019ab18ffe5af97ffe49faab9eef384df543b1e7683bbabe181`.
+Session hash: `e4596cd7beb8789986be8ea71373b9144c75ec15821655d40a207bf04c9cad62`.
 Evidence: `phost/evidence/session/session_verdict.json`.
 
 ```sh
 ./verify_session.sh
 ```
 
+### Second Dialect: `posix:strspn`
+
+The five ISO C targets carry `dialect: libc`. The sixth does not, and the difference
+is checkable: **ISO C does not specify `strspn`** — it is a POSIX function (as are
+`strcspn`, `strpbrk`, `strtok`, `strcasecmp`, `strdup`). The `dialect` field names the
+specification the contract is drawn from, so a POSIX-only contract cannot be recorded
+as a C-library contract without conflating two standards.
+
+| Aspect | Result |
+|--------|--------|
+| Qualified id | `posix:strspn:c-locale:u64:v1` (dialect `posix`, symbol `strspn`, locale `C`) |
+| Observable | the length of the initial segment of `s` consisting only of bytes in `accept` — a prefix length decided by **set membership** |
+| Corpus | 578 cases: the complete `(span, n)` grid (36), the empty set and empty string, a stop byte before the terminator, every set size 1..=8, a disjoint set, the terminator at the bound, and two exhaustive 0..=255 sweeps (the accepted byte and the stopping byte) |
+| Replay | **578/578 pass**, 0 failed |
+| Executed object | **578/578 pass** — the branchless `.phor` candidate (`_phor_phor_strspn_len`, 25072-byte ELF64, **0 relocations**) matches the foreign oracle case for case |
+| Runtime dispatch | **578/578 native**, 0 fallback, 0 broken seals |
+| Verdict / promotion | `consistent` / `sealed` |
+| Oracle hash | `ab62795e45833c41d2feab54c13379ef670c1ee25f9f9325bbb9bc166f32591d` |
+| Candidate object hash | `c93271d069fd998e6de8c2cd07e665bd098f6fb64072cdd98fb44ae1375dbafc` |
+
+Why this is a real qualification and not a rename:
+
+- the corpus falsifies a *single-byte compare* standing in for a set test (set sizes
+  1..=8 are all present), and falsifies a scan that forgets that the terminator is
+  never a set member (accepted bytes are placed after the terminator);
+- `verify_jit_porting_court.sh` now requires the sealed package's `dialect` to equal
+  the **namespace of the target id** (`posix:strspn…` must seal as `dialect: posix`),
+  so the qualification cannot drift back into an unqualified claim.
+
+The honest limit, stated in **`docs/DIALECT_QUALIFICATION.md`**: `posix:` records the
+*specification namespace*. The implementation observed is still the host C library,
+and the seal binds the observed behavior by oracle hash, so a differing implementation
+cannot pass silently — but implementation-independence would require observing a
+second implementation (e.g. a musl container) and promoting only on agreement. That
+axis is future work, and the document says so.
+
 ### Test Results (reproduced on `main`)
-- phost: 217 passed, 0 failed, 4 ignored (221 total). The ignored tests read
+- phost: 223 passed, 0 failed, 4 ignored (227 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -441,9 +477,9 @@ Evidence: `phost/evidence/session/session_verdict.json`.
   constants resolving to literals (including integer constant folding of `0 - 1`),
   `&&` lowering to `And`, shift precedence, and `x = expr` storing instead of
   adding.
-- `.phor` corpus: 316/316 files lower to non-empty ELF64 objects
-  (`src/` 232, `examples/` 47, `tests/` 34, `fixtures/` 2, `README.phor`). These are
-  bootstrap-stage results: the checker still reports diagnostics for constructs
+- `.phor` corpus: 369/369 files lower to non-empty ELF64 objects
+  (`src/` 232, `examples/` 51, `tests/` 83 incl. 46 `compile-pass`, `fixtures/` 2,
+  `README.phor`). These are bootstrap-stage results: the checker still reports diagnostics for constructs
   outside its current subset, but lowering and ELF emission complete for every file.
 - `.ph` compile-pass fixtures: 46/46 files emit objects.
 
@@ -457,9 +493,10 @@ cargo run -p phost -- port promote memcmp        # JIT-porting court (312)
 cargo run -p phost -- port promote memchr        # JIT-porting court (482)
 cargo run -p phost -- port promote strlen        # JIT-porting court (308)
 cargo run -p phost -- port promote strrchr       # JIT-porting court (336)
+cargo run -p phost -- port promote strspn        # JIT-porting court (578, POSIX dialect)
 cargo run -p phost -- port store                # load + verify the committed store
 cargo run -p phost -- port store --write        # regenerate it from committed evidence
-cargo run -p phost -- port session              # one load, ten ports, five objects
+cargo run -p phost -- port session              # one load, twelve ports, six objects
 cargo run -p phost -- port session --no-capability   # store never read
 cargo run -p phost -- port native toupper 61     # runtime dispatch (sealed object)
 cargo run -p phost -- port native memchr 616263:62:0300000000000000
@@ -476,6 +513,7 @@ cargo run -p phost -- port compose --target toupper_memchr_suffix 62617862:61:62
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
+./verify_jit_porting_court.sh --target strspn                     # the POSIX dialect
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
 ./verify_composition_court.sh                                    # composition #1 (560)
 ./verify_composition_court.sh --check-committed

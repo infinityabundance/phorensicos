@@ -4,12 +4,17 @@
 // identity is qualified (`dialect:symbol:locale:contract:version`) so behavior
 // that depends on locale or ABI can never be silently conflated later.
 //
-// Five targets exist:
+// Six targets exist:
 //   - libc:toupper:c-locale:u8:v1     exhaustive byte domain, 256 cases
 //   - libc:memcmp:c-locale:sign:v1    bounded deterministic corpus, ordering (312)
 //   - libc:memchr:c-locale:index:v1   bounded deterministic corpus, first-match index (482)
 //   - libc:strlen:c-locale:u64:v1     bounded deterministic corpus, NUL-terminated length (308)
 //   - libc:strrchr:c-locale:index:v1  bounded deterministic corpus, last-match index (336)
+//   - posix:strspn:c-locale:u64:v1    bounded deterministic corpus, set-membership span (558)
+//
+// The dialect names the *specification the contract is drawn from*: the first five
+// are ISO C surfaces, the sixth is POSIX (`strspn` is not in ISO C). See
+// docs/DIALECT_QUALIFICATION.md.
 //
 // The corpus for a target is deterministic and bounded; it is enumerated in a
 // fixed order so the court is reproducible and the verdict does not depend on
@@ -149,6 +154,42 @@ pub const LIBC_STRRCHR: PortTarget = PortTarget {
     // LITTLE-ENDIAN (byte i in bits 8*i) and zero-extended. The packed word must
     // contain a NUL terminator (the harness enforces n).
     abi_symbol: "phor_strrchr_index",
+};
+
+/// The **POSIX** function `strspn` — a second dialect, and a new observable shape.
+///
+/// ISO C does not specify `strspn`; it is a POSIX function. The `dialect` field
+/// names the *specification the contract is drawn from*, so this target cannot be
+/// recorded as a C-library contract without silently conflating two standards
+/// (`docs/DIALECT_QUALIFICATION.md`). The observed implementation is still the host
+/// C library — the cage is the boundary — and the seal binds the *observed*
+/// behavior, so a different implementation with different behavior cannot pass.
+///
+/// The observable is the **length of the initial segment of `s` consisting only of
+/// bytes in `accept`** — a prefix length decided by set membership. That is a new
+/// shape next to `memcmp` (order), `memchr`/`strrchr` (first/last match index) and
+/// `strlen` (length to the terminator). `accept` is a C string, so it can never
+/// contain NUL; the terminator is therefore always a byte outside the set, which is
+/// what ends the span.
+///
+/// `n` is the ABI precondition bound: the terminator of `s` lies within its first
+/// `n` bytes, so the foreign observation never reads past the caller's window and
+/// the scan fits one packed word.
+pub const POSIX_STRSPN: PortTarget = PortTarget {
+    id: "posix:strspn:c-locale:u64:v1",
+    dialect: "posix",
+    symbol: "strspn",
+    version: "host-observed-v1",
+    locale_contract: "C",
+    input_schema: "(u8[] s, u8[] accept, usize n) — a buffer whose NUL terminator lies within the first n bytes, a NUL-free accept set, and the bound",
+    output_schema: "u64 span length (index of the first byte not in accept; the terminator is never in accept)",
+    domain_summary: "bounded deterministic corpus: the complete (span, n) grid with the whole prefix in the set, empty set and empty string, a stop byte before the terminator, every set size 1..=8, a disjoint set, the unsigned edge bytes, and two exhaustive 0..=255 sweeps (the accepted byte value and the stopping byte value)",
+    candidate_source: "examples/jit_port_strspn.phor",
+    // ABI: (ws: u64, wa: u64, n: u64) -> u64 span length; the first n bytes of `s`
+    // and the whole accept set are packed LITTLE-ENDIAN (byte i in bits 8*i).
+    // Unused accept lanes are zero and are inert because membership requires a
+    // non-NUL byte.
+    abi_symbol: "phor_strspn_len",
 };
 
 /// One input case for a target: an ordered list of byte-slice arguments.
@@ -665,6 +706,129 @@ pub fn memchr_corpus() -> Vec<TestCase> {
     c
 }
 
+/// The `posix:strspn` corpus.
+///
+/// Every case is `(s, accept, n)` with the terminator of `s` inside the first `n`
+/// bytes, `accept` free of NUL, and both buffers at most 8 bytes (one packed word).
+pub fn strspn_corpus() -> Vec<TestCase> {
+    let mut c: Vec<TestCase> = Vec::new();
+
+    let mk = |cases: &mut Vec<TestCase>, id: &str, s: &[u8], accept: &[u8], n: usize| {
+        cases.push(TestCase::new(
+            id,
+            vec![
+                s.to_vec(),
+                accept.to_vec(),
+                (n as u64).to_le_bytes().to_vec(),
+            ],
+        ));
+    };
+
+    // Distinct non-NUL bytes that span the unsigned boundary at 0x7f/0x80, so a
+    // high byte can never be mistaken for a terminator or for padding.
+    const FILL: [u8; 8] = [0x01, 0x7f, 0x80, 0xfe, 0xff, 0x41, 0x61, 0x02];
+    const ABSENT: u8 = 0x5a; // 'Z', in none of the sets below
+
+    // A — the complete (span, n) grid: the whole prefix is in the set, so the span
+    //     is the terminator index. `n` is only a bound; the tail past the
+    //     terminator repeats accepted bytes, so a scan that ignored the terminator
+    //     would report a longer span.
+    for k in 0..=7usize {
+        for n in (k + 1)..=8usize {
+            let mut s = alloc::vec![0xffu8; n];
+            s[..k].copy_from_slice(&FILL[..k]);
+            s[k] = 0x00;
+            for i in (k + 1)..n {
+                // Accepted bytes after the terminator: the span must still stop at k.
+                s[i] = FILL[(i - k) % 8];
+            }
+            mk(&mut c, &format!("A.{}.{}", k, n), &s, &FILL[..k], n);
+        }
+    }
+
+    // B — the empty set and the empty string: both spans are 0.
+    mk(&mut c, "B.empty_set", &[0x61, 0x62, 0x00, 0xff], &[], 4);
+    mk(
+        &mut c,
+        "B.empty_string",
+        &[0x00, 0x61, 0x62, 0xff],
+        &FILL[..3],
+        4,
+    );
+    mk(&mut c, "B.empty_both", &[0x00, 0xff, 0xff, 0xff], &[], 4);
+
+    // C — a stop byte before the terminator: the span ends at the first byte
+    //     outside the set, not at the terminator. `ABSENT` is in no set below.
+    for k in 0..=6usize {
+        let mut s = alloc::vec![0xffu8; 8];
+        s[..k].copy_from_slice(&FILL[..k]);
+        s[k] = ABSENT;
+        for i in (k + 1)..8 {
+            s[i] = if i == 7 { 0x00 } else { FILL[i - k] };
+        }
+        // A set that excludes ABSENT but includes everything before it.
+        mk(&mut c, &format!("C.{}", k), &s, &FILL[..k], 8);
+    }
+
+    // D — every set size 1..=8 with the matching prefix: membership is a *set*
+    //     test, so a candidate that compared a single byte must fail here.
+    for m in 1..=8usize {
+        let mut s = alloc::vec![0x00u8; 8];
+        s[..m].copy_from_slice(&FILL[..m]);
+        s[m.min(7)] = 0x00;
+        mk(&mut c, &format!("D.{}", m), &s, &FILL[..m], 8);
+    }
+
+    // E — a disjoint set: nothing matches, so the span is 0.
+    for m in 1..=4usize {
+        let mut s = alloc::vec![0xffu8; 8];
+        s[..m].copy_from_slice(&FILL[..m]);
+        s[m] = 0x00;
+        mk(
+            &mut c,
+            &format!("E.{}", m),
+            &s,
+            &[0x30, 0x31, 0x32, 0x33],
+            m + 1,
+        );
+    }
+
+    // F — the terminator is the only stop and sits at the bound: the span equals n.
+    for n in 1..=8usize {
+        let mut s = alloc::vec![0xffu8; 8];
+        for i in 0..(n - 1) {
+            s[i] = FILL[i];
+        }
+        s[n - 1] = 0x00;
+        mk(&mut c, &format!("F.bound.{}", n), &s, &FILL, n);
+    }
+
+    // G — exhaustive sweep of the accepted byte value: `s = [x, x, NUL]` with the
+    //     one-byte set `{x}` has span 2 for every non-NUL x, and span 0 for x = 0
+    //     (the set is empty, and the first byte terminates).
+    for x in 0..=255u16 {
+        let x = x as u8;
+        let accept: &[u8] = if x == 0 { &[] } else { &[x] };
+        mk(&mut c, &format!("G.{:02x}", x), &[x, x, 0x00], accept, 3);
+    }
+
+    // H — exhaustive sweep of the stopping byte value: `s = [x, 'A', NUL]` with the
+    //     set `{'A'}` has span 0 for x = 0, span 1 for x not in the set, and span 2
+    //     for x = 'A'.
+    for x in 0..=255u16 {
+        let x = x as u8;
+        mk(
+            &mut c,
+            &format!("H.{:02x}", x),
+            &[x, 0x41, 0x00],
+            &[0x41],
+            3,
+        );
+    }
+
+    c
+}
+
 /// The deterministic case set for a target.
 pub fn cases_for(target: &PortTarget) -> Vec<TestCase> {
     match target.id {
@@ -673,6 +837,7 @@ pub fn cases_for(target: &PortTarget) -> Vec<TestCase> {
         id if id == LIBC_MEMCHR.id => memchr_corpus(),
         id if id == LIBC_STRLEN.id => strlen_corpus(),
         id if id == LIBC_STRRCHR.id => strrchr_corpus(),
+        id if id == POSIX_STRSPN.id => strspn_corpus(),
         _ => Vec::new(),
     }
 }
@@ -685,6 +850,7 @@ pub fn resolve_target(name: &str) -> Option<PortTarget> {
         "memchr" | "libc:memchr:c-locale:index:v1" => Some(LIBC_MEMCHR),
         "strlen" | "libc:strlen:c-locale:u64:v1" => Some(LIBC_STRLEN),
         "strrchr" | "libc:strrchr:c-locale:index:v1" => Some(LIBC_STRRCHR),
+        "strspn" | "posix:strspn:c-locale:u64:v1" => Some(POSIX_STRSPN),
         _ => None,
     }
 }
@@ -848,6 +1014,77 @@ mod tests {
         assert!(ids.contains(&"D.7f"));
         assert!(ids.contains(&"D.80"));
         assert!(ids.contains(&"D.ff"));
+    }
+
+    #[test]
+    fn test_strspn_corpus_is_deterministic_and_bounded() {
+        let a = strspn_corpus();
+        let b = strspn_corpus();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 578);
+
+        let mut ids: Vec<&str> = a.iter().map(|c| c.case_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), a.len(), "case ids are unique");
+
+        for c in &a {
+            assert_eq!(c.args.len(), 3, "case {}", c.case_id);
+            let s = &c.args[0];
+            let accept = &c.args[1];
+            let n = u64::from_le_bytes(c.args[2].as_slice().try_into().unwrap()) as usize;
+            assert!(s.len() <= 8, "case {}", c.case_id);
+            assert!(accept.len() <= 8, "case {}", c.case_id);
+            assert!(n <= 8 && n <= s.len(), "case {}", c.case_id);
+            // The precondition: the terminator is inside the bound, so the foreign
+            // observation cannot read past the caller's window and the span is
+            // always decided within one packed word.
+            assert!(
+                s[..n].contains(&0),
+                "case {} has no terminator inside its bound",
+                c.case_id
+            );
+            // A C string set cannot contain NUL; an interior NUL would silently
+            // change the set, so the corpus never encodes one.
+            assert!(
+                !accept.contains(&0),
+                "case {} has a NUL inside the accept set",
+                c.case_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_strspn_corpus_covers_required_axes() {
+        let cases = strspn_corpus();
+        let ids: Vec<&str> = cases.iter().map(|c| c.case_id.as_str()).collect();
+
+        for group in ["A.", "B.", "C.", "D.", "E.", "F.", "G.", "H."] {
+            assert!(
+                ids.iter().any(|id| id.starts_with(group)),
+                "strspn corpus is missing group {}",
+                group
+            );
+        }
+
+        // The complete (span, n) grid, with accepted bytes after the terminator.
+        assert_eq!(ids.iter().filter(|id| id.starts_with("A.")).count(), 36);
+        assert!(ids.contains(&"A.0.1"));
+        assert!(ids.contains(&"A.7.8"));
+        // The degenerate cases: an empty set and an empty string both span 0.
+        assert!(ids.contains(&"B.empty_set"));
+        assert!(ids.contains(&"B.empty_string"));
+        // Every set size 1..=8, so a single-byte compare cannot pass.
+        assert_eq!(ids.iter().filter(|id| id.starts_with("D.")).count(), 8);
+        assert!(ids.contains(&"D.8"));
+        // Both exhaustive sweeps: the accepted byte and the stopping byte.
+        assert_eq!(ids.iter().filter(|id| id.starts_with("G.")).count(), 256);
+        assert_eq!(ids.iter().filter(|id| id.starts_with("H.")).count(), 256);
+        assert!(ids.contains(&"G.00"));
+        assert!(ids.contains(&"G.41"));
+        assert!(ids.contains(&"H.7f"));
+        assert!(ids.contains(&"H.80"));
+        assert!(ids.contains(&"H.ff"));
     }
 
     #[test]

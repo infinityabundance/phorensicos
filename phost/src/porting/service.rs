@@ -208,9 +208,9 @@ fn n8(n: usize) -> Vec<u8> {
 
 /// The deterministic session plan: every sealed port in the store, once.
 ///
-/// The five leaves come first, then the compositions. Because the
-/// compositions resolve to the same leaves, a full session maps **five** objects
-/// and serves every port — that reuse is the point.
+/// The leaves come first, then the compositions. Because the compositions resolve
+/// to the same leaves, a full session maps far fewer objects than it serves ports —
+/// that reuse is the point.
 pub fn session_plan() -> Vec<SessionCall> {
     alloc::vec![
         // ---- leaves ----
@@ -237,12 +237,6 @@ pub fn session_plan() -> Vec<SessionCall> {
             expect_hex: "01000000",
         },
         SessionCall {
-            label: "strlen(\"abc\\0\",4)",
-            port: crate::porting::target::LIBC_STRLEN.id,
-            args: alloc::vec![alloc::vec![0x61, 0x62, 0x63, 0x00], n8(4)],
-            expect_hex: "0300000000000000",
-        },
-        SessionCall {
             label: "strrchr(\"abc\\0\",'b',4)",
             port: crate::porting::target::LIBC_STRRCHR.id,
             args: alloc::vec![
@@ -251,6 +245,23 @@ pub fn session_plan() -> Vec<SessionCall> {
                 n8(4)
             ],
             expect_hex: "01000000",
+        },
+        // The POSIX dialect: "abc\0" against the set {"ab"} spans 2.
+        SessionCall {
+            label: "strspn(\"abc\\0\",\"ab\",4)",
+            port: crate::porting::target::POSIX_STRSPN.id,
+            args: alloc::vec![
+                alloc::vec![0x61, 0x62, 0x63, 0x00],
+                alloc::vec![0x61, 0x62],
+                n8(4)
+            ],
+            expect_hex: "0200000000000000",
+        },
+        SessionCall {
+            label: "strlen(\"abc\\0\",4)",
+            port: crate::porting::target::LIBC_STRLEN.id,
+            args: alloc::vec![alloc::vec![0x61, 0x62, 0x63, 0x00], n8(4)],
+            expect_hex: "0300000000000000",
         },
         // ---- compositions ----
         SessionCall {
@@ -501,11 +512,16 @@ mod tests {
     fn test_session_plan_covers_every_sealed_port() {
         let plan = session_plan();
         let ports: Vec<&str> = plan.iter().map(|c| c.port).collect();
-        assert_eq!(ports.len(), 11, "the plan serves every sealed port once");
+        assert_eq!(ports.len(), 12, "the plan serves every sealed port once");
         assert_eq!(
             ports.iter().filter(|p| p.starts_with("libc:")).count(),
             5,
-            "five leaves"
+            "five ISO C leaves"
+        );
+        assert_eq!(
+            ports.iter().filter(|p| p.starts_with("posix:")).count(),
+            1,
+            "one POSIX leaf"
         );
         assert_eq!(
             ports
@@ -531,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_is_consistent_and_serves_ten_ports_from_five_objects() {
+    fn test_session_is_consistent_and_serves_every_port_from_six_objects() {
         let (v, mismatches, service) = run_session(store::STORE_PATH, &granted()).unwrap();
         assert!(mismatches.is_empty(), "{:?}", mismatches);
         assert!(v.is_consistent());
@@ -541,10 +557,10 @@ mod tests {
         assert_eq!(v.fallback_calls, 0);
         assert_eq!(v.broken_seal_calls, 0);
         assert_eq!(v.ports_in_store, v.calls as usize);
-        // Ten ports, five objects: the leaves are mapped once and reused by every
-        // chain that consumes them.
-        assert_eq!(v.objects_mapped, 5);
-        assert_eq!(service.objects_mapped(), 5);
+        // Every port, six objects (five ISO C leaves and one POSIX leaf): the leaves
+        // are mapped once and reused by every chain that consumes them.
+        assert_eq!(v.objects_mapped, 6);
+        assert_eq!(service.objects_mapped(), 6);
         // Ten top-level calls, but many more resolutions once a chain's own stages
         // are counted.
         assert_eq!(v.dispatches, service.dispatches());
