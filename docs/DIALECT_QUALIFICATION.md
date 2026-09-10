@@ -61,10 +61,20 @@ That limit is not left to prose — the seal binds the observed behavior by hash
   silently — the replay and dispatch courts would fail against the sealed traces.
 
 So the honest reading is: *the POSIX-specified contract for `strspn` in the C locale,
-as observed on this host*. Turning that into *implementation-independent* behavior
-would require observing a **second** implementation (for example a musl-container
-run of the same corpus) and promoting only if both agree — a separate axis, and
-future work.
+as observed on this host*. The **implementation axis** is a separate court, and it
+now exists: the cross-implementation court (`docs/REPLAY_COURTS.md`, `verify_cross_implementation.sh`)
+observes the *same sealed corpus* through a **second, independent implementation** —
+musl, compiled statically by `musl-gcc` so an out-of-process observer cannot be the
+host's library in disguise — and requires agreement on every case. It records that the
+two implementations produced the same **sealed trace set**, not merely the same
+answers, and binds the leaf's committed sealed oracle hash.
+
+That is a stronger claim than "as this host implements it", and it is still bounded:
+agreement over a finite corpus is **evidence, not proof** of equivalence. It shows the
+sealed corpus does not distinguish glibc from musl; it does not show the contract holds
+for every implementation or every input. The qualification (`posix:` vs `libc:`) and the
+implementation axis are orthogonal: the first names which specification the contract is
+drawn from, the second names the implementations it has been checked against.
 
 ## What would not qualify
 
@@ -89,3 +99,6 @@ future work.
    implementations (here: a single-byte compare instead of a set test).
 6. Keep the verifier honest: the sealed package's `dialect` must equal the namespace
    of the target id, and the corpus checks must pin the axes the contract names.
+7. If the contract is claimed to be implementation-independent, run the
+   cross-implementation court (`./verify_cross_implementation.sh`) and state the limit:
+   agreement over a bounded corpus is evidence, not proof.

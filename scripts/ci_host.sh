@@ -24,6 +24,8 @@ cargo build -q -p phost -p phorc
 # regenerating pass touches the evidence dirs.
 ./verify_store.sh
 ./verify_session.sh
+# The implementation axis: the same sealed corpora through a second implementation.
+./verify_cross_implementation.sh
 
 echo
 echo "=== JIT-Porting Court ==="

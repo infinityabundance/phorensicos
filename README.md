@@ -116,6 +116,7 @@ foreign behavior → dialect cage       (observe a named specification as a blac
                  → composition court  (sealed ports become runtime building blocks)
                  → persistent store   (the seal is committed; the runtime loads, not re-derives)
                  → sealed native service (one verified load, many consumers)
+                 → cross-implementation court (the same seal observed through a second implementation)
 ```
 
 | Target | Corpus | Replay | Executed object | Runtime dispatch |
@@ -193,11 +194,53 @@ The honest limit is stated in the qualification review, `docs/DIALECT_QUALIFICAT
 `posix:` records the *specification namespace*; the *implementation* observed is still
 the host C library, and the seal binds the observed behavior by oracle hash, so a
 different implementation with different behavior cannot pass silently. Making the
-result implementation-independent would mean observing a second implementation (e.g.
-a musl container) and promoting only on agreement — a separate axis, future work.
+result implementation-independent is a separate axis, and it is now closed by the
+cross-implementation court described in the next section.
 
 The verifier now requires the sealed package's `dialect` to equal the namespace of
 the target id, so this cannot drift back into an unqualified claim.
+
+### The implementation axis: a second implementation
+
+A seal records an observation of **one** implementation — the host C library — so a
+`libc:` or `posix:` id names the contract, not the implementation that was observed.
+The **cross-implementation court** closes that gap: for every sealed leaf it observes
+the *same sealed corpus* through a **second, independent implementation** — musl,
+compiled statically by `musl-gcc` so an out-of-process observer cannot be the host's
+library in disguise — and requires agreement on every case:
+
+```text
+sealed corpus → dialect cage (host libc, in-process)   → implementation A
+              → musl probe  (static, out-of-process)  → implementation B
+              → per-case comparison → cross-implementation verdict
+```
+
+The claim is deliberately narrow and checkable: the two implementations produced the
+same **sealed trace set** (`secondary_oracle_hash == primary_oracle_hash`), not merely
+the same answers — and `primary_oracle_hash` is the leaf's committed sealed oracle
+hash, so the cross verdict cannot be detached from the seal it refers to:
+
+| Target | Cases | Agreements | Disagreements |
+|--------|-------|-----------|---------------|
+| `libc:toupper:c-locale:u8:v1` | 256 | **256** | 0 |
+| `libc:memcmp:c-locale:sign:v1` | 312 | **312** | 0 |
+| `libc:memchr:c-locale:index:v1` | 482 | **482** | 0 |
+| `libc:strlen:c-locale:u64:v1` | 308 | **308** | 0 |
+| `libc:strrchr:c-locale:index:v1` | 336 | **336** | 0 |
+| `posix:strspn:c-locale:u64:v1` | 578 | **578** | 0 |
+
+Two facts about the run are environment-bound and are recorded as **observed, not
+asserted** (the same split the boot manifest uses for the kernel image): the host
+library's version string, and the compiled probe's hash (`musl-gcc`-version-bound).
+The asserted claim is reproducible instead: the verifier rebuilds the probe, reruns
+the corpus, and requires the asserted fields to match the committed verdict without
+touching it. The probe is edited independently of the Rust cage and its per-symbol
+decoding is written out again, because an observer that shared the cage's code could
+only confirm the cage.
+
+The honest limit stays: **agreement on a bounded corpus is evidence, not proof of
+equivalence.** It shows the sealed corpus does not distinguish the two implementations;
+it does not show the contract holds for every implementation or every input.
 
 ### Composition: sealed ports as runtime building blocks
 
@@ -465,6 +508,8 @@ cargo run -p phost -- port promote memchr
 cargo run -p phost -- port promote strlen
 cargo run -p phost -- port promote strrchr
 cargo run -p phost -- port promote strspn     # the POSIX dialect
+cargo run -p phost -- port cross toupper      # the same sealed corpus through musl
+cargo run -p phost -- port cross strspn       # the POSIX dialect, second implementation
 cargo run -p phost -- port native toupper 61              # call site: run the sealed object
 cargo run -p phost -- port native memcmp 616263:616264:0300000000000000
 cargo run -p phost -- port native memchr 616263:62:0300000000000000
@@ -504,6 +549,7 @@ cargo run -p phost -- port compose --target toupper_memchr_suffix 62617862:61:62
 ./verify_composition_court.sh --target toupper_memchr_suffix --check-committed
 ./verify_store.sh                                                          # persistent store
 ./verify_session.sh                                                        # sealed native service
+./verify_cross_implementation.sh                                           # the implementation axis
 ```
 
 Verified: the seals bind the **qualified target id** (`libc:memcmp:c-locale:sign:v1`),
@@ -570,7 +616,8 @@ docker compose up --build        # both, one shot
 ```
 
 `host` runs the compiler/runtime tests and the court verifiers (`verify_store.sh`,
-`verify_session.sh`, `verify_jit_porting_court.sh`, `verify_composition_court.sh`).
+`verify_session.sh`, `verify_cross_implementation.sh`, `verify_jit_porting_court.sh`,
+`verify_composition_court.sh`).
 `kernel` builds the
 Multiboot kernel, boots it under QEMU, verifies the boot evidence (13 checks) and
 checks the boot evidence is byte-reproducible against the committed
@@ -593,7 +640,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **223 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **230 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | every corpus source emits a non-empty object: **369 / 369, 0 failures** (`src/` 232, `examples/` 51, `tests/` 83 incl. 46 `compile-pass`, `fixtures/` 2, `README.phor`) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -613,6 +660,7 @@ All numbers below were reproduced on a clean checkout.
 | Compiled candidate authority | `phorc` compiles each `.phor` candidate; object/receipt hashes match an independent recompilation and a fresh container run |
 | Persistent sealed port store | `phost/evidence/store/index.json` commits all **12** sealed ports (6 leaf object hashes + 6 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry, and rejects a composition cycle; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
 | Sealed native service | one verified store load serves many consumers: **12 ports from 6 mapped objects**, **53** sealed-port resolutions including nested stages, **0 fallbacks / 0 broken seals**; `toupper` fan-in 30, `memchr` 8, `strlen` 4, `toupper_each` 3; the session reproduces from a copy of the store at another path, a missing store fails closed, and without `PORTING` the store is never read |
+| Cross-implementation | every sealed leaf observed through a **second, independent implementation** (musl, statically linked, `libc=musl` from its own check, no `PT_INTERP`): `toupper` 256, `memcmp` 312, `memchr` 482, `strlen` 308, `strrchr` 336, `strspn` 578 — **2272 cases, 0 disagreements**; `secondary_oracle_hash == primary_oracle_hash ==` the committed sealed oracle hash; agreements on a bounded corpus are evidence, not proof |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
 
 ### Known gaps

@@ -207,10 +207,17 @@ fn port_cli(args: &[String]) -> i32 {
         );
         eprintln!("       phost port store [--check|--write] [PATH]");
         eprintln!("       phost port session [--out DIR] [--no-capability]");
+        eprintln!("       phost port cross <symbol> [--out DIR] [--probe PATH]");
         return 2;
     }
 
     let stage = args[0].as_str();
+
+    // The cross-implementation court: the same sealed corpus through a second,
+    // independent implementation.
+    if stage == "cross" {
+        return cross_cli(&args[1..]);
+    }
 
     // The long-lived sealed native service: one verified store load, many consumers.
     if stage == "session" {
@@ -624,6 +631,129 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// `phost port cross <symbol> [--out DIR] [--probe PATH] [--no-capability]`
+///
+/// The cross-implementation court: the target's sealed corpus is observed through
+/// the host C library (the sealed path) and through musl via a statically linked
+/// probe, and the two must agree on every case. The verdict binds the sealed oracle
+/// hash, so the claim cannot be separated from the seal it refers to.
+fn cross_cli(args: &[String]) -> i32 {
+    use phost::porting::{self, cross_impl, PortingAuthority};
+
+    if args.is_empty() {
+        eprintln!("Usage: phost port cross <symbol> [--out DIR] [--probe PATH]");
+        return 2;
+    }
+
+    let symbol = args[0].as_str();
+    let mut out = format!("phost/evidence/cross/{}", symbol);
+    let mut probe_path: Option<String> = None;
+    let mut auth = PortingAuthority::granted();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-capability" => {
+                auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--out" if i + 1 < args.len() => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            "--probe" if i + 1 < args.len() => {
+                probe_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let target = match porting::resolve_target(symbol) {
+        Some(t) => t,
+        None => {
+            eprintln!("port cross: unknown symbol {}", symbol);
+            return 2;
+        }
+    };
+
+    // The probe is an instrument: build it if the caller did not supply one.
+    let probe = match probe_path {
+        Some(p) => match cross_impl::probe_artifact(&p) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("port cross: {}", e);
+                return 1;
+            }
+        },
+        None => {
+            let path = format!("/tmp/phorensic-musl-probe-{}", std::process::id());
+            match cross_impl::compile_probe(&path) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("port cross: {}", e);
+                    return 1;
+                }
+            }
+        }
+    };
+
+    match cross_impl::run_cross_court(&target, &probe, &auth) {
+        Ok((v, mismatches)) => {
+            println!("=== Cross-Implementation Court ===");
+            println!("Target:        {}", v.target);
+            println!(
+                "Dialect:       {} (locale {})",
+                v.dialect, v.locale_contract
+            );
+            println!("Primary:       {} — {}", v.primary, v.primary_mechanism);
+            println!("  observed:    {}", v.primary_version_observed);
+            println!("Secondary:     {} — {}", v.secondary, v.secondary_mechanism);
+            println!("  identity:    {}", v.secondary_identity);
+            println!(
+                "Probe source:  {} ({})",
+                v.probe_source,
+                &v.probe_source_hash[..12]
+            );
+            println!(
+                "Probe binary:  {} (observed, toolchain-bound)",
+                &v.probe_binary_hash[..12]
+            );
+            println!("Cases:         {}", v.cases_run);
+            println!("Agreements:    {}", v.agreements);
+            println!("Disagreements: {}", v.disagreements);
+            println!("Primary oracle hash:   {}", v.primary_oracle_hash);
+            println!("Secondary oracle hash: {}", v.secondary_oracle_hash);
+            if !mismatches.is_empty() {
+                for m in mismatches.iter().take(10) {
+                    println!(
+                        "  [DISAGREE] {}: primary {} secondary {}",
+                        m.case_id, m.primary_hex, m.secondary_hex
+                    );
+                }
+            }
+            println!("Verdict:       {}", v.verdict.as_str());
+
+            match phost::porting::evidence::write_cross_evidence(&out, &v, &mismatches) {
+                Ok(p) => println!("Evidence:      {}", p),
+                Err(e) => {
+                    eprintln!("port cross: writing evidence failed: {}", e);
+                    return 1;
+                }
+            }
+            if v.is_consistent() {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("port cross {}: {}", symbol, e);
+            1
+        }
+    }
 }
 
 /// `phost port session [--out DIR] [--no-capability] [PATH]`

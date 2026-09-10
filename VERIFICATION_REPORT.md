@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 223 pass, 4 ignored | 227 total: 166 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
+| All tests (phost) | ✅ 230 pass, 4 ignored | 234 total: 173 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -35,6 +35,7 @@
 | Register allocator | ✅ | x86-64 register allocator (deterministic, spill-correct) in codegen |
 | Sealed-object execution | ✅ | `exec.rs` loads the sealed ELF64 object, verifies its hash, maps it and calls the ABI entry |
 | Sealed native dispatch | ✅ | `dispatch.rs`: the runtime prefers the sealed object at a call site; broken seals fail closed, no capability → foreign fallback |
+| Cross-implementation court | ✅ | `cross_impl.rs`: the same sealed corpus observed through a second, independent implementation (musl via a statically linked probe); all six leaves agree, 2272 cases / 0 disagreements |
 
 ### Compiler Pipeline
 ```
@@ -87,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 223 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + six sealed composition courts (incl. a nested one and a buffer-slicing one) + persistent sealed port store + sealed native service |
+| phost reach | 230 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + six sealed composition courts (incl. a nested one and a buffer-slicing one) + persistent sealed port store + sealed native service + cross-implementation court |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -462,14 +463,59 @@ Why this is a real qualification and not a rename:
   so the qualification cannot drift back into an unqualified claim.
 
 The honest limit, stated in **`docs/DIALECT_QUALIFICATION.md`**: `posix:` records the
-*specification namespace*. The implementation observed is still the host C library,
-and the seal binds the observed behavior by oracle hash, so a differing implementation
-cannot pass silently — but implementation-independence would require observing a
-second implementation (e.g. a musl container) and promoting only on agreement. That
-axis is future work, and the document says so.
+*specification namespace*. The implementation observed for the seal is the host C
+library, and the seal binds the observed behavior by oracle hash, so a differing
+implementation cannot pass silently. Implementation-independence is a **separate axis**,
+now closed by the cross-implementation court below.
+
+### Cross-Implementation Court
+
+A seal binds an observation of *one* implementation: the host C library. So
+"the POSIX contract for `strspn`" is really "the POSIX contract as this host implements
+it". The cross-implementation court (`phost/src/porting/cross_impl.rs`,
+`phost/foreign/musl_probe.c`) closes that gap by observing the **same sealed corpus**
+through a **second, independent implementation** and requiring agreement on every case.
+
+The second implementation is musl, reached out-of-process through a statically linked
+probe (`musl-gcc -static`). Independence is checked, not asserted: the verifier builds
+the probe itself, requires the probe to report `libc=musl` from its own `#ifdef`
+check, and parses the ELF to require **no `PT_INTERP`** — a static binary cannot be
+dynamically linking the host's library. The probe's per-symbol decoding is written out
+again rather than shared with the Rust cage, because an observer that shared the cage's
+code could only confirm the cage.
+
+| Aspect | Result |
+|--------|--------|
+| Targets | all six sealed leaves: `toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`, `strspn` |
+| Primary | `host-libc` — in-process FFI (the dialect cage), i.e. exactly the sealed path |
+| Secondary | `musl` — out-of-process statically linked probe (`libc=musl`, no `PT_INTERP`) |
+| Cases | **2272** total (256 + 312 + 482 + 308 + 336 + 578), **0 disagreements** |
+| Trace sets | `secondary_oracle_hash == primary_oracle_hash` for every target — the same sealed trace set, not merely the same answers |
+| Seal binding | `primary_oracle_hash ==` the leaf's committed `combined_oracle_hash` |
+| Verdict / promotion | `consistent` for every target; promotion is unchanged and separate |
+
+Two facts about the run are environment-bound and are recorded as **observed, not
+asserted** (the same split the boot manifest uses for the kernel image): the host
+library's version string (here `gnu libc 2.44`) and the compiled probe's hash
+(`musl-gcc`-version-bound). The `residual_hash` covers exactly the asserted claim; a
+test asserts that changing the probe binary hash does **not** change the residual, while
+changing the second implementation's identity **does**.
+
+Reproduce:
+
+```sh
+cargo run -p phost -- port cross toupper      # 256 cases, 0 disagreements
+cargo run -p phost -- port cross strspn       # 578 cases, the POSIX dialect
+./verify_cross_implementation.sh              # rebuild the probe + verify all six
+```
+
+The verifier writes only to a temp directory and fails loudly (exit 2) when `musl-gcc`
+is absent, because a cross-implementation claim that cannot observe a second
+implementation must never pass quietly. The honest limit is unchanged: **agreement on a
+bounded corpus is evidence, not proof of equivalence.**
 
 ### Test Results (reproduced on `main`)
-- phost: 223 passed, 0 failed, 4 ignored (227 total). The ignored tests read
+- phost: 230 passed, 0 failed, 4 ignored (234 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -494,6 +540,8 @@ cargo run -p phost -- port promote memchr        # JIT-porting court (482)
 cargo run -p phost -- port promote strlen        # JIT-porting court (308)
 cargo run -p phost -- port promote strrchr       # JIT-porting court (336)
 cargo run -p phost -- port promote strspn        # JIT-porting court (578, POSIX dialect)
+cargo run -p phost -- port cross toupper          # cross-implementation court (256, musl)
+cargo run -p phost -- port cross strspn           # cross-implementation court (578, musl)
 cargo run -p phost -- port store                # load + verify the committed store
 cargo run -p phost -- port store --write        # regenerate it from committed evidence
 cargo run -p phost -- port session              # one load, twelve ports, six objects
@@ -532,6 +580,7 @@ cargo run -p phost -- port compose --target toupper_memchr --store --phorc /none
 cargo run -p phost -- port compose --target toupper_each_strlen_memchr --store --phorc /nonexistent/phorc
 ./verify_store.sh                                # persistent store verifier
 ./verify_session.sh                              # sealed native service verifier
+./verify_cross_implementation.sh                 # cross-implementation court (all six leaves)
 cd phost_kernel && ./build_kernel.sh             # Multiboot image
 ./boot_qemu.sh phorensic-kernel.elf evidence 8   # boot + capture
 ./verify_evidence.sh evidence                    # 13/13 boot-evidence checks
@@ -559,4 +608,7 @@ verdict, promotion receipt, sealed package) is committed as
 `phost/evidence/porting/{toupper,memcmp,memchr,strlen,strrchr}/`, and the
 composition verdicts as
 `phost/evidence/composition/{toupper_memchr,toupper_strlen_memchr,toupper_strlen_memchr_pair,toupper_each,toupper_each_strlen_memchr}/composition_verdict.json`
-(the large composition oracle traces are regenerable and stay gitignored).
+(the large composition oracle traces are regenerable and stay gitignored). The
+cross-implementation verdicts are committed as
+`phost/evidence/cross/{toupper,memcmp,memchr,strlen,strrchr,strspn}/cross_implementation_verdict.json`,
+with the environment-bound facts under `observed_not_asserted`.

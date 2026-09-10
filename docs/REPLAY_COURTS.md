@@ -510,10 +510,63 @@ as `m + t - m*t`), emits a 25072-byte ELF64 object with **0 relocations**, and i
 loaded and called by the execution court for every case.
 
 The qualification is checked, not asserted: the leaf verifier requires the sealed
-package's `dialect` to equal the namespace of the target id. The honest limit — the
-implementation observed is still the host C library, so this binds the POSIX contract
-*as observed* rather than implementation-independent behavior — is documented in
-`docs/DIALECT_QUALIFICATION.md`.
+package's `dialect` to equal the namespace of the target id. The implementation
+observed for the seal is the host C library, so this binds the POSIX contract *as
+observed*; implementation-independence is a separate axis, closed by the
+cross-implementation court below.
+
+### Cross-implementation court
+
+The dialect names the specification; a seal still observes *one* implementation of it.
+The cross-implementation court (`phost::porting::cross_impl`) closes that gap for every
+sealed leaf: it observes the **same sealed corpus** through a second, independent
+implementation and requires agreement on every case.
+
+```text
+target -> cases_for(target)                              the sealed corpus
+       -> dialect_cage (host C library, in-process)      -> implementation A
+       -> musl probe   (static, out-of-process)          -> implementation B
+       -> per-case comparison -> cross-implementation verdict
+```
+
+The second implementation is musl, reached out-of-process through a statically linked
+probe (`phost/foreign/musl_probe.c`, built with `musl-gcc -static`). Independence is
+checked rather than asserted: the verifier builds the probe, requires it to report
+`libc=musl` from its own `#ifdef __GLIBC__` check, and parses the ELF to require **no
+`PT_INTERP`** — a static binary cannot be dynamically linking the host's library. The
+probe's per-symbol decoding is deliberately written out again rather than shared with
+the Rust cage, because an observer that shared the cage's code could only confirm the
+cage.
+
+The verdict (`cross_implementation_verdict.json`) records both oracle hashes. The
+stronger claim is not per-case agreement but that the two implementations produced the
+**same sealed trace set**: `secondary_oracle_hash == primary_oracle_hash`, and
+`primary_oracle_hash` is the leaf's committed sealed oracle hash, so a cross verdict
+cannot be detached from the seal it refers to. A probe that answers nothing fails
+closed rather than "agreeing" vacuously, and a probe not built against musl is refused
+rather than compared.
+
+Claim hygiene: the host library's version string and the compiled probe's hash are
+environment-bound, so they are recorded **observed, not asserted** (the same split the
+boot manifest uses for the kernel image). The `residual_hash` covers exactly the
+asserted claim, and a test asserts the probe hash is outside it.
+
+The limit is load-bearing: **agreement on a bounded corpus is evidence, not proof of
+equivalence.** It shows the sealed corpus does not distinguish glibc from musl; it does
+not show the contract holds for every implementation or every input. Promotion itself is
+unchanged — this is an additional, orthogonal residual.
+
+Reproduce:
+
+```sh
+phost port cross toupper      # 256 cases, 0 disagreements
+phost port cross strspn       # 578 cases, the POSIX dialect
+./verify_cross_implementation.sh
+```
+
+The verifier writes only to a temp dir and fails loudly (exit 2) when `musl-gcc` is
+absent, so a cross-implementation claim can never pass by skipping the second
+implementation.
 
 ### Mapping to court concepts
 
@@ -1003,14 +1056,18 @@ phost/src/porting/                target, dialect_cage, oracle_trace,
                                   composition, composition_strlen_memchr,
                                   composition_pair, composition_toupper_each,
                                   composition_nested, composition_suffix, store,
-                                  json, service
+                                  json, service, cross_impl
+phost/foreign/musl_probe.c        the second-implementation observer (musl-gcc -static)
 phost/evidence/store/index.json   persistent store: every sealed port (leaf objects
                                   + composition chain hashes), committed
 phost/evidence/session/           session verdict (one load, many consumers)
+phost/evidence/cross/             cross-implementation verdicts (one per sealed leaf)
 verify_store.sh                   persistent store verifier (load, regenerate,
                                   independent recompilation, no-compiler runtime)
-verify_session.sh                 sealed native service verifier (one load, ten
-                                  ports, five objects, fan-in, fail-closed)
+verify_session.sh                 sealed native service verifier (one load, twelve
+                                  ports, six objects, fan-in, fail-closed)
+verify_cross_implementation.sh    cross-implementation verifier (rebuilds the musl
+                                  probe, checks independence, all six leaves)
 ```
 
 The examples and evidence:
@@ -1029,9 +1086,11 @@ phost/evidence/porting/strlen/    strlen evidence set (308 cases) + candidate.o
 phost/evidence/porting/strrchr/   strrchr evidence set (336 cases) + candidate.o
 phost/evidence/porting/strspn/    strspn evidence set (578 cases, POSIX) + candidate.o
 phost/evidence/composition/      composition verdicts (chains over sealed ports)
-verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr)
-verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr)
+phost/evidence/cross/            cross-implementation verdicts (one per sealed leaf)
+verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr|strlen|strrchr|strspn)
+verify_composition_court.sh       composition court verifier (--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix)
 verify_store.sh                   persistent store verifier
+verify_cross_implementation.sh    cross-implementation verifier
 ```
 
 The committed leaf `candidate.o` is the seal, so it is committed; only

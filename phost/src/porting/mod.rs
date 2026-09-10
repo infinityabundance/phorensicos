@@ -38,6 +38,7 @@ pub mod composition_pair;
 pub mod composition_strlen_memchr;
 pub mod composition_suffix;
 pub mod composition_toupper_each;
+pub mod cross_impl;
 pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;

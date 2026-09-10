@@ -309,20 +309,22 @@ foreign behavior → dialect cage → oracle traces → behavior signature
 → composition court (sealed ports become runtime building blocks)
 → persistent store (the seal is committed; the runtime loads it, not re-derives it)
 → sealed native service (one verified load, many consumers)
+→ cross-implementation court (the seal is checked against a second implementation)
 → runtime prefers native
 ```
 
-- **Dialect cage** — observes a foreign API surface as a black box. Five targets
-  so far: libc `toupper` (exhaustive `0x00..=0xff`), libc `memcmp` (a bounded
+- **Dialect cage** — observes a foreign API surface as a black box. Six targets so
+  far: libc `toupper` (exhaustive `0x00..=0xff`), libc `memcmp` (a bounded
   deterministic corpus forcing length, buffers and ordering), libc `memchr`
   (a bounded deterministic corpus forcing search: first-match index, absent
   needle, repeated needles, the `n`-boundary, and an exhaustive 256-value needle
   sweep), libc `strlen` (a bounded deterministic corpus forcing NUL termination:
   the complete `(k, n)` terminator-index/scan-bound grid, non-NUL fillers,
-  first-NUL-wins tails, and an exhaustive 256-value non-terminator sweep) and libc
+  first-NUL-wins tails, and an exhaustive 256-value non-terminator sweep), libc
   `strrchr` (a bounded deterministic corpus forcing *last*-match semantics inside
   the string: unique and repeated occurrences, needles that occur only after the
-  terminator, needles straddling it, and an exhaustive 256-value needle sweep).
+  terminator, needles straddling it, and an exhaustive 256-value needle sweep), and
+  POSIX `strspn` (a prefix length decided by set membership; a second dialect).
   `memchr`/`strrchr` pointer results are normalized to indexes, which is the
   portable part of their contracts. No foreign source is read or copied.
 - **Court session** — replays a clean-room native candidate against sealed oracle
@@ -368,7 +370,7 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   evidence set. Gated by the `PORTING` capability.
 - **Persistent store** — the seal is a committed artifact, not something the
   runtime recomputes. `phost/evidence/store/index.json` names every sealed port
-  (five leaf object hashes, six composition chain hashes) and loading it verifies
+  (six leaf object hashes, six composition chain hashes) and loading it verifies
   each entry: leaf object bytes must hash to their seal, every composition stage
   must be a sealed entry, and the document's residual hash must cover its entries.
   It fails closed — a missing or broken entry is an error, never a partial store —
@@ -378,9 +380,17 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   byte-equality. `--store` runs the composition court from the index instead of
   deriving it, so the committed verdict reproduces with no compiler at all.
 
-  verifier independently recompiles each `.phor` source and requires
-  byte-equality. `--store` runs the composition court from the index instead of
-  deriving it, so the committed verdict reproduces with no compiler at all.
+- **Cross-implementation court** — a seal binds an observation of *one*
+  implementation, so the dialect cage's "the POSIX contract for `strspn`" is really
+  "as this host implements it". This court observes the same sealed corpus through a
+  **second, independent implementation** (musl, out-of-process through a statically
+  linked `musl-gcc` probe) and requires agreement on every case. Independence is
+  checked, not asserted: the probe must report `libc=musl` from its own check and its
+  ELF must have no `PT_INTERP`. All six leaves agree over 2272 cases with zero
+  disagreements, and the two implementations produce the *same sealed trace set*
+  (`secondary_oracle_hash == primary_oracle_hash`), bound to the leaf's committed
+  sealed oracle hash. The limit is explicit: agreement on a bounded corpus is
+  evidence, not proof of equivalence.
 
 - **Sealed native service** — one verified load, many consumers. The service owns
   an index for its lifetime; `open` is the only place with a store path, so a call

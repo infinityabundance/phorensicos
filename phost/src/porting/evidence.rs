@@ -23,6 +23,7 @@ use crate::porting::composition_pair::PairVerdict;
 use crate::porting::composition_strlen_memchr::StrlenMemchrVerdict;
 use crate::porting::composition_suffix::SuffixVerdict;
 use crate::porting::composition_toupper_each::ToupperEachVerdict;
+use crate::porting::cross_impl::{CrossMismatch, CrossVerdict};
 use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
@@ -257,5 +258,23 @@ pub fn write_session_evidence(dir: &str, verdict: &SessionVerdict) -> io::Result
     fs::create_dir_all(&base)?;
     let path = base.join("session_verdict.json");
     fs::write(&path, verdict.to_json())?;
+    Ok(path.display().to_string())
+}
+
+/// Write the **cross-implementation** evidence: the same sealed corpus observed
+/// through a second, independent implementation. Returns the verdict path.
+///
+/// The residual is the verdict (which binds the sealed oracle hash) plus the
+/// disagreements, if any — a cross-implementation court that disagreed is evidence
+/// too, and must be committed rather than hidden.
+pub fn write_cross_evidence(
+    dir: &str,
+    verdict: &CrossVerdict,
+    mismatches: &[CrossMismatch],
+) -> io::Result<String> {
+    let base = PathBuf::from(dir);
+    fs::create_dir_all(&base)?;
+    let path = base.join("cross_implementation_verdict.json");
+    fs::write(&path, verdict.to_json(mismatches))?;
     Ok(path.display().to_string())
 }
