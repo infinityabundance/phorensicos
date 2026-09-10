@@ -25,6 +25,8 @@ cargo build -q -p phost -p phorc
 ./verify_jit_porting_court.sh --target toupper --check-committed
 ./verify_jit_porting_court.sh --target memcmp --check-committed
 ./verify_jit_porting_court.sh --target memchr --check-committed
+./verify_composition_court.sh --check-committed
 ./verify_jit_porting_court.sh --target toupper
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
+./verify_composition_court.sh

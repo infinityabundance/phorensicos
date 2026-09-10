@@ -204,6 +204,9 @@ fn port_cli(args: &[String]) -> i32 {
         eprintln!(
             "       phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
         );
+        eprintln!(
+            "       phost port compose [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]"
+        );
         return 2;
     }
 
@@ -213,6 +216,12 @@ fn port_cli(args: &[String]) -> i32 {
     // the sealed-native dispatcher.
     if stage == "native" {
         return native_cli(&args[1..]);
+    }
+
+    // Sealed Composition Dispatch Court: a composed target built from sealed
+    // ports, executed through the dispatcher.
+    if stage == "compose" {
+        return compose_cli(&args[1..]);
     }
     let depth = match PortDepth::parse(stage) {
         Some(d) => d,
@@ -311,7 +320,6 @@ fn port_cli(args: &[String]) -> i32 {
 /// instead of running the native artifact.
 fn native_cli(args: &[String]) -> i32 {
     use phost::porting::{self, PortingAuthority};
-
     if args.is_empty() {
         eprintln!("Usage: phost port native <symbol> [ARGS_HEX] [--no-capability] [--out DIR] [--phorc PATH]");
         return 2;
@@ -385,4 +393,151 @@ fn native_cli(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `phost port compose [HAY_HEX:NEEDLE_HEX:N_HEX] [--no-capability] [--out DIR] [--phorc PATH]`
+///
+/// The Sealed Composition Dispatch Court for `toupper ∘ memchr`. With no
+/// positional argument it runs the whole composition corpus through the sealed
+/// chain and writes the composition evidence; with an argument it runs one
+/// composed call and prints each stage.
+fn compose_cli(args: &[String]) -> i32 {
+    use phost::porting::{self, PortingAuthority};
+
+    let mut call: Option<String> = None;
+    let mut out = String::from("phost/evidence/composition/toupper_memchr");
+    let mut phorc: Option<String> = None;
+    let mut dispatch_auth = PortingAuthority::granted();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-capability" => {
+                dispatch_auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--out" if i + 1 < args.len() => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            "--phorc" if i + 1 < args.len() => {
+                phorc = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                call = Some(match call {
+                    Some(prev) => format!("{}:{}", prev, other),
+                    None => other.to_string(),
+                });
+                i += 1;
+            }
+        }
+    }
+
+    match call {
+        None => match porting::run_composition_court(
+            &PortingAuthority::granted(),
+            &out,
+            phorc.as_deref(),
+        ) {
+            Ok(r) => {
+                println!("=== Sealed Composition Dispatch Court ===");
+                println!("Target:        {}", r.target);
+                println!("Stages:        {}", r.stages.join(" -> "));
+                println!("Cases:         {}", r.cases_run);
+                println!(
+                    "toupper(hay):  {} native / {} cases",
+                    r.toupper_hay_native_cases, r.cases_run
+                );
+                println!(
+                    "toupper(needle): {} native / {} cases",
+                    r.toupper_needle_native_cases, r.cases_run
+                );
+                println!(
+                    "memchr:        {} native / {} cases",
+                    r.memchr_native_cases, r.cases_run
+                );
+                println!(
+                    "Fallback:      {}   Broken seal: {}",
+                    r.fallback_cases, r.broken_seal_cases
+                );
+                println!("Passed:        {}", r.cases_passed);
+                println!("Failed:        {}", r.cases_failed);
+                println!("Dispatches:    {}", r.dispatches_run);
+                println!("toupper object: {}", r.toupper_object_hash);
+                println!("memchr object:  {}", r.memchr_object_hash);
+                println!("Chain hash:    {}", r.chain_hash);
+                println!("Oracle hash:   {}", r.oracle_hash);
+                println!("Verdict:       {}", r.verdict);
+                println!(
+                    "Sealed:        {}",
+                    if r.sealed { "yes" } else { "no" }
+                );
+                println!("Evidence:      {}", r.evidence_dir);
+                0
+            }
+            Err(e) => {
+                eprintln!("port compose: {}", e);
+                1
+            }
+        },
+        Some(framed) => {
+            let args = match porting::parse_hex_args(&framed) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("port compose: {}", e);
+                    return 2;
+                }
+            };
+            if args.len() < 3 {
+                eprintln!("port compose: expected HAY_HEX:NEEDLE_HEX:N_HEX");
+                return 2;
+            }
+            let hay = &args[0];
+            let needle = args[1].first().copied().unwrap_or(0);
+            let n = u64::from_le_bytes(match args[2].as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => {
+                    eprintln!("port compose: N must be an 8-byte little-endian length");
+                    return 2;
+                }
+            }) as usize;
+
+            match porting::run_composition_call(hay, needle, n, &dispatch_auth, phorc.as_deref()) {
+                Ok(c) => {
+                    println!("=== Sealed Composition Call ===");
+                    println!("Input:         {}", framed);
+                    println!("toupper(hay):  {} -> {}", c.hay_stage, hex_encode(&c.hay_norm));
+                    println!(
+                        "toupper(needle): {} -> {}",
+                        c.needle_stage,
+                        c.needle_norm
+                            .map(|b| format!("{:02x}", b))
+                            .unwrap_or_else(|| String::from("-"))
+                    );
+                    println!("memchr:        {}", c.memchr_stage);
+                    println!(
+                        "Index:         {}",
+                        c.index
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| String::from("-"))
+                    );
+                    println!("Dispatches:    {}", c.dispatches);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("port compose: {}", e);
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }

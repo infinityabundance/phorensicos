@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::porting::behavior_signature::BehaviorSignature;
 use crate::porting::candidate::CandidateSignature;
+use crate::porting::composition::CompositionVerdict;
 use crate::porting::dispatch::DispatchVerdict;
 use crate::porting::exec::ExecutionVerdict;
 use crate::porting::oracle_trace::{self, OracleTrace};
@@ -170,4 +171,27 @@ pub fn write_evidence_set(
 /// Helper for callers that only need the sealed package residual string.
 pub fn package_id(target: &PortTarget) -> String {
     format!("native:{}", target.id)
+}
+
+/// Write the composition evidence set: the sealed oracle traces and the
+/// composition verdict. Returns the verdict path.
+///
+/// The composition has no candidate of its own — its implementation is the
+/// chain of already-sealed objects — so the evidence is the oracle plus the
+/// per-stage chain verdict.
+pub fn write_composition_evidence(
+    dir: &str,
+    traces: &[OracleTrace],
+    verdict: &CompositionVerdict,
+    mismatches: &[Mismatch],
+) -> io::Result<String> {
+    let base = PathBuf::from(dir);
+    fs::create_dir_all(&base)?;
+    fs::write(
+        base.join("composition_oracle_traces.json"),
+        oracle_trace::traces_to_json(traces),
+    )?;
+    let verdict_path = base.join("composition_verdict.json");
+    fs::write(&verdict_path, verdict.to_json(mismatches))?;
+    Ok(verdict_path.display().to_string())
 }

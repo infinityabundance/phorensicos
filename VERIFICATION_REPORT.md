@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 130 pass, 4 ignored | 134 total: 8 serial + 4 kernel + 49 nucleus + 65 porting (incl. exec + dispatch courts); the 4 ignored read privileged control registers and require ring 0 |
+| All tests (phost) | ✅ 135 pass, 4 ignored | 139 total: 8 serial + 4 kernel + 49 nucleus + 70 porting (incl. exec, dispatch and composition courts); the 4 ignored read privileged control registers and require ring 0 |
 | All tests (phorc) | ✅ 48 pass | 44 unit (parser/checker/lower/codegen) + 4 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -166,8 +166,41 @@ receipt and the sealed package.
 Try it: `phost port native toupper 61` (native) and
 `phost port native toupper 61 --no-capability` (foreign fallback).
 
+### Sealed Composition Dispatch Court
+
+The leaf courts prove a sealed artifact is correct and preferred. The composition
+court proves sealed artifacts are **runtime building blocks**: one composed
+target whose implementation is a chain of already-sealed objects, executed
+entirely through `NativeDispatcher` with **no foreign calls in the sealed path**
+and no Rust mirror consulted.
+
+| Aspect | `phor:compose:toupper_memchr:c-locale:index:v1` |
+|--------|--------------------------------------------------|
+| Stages | `libc:toupper:c-locale:u8:v1` → `libc:memchr:c-locale:index:v1` |
+| Oracle | foreign C-locale `toupper` over the haystack and needle, then foreign `memchr` |
+| Corpus | 560 cases (the `memchr` corpus + C-locale fold cases) |
+| toupper (haystack) stage | ✅ 560/560 native |
+| toupper (needle) stage | ✅ 560/560 native |
+| memchr stage | ✅ 560/560 native |
+| Foreign fallback | **0** |
+| Broken seal | **0** |
+| Passed / failed | 560 / 0 |
+| Sealed dispatches | 4776 |
+| Dispatched toupper object | `05c175a89a25d339f22793193860045e94cdf5c4a2f85cfba3dea3677ab4e8d4` (= committed leaf seal) |
+| Dispatched memchr object | `90d35156eef8b7009352ebb0ac6fa0f9137c95a515ae1a1e760a37147032bbb8` (= committed leaf seal) |
+| Chain hash | `d00bdf2697e24d2aa947cfafb9b37be24e93516d88531cb312fba9f2eafc0c22` |
+| Oracle hash | `974140b6e04643eef0ce7a78b5fb604a83201c375d69049c6cbdae667e2d06a9` |
+| Verdict | `consistent` |
+
+The composition adds no new trusted code; its `oracle_hash` and `chain_hash` are
+bound in `phost/evidence/composition/toupper_memchr/composition_verdict.json`.
+`chain_hash` covers the per-stage status, the normalized intermediates and the
+final index, so a skipped or fallback stage changes it even if the index matches.
+The fold cases (`G.*`) only match *after* `toupper` normalizes both sides, so a
+composition that dropped the toupper stage cannot pass.
+
 ### Test Results (reproduced on `main`)
-- phost: 130 passed, 0 failed, 4 ignored (134 total). The ignored tests read
+- phost: 135 passed, 0 failed, 4 ignored (139 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
@@ -217,4 +250,6 @@ explicitly, and the kernel CI verifies the flag is still `false` before checking
 the evidence. The porting evidence set (oracle traces,
 behavior/candidate signatures, replay verdict, execution verdict, dispatch
 verdict, promotion receipt, sealed package) is committed as
-`phost/evidence/porting/{toupper,memcmp,memchr}/`.
+`phost/evidence/porting/{toupper,memcmp,memchr}/`, and the composition verdict as
+`phost/evidence/composition/toupper_memchr/composition_verdict.json` (the large
+composition oracle traces are regenerable and stay gitignored).

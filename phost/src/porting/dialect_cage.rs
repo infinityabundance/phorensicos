@@ -3,7 +3,7 @@
 // The cage is the clean-room boundary. It runs the *foreign* implementation as
 // an observed black box and records input/output/status/locale/effects — it never
 // reads, copies, or embeds foreign source. Foreign functions are reached through
-// a single narrow FFI shim (libc `toupper`, `memcmp`).
+// a single narrow FFI shim (libc `toupper`, `memcmp`, `memchr`).
 //
 // This module is std-only: observing a foreign implementation requires the
 // foreign runtime to be present. Kernel-side replay against already-sealed
@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
 
 use crate::porting::candidate::{decode_usize, encode_index, encode_sign};
+use crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_TOUPPER};
 use crate::porting::{PortError, PortingAuthority};
@@ -128,6 +129,62 @@ pub fn observe_target(
     }
 
     Err(PortError::UnsupportedTarget(String::from(target.id)))
+}
+
+/// Observe the composition `toupper ∘ memchr` through the **foreign** runtime:
+/// uppercase the haystack with libc `toupper` (C locale), uppercase the needle
+/// with libc `toupper`, then run libc `memchr` over the normalized haystack.
+///
+/// This is the oracle the sealed composition must reproduce *without* any
+/// foreign calls in the sealed path.
+pub fn observe_composition(
+    cases: &[TestCase],
+    auth: &PortingAuthority,
+) -> Result<Vec<OracleTrace>, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+
+    Ok(cases
+        .iter()
+        .map(|case| {
+            let hay = case.args.first().cloned().unwrap_or_default();
+            let needle = case
+                .args
+                .get(1)
+                .and_then(|a| a.first())
+                .copied()
+                .unwrap_or(0);
+            let n = case.args.get(2).map(|x| decode_usize(x)).unwrap_or(0);
+            let n = n.min(hay.len());
+
+            // Stage 1+2: foreign C-locale `toupper` over the haystack and needle.
+            let upper: Vec<u8> = hay
+                .iter()
+                .map(|&b| unsafe { toupper(b as c_int) as u8 })
+                .collect();
+            let upper_needle = unsafe { toupper(needle as c_int) as u8 };
+
+            // Stage 3: foreign `memchr` over the normalized haystack.
+            let base = upper.as_ptr();
+            let found = unsafe { memchr(base as *const c_void, upper_needle as c_int, n) };
+            let idx: i32 = if found.is_null() {
+                -1
+            } else {
+                (found as usize - base as usize) as i32
+            };
+
+            OracleTrace::for_target_id(
+                COMPOSITION_TOUPPER_MEMCHR.id,
+                COMPOSITION_TOUPPER_MEMCHR.locale_contract,
+                &case.case_id,
+                &case.args,
+                &encode_index(idx),
+                "ok",
+                &["compute"],
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]

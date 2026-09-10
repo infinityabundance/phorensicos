@@ -123,6 +123,15 @@ pub fn encode_index(index: i32) -> Vec<u8> {
     index.to_le_bytes().to_vec()
 }
 
+/// Decode a 4-byte little-endian index produced by the compiled candidate.
+/// Short input decodes as `-1` (fail closed: "absent").
+pub fn decode_index(bytes: &[u8]) -> i32 {
+    if bytes.len() < 4 {
+        return -1;
+    }
+    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 /// Decode a little-endian `usize` argument (the compared length).
 pub fn decode_usize(bytes: &[u8]) -> usize {
     let mut buf = [0u8; 8];

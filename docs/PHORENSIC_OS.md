@@ -305,7 +305,8 @@ the **JIT-Porting Court**. It ports behavior at the API boundary:
 foreign behavior → dialect cage → oracle traces → behavior signature
 → native candidate → replay court → comparison → promotion → sealed package
 → execution court (load and call the sealed object)
-→ dispatch court (runtime serves calls from the sealed object) → runtime prefers native
+→ dispatch court (runtime serves calls from the sealed object)
+→ composition court (sealed ports become runtime building blocks) → runtime prefers native
 ```
 
 - **Dialect cage** — observes a foreign API surface as a black box. Three targets
@@ -328,6 +329,12 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   artifact the call falls back to the foreign implementation; a *broken seal* is
   terminal and never falls back. The court requires every case to be served
   natively.
+- **Composition court** — proves sealed ports compose. One composed target
+  (`phor:compose:toupper_memchr:c-locale:index:v1`) is implemented as `toupper`
+  over the haystack and needle followed by `memchr`, dispatched entirely through
+  the sealed store with no foreign calls and no Rust mirror. The verdict records
+  per-stage native/fallback/broken-seal counts and a chain hash over the
+  intermediates.
 - **Promotion** — advances the candidate to `sealed` only when the replay court,
   the execution court *and* the dispatch court all match exactly, with a complete
   evidence set. Gated by the `PORTING` capability.

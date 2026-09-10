@@ -32,6 +32,7 @@ use crate::kernel::CapabilitySet;
 pub mod behavior_signature;
 pub mod candidate;
 pub mod compiled;
+pub mod composition;
 pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;
@@ -43,6 +44,7 @@ pub mod target;
 
 pub use behavior_signature::BehaviorSignature;
 pub use candidate::{CandidateArtifacts, CandidateSignature};
+pub use composition::{CompositionTarget, CompositionVerdict, COMPOSITION_TOUPPER_MEMCHR};
 pub use dispatch::{
     DispatchError, DispatchOutcome, DispatchSource, DispatchVerdict, NativeDispatcher,
 };
@@ -623,6 +625,117 @@ pub fn run_port_court(
             .map(|v| v.verdict.as_str().to_string())
             .unwrap_or_default(),
     })
+}
+
+/// Build the sealed store index for the composition: the two leaf ports,
+/// compiled fresh (deterministically) and marked sealed.
+///
+/// The composition adds no new trusted code — its implementation *is* these two
+/// already-sealed objects.
+fn build_composition_index(phorc: Option<&str>) -> Result<SealedPortIndex, PortError> {
+    let mut index = SealedPortIndex::new();
+    for target in [target::LIBC_TOUPPER, target::LIBC_MEMCHR] {
+        let dir = format!("phost/evidence/porting/{}", target.symbol);
+        let c = compiled::compile_candidate(&target, &dir, phorc)
+            .map_err(|e| PortError::Compile(e.message()))?;
+        index.insert(SealedPortEntry {
+            target: target.id.to_string(),
+            trust: TrustState::Sealed,
+            oracle_hash: String::new(),
+            candidate_behavior_hash: String::new(),
+            candidate_source_hash: c.source_hash,
+            candidate_object_hash: c.object_hash,
+            candidate_object_path: c.object_path,
+            sealed_package: format!("{}/sealed_package.json", dir),
+        });
+    }
+    Ok(index)
+}
+
+/// Outcome of a composition court run, suitable for printing.
+#[derive(Clone, Debug)]
+pub struct CompositionReport {
+    pub target: String,
+    pub stages: Vec<String>,
+    pub cases_run: u64,
+    pub toupper_hay_native_cases: u64,
+    pub toupper_needle_native_cases: u64,
+    pub memchr_native_cases: u64,
+    pub fallback_cases: u64,
+    pub broken_seal_cases: u64,
+    pub cases_passed: u64,
+    pub cases_failed: u64,
+    pub dispatches_run: u64,
+    pub toupper_object_hash: String,
+    pub toupper_elf_symbol: String,
+    pub memchr_object_hash: String,
+    pub memchr_elf_symbol: String,
+    pub oracle_hash: String,
+    pub chain_hash: String,
+    pub verdict: String,
+    pub sealed: bool,
+    pub evidence_dir: String,
+}
+
+/// Run the Sealed Composition Dispatch Court for `toupper ∘ memchr`.
+///
+/// The oracle comes from the foreign runtime (`dialect_cage::observe_composition`);
+/// the implementation is the chain of sealed objects executed through
+/// `NativeDispatcher` — no Rust mirror is consulted.
+pub fn run_composition_court(
+    auth: &PortingAuthority,
+    out_dir: &str,
+    phorc: Option<&str>,
+) -> Result<CompositionReport, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+
+    let index = build_composition_index(phorc)?;
+    let cases = composition::composition_corpus();
+    let traces = dialect_cage::observe_composition(&cases, auth)?;
+    let (verdict, mismatches) = composition::run_composition_court(&traces, &index, auth);
+
+    let verdict_path =
+        evidence::write_composition_evidence(out_dir, &traces, &verdict, &mismatches)
+            .map_err(|e| PortError::Io(format!("{}", e)))?;
+
+    Ok(CompositionReport {
+        target: verdict.target.clone(),
+        stages: verdict.stages.clone(),
+        cases_run: verdict.cases_run,
+        toupper_hay_native_cases: verdict.toupper_hay_native_cases,
+        toupper_needle_native_cases: verdict.toupper_needle_native_cases,
+        memchr_native_cases: verdict.memchr_native_cases,
+        fallback_cases: verdict.fallback_cases,
+        broken_seal_cases: verdict.broken_seal_cases,
+        cases_passed: verdict.cases_passed,
+        cases_failed: verdict.cases_failed,
+        dispatches_run: verdict.dispatches_run,
+        toupper_object_hash: verdict.toupper_object_hash.clone(),
+        toupper_elf_symbol: verdict.toupper_elf_symbol.clone(),
+        memchr_object_hash: verdict.memchr_object_hash.clone(),
+        memchr_elf_symbol: verdict.memchr_elf_symbol.clone(),
+        oracle_hash: verdict.oracle_hash.clone(),
+        chain_hash: verdict.chain_hash.clone(),
+        verdict: verdict.verdict.as_str().to_string(),
+        sealed: verdict.is_sealed_eligible(),
+        evidence_dir: verdict_path,
+    })
+}
+
+/// Run one composed call for the CLI: `hay`, `needle`, `n`.
+pub fn run_composition_call(
+    hay: &[u8],
+    needle: u8,
+    n: usize,
+    auth: &PortingAuthority,
+    phorc: Option<&str>,
+) -> Result<composition::CompositionCall, PortError> {
+    let index = build_composition_index(phorc)?;
+    Ok(composition::run_composition_call(
+        &index, hay, needle, n, auth,
+    ))
 }
 
 #[cfg(test)]

@@ -540,6 +540,67 @@ phost port native memcmp 616263:616264:0300000000000000         # sealed-object 
 phost port native toupper 61 --no-capability                    # foreign-fallback
 ```
 
+### Sealed composition dispatch court
+
+The leaf courts prove a sealed artifact is correct (`exec`), then preferred
+(`dispatch`). The composition court proves they can be **composed by the
+runtime**: one composed target built from already-sealed ports, executed
+entirely through `NativeDispatcher`, with no foreign calls in the sealed path and
+no Rust mirror consulted.
+
+```text
+phor:compose:toupper_memchr:c-locale:index:v1
+
+  input:  haystack, needle, n
+  oracle: foreign C-locale toupper over the haystack and the needle,
+          then foreign memchr over the normalized haystack -> index or -1
+  sealed: dispatch sealed toupper once per haystack byte and once for the
+          needle, then dispatch sealed memchr once
+```
+
+The id is `phor:compose:…`, not `libc:…`: this is no longer a single foreign API
+surface but a Phorensic composition over already-sealed ports, and it adds no new
+trusted code.
+
+`composition_verdict.json` records the per-stage accounting:
+
+```text
+target  stages  locale_contract
+cases_run
+toupper_hay_native_cases  toupper_needle_native_cases  memchr_native_cases
+fallback_cases  broken_seal_cases
+cases_passed  cases_failed  dispatches_run
+toupper_object_hash  toupper_elf_symbol
+memchr_object_hash   memchr_elf_symbol
+oracle_hash  chain_hash  verdict  mismatches
+```
+
+`verdict = consistent` only when **every** stage was served by the sealed object
+for **every** case (`*_native_cases == cases_run`), with zero foreign fallbacks
+and zero broken seals, and every index matched the oracle. A broken seal is again
+counted separately from a fallback.
+
+`chain_hash` covers the whole chain per case — the stage statuses, the normalized
+`toupper` intermediates and the final index — so a skipped or fallback stage
+changes the hash even when the index coincides.
+
+The dispatched object hashes are cross-checked by the verifier against the
+committed leaf seals, so the composition provably used the exact sealed artifacts
+under `phost/evidence/porting/{toupper,memchr}/`.
+
+The corpus reuses the `memchr` corpus and adds C-locale fold cases (`G.*`) where a
+needle only matches after `toupper` normalizes both sides — a composition that
+dropped the toupper stage cannot pass.
+
+Reproduce:
+
+```sh
+phost port compose                                  # composition court (560 cases)
+phost port compose 614263:62:0300000000000000       # one composed call
+./verify_composition_court.sh                       # determinism
+./verify_composition_court.sh --check-committed     # fresh == checked-in
+```
+
 ### Seal contents
 
 The sealed package binds the qualified target id, the locale contract, the
@@ -567,14 +628,17 @@ revealed.
 ```text
 phost/src/porting/                target, dialect_cage, oracle_trace,
                                   behavior_signature, candidate, replay_court,
-                                  promotion, evidence, compiled, exec, dispatch
+                                  promotion, evidence, compiled, exec, dispatch,
+                                  composition
 examples/jit_port_toupper.phor    toupper native candidate, in Phorensic
 examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
-examples/jit_port_memchr.phor      memchr native candidate, in Phorensic
-phost/evidence/porting/toupper/    toupper evidence set (256 cases) + candidate.o
-phost/evidence/porting/memcmp/     memcmp evidence set (312 cases) + candidate.o
-phost/evidence/porting/memchr/     memchr evidence set (482 cases) + candidate.o
-verify_jit_porting_court.sh        court verifier (--target toupper|memcmp|memchr)
+examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
+phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
+phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
+phost/evidence/porting/memchr/    memchr evidence set (482 cases) + candidate.o
+phost/evidence/composition/      composition verdict (chain over sealed ports)
+verify_jit_porting_court.sh       leaf court verifier (--target toupper|memcmp|memchr)
+verify_composition_court.sh       composition court verifier
 ```
 
 The compiled `candidate.o` / `candidate.receipts.json` are regenerated (and are

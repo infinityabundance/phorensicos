@@ -50,7 +50,15 @@ impl OracleTrace {
             .map(|a| hex::encode(a))
             .collect::<Vec<String>>()
             .join(":");
-        Self::from_parts(target, case_id, input_hex, output, status, effects)
+        Self::from_parts(
+            &target.id,
+            &target.locale_contract,
+            case_id,
+            input_hex,
+            output,
+            status,
+            effects,
+        )
     }
 
     /// Convenience for single-argument targets (e.g. `toupper`).
@@ -65,8 +73,37 @@ impl OracleTrace {
         Self::new(target, case_id, &[input.to_vec()], output, status, effects)
     }
 
+    /// Build a trace for an explicit target id + locale contract, without a
+    /// `PortTarget`. Compositions have no single foreign symbol to point at, but
+    /// they still seal oracle traces under a qualified id.
+    pub fn for_target_id(
+        target_id: &str,
+        locale_contract: &str,
+        case_id: &str,
+        args: &[Vec<u8>],
+        output: &[u8],
+        status: &str,
+        effects: &[&str],
+    ) -> Self {
+        let input_hex = args
+            .iter()
+            .map(|a| hex::encode(a))
+            .collect::<Vec<String>>()
+            .join(":");
+        Self::from_parts(
+            target_id,
+            locale_contract,
+            case_id,
+            input_hex,
+            output,
+            status,
+            effects,
+        )
+    }
+
     fn from_parts(
-        target: &PortTarget,
+        target_id: &str,
+        locale_contract: &str,
         case_id: &str,
         input_hex: String,
         output: &[u8],
@@ -74,8 +111,8 @@ impl OracleTrace {
         effects: &[&str],
     ) -> Self {
         let mut trace = Self {
-            target: target.id.to_string(),
-            locale_contract: target.locale_contract.to_string(),
+            target: target_id.to_string(),
+            locale_contract: locale_contract.to_string(),
             case_id: case_id.to_string(),
             input_hex,
             output_hex: hex::encode(output),

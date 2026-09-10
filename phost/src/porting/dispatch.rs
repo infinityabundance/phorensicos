@@ -136,6 +136,15 @@ impl NativeDispatcher {
         self.loaded.len()
     }
 
+    /// The object hash + ELF symbol of the sealed object loaded for `target_id`,
+    /// if it has already been dispatched to (which is how a composition records
+    /// the concrete artifact each stage used).
+    pub fn sealed_binding(&self, target_id: &str) -> Option<(String, String)> {
+        self.loaded
+            .get(target_id)
+            .map(|h| (h.object_hash.clone(), h.elf_symbol.clone()))
+    }
+
     /// Dispatch one call for `target`.
     pub fn dispatch(
         &mut self,

@@ -7,6 +7,7 @@
 // Two targets exist:
 //   - libc:toupper:c-locale:u8:v1     exhaustive byte domain, 256 cases
 //   - libc:memcmp:c-locale:sign:v1    bounded deterministic corpus, ordering
+//   - libc:memchr:c-locale:index:v1   bounded deterministic corpus, first-match index
 //
 // The corpus for a target is deterministic and bounded; it is enumerated in a
 // fixed order so the court is reproducible and the verdict does not depend on
@@ -91,7 +92,8 @@ pub const LIBC_MEMCHR: PortTarget = PortTarget {
     output_schema: "i32 index of the first match, or -1 when absent",
     domain_summary: "bounded deterministic corpus: lengths 0..=8, first match at every index, absent needle, repeated needles, n-boundary, edge bytes, exhaustive 0..=255 needle sweep",
     candidate_source: "examples/jit_port_memchr.phor",
-    // ABI: (wh: u64 packed big-endian, needle: u64, n: u64) -> u64 index or -1.
+    // ABI: (wh: u64, needle: u64, n: u64) -> u64 index or -1; the haystack's
+    // first n bytes are packed LITTLE-ENDIAN (byte i in bits 8*i).
     abi_symbol: "phor_memchr_index",
 };
 
