@@ -72,7 +72,7 @@ artifact being the ordinary compiled `.phor` ELF.
 ## Test suites at this phase
 
 ```text
-phost     317 passed, 0 failed, 4 ignored
+phost     326 passed, 0 failed, 4 ignored
 phorc      50 passed, 0 failed
 phorport   37 passed, 0 failed
 ```
@@ -141,3 +141,26 @@ for defects the design corpus *misses*; that case is Phase 4's Gate E (the
 `strspn` XOR-fold defect: 578 design cases, 0 divergences, then an FRF-Fuzz
 campaign) and is measured there, not here. No p-value is converted into a
 correctness claim.
+
+## Phase 10 — bounded CompositionIR synthesis
+
+`phost/src/porting/composition_synth.rs` enumerates well-typed acyclic
+`CompositionIR` graphs over a declared grammar and port set, validates each
+candidate, and accepts one only when it matches the oracle on the whole
+composition corpus. The test `test_synthesis_rediscovers_toupper_each` gives it
+only the declared inputs (`[Bytes, Scalar]`), the declared port set (the sealed
+`toupper`), the output type (`Bytes`) and the oracle behavior, and it rediscovers
+the committed `toupper_each` shape. **Bounded claim:** the grammar is the subset
+the existing chains use; the larger seven-node chains are not reached within the
+current state budget, and a goal-directed search is future work.
+
+## Phase 11 — ABI v2, court side
+
+`phost/src/porting/abi_v2.rs` implements the guarded-arena memory-effect court:
+before/after images, the actual write set, guard-zone observation, and overlap
+classification with forward/backward reference models. Tests show it detects a
+guard clobber and a write outside the allowed range, and separates a naive
+forward `memcpy` from an overlap-correct `memmove` in both directions. **Honest
+boundary:** `phorc` does not yet emit pointer/region arguments, so no
+memory-effect port is executed or sealed; this is the court-side contract only.
+`memset`, `memcpy` and `memmove` remain future work.

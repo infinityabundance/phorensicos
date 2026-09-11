@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 315 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations and the demand model |
+| phost reach | 326 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations, the demand model, bounded `CompositionIR` synthesis and the guarded-arena memory-effect court |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -675,6 +675,26 @@ on the declared `strspn` families it is an honest negative (all arms distinguish
 4/4, because the design corpus already suffices). See
 `docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md` and
 `phost/evidence/phorport/ablation/strspn.json`.
+
+### Phase 10 — bounded CompositionIR synthesis
+
+`phost/src/porting/composition_synth.rs` is a bounded typed-graph enumerator over
+a declared grammar and port set. It rediscovers the `toupper_each` composition
+(a slice of a declared input followed by the sealed `toupper` map) from the
+declared inputs, ports, output type and oracle behavior alone, validating each
+candidate and matching it against the oracle on the whole corpus. The larger
+chains are not reached within the current budget. See
+`docs/COMPOSITION_SYNTHESIS.md`.
+
+### Phase 11 — ABI v2 (court side)
+
+`phost/src/porting/abi_v2.rs` implements the memory-effect court: guarded arenas,
+before/after images, the actual write set, guard-zone observation, and overlap
+classification with forward/backward reference models. Hostile tests show it
+detects a guard clobber, a write outside the allowed range, and separates a naive
+forward `memcpy` from an overlap-correct `memmove` in both directions. `phorc`
+does not yet emit pointer/region arguments, so **no memory-effect port is
+sealed**; the compiler half is future work. See `docs/ABI_V2.md`.
 
 ```sh
 ./scripts/integration_baseline.sh

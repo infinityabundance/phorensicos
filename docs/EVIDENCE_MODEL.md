@@ -79,6 +79,15 @@ not replace Phorensicos promotion, and Phorensicos does not reimplement FRF's
 object model. `phorport/src/frf.rs` runs FRF's own court/receipt/claim commands
 and retains the ids verbatim.
 
+**Build-bound identities (honest limit).** FRF binds the *runner executable hash*
+into its run and receipt ids. The promotion receipt therefore reproduces for a
+fixed coordinator build, and across builds it differs only in those ids and the
+identities that reference them. `verify_autonomous_seal.sh` therefore checks the
+promotion receipt's **structure** (profile, the thirteen obligations, their
+roles, the candidate-object binding, the FRF receipts present) and compares the
+build-independent **qualification receipt byte-for-byte**. This is recorded as an
+observed property, not hidden.
+
 ## 6. Not claimed
 
 Bound evidence is not a proof of equivalence. `AUTONOMOUS-SEAL/v1` is a bounded

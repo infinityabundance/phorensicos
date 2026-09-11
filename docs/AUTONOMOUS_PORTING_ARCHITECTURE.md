@@ -84,8 +84,8 @@ versioned, and the documentation states exactly what was demonstrated.
 | **7** | Held-out qualification + multi-oracle policy + FRF outer-court binding + `AUTONOMOUS-SEAL/v1` + candidate containment | **core done** — an independent-construction held-out universe with a redacted receipt and a leakage audit; the multi-oracle policy (host-observed / multi-implementation, never a majority vote); the FRF outer court as a differential court (receipts retained verbatim); the `AUTONOMOUS-SEAL/v1` 13-obligation profile; and an out-of-process contained candidate worker (rlimits, `no_new_privs`, timeout, crash recovery). The pipeline seals a reconstructed `strspn` end-to-end and reproduces byte-for-byte (`verify_autonomous_seal.sh`); see `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`, `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md` |
 | **8** | Immutable store generations + demand-driven port queue + explicit service generation binding | **core done** — `StoreGeneration`/`GenerationLedger` with content-identity lineage and fail-closed verification; a session binds a generation and refuses an unbound artifact; a runtime miss emits a bounded, non-blocking `PortDemand`; deterministic integer demand ranking with a recorded breakdown (`docs/STORE_GENERATIONS.md`) |
 | **9** | Blind-regeneration demonstrations + controlled ablation + empirical verification report | **core done** — a bounded enumerative Phor synthesizer (`phorport/src/synth.rs`) reconstructs `strlen` (and supports `memchr`) from the spec alone and seals; five ablation arms measure executions-to-first-distinguishing-input with a shared seed, reporting an honest negative result on the declared `strspn` families (`docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md`) |
-| **10** | Automatic bounded `CompositionIR` synthesis | not started |
-| **11** | ABI v2 bounded memory effects (only after the above) | not started |
+| **10** | Automatic bounded `CompositionIR` synthesis | **core done** — a bounded typed-graph enumerator rediscovers the `toupper_each` slice-plus-map composition from the declared inputs, ports, output type and oracle behavior, with validation and oracle matching (`docs/COMPOSITION_SYNTHESIS.md`); the larger chains are not reached within the current budget |
+| **11** | ABI v2 bounded memory effects (only after the above) | **court side done** — a guarded-arena model with before/after images, actual write set, guard-zone observation and overlap classification, hostile-tested; the compiler/lowering half (pointer/region arguments) is not implemented, so no memory-effect port is sealed (`docs/ABI_V2.md`) |
 
 ### Phase 0 — done
 
@@ -252,6 +252,16 @@ K  immutable publication        a successful campaign creates a new store genera
                                 rather than mutating a bound one
 L  clean-room reproduction      the host integration reproduces from a clean checkout
 ```
+
+Status at Phase 11: **A–K** are demonstrated by executable courts and committed
+evidence (A by the byte-identical baseline and `ci_host.sh`; D by the challenge
+court; E by the Phase 4 campaign; F by the Gemel memory; G by the isolation audit;
+H by the blind `strlen` regeneration and the `strspn` campaign; I by the execution
+and dispatch courts; J by the sealed service opening with no external machinery;
+K by the generation ledger and generation-bound service). **L** — the Docker
+clean-room host/kernel courts — is run on the host changes; a Docker rerun of the
+Phase 8–11 additions has not been performed in this session and is therefore not
+claimed.
 
 ---
 

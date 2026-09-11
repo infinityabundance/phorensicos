@@ -30,6 +30,7 @@ use core::fmt;
 use crate::kernel::CapabilitySet;
 
 pub mod abi;
+pub mod abi_v2;
 pub mod autonomous_seal;
 pub mod behavior_signature;
 pub mod candidate;
@@ -44,6 +45,7 @@ pub mod composition_registry;
 pub mod composition_slice_search;
 pub mod composition_strlen_memchr;
 pub mod composition_suffix;
+pub mod composition_synth;
 pub mod composition_toupper_each;
 pub mod cross_impl;
 pub mod demand;
