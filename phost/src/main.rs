@@ -207,6 +207,8 @@ fn port_cli(args: &[String]) -> i32 {
         );
         eprintln!("       phost port store [--check|--write] [PATH]");
         eprintln!("       phost port session [--out DIR] [--no-capability]");
+        eprintln!("       phost port generation-session [--out DIR] [--generation PATH] [--registry PATH] [--store PATH] [--no-capability]");
+        eprintln!("       phost port generation-artifact <target-id> --object <path> --sealed-package <path> --out <registry.json>");
         eprintln!("       phost port cross <symbol> [--out DIR] [--probe PATH]");
         eprintln!("       phost port challenge <symbol|composition> [--out DIR]");
         return 2;
@@ -223,6 +225,17 @@ fn port_cli(args: &[String]) -> i32 {
     // The long-lived sealed native service: one verified store load, many consumers.
     if stage == "session" {
         return session_cli(&args[1..]);
+    }
+
+    // The generation-aware session: materialize a published generation's exact
+    // runtime index and serve every port it binds (consumption of §19).
+    if stage == "generation-session" {
+        return generation_session_cli(&args[1..]);
+    }
+
+    // Emit the committed locator registry for an autonomously published leaf.
+    if stage == "generation-artifact" {
+        return generation_artifact_cli(&args[1..]);
     }
 
     // The persistent sealed port store: load and verify the committed index, or
@@ -956,6 +969,177 @@ fn session_cli(args: &[String]) -> i32 {
             } else {
                 1
             }
+        }
+    }
+}
+
+/// `phost port generation-session [--out DIR] [--generation PATH] [--registry PATH] [--store PATH] [--no-capability]`
+///
+/// Materialize the exact runtime index a published store generation represents and
+/// serve every port it binds from one verified load under a generation binding.
+/// Needs no compiler, oracle, FRF, FRF-Fuzz or Gemel: it reads committed evidence
+/// and committed object bytes only.
+fn generation_session_cli(args: &[String]) -> i32 {
+    use phost::porting::generation_session as gs;
+    use phost::porting::{store, PortingAuthority};
+
+    let mut out = String::from("phost/evidence/session");
+    let mut generation = gs::DEFAULT_GENERATION_PATH.to_string();
+    let mut registry = gs::DEFAULT_ARTIFACT_REGISTRY_PATH.to_string();
+    let mut store_path = store::STORE_PATH.to_string();
+    let mut auth = PortingAuthority::granted();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-capability" => {
+                auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--out" if i + 1 < args.len() => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            "--generation" if i + 1 < args.len() => {
+                generation = args[i + 1].clone();
+                i += 2;
+            }
+            "--registry" if i + 1 < args.len() => {
+                registry = args[i + 1].clone();
+                i += 2;
+            }
+            "--store" if i + 1 < args.len() => {
+                store_path = args[i + 1].clone();
+                i += 2;
+            }
+            other => {
+                eprintln!("port generation-session: unknown argument {other}");
+                return 2;
+            }
+        }
+    }
+
+    match gs::run_generation_session(&generation, &registry, &store_path, &auth) {
+        Ok((verdict, _service)) => {
+            println!("=== Generation Session ===");
+            println!("Generation:       {}", verdict.generation_id);
+            println!("Parent:           {}", verdict.parent_generation_id);
+            println!("Materialized idx: {}", verdict.materialized_index_hash);
+            println!("Ports:            {}", verdict.ports_available);
+            println!("Store loads:      {}", verdict.store_loads);
+            println!("Calls:            {}", verdict.calls);
+            println!("Native calls:     {}", verdict.native_calls);
+            println!(
+                "Foreign fallback: {}   Broken seal: {}",
+                verdict.fallback_calls, verdict.broken_seal_calls
+            );
+            println!("Objects mapped:   {}", verdict.objects_mapped);
+            println!("Dispatches:       {}", verdict.dispatches);
+            println!();
+            println!("Per-port resolutions (nested stages included):");
+            for (port, count) in &verdict.per_port {
+                println!("  {:<58} {}", port, count);
+            }
+            if !verdict.mismatches.is_empty() {
+                println!();
+                for m in &verdict.mismatches {
+                    println!(
+                        "  [MISMATCH] {}: expected {} got {} ({})",
+                        m.label, m.expected_hex, m.actual_hex, m.reason
+                    );
+                }
+            }
+            println!();
+            println!("Session hash:     {}", verdict.session_hash);
+            println!("Verdict:          {}", verdict.verdict_str());
+
+            if !out.is_empty() {
+                let path = std::path::Path::new(&out).join("generation_session.json");
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Err(e) = std::fs::write(&path, verdict.to_json()) {
+                    eprintln!("port generation-session: writing evidence failed: {e}");
+                    return 1;
+                }
+                println!("Evidence:         {}", path.display());
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("port generation-session: {e}");
+            // A capability denial is the expected, fail-closed outcome.
+            if auth.can_observe() {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// `phost port generation-artifact <target-id> --object <path> --sealed-package <path> --out <registry.json>`
+///
+/// Derive the committed locator for an autonomously published leaf from committed
+/// evidence (observing its declared corpus and hashing the committed object) and
+/// write the artifact registry. This is evidence generation, not a runtime path.
+fn generation_artifact_cli(args: &[String]) -> i32 {
+    use phost::porting::generation_session as gs;
+
+    let Some(target_id) = args.first().cloned() else {
+        eprintln!("usage: phost port generation-artifact <target-id> --object <path> --sealed-package <path> --out <registry.json>");
+        return 2;
+    };
+    let mut object = None;
+    let mut sealed = None;
+    let mut out = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--object" if i + 1 < args.len() => {
+                object = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--sealed-package" if i + 1 < args.len() => {
+                sealed = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--out" if i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("port generation-artifact: unknown argument {other}");
+                return 2;
+            }
+        }
+    }
+    let (Some(object), Some(sealed), Some(out)) = (object, sealed, out) else {
+        eprintln!("usage: phost port generation-artifact <target-id> --object <path> --sealed-package <path> --out <registry.json>");
+        return 2;
+    };
+
+    let base = phost::porting::compiled::workspace_root();
+    match gs::emit_autonomous_artifact(&target_id, &object, &sealed, &base) {
+        Ok(artifact) => {
+            let mut artifacts = vec![artifact];
+            artifacts.sort_by(|a, b| a.target.cmp(&b.target));
+            let registry = gs::ArtifactRegistry { artifacts };
+            if let Some(dir) = std::path::Path::new(&out).parent() {
+                if !dir.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+            }
+            if let Err(e) = std::fs::write(&out, registry.to_json()) {
+                eprintln!("port generation-artifact: writing {out} failed: {e}");
+                return 1;
+            }
+            print!("{}", registry.to_json());
+            0
+        }
+        Err(e) => {
+            eprintln!("port generation-artifact: {e}");
+            1
         }
     }
 }

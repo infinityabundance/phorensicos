@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 331 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + `strspn`, the last recorded under a historical `posix:` identity and corrected by a `libc:strspn` successor via evidence-preserving supersession) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations, the demand model, bounded `CompositionIR` synthesis, the guarded-arena memory-effect court and the contract-provenance supersession record |
+| phost reach | 340 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + `strspn`, the last recorded under a historical `posix:` identity and corrected by a `libc:strspn` successor via evidence-preserving supersession) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + generation-aware consumption (a session bound to generation 1 materializes the exact runtime index and serves 14 ports from 7 objects) + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations, the demand model, bounded `CompositionIR` synthesis, the guarded-arena memory-effect court and the contract-provenance supersession record |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -933,8 +933,9 @@ docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 
 **Gate L (clean-room reproduction) is verified.** From a clean checkout of the final
 tree,
-`docker compose build host && docker compose run --rm host` exits 0 (74 verifier
-blocks — including the new `./verify_supersession.sh` — with 0 failures) and
+`docker compose build host && docker compose run --rm host` exits 0 (75 verifier
+blocks — including `./verify_supersession.sh` and `./verify_generation_session.sh`
+— with 0 failures) and
 `docker compose build kernel && docker compose run --rm kernel` exits 0 (13/13
 boot-evidence checks, all five captured artifacts byte-reproducible against the
 committed manifest). The Docker build context excludes host-local foundry state, so

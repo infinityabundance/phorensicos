@@ -124,7 +124,57 @@ historical `posix:strspn` leaf carried forward unchanged). Publication is
 (`d219be2c…`) is unchanged, existing sessions stay bound to their generation, and a
 new session may open generation 1.
 
-## 7. What is not claimed
+## 7. Consuming a generation: exact materialization
+
+Publishing a generation is only half of §19. `phost/src/porting/generation_session.rs`
+closes the other half: a session bound to generation N materializes the **exact**
+runtime index N represents and serves every port it binds.
+
+The invariant is **equality**, not containment:
+
+```text
+Artifacts(dispatcher) == Artifacts(generation)
+```
+
+The materializer takes three committed inputs — the verified baseline index, the
+committed `StoreGeneration`, and the committed autonomous artifact registry
+(`phost/evidence/autonomous/artifacts.json`; the locator for a leaf a later campaign
+published) — and:
+
+1. verifies the generation and that its parent is the genesis of the committed
+   baseline index (a foreign parent is refused);
+2. resolves each entry against the baseline index (carrying its object path and
+   metadata) or, for a new target, against the registry;
+3. verifies each artifact against the generation's recorded hash, and each new
+   object's bytes against that hash;
+4. requires the result to equal the generation exactly, and every baseline entry to
+   be carried forward (a substituted, missing, dropped or extra port fails closed).
+
+Only then is the service opened (`SealedNativeService::from_materialized`) with a
+`GenerationBinding`. A bound session also **refuses** a port its generation does not
+bind (fail closed) rather than falling back, so a session's semantics are exactly
+its generation's.
+
+The committed `phost/evidence/session/generation_session.json` records the
+generation-1 session under a distinct schema,
+`phorensic.porting.generation_session.v1`:
+
+```text
+generation:        8e6fafec…   parent: f47d1bec…
+ports:             14   calls: 14   native: 14   fallback: 0   broken seal: 0
+objects mapped:     7   dispatches: 69   store loads: 1
+posix:strspn  -> c93271d0… (historical LegacyV1 object)
+libc:strspn   -> c40c4e3a… (successor AutonomousV1 object)
+```
+
+The lineage does not merely *remember* both identities: the runtime distinguishes
+and serves both, each from its own artifact, in one immutable generation. The
+generation binding is deliberately **not** part of the legacy session hash, so the
+committed baseline session verdict (`d219be2c…`, 13 ports, 6 objects) is byte
+identical. `./verify_generation_session.sh` proves all of the above, and that the
+session runs with no compiler, oracle, FRF, FRF-Fuzz or Gemel available.
+
+## 8. What is not claimed
 
 Generations provide content-identity and immutable lineage now; external
 signatures are a later layer and are not required by this phase.

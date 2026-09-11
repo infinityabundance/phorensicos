@@ -72,14 +72,13 @@ artifact being the ordinary compiled `.phor` ELF.
 ## Test suites at this phase
 
 ```text
-phost     331 passed, 0 failed, 4 ignored
+phost     340 passed, 0 failed, 4 ignored
 phorc      50 passed, 0 failed
 phorport   37 passed, 0 failed
 ```
 
 (The `phost` count rose from 326 to 331 with the contract-provenance correction,
-which added the successor spec, its registry row, and the supersession record and
-tests.)
+and to 340 with the generation-session court and its hostile tests.)
 
 New hostile tests include: precondition enforcement in the qualification
 generator; universe determinism and independence (novelty over the design
@@ -193,7 +192,17 @@ seal, the successor's own seal, and that the two evidence closures differ;
 entries = the 13 carried forward unchanged plus the successor under
 `AutonomousV1`. Publication is additive: the committed v1 index and the long-lived
 session verdict (`d219be2c…`) are unchanged, and existing sessions stay bound to
-their generation.
+their generation;
+* the generation is **consumed**: `phost port generation-session` materializes
+generation 1's exact runtime index (`Artifacts(dispatcher) == Artifacts(gen)`) and
+serves all **14 ports from 7 mapped objects**, 0 fallback, 0 broken seals,
+distinguishing `posix:strspn` (served the historical object `c93271d0…`) from
+`libc:strspn` (served the successor object `c40c4e3a…`). A bound session refuses a
+port its generation does not bind, and a substituted, dropped, missing or extra
+artifact fails before the first call. Committed as
+`phost/evidence/session/generation_session.json`
+(`phorensic.porting.generation_session.v1`); verified by
+`./verify_generation_session.sh`.
 
 **Bounded claim.** The observed behavior was never in question; only the provenance
 metadata was wrong. The successor is the same observed surface with corrected

@@ -15,31 +15,15 @@ use phost::porting::SealedPortIndex;
 /// The legacy store's evidence did not carry an autonomous closure, so the
 /// genesis closure is the deterministic digest of the entries it publishes; a
 /// later autonomous publication binds its own closure as the child generation.
+/// The derivation lives in `phost` so the runtime's generation-aware open and
+/// this host-side publisher agree on one definition.
 pub fn genesis_from_index(index: &SealedPortIndex) -> Result<StoreGeneration, String> {
-    let mut entries: Vec<GenerationEntry> = Vec::new();
-    for e in index.entries() {
-        entries.push(GenerationEntry::new(
-            e.target.clone(),
-            e.artifact_hash(),
-            SealProfile::LegacyV1,
-            format!("legacy:{}:{}", e.target, e.artifact_hash()),
-        ));
-    }
-    let closure = EvidenceClosureId::new(genesis_closure_id(index));
-    StoreGeneration::genesis(entries, closure).map_err(|e| e.as_str().to_string())
+    phost::porting::store_generation::genesis_from_index(index).map_err(|e| e.as_str().to_string())
 }
 
 /// The deterministic closure identity of a sealed-port index.
 pub fn genesis_closure_id(index: &SealedPortIndex) -> String {
-    let mut parts: Vec<String> = index
-        .entries()
-        .iter()
-        .map(|e| format!("{}:{}", e.target, e.artifact_hash()))
-        .collect();
-    parts.sort();
-    crate::compile::sha256_hex(
-        format!("PHOR/STORE-GENERATION/genesis/v1|{}", parts.join("|")).as_bytes(),
-    )
+    phost::porting::store_generation::genesis_closure_id(index)
 }
 
 /// Publish one newly sealed port into a child generation.

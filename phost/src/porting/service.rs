@@ -39,6 +39,10 @@ pub struct SealedNativeService {
     broken_seal_calls: u64,
     /// `(port, source, output_hex)` per call, in call order (the session residual).
     log: Vec<(String, &'static str, String)>,
+    /// `port -> object_hash` for every native call: which sealed artifact served
+    /// each port. On a generation-bound session this is the evidence that each port
+    /// was served the exact artifact its generation bound.
+    served: BTreeMap<String, String>,
     /// The immutable generation this session is bound to (§19). When present, the
     /// service refuses to serve an artifact that its generation did not bind.
     generation: Option<crate::porting::store_generation::GenerationBinding>,
@@ -67,6 +71,7 @@ impl SealedNativeService {
             fallback_calls: 0,
             broken_seal_calls: 0,
             log: Vec::new(),
+            served: BTreeMap::new(),
             generation: None,
         })
     }
@@ -92,6 +97,30 @@ impl SealedNativeService {
         Self::open(store::STORE_PATH, auth)
     }
 
+    /// Open the service over an already-materialized index that a caller has
+    /// verified against a generation. The store path is recorded for evidence;
+    /// it is not read again.
+    pub fn from_materialized(
+        store_path: &str,
+        index: crate::porting::SealedPortIndex,
+        binding: crate::porting::store_generation::GenerationBinding,
+    ) -> Self {
+        let ports_in_store = index.len();
+        Self {
+            store_path: store_path.to_string(),
+            store_residual_hash: String::new(),
+            ports_in_store,
+            dispatcher: NativeDispatcher::new(index),
+            calls: 0,
+            native_calls: 0,
+            fallback_calls: 0,
+            broken_seal_calls: 0,
+            log: Vec::new(),
+            served: BTreeMap::new(),
+            generation: Some(binding),
+        }
+    }
+
     /// Serve one call by qualified **port id** (a leaf object or a composition).
     ///
     /// No store access: the seal was resolved in [`Self::open`]. A composition is
@@ -104,6 +133,20 @@ impl SealedNativeService {
         auth: &PortingAuthority,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls += 1;
+        // A generation-bound session serves only the ports its generation binds.
+        // A port outside the generation is refused (fail closed) rather than
+        // silently served by the foreign fallback path: the whole point of binding
+        // a generation is that the session's semantics are exactly that
+        // generation's.
+        if let Some(binding) = &self.generation {
+            if binding.expected_artifact(port_id).is_none() {
+                self.broken_seal_calls += 1;
+                return Err(DispatchError::SealBroken(format!(
+                    "port {} is not bound by this session's generation",
+                    port_id
+                )));
+            }
+        }
         let outcome = match self.dispatcher.dispatch_port(port_id, args, auth) {
             Ok(o) => o,
             Err(e) => {
@@ -129,6 +172,8 @@ impl SealedNativeService {
                     }
                 }
                 self.native_calls += 1;
+                self.served
+                    .insert(port_id.to_string(), outcome.object_hash.clone());
             }
             DispatchSource::ForeignFallback => self.fallback_calls += 1,
         }
@@ -192,6 +237,12 @@ impl SealedNativeService {
             .get(port_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// `port -> object_hash` for every native call: which sealed artifact served
+    /// each port.
+    pub fn served_artifacts(&self) -> &BTreeMap<String, String> {
+        &self.served
     }
 
     /// SHA-256 over the session call log — the behavior residual of the session.
@@ -394,9 +445,24 @@ pub fn run_session(
     auth: &PortingAuthority,
 ) -> Result<(SessionVerdict, Vec<SessionMismatch>, SealedNativeService), PortError> {
     let mut service = SealedNativeService::open(store_path, auth)?;
+    let mismatches = run_plan(&mut service, &session_plan(), auth);
+    let verdict = service.verdict(&mismatches);
+    Ok((verdict, mismatches, service))
+}
+
+/// Run a plan through an already-open service, returning every mismatch.
+///
+/// Shared by the baseline session and the generation session, so both apply the
+/// same rule: a port is served either natively with the exact recorded output, or
+/// it is a mismatch (a fallback or a broken seal).
+pub fn run_plan(
+    service: &mut SealedNativeService,
+    plan: &[SessionCall],
+    auth: &PortingAuthority,
+) -> Vec<SessionMismatch> {
     let mut mismatches: Vec<SessionMismatch> = Vec::new();
 
-    for call in session_plan() {
+    for call in plan {
         match service.call(call.port, &call.args, auth) {
             Ok(o) if o.source.is_native() => {
                 let actual = hex::encode(&o.output);
@@ -427,8 +493,7 @@ pub fn run_session(
         }
     }
 
-    let verdict = service.verdict(&mismatches);
-    Ok((verdict, mismatches, service))
+    mismatches
 }
 
 // ---------------------------------------------------------------------------

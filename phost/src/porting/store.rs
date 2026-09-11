@@ -42,10 +42,12 @@ pub const STORE_PATH: &str = "phost/evidence/store/index.json";
 /// The store document schema.
 pub const STORE_SCHEMA: &str = "phorensic.porting.store.v1";
 
-/// The leaf symbols the store covers, in the order they are emitted. The first five
-/// are ISO C surfaces (`dialect: libc`); `strspn` is a POSIX surface
-/// (`dialect: posix`) — the qualification is part of the target id, not a detail of
-/// which library happened to be observed.
+/// The leaf symbols the store covers, in the order they are emitted. All six are
+/// ISO C surfaces (`dialect: libc`); the committed sixth leaf is the **historical
+/// misqualified `posix:strspn` record**, preserved as evidence and corrected by a
+/// `libc:strspn` successor (`docs/CONTRACT_PROVENANCE_MIGRATION.md`). The
+/// qualification is part of the target id, not a detail of which library happened
+/// to be observed.
 const LEAF_SYMBOLS: [&str; 6] = ["toupper", "memcmp", "memchr", "strlen", "strrchr", "strspn"];
 
 /// The compositions the store covers, in dependency order (a nested chain's inner

@@ -188,6 +188,12 @@ The published artifact is the successor's autonomous object
 committed `LegacyV1` artifact (`c93271d0…`) — so both the correction and the record
 it corrects remain addressable in one lineage.
 
+The successor is then **consumed**: `phost port generation-session` materializes
+generation 1's exact runtime index and serves all 14 ports from 7 mapped objects,
+distinguishing `posix:strspn` (served the historical object) from `libc:strspn`
+(served the successor object). See `docs/STORE_GENERATIONS.md` §7 and
+`./verify_generation_session.sh`.
+
 ---
 
 ## 6. Verification
@@ -247,6 +253,8 @@ requalify (held-out universe, challenge, FRF, execution, dispatch)
 new AUTONOMOUS-SEAL/v1
         ↓
 new immutable store generation (additive; the prior generation is not mutated)
+        ↓
+generation session materializes the exact index and serves every bound port
 ```
 
 The historical record is preserved, the successor is requalified, and the two are

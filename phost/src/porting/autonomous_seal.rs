@@ -63,6 +63,16 @@ impl SealProfile {
         }
     }
 
+    /// Parse the profile name written by [`Self::as_str`]. Fails closed on an
+    /// unknown profile rather than defaulting to a weaker one.
+    pub fn parse(s: &str) -> Option<SealProfile> {
+        match s {
+            "LegacyV1" => Some(SealProfile::LegacyV1),
+            "AutonomousV1" => Some(SealProfile::AutonomousV1),
+            _ => None,
+        }
+    }
+
     /// The obligations this profile requires.
     pub fn required_obligations(self) -> &'static [Obligation] {
         match self {

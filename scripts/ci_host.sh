@@ -75,6 +75,12 @@ echo "=== Autonomous Porting Foundry (Phase 7) ==="
 # historical `posix:strspn` evidence is preserved; the `libc:strspn` successor is
 # requalified and resealed on its own PortSpecId (docs/CONTRACT_PROVENANCE_MIGRATION.md).
 ./verify_supersession.sh
+# Phase 8 (§19) consumption: a session bound to generation 1 materializes the exact
+# runtime index and serves every port it binds (14 ports, 7 objects), while the
+# committed baseline session is unchanged.
+echo
+echo "=== Generation Session Court (Phase 8 consumption) ==="
+./verify_generation_session.sh
 # Phase 3: the court-sensitivity (challenge) court — is the instrument blind?
 for ch in toupper memcmp memchr strlen strrchr strspn toupper_memchr toupper_strlen_memchr toupper_strlen_memchr_pair toupper_each toupper_each_strlen_memchr toupper_memchr_suffix toupper_each_slice_search; do
     ./verify_challenge_court.sh --target "$ch" --check-committed

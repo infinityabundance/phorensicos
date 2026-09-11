@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use crate::porting::autonomous_seal::SealProfile;
 use crate::porting::ident::{EvidenceClosureId, StoreGenerationId};
 use crate::porting::sha256_hex;
+use crate::porting::SealedPortIndex;
 
 /// The content-identity domain tag for a generation.
 pub const STORE_GENERATION_DOMAIN: &[u8] = b"PHOR/STORE-GENERATION/v1\0";
@@ -69,6 +70,7 @@ fn enc(out: &mut Vec<u8>, s: &str) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenerationError {
     UnknownSchema(u32),
+    UnknownSealProfile,
     Empty,
     DuplicateTarget,
     MissingParent,
@@ -86,6 +88,7 @@ impl GenerationError {
     pub fn as_str(&self) -> &'static str {
         match self {
             GenerationError::UnknownSchema(_) => "unknown store-generation schema version",
+            GenerationError::UnknownSealProfile => "unknown seal profile in a store generation",
             GenerationError::Empty => "store generation is empty",
             GenerationError::DuplicateTarget => "duplicate target in a store generation",
             GenerationError::MissingParent => "a parent generation is required but absent",
@@ -237,6 +240,76 @@ impl StoreGeneration {
             entries.join(",\n")
         )
     }
+
+    /// Parse a generation from its canonical JSON projection and verify it.
+    ///
+    /// Fails closed on a missing/unknown schema, a malformed entry, an unknown
+    /// seal profile, an unsorted or duplicated entry list, a recomputed-identity
+    /// mismatch or a missing closure — a parsed generation is never trusted, it is
+    /// always re-verified.
+    pub fn parse(text: &str) -> Result<StoreGeneration, GenerationError> {
+        use crate::porting::json::Json;
+
+        let doc = Json::parse(text).map_err(|_| GenerationError::MalformedEntry)?;
+        let schema_version = doc
+            .i64_at("schema_version")
+            .filter(|v| *v >= 0 && *v <= u32::MAX as i64)
+            .ok_or(GenerationError::MalformedEntry)? as u32;
+        let generation_id = StoreGenerationId::new(
+            doc.str_at("generation_id")
+                .filter(|s| !s.is_empty())
+                .ok_or(GenerationError::MalformedEntry)?,
+        );
+        let parent = match doc.get("parent") {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(StoreGenerationId::new(
+                v.as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or(GenerationError::MalformedEntry)?,
+            )),
+        };
+        let evidence_closure = EvidenceClosureId::new(
+            doc.str_at("evidence_closure")
+                .filter(|s| !s.is_empty())
+                .ok_or(GenerationError::MalformedEntry)?,
+        );
+        let raw = doc
+            .get("entries")
+            .and_then(|v| v.as_arr())
+            .ok_or(GenerationError::MalformedEntry)?;
+        let mut entries: Vec<GenerationEntry> = Vec::with_capacity(raw.len());
+        for e in raw {
+            let target = e
+                .str_at("target")
+                .filter(|s| !s.is_empty())
+                .ok_or(GenerationError::MalformedEntry)?;
+            let artifact_hash = e
+                .str_at("artifact_hash")
+                .filter(|s| !s.is_empty())
+                .ok_or(GenerationError::MalformedEntry)?;
+            let profile = SealProfile::parse(e.str_at("seal_profile").unwrap_or(""))
+                .ok_or(GenerationError::UnknownSealProfile)?;
+            let evidence_id = e
+                .str_at("evidence_id")
+                .filter(|s| !s.is_empty())
+                .ok_or(GenerationError::MalformedEntry)?;
+            entries.push(GenerationEntry::new(
+                target,
+                artifact_hash,
+                profile,
+                evidence_id,
+            ));
+        }
+        let g = StoreGeneration {
+            schema_version,
+            generation_id,
+            parent,
+            entries,
+            evidence_closure,
+        };
+        g.verify()?;
+        Ok(g)
+    }
 }
 
 fn derive_id(
@@ -254,6 +327,35 @@ fn derive_id(
     }
     enc(&mut out, closure.as_str());
     StoreGenerationId::new(sha256_hex(&out))
+}
+
+/// The deterministic evidence closure of a sealed-port index: the sorted
+/// `target:artifact_hash` pairs. The legacy baseline carried no autonomous
+/// closure, so the genesis generation binds this digest instead.
+pub fn genesis_closure_id(index: &SealedPortIndex) -> String {
+    let mut parts: Vec<String> = index
+        .entries()
+        .iter()
+        .map(|e| format!("{}:{}", e.target, e.artifact_hash()))
+        .collect();
+    parts.sort();
+    sha256_hex(format!("PHOR/STORE-GENERATION/genesis/v1|{}", parts.join("|")).as_bytes())
+}
+
+/// The genesis generation for a verified sealed-port index: every entry carried
+/// as `LegacyV1`, with the index's deterministic closure. This is the parent of
+/// the first autonomous publication.
+pub fn genesis_from_index(index: &SealedPortIndex) -> Result<StoreGeneration, GenerationError> {
+    let mut entries: Vec<GenerationEntry> = Vec::with_capacity(index.len());
+    for e in index.entries() {
+        entries.push(GenerationEntry::new(
+            e.target.clone(),
+            e.artifact_hash(),
+            SealProfile::LegacyV1,
+            format!("legacy:{}:{}", e.target, e.artifact_hash()),
+        ));
+    }
+    StoreGeneration::genesis(entries, EvidenceClosureId::new(genesis_closure_id(index)))
 }
 
 /// A session's binding to one generation. It can never serve an artifact that is

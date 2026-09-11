@@ -53,6 +53,7 @@ pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;
 pub mod exec;
+pub mod generation_session;
 pub mod ident;
 pub mod json;
 pub mod oracle_trace;
