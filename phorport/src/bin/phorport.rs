@@ -85,7 +85,7 @@ fn fs_canonical(p: &str) -> String {
 fn command(args: &[String]) -> Result<i32, String> {
     let Some(cmd) = args.first() else {
         return Err(String::from(
-            "usage: phorport <probe|corpus|fuzz|history|campaign> <symbol> --candidate-src <path> …",
+            "usage: phorport <probe|corpus|fuzz|history|campaign|autonomy> <symbol> --candidate-src <path> …",
         ));
     };
     let symbol = args
@@ -214,6 +214,188 @@ fn command(args: &[String]) -> Result<i32, String> {
             ),
         }
         return Ok(if report.frozen.is_some() { 0 } else { 1 });
+    }
+
+    // `autonomy` runs the full Phase 7 pipeline: CEGIS → qualification →
+    // challenge → multi-oracle → FRF → execution → dispatch → AUTONOMOUS-SEAL.
+    if cmd == "autonomy" {
+        use phorport::cegis::{CampaignManifest, DiscoveryHook};
+        use phorport::pipeline::{run_autonomous, AutonomyInputs};
+        use phorport::producer::{KnownCounterexample, ScriptedProducer};
+
+        let target = resolve_target(&symbol).ok_or_else(|| format!("unknown symbol {symbol}"))?;
+        let spec = phost::porting::portspec::by_target_id(target.id)
+            .ok_or_else(|| format!("no PortSpec for {}", target.id))?;
+        let source_paths = arg_values(args, "--source");
+        if source_paths.is_empty() {
+            return Err(String::from("autonomy needs at least one --source <path>"));
+        }
+        let mut sources = Vec::new();
+        for p in &source_paths {
+            sources.push(std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?);
+        }
+        let mut producer = ScriptedProducer::new(sources);
+
+        let frf_fuzz_bin = arg_value(args, "--frf-fuzz-bin");
+        let frf_fuzz_root = arg_value(args, "--frf-fuzz-root");
+        let max_time = arg_value(args, "--max-time")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let out_dir = PathBuf::from(arg_value(args, "--out").unwrap_or_else(|| {
+            workspace
+                .join("phost/evidence/phorport/autonomy")
+                .join(&symbol)
+                .display()
+                .to_string()
+        }));
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        let phorport_root = phorport_root(&workspace);
+        let work = workspace.join(".phorport/autonomy").join(&symbol);
+        let fuzz_root = workspace.join(".phorport/fuzz");
+        let frf_store = arg_value(args, "--frf-store")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| work.join("frf"));
+        let program = std::env::current_exe().map_err(|e| e.to_string())?;
+
+        let mut hook = |cfg: &HarnessConfig| -> Vec<KnownCounterexample> {
+            let (Some(bin), Some(root)) = (&frf_fuzz_bin, &frf_fuzz_root) else {
+                return Vec::new();
+            };
+            match explore::campaign(
+                cfg,
+                &target,
+                &symbol,
+                None,
+                "autonomy",
+                &fuzz_root,
+                Path::new(root),
+                &phorport_root,
+                Path::new(bin),
+                max_time,
+                out_dir.to_str().unwrap_or("out"),
+            ) {
+                Ok(o) => o
+                    .counterexample
+                    .map(|cx| {
+                        vec![KnownCounterexample {
+                            residual: cx.minimal_residual,
+                            input_hex: cx.minimal_hex,
+                            oracle_hex: cx.oracle_hex,
+                            candidate_hex: cx.candidate_output_hex,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let discovery: Option<DiscoveryHook> = if frf_fuzz_bin.is_some() && frf_fuzz_root.is_some()
+        {
+            Some(&mut hook)
+        } else {
+            None
+        };
+
+        let inputs = AutonomyInputs {
+            spec,
+            target: target.clone(),
+            base_config: HarnessConfig {
+                target_id: target.id.to_string(),
+                candidate_path: String::new(),
+                candidate_hash: String::new(),
+            },
+            work_root: work.clone(),
+            frf_store_root: frf_store,
+            program,
+            manifest: CampaignManifest {
+                target_id: target.id.to_string(),
+                port_spec_id: spec.id(),
+                design_generator: String::from("registry"),
+                qualification_policy: phost::porting::portspec::qualification_name(
+                    spec.qualification,
+                )
+                .to_string(),
+                discovery_budget: arg_value(args, "--budget")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(4),
+                challenge_required: true,
+                seal_profile: String::from("autonomous-v1"),
+            },
+            memory: None,
+        };
+
+        let report = run_autonomous(&inputs, &mut producer, discovery)
+            .map_err(|e| format!("autonomy: {e}"))?;
+
+        std::fs::write(out_dir.join("campaign_log.txt"), report.log.join("\n"))
+            .map_err(|e| e.to_string())?;
+        if let Some(q) = &report.qualification {
+            std::fs::write(
+                out_dir.join("qualification_receipt.json"),
+                q.receipt.to_json(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(i) = &report.isolation {
+            std::fs::write(
+                out_dir.join("isolation_report.json"),
+                format!(
+                    "{{\n  \"schema\": \"phorensic.phorport.isolation_report.v1\",\n  \"workspace\": \"{}\",\n  \"markers_checked\": {},\n  \"universe_built_after_freeze\": {},\n  \"clean\": {},\n  \"leaks\": [{}]\n}}\n",
+                    i.workspace_root,
+                    i.markers_checked,
+                    i.universe_built_after_freeze,
+                    i.clean(),
+                    i.leaks
+                        .iter()
+                        .map(|l| format!("\"{}\"", l.replace('"', "'")))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(m) = &report.multi_oracle {
+            std::fs::write(
+                out_dir.join("multi_oracle_verdict.json"),
+                m.verdict.to_json(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        println!("=== Autonomous Porting Campaign ===");
+        println!("manifest: {}", report.manifest_id);
+        for line in &report.log {
+            println!("  {line}");
+        }
+        return match &report.seal {
+            Some(seal) => {
+                std::fs::write(
+                    out_dir.join("autonomous_promotion_receipt.json"),
+                    seal.to_json(),
+                )
+                .map_err(|e| e.to_string())?;
+                println!("sealed: {}", seal.profile.as_str());
+                println!("closure: {}", seal.closure.as_str());
+                println!("receipt: {}", seal.residual_hash);
+                println!("evidence: {}", out_dir.display());
+                Ok(0)
+            }
+            None => {
+                let refusal = report
+                    .seal_refusal
+                    .map(|r| r.describe())
+                    .unwrap_or_else(|| String::from("no candidate frozen"));
+                std::fs::write(
+                    out_dir.join("seal_refusal.json"),
+                    format!(
+                        "{{\n  \"schema\": \"phorensic.phorport.seal_refusal.v1\",\n  \"reason\": \"{}\"\n}}\n",
+                        refusal.replace('"', "'")
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
+                println!("refused: {refusal}");
+                Ok(1)
+            }
+        };
     }
 
     // `history` reads Gemel memory and needs no candidate object.
@@ -389,8 +571,142 @@ fn phorport_root(workspace: &Path) -> PathBuf {
     workspace.join("phorport")
 }
 
+/// The value following `--frf-fuzz-fixture`.
+fn fixture_path(args: &[String]) -> Option<String> {
+    arg_value(args, "--frf-fuzz-fixture")
+}
+
+/// `phorport __oracle <target_id> --frf-fuzz-fixture <fixture>`.
+///
+/// The reference side of the FRF differential court: observe the foreign oracle
+/// and print the observable to stderr. Exit 0 on success, 3 on a deterministic
+/// error (which FRF records as a divergence, never as agreement).
+fn oracle_mode(args: &[String]) -> i32 {
+    let target_id = match args.get(1) {
+        Some(t) => t.clone(),
+        None => return 3,
+    };
+    let fixture = match fixture_path(args) {
+        Some(f) => f,
+        None => return 3,
+    };
+    let target = match resolve_target(&target_id) {
+        Some(t) => t,
+        None => {
+            eprintln!("oracle-error unknown-target");
+            return 3;
+        }
+    };
+    let spec = match phost::porting::portspec::by_target_id(&target_id) {
+        Some(s) => s,
+        None => {
+            eprintln!("oracle-error no-spec");
+            return 3;
+        }
+    };
+    let data = match std::fs::read(&fixture) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("oracle-error fixture-unreadable");
+            return 3;
+        }
+    };
+    let args_decoded = match phorport::case::decode_args(&target, &data) {
+        Some(a) => a,
+        None => {
+            eprintln!("oracle-error undecodable");
+            return 3;
+        }
+    };
+    if phost::porting::portspec::validate_case(spec, &args_decoded).is_err() {
+        eprintln!("oracle-error out-of-contract");
+        return 3;
+    }
+    let case = phost::porting::target::TestCase::new(String::from("frf"), args_decoded);
+    let auth = phost::porting::PortingAuthority::granted();
+    match phost::porting::dialect_cage::observe_target(&target, core::slice::from_ref(&case), &auth)
+    {
+        Ok(traces) => match traces.first() {
+            Some(t) => {
+                eprintln!("oracle {}", t.output_hex);
+                0
+            }
+            None => {
+                eprintln!("oracle-error empty");
+                3
+            }
+        },
+        Err(_) => {
+            eprintln!("oracle-error cage");
+            3
+        }
+    }
+}
+
+/// `phorport __differential <target> <object> <hash> --frf-fuzz-fixture <fixture>`.
+///
+/// The candidate side of the FRF differential court. On parity it prints the
+/// **same** line the authority prints (so FRF observes no residual); on a
+/// divergence it prints the oracle line plus a divergence line and exits 2.
+fn differential_mode(args: &[String]) -> i32 {
+    let target_id = match args.get(1) {
+        Some(t) => t.clone(),
+        None => return 3,
+    };
+    let object_path = match args.get(2) {
+        Some(p) => p.clone(),
+        None => return 3,
+    };
+    let object_hash = match args.get(3) {
+        Some(h) => h.clone(),
+        None => return 3,
+    };
+    let fixture = match fixture_path(args) {
+        Some(f) => f,
+        None => return 3,
+    };
+    let data = match std::fs::read(&fixture) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("differential-error fixture-unreadable");
+            return 3;
+        }
+    };
+    let config = HarnessConfig {
+        target_id,
+        candidate_path: object_path,
+        candidate_hash: object_hash,
+    };
+    let o = phorport::harness::probe(&config, &data);
+    if !o.valid {
+        eprintln!("differential-error invalid-case");
+        return 3;
+    }
+    if o.matched {
+        // Byte-identical to the authority's observation: parity.
+        eprintln!("oracle {}", o.oracle_hex);
+        0
+    } else {
+        eprintln!("oracle {}", o.oracle_hex);
+        eprintln!("divergence {} {}", o.residual, o.candidate_hex);
+        2
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The hidden containment subcommand: run the untrusted-candidate worker loop.
+    if args.first().map(String::as_str) == Some("__worker") {
+        return ExitCode::from(phorport::worker::run_worker() as u8);
+    }
+    // The hidden FRF court modes: the reference oracle and the differential
+    // candidate. These print to stderr, which FRF observes.
+    if args.first().map(String::as_str) == Some("__oracle") {
+        return ExitCode::from(oracle_mode(&args) as u8);
+    }
+    if args.first().map(String::as_str) == Some("__differential") {
+        return ExitCode::from(differential_mode(&args) as u8);
+    }
     match command(&args) {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::from(1),

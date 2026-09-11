@@ -81,7 +81,7 @@ versioned, and the documentation states exactly what was demonstrated.
 | **4** | FRF-Fuzz differential exploration + residual semantic bank + court-verified minimization | **core done** — the `phorport` host crate: comparison harness, `PORT.*` residual bank, court-verified minimization, durable counterexamples, and an FRF-Fuzz campaign bridge; Gate E demonstrated on a defect the design corpus misses (`docs/AUTONOMOUS_PORTING.md`) |
 | **5** | Gemel longitudinal memory + failed-attempt/negative-knowledge integration | **core done** — durable counterexample and rejected-candidate records in Gemel (its own object model, optional), retrieved so failed work is not re-explored; Gate F demonstrated (`docs/GEMEL_MEMORY.md`); intents/trajectories/revision replay remain |
 | **6** | `CandidateProducer` + isolated synthesis workspace + bounded CEGIS + disagreement-driven experiment selection | **core done** — the producer trait (scripted + external-command adapters), constraint enforcement, the isolated synthesis workspace with a leak audit, the monotonic campaign state machine, and the bounded CEGIS loop (design + discovery courts, revision on failure, freeze on survival); disagreement selection remains (`docs/CEGIS.md`) |
-| **7** | Held-out qualification + multi-oracle policy + FRF outer-court binding + `AUTONOMOUS-SEAL/v1` | not started |
+| **7** | Held-out qualification + multi-oracle policy + FRF outer-court binding + `AUTONOMOUS-SEAL/v1` + candidate containment | **core done** — an independent-construction held-out universe with a redacted receipt and a leakage audit; the multi-oracle policy (host-observed / multi-implementation, never a majority vote); the FRF outer court as a differential court (receipts retained verbatim); the `AUTONOMOUS-SEAL/v1` 13-obligation profile; and an out-of-process contained candidate worker (rlimits, `no_new_privs`, timeout, crash recovery). The pipeline seals a reconstructed `strspn` end-to-end and reproduces byte-for-byte (`verify_autonomous_seal.sh`); see `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`, `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md` |
 | **8** | Immutable store generations + demand-driven port queue + explicit service generation binding | not started |
 | **9** | Blind-regeneration demonstrations + controlled ablation + empirical verification report | not started |
 | **10** | Automatic bounded `CompositionIR` synthesis | not started |
@@ -164,11 +164,12 @@ byte-identical v1 evidence under the legacy verifier. See `docs/COMPOSITION_IR.m
 ### Phase 3 — done
 
 `phost/src/porting/challenge.rs` makes the measuring instrument falsifiable. A
-bounded `MutationProfile` of intentionally wrong implementations is run against the
-**same corpus and oracle the real court uses**: leaf mutants are wrong observable
-implementations, composition mutants are wrong `CompositionIR`s evaluated over the
-sealed store against the correct chain's committed oracle. Every declared family is
-detected, so the courts are demonstrably not blind to them.
+bounded `MutationProfile` of intentionally wrong implementations is run against
+the **same corpus and oracle the real court uses**: leaf mutants are wrong
+observable implementations, composition mutants are wrong `CompositionIR`s
+evaluated over the sealed store against the correct chain's committed oracle.
+Every declared family is detected, so the courts are demonstrably not blind to
+them.
 
 The equivalent/undetermined discipline is enforced: an equivalent mutant (equal to
 the correct implementation on every valid input under the declared preconditions) is
@@ -180,6 +181,48 @@ Evidence is committed at `phost/evidence/challenge/<name>/challenge_verdict.json
 and verified by `verify_challenge_court.sh` (schema, counts, no blind spots,
 equivalence notes, canonical residual). This is the local instrument check the
 autonomous qualification profile (Phase 7) requires. See `docs/CHALLENGE.md`.
+
+### Phase 7 — core done
+
+The autonomous profile is now real and reproduces. In `phost`:
+
+* `porting/ident.rs` — the identity namespaces (`PortSpecId`, `FrfReceiptId`,
+  `GemelGid`, …) as distinct opaque newtypes whose canonical tokens never
+  collide, plus the content-addressed **evidence closure** (sorted, length
+  framed, domain-separated).
+* `porting/oracle_witness.rs` — `OracleWitness`, the `MultiOracleVerdict`, and
+  divergence classification: a disagreement is an `OracleDivergenceResidual` to
+  classify, never a majority vote.
+* `porting/autonomous_seal.rs` — the `AUTONOMOUS-SEAL/v1` profile: obligations
+  O1–O13, each carrying the references it is built from, verified by a pure
+  fail-closed function; `LegacyV1` history stays immutable.
+* `portspec.rs` — `QualificationPolicy` extended to `ImplementationFamily`,
+  `MultiImplementation`, `MultiEnvironment`, `PortableCandidate` (existing specs
+  keep their identities: `HostObserved` is unchanged).
+
+In `phorport`:
+
+* `qualification.rs` — the held-out universe, built **after** the candidate is
+  frozen from a role-lattice construction independent in kind from the design
+  corpora; the receipt is redacted, and the raw observations live only in the
+  auditor's ledger.
+* `multioracle.rs` — the implementation axis, reusing the cross-implementation
+  court; an unavailable second implementation is an explicit
+  `InsufficientWitnesses`, never a silent success with one.
+* `frf.rs` — the FRF outer court as a differential court; run/receipt/claim ids
+  are retained verbatim.
+* `worker.rs` — the untrusted candidate worker (out-of-process, `no_new_privs`,
+  `RLIMIT_AS/CPU/CORE/NOFILE`, timeout, crash recovery).
+* `pipeline.rs` — the end-to-end flow (CEGIS → qualification → challenge →
+  multi-oracle → FRF → execution → dispatch → seal), with the isolation audit and
+  fail-closed refusal.
+
+Demonstrated: `phorport autonomy strspn` reconstructs a candidate and seals it
+under `AutonomousV1` with all 13 obligations; `verify_autonomous_seal.sh` checks
+the committed evidence and proves the promotion and qualification receipts
+reproduce byte-for-byte. Honest limits are stated in the phase docs (one shape,
+host-observed policy in the committed campaign, FRF authority is a helper around
+the host dialect cage whose bytes FRF admits).
 
 ---
 

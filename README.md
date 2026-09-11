@@ -530,6 +530,22 @@ design and discovery courts; a falsified revision is minimized, remembered, and
 revised, and only a survivor is **frozen** — by exact source bytes, so any change is
 a new identity. See `docs/CEGIS.md`.
 
+### Qualification, the implementation axis, and the autonomous seal
+
+A frozen candidate is not yet admissible. `phorport autonomy <symbol>` runs the
+full pipeline: the bounded CEGIS loop, then a **held-out qualification universe**
+built *after* the freeze from a role-lattice construction independent of the
+design corpora, then the court-sensitivity challenge, the multi-oracle court, the
+**FRF outer court** (receipts retained verbatim), the ordinary uninstrumented
+execution court and the native dispatch court. Only then is the
+**`AUTONOMOUS-SEAL/v1`** profile verified: thirteen obligations, each carrying the
+references it is built from, refused closed if any is absent or inconsistent.
+Candidate execution runs in a separate, bounded worker (`no_new_privs`,
+rlimits, timeout, crash recovery). `verify_autonomous_seal.sh` checks the
+committed evidence for the reconstructed `strspn` candidate and proves the
+receipts reproduce byte-for-byte. See `docs/QUALIFICATION_POLICY.md`,
+`docs/EVIDENCE_MODEL.md`, `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md`.
+
 ### Persistent sealed port store
 
 A court *derives* a seal: it observes foreign behavior, compiles the clean-room
@@ -816,6 +832,7 @@ All numbers below were reproduced on a clean checkout.
 
 - `docs/PHORENSIC_LANGUAGE.md`, `docs/PHORENSIC_GRAMMAR.md` — the language.
 - `docs/DIALECT_QUALIFICATION.md` — how a `dialect:` namespace is earned (`posix` vs `libc`).
+- `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`, `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md`, `docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md` — Phase 7: held-out qualification, the implementation axis, the evidence model and `AUTONOMOUS-SEAL/v1`.
 - `docs/PHORENSIC_COMPILER.md` — pipeline and artifact tiers.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.

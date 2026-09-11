@@ -65,6 +65,11 @@ cargo build -q -p phost -p phorc
 echo
 echo "=== Autonomous Porting Foundry (Phase 4) ==="
 ./verify_phorport.sh
+# Phase 7: held-out qualification, the multi-oracle policy, the FRF outer court,
+# candidate containment and the AUTONOMOUS-SEAL/v1 promotion profile.
+echo
+echo "=== Autonomous Porting Foundry (Phase 7) ==="
+./verify_autonomous_seal.sh
 # Phase 3: the court-sensitivity (challenge) court — is the instrument blind?
 for ch in toupper memcmp memchr strlen strrchr strspn toupper_memchr toupper_strlen_memchr toupper_strlen_memchr_pair toupper_each toupper_each_strlen_memchr toupper_memchr_suffix toupper_each_slice_search; do
     ./verify_challenge_court.sh --target "$ch" --check-committed

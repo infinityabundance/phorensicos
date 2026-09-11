@@ -81,7 +81,11 @@ impl CompiledCandidate {
 
 /// Walk up from the current directory to the workspace root (a directory with a
 /// `Cargo.toml` and an `examples/` tree).
-pub(crate) fn workspace_root() -> PathBuf {
+///
+/// Public so the host-side foundry can compile a candidate source from a
+/// workspace-relative path, which is what makes the emitted object (and thus the
+/// autonomous seal) independent of the absolute checkout location.
+pub fn workspace_root() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir: PathBuf = cwd.clone();
     loop {

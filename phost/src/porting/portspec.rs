@@ -232,19 +232,55 @@ impl CandidateConstraints {
     };
 }
 
-/// How strongly a result is qualified. Phase 1 records the honest current state:
-/// the seals were observed on one implementation (the host C library); the
-/// cross-implementation court adds a second witness and is recorded separately.
+/// How strongly a result is qualified. Phase 1 recorded the honest original
+/// state (one implementation observed). Phase 7 extends the policy to the
+/// implementation axis: a `PortSpec` may require multiple independent
+/// implementation or environment witnesses to agree (never a majority vote).
+///
+/// The names describe what is *observed*: none of these proves the
+/// specification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualificationPolicy {
     /// Observed through one implementation.
     HostObserved,
+    /// Observed through one implementation family, explicitly named.
+    ImplementationFamily { family: &'static str },
+    /// At least `minimum_witnesses` independent implementations must agree.
+    MultiImplementation { minimum_witnesses: u16 },
+    /// At least `minimum_environments` distinct environments must agree.
+    MultiEnvironment { minimum_environments: u16 },
+    /// A portable candidate: at least `minimum_witnesses` implementations agree.
+    PortableCandidate { minimum_witnesses: u16 },
 }
 
 impl QualificationPolicy {
-    fn tag(&self) -> u8 {
+    pub fn tag(&self) -> u8 {
         match self {
             QualificationPolicy::HostObserved => 1,
+            QualificationPolicy::ImplementationFamily { .. } => 2,
+            QualificationPolicy::MultiImplementation { .. } => 3,
+            QualificationPolicy::MultiEnvironment { .. } => 4,
+            QualificationPolicy::PortableCandidate { .. } => 5,
+        }
+    }
+
+    /// The minimum number of independent witnesses this policy requires.
+    ///
+    /// `HostObserved` and `ImplementationFamily` name a single witness; the
+    /// multi-* policies require their declared count, never fewer than two.
+    pub fn required_witnesses(self) -> u16 {
+        match self {
+            QualificationPolicy::HostObserved => 1,
+            QualificationPolicy::ImplementationFamily { .. } => 1,
+            QualificationPolicy::MultiImplementation { minimum_witnesses } => {
+                minimum_witnesses.max(2)
+            }
+            QualificationPolicy::MultiEnvironment {
+                minimum_environments,
+            } => minimum_environments.max(2),
+            QualificationPolicy::PortableCandidate { minimum_witnesses } => {
+                minimum_witnesses.max(2)
+            }
         }
     }
 }
@@ -390,6 +426,15 @@ pub fn canonical_bytes(spec: &PortSpec) -> Vec<u8> {
     c.str(spec.case_space.summary);
 
     c.u8(spec.qualification.tag());
+    match spec.qualification {
+        QualificationPolicy::HostObserved => {}
+        QualificationPolicy::ImplementationFamily { family } => c.str(family),
+        QualificationPolicy::MultiImplementation { minimum_witnesses }
+        | QualificationPolicy::PortableCandidate { minimum_witnesses } => c.u16(minimum_witnesses),
+        QualificationPolicy::MultiEnvironment {
+            minimum_environments,
+        } => c.u16(minimum_environments),
+    }
 
     c.u32(spec.candidate.max_source_bytes);
     c.u8(spec.candidate.leaf_only as u8);
@@ -499,9 +544,13 @@ fn case_space_name(k: CaseSpaceKind) -> &'static str {
     }
 }
 
-fn qualification_name(q: QualificationPolicy) -> &'static str {
+pub fn qualification_name(q: QualificationPolicy) -> &'static str {
     match q {
         QualificationPolicy::HostObserved => "host-observed",
+        QualificationPolicy::ImplementationFamily { .. } => "implementation-family",
+        QualificationPolicy::MultiImplementation { .. } => "multi-implementation",
+        QualificationPolicy::MultiEnvironment { .. } => "multi-environment",
+        QualificationPolicy::PortableCandidate { .. } => "portable-candidate",
     }
 }
 

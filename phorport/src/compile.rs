@@ -9,7 +9,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use phost::porting::compiled::compile_candidate;
+use phost::porting::compiled::{compile_candidate, workspace_root};
 use phost::porting::target::{resolve_target, PortTarget};
 
 /// The identity of one candidate revision.
@@ -54,9 +54,21 @@ pub fn compile_source(
     let src = work_dir.join("candidate.phor");
     std::fs::write(&src, source).map_err(|e| e.to_string())?;
 
+    // Compile from a path **relative to the workspace root** whenever the working
+    // directory is inside it. `phorc` embeds the source path in the object, so a
+    // relative path makes the emitted bytes — and therefore the autonomous seal —
+    // independent of the absolute checkout location (`/work` in a container, any
+    // path on a host). This is the canonical invocation for byte-reproducible
+    // rebuilds (Phase 7/§22).
+    let root = workspace_root();
+    let source_path = match src.strip_prefix(&root) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => src.to_string_lossy().into_owned(),
+    };
+
     // `PortTarget` carries a `&'static str` source path. The foundry compiles a
     // bounded number of revisions, so leaking the path is bounded and honest.
-    let src_static: &'static str = Box::leak(src.to_string_lossy().into_owned().into_boxed_str());
+    let src_static: &'static str = Box::leak(source_path.into_boxed_str());
     let target = PortTarget {
         candidate_source: src_static,
         ..base

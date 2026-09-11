@@ -12,7 +12,71 @@
 // the port's `PortSpec` validator — a decoded case that violates its contract is
 // reported `valid: false` and never reaches the foreign oracle.
 
-use phost::porting::target::PortTarget;
+use phost::porting::target::{PortTarget, TestCase};
+
+/// The epistemic role of a case (§5). Universes are not interchangeable: a case
+/// is only a training example, a regression, or a held-out evaluation depending
+/// on which universe it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseUniverse {
+    /// Deterministic specification-derived cases; visible to the producer.
+    Design,
+    /// Cases found after a candidate exists (mutation, compare, disagreement).
+    Discovery,
+    /// Held-out evaluation; never visible to the producer before freeze.
+    Qualification,
+    /// Deliberately wrong implementations, used to check court sensitivity.
+    Challenge,
+}
+
+impl CaseUniverse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaseUniverse::Design => "design",
+            CaseUniverse::Discovery => "discovery",
+            CaseUniverse::Qualification => "qualification",
+            CaseUniverse::Challenge => "challenge",
+        }
+    }
+}
+
+/// Where a case came from, in enough detail to reconstruct its construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseProvenance {
+    /// The generator identity, e.g. `qualification:role-lattice.v1`.
+    pub source: String,
+    /// Deterministic construction detail (never a wall clock).
+    pub detail: String,
+}
+
+/// A port case with an explicit universe and provenance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortCase {
+    pub id: String,
+    pub universe: CaseUniverse,
+    pub args: Vec<Vec<u8>>,
+    pub provenance: CaseProvenance,
+}
+
+impl PortCase {
+    /// Lift a design `TestCase` into a universe-tagged case.
+    pub fn from_design(case: &TestCase) -> Self {
+        PortCase {
+            id: case.case_id.clone(),
+            universe: CaseUniverse::Design,
+            args: case.args.clone(),
+            provenance: CaseProvenance {
+                source: String::from("design:registry"),
+                detail: String::from("the target's registered corpus"),
+            },
+        }
+    }
+
+    /// Encode this case into a fuzz input for `target` (the seed form).
+    pub fn encode(&self, target: &PortTarget) -> Vec<u8> {
+        encode_args(target, &self.args)
+    }
+}
 
 /// Exactly `n` bytes starting at `start`, zero-padded when the input is short.
 /// Total by construction: the decoder never panics and never indexes past a

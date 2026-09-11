@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 279 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court |
+| phost reach | 306 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses and the `AUTONOMOUS-SEAL/v1` obligation profile |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -622,6 +622,35 @@ is byte-reproducible at a given toolchain (no wall-clock value enters the hash).
 | Session | 13 calls, 13 native, 68 dispatches, 6 objects, `d219be2c…` |
 | Tests | phorc 50, phost 241 (4 ignored), 0 failures |
 | Baseline residual | `1c52a04bf43283d2367c74a6266246a101b67125ea752330e3d61d05b7f121d1` |
+
+### Phase 7 — held-out qualification, the implementation axis, the FRF outer court, `AUTONOMOUS-SEAL/v1`
+
+The host-only foundry (`phorport`) gained the held-out qualification universe
+(role-lattice, constructed after the freeze, redacted receipt, leakage audit), the
+multi-oracle policy (host-observed / multi-implementation, never a majority
+vote), the FRF outer court bound to its own store (receipts retained verbatim),
+an out-of-process contained candidate worker (`no_new_privs`, `RLIMIT_AS/CPU/CORE/NOFILE`,
+timeout, crash recovery), and the end-to-end pipeline. `phost` gained the
+identity namespaces, the content-addressed evidence closure, `OracleWitness` /
+`MultiOracleVerdict`, and the `AUTONOMOUS-SEAL/v1` obligation profile (O1–O13).
+
+`verify_autonomous_seal.sh` checks the committed evidence for the reconstructed
+`strspn` candidate and proves the promotion and qualification receipts reproduce
+byte-for-byte. Committed identities:
+
+| Aspect | Result |
+|--------|--------|
+| Seal profile | `AutonomousV1`, 13/13 obligations |
+| Promotion receipt | `b82e62678b905bf10ab737bfc248a912ed1d6d1fad9ff17fee2edc13ae5833a0` |
+| Evidence closure | `cf8b202a568d63dae771800f1a9ce953b46dca9f05817cccb43109d2729bad84` |
+| Held-out qualification | 498/498 cases, `isolated`, universe `3bdde558…` |
+| Multi-oracle | `concordant`, 578 cases, `host-observed` |
+| Isolation audit | 997 markers checked, 0 leaks, universe built after freeze |
+| FRF receipts | one `verified` divergence (revision 0) + one preserved parity receipt |
+
+Details: `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`,
+`docs/THREAT_MODEL_AUTONOMOUS_PORTING.md`,
+`docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md`.
 
 ```sh
 ./scripts/integration_baseline.sh

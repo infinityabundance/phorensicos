@@ -30,6 +30,7 @@ use core::fmt;
 use crate::kernel::CapabilitySet;
 
 pub mod abi;
+pub mod autonomous_seal;
 pub mod behavior_signature;
 pub mod candidate;
 pub mod challenge;
@@ -49,8 +50,10 @@ pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;
 pub mod exec;
+pub mod ident;
 pub mod json;
 pub mod oracle_trace;
+pub mod oracle_witness;
 pub mod portspec;
 pub mod promotion;
 pub mod registry;
