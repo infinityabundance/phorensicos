@@ -187,7 +187,13 @@ sensitivity challenge, the FRF outer court, ordinary uninstrumented execution, n
 dispatch, and **13/13** `AUTONOMOUS-SEAL/v1` obligations (evidence closure
 `b7ec423a…`, promotion receipt `3b93f1d7…`);
 * `./verify_supersession.sh` asserts the correction record, the preserved historical
-seal, the successor's own seal, and that the two evidence closures differ.
+seal, the successor's own seal, and that the two evidence closures differ;
+* the successor is published as an **immutable child generation** — generation 1
+`8e6fafec…`, parent the genesis `f47d1bec…` built from the committed index; 14
+entries = the 13 carried forward unchanged plus the successor under
+`AutonomousV1`. Publication is additive: the committed v1 index and the long-lived
+session verdict (`d219be2c…`) are unchanged, and existing sessions stay bound to
+their generation.
 
 **Bounded claim.** The observed behavior was never in question; only the provenance
 metadata was wrong. The successor is the same observed surface with corrected

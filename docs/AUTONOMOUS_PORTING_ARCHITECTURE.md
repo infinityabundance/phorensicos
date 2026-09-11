@@ -261,7 +261,9 @@ evidence (A by the byte-identical baseline and `ci_host.sh`; D by the challenge
 court; E by the Phase 4 campaign; F by the Gemel memory; G by the isolation audit;
 H by the blind `strlen` regeneration and the `strspn` campaign; I by the execution
 and dispatch courts; J by the sealed service opening with no external machinery;
-K by the generation ledger and generation-bound service; L below).
+K by the generation ledger, the generation-bound service, and the committed
+`strspn` child generation (`8e6fafec…`, `phost/evidence/phorport/autonomy/
+libc-strspn-c-locale-u64-v1/store_generation.json`); L below).
 
 **Gate L — clean-room reproduction (verified).** From a clean checkout (re-run on
 the final tree), `docker compose build host` + `docker compose run --rm host` and

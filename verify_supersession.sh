@@ -25,6 +25,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 PHORPORT="$ROOT/target/debug/phorport"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 
 HIST_ID="posix:strspn:c-locale:u64:v1"
 SUCC_ID="libc:strspn:c-locale:u64:v1"
@@ -34,6 +36,14 @@ SUCC_SLUG="libc-strspn-c-locale-u64-v1"
 # seals bind it); the successor id is new and distinct.
 HIST_SPEC_ID="bc0420f01bad52131db35d97636f9e31d55c7903585498ace718524e306f4c23"
 SUCC_SPEC_ID="a4ee309a8959b40a1f8d32bf3944156a70fbc15b0a4a8e85a10de5344bd1e697"
+
+# The successor's sealed artifact, its evidence closure and its promotion receipt,
+# and the immutable generation it is published into (Phase 8 §19).
+SUCC_ARTIFACT="c40c4e3a5100257b04f7df0b593e961bb0acc4ad2658e1604fda068fc7dd54e2"
+SUCC_CLOSURE="b7ec423a12e27a409fc47944ace471ada1fae9b44d0dd18d89aedef16fd2fc0b"
+SUCC_EVIDENCE="3b93f1d76df3fbdc2ee8236b0448486576535cc3506a3c2175f4d9aa93a8a6a0"
+SUCC_GENERATION_ID="8e6fafec7b2b66ced51d8699d86fc264983fe2cd501c11b9c316f4d125912ba5"
+HIST_ARTIFACT="c93271d069fd998e6de8c2cd07e665bd098f6fb64072cdd98fb44ae1375dbafc"
 
 HIST_EVID="$ROOT/phost/evidence/phorport/autonomy/strspn"
 SUCC_EVID="$ROOT/phost/evidence/phorport/autonomy/$SUCC_SLUG"
@@ -95,6 +105,40 @@ SUCC_CLOSURE="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['
 [ -n "$SUCC_CLOSURE" ] || fail "the successor closure is empty"
 [ "$HIST_CLOSURE" != "$SUCC_CLOSURE" ] || fail "the successor reuses the historical closure"
 pass "distinct closures: historical $HIST_CLOSURE, successor $SUCC_CLOSURE"
+
+echo "--- 7. the successor is published as an immutable store generation ---"
+GEN="$SUCC_EVID/store_generation.json"
+[ -f "$GEN" ] || fail "no committed store generation at $GEN"
+GEN_TMP="$TMP/generation.json"
+"$PHORPORT" store generations \
+    --publish-target "$SUCC_ID" \
+    --publish-artifact "$SUCC_ARTIFACT" \
+    --closure "$SUCC_CLOSURE" \
+    --publish-evidence "$SUCC_EVIDENCE" \
+    --out "$GEN_TMP" >/dev/null 2>&1 \
+    || fail "the store generation did not regenerate"
+diff -q "$GEN" "$GEN_TMP" >/dev/null \
+    || fail "the committed store generation did not reproduce"
+python3 - "$GEN" "$SUCC_ID" "$SUCC_ARTIFACT" "$SUCC_GENERATION_ID" "$HIST_ARTIFACT" <<'PY' || exit 1
+import json, sys
+g = json.load(open(sys.argv[1]))
+succ_id, succ_art, succ_gen, hist_art = sys.argv[2:6]
+assert g["schema"] == "phorensic.porting.store_generation.v1", g["schema"]
+assert g["generation_id"] == succ_gen, (g["generation_id"], succ_gen)
+assert g["parent"], "the published generation must have a parent"
+assert len(g["entries"]) == 14, len(g["entries"])
+e = {x["target"]: x for x in g["entries"]}
+# The successor is admitted under its own autonomous profile and artifact.
+assert succ_id in e, "the successor is not published in the generation"
+assert e[succ_id]["seal_profile"] == "AutonomousV1", e[succ_id]
+assert e[succ_id]["artifact_hash"] == succ_art, e[succ_id]
+# The historical leaf is carried forward unchanged: the v1 baseline is not mutated.
+hist = e["posix:strspn:c-locale:u64:v1"]
+assert hist["seal_profile"] == "LegacyV1", hist
+assert hist["artifact_hash"] == hist_art, hist
+print(f"    generation {g['generation_id'][:16]}...: 14 entries, parent bound, successor AutonomousV1")
+PY
+pass "successor published as an immutable child generation; the v1 index is untouched"
 
 echo
 echo "ALL CHECKS PASSED"

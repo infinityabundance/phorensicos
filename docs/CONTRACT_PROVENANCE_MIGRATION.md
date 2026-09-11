@@ -165,12 +165,28 @@ directory, and their receipt and closure identities are distinct.
 
 The successor's seal binds the §19 generation **relation** as obligation O13: a
 `previous-store-generation` (the sealed baseline) and a `current` generation derived
-from the successor's target, object and closure. Publishing the successor into the
-committed store index would be a **new immutable generation** (available through
-`phorport store generations … --publish-target … --publish-artifact … --closure …`)
-and would change the runtime store identity and the long-lived session verdict. That is
-a deliberate act, not performed by the correction itself: the committed store remains
-the 6-leaf + 7-composition baseline, and the successor carries its own autonomous seal.
+from the successor's target, object and closure. The correction then **publishes the
+successor as an immutable child generation** — additively, without mutating the
+committed baseline:
+
+```text
+generation 0 (genesis)   f47d1bec90d8bba92f441138fc29db77094c9a35420057a5d60c3ee4163bdf73
+                         13 entries, all LegacyV1, from phost/evidence/store/index.json
+generation 1            8e6fafec7b2b66ced51d8699d86fc264983fe2cd501c11b9c316f4d125912ba5
+                         parent = generation 0
+                         14 entries = the 13 carried forward unchanged
+                           + libc:strspn:c-locale:u64:v1 under AutonomousV1 (closure b7ec423a…)
+```
+
+Committed at
+`phost/evidence/phorport/autonomy/libc-strspn-c-locale-u64-v1/store_generation.json`
+and verified by `./verify_supersession.sh`. The committed v1 index is **not
+mutated**: the long-lived session verdict (`d219be2c…`) is unchanged, existing
+sessions stay bound to their generation, and a new session may open generation 1.
+The published artifact is the successor's autonomous object
+(`c40c4e3a…`), and the historical `posix:strspn` leaf is carried forward with its
+committed `LegacyV1` artifact (`c93271d0…`) — so both the correction and the record
+it corrects remain addressable in one lineage.
 
 ---
 
@@ -189,7 +205,10 @@ asserts, in order:
 4. the successor has its own distinct `PortSpecId` and its own `AutonomousV1` seal;
 5. the successor autonomous seal verifies
    (`./verify_autonomous_seal.sh --target strspn --target-id libc:strspn:c-locale:u64:v1 --evidence-slug libc-strspn-c-locale-u64-v1`);
-6. the two evidence closures differ (no identity collapse).
+6. the two evidence closures differ (no identity collapse);
+7. the successor is published as an immutable child generation — the recorded
+   identity recomputes, the parent is bound, and the historical baseline entry is
+   carried forward unchanged.
 
 `scripts/ci_host.sh` runs it after the Phase 7 verifier.
 
@@ -205,8 +224,8 @@ asserts, in order:
 - It does **not** prove the ISO C contract holds for every input or every
   implementation. The successor's seal is bounded evidence over its declared corpus,
   exactly like every other `AutonomousV1` seal.
-- It does **not** yet publish the successor into the committed store; the seal binds the
-  generation relation, and the committed baseline is unchanged.
+- It publishes the successor into an **additive** immutable generation; the committed
+  v1 store index is not rewritten and existing sessions are unaffected.
 
 ---
 
@@ -227,7 +246,7 @@ requalify (held-out universe, challenge, FRF, execution, dispatch)
         ↓
 new AUTONOMOUS-SEAL/v1
         ↓
-store-generation relation bound in the seal
+new immutable store generation (additive; the prior generation is not mutated)
 ```
 
 The historical record is preserved, the successor is requalified, and the two are

@@ -553,7 +553,8 @@ Why this is a correction and not a rename:
 
 `./verify_supersession.sh` asserts all of the above: the correction record is
 consistent, the historical evidence still verifies, the successor carries its own seal,
-and the two closures differ.
+the two closures differ, and the successor is published as an immutable child
+generation whose parent and carried-forward baseline entries check out.
 
 The honest limit, stated in **`docs/DIALECT_QUALIFICATION.md`**: the dialect records the
 *specification namespace*. The implementation observed for the seal is the host C

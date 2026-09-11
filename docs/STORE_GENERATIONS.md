@@ -97,9 +97,34 @@ distinguishes 14 of 21 surviving candidate pairs"*, never *"this candidate is
 
 `phorport demand rank <surface>…` prints the ranking; `phorport store generations`
 prints the genesis generation and, with `--publish-target/--publish-artifact/
---closure`, a child generation.
+--closure [--publish-evidence <id>] [--out <file>]`, a child generation. `--out`
+writes the published generation as canonical JSON, so a publication can be a
+committed, re-verifiable artifact rather than a screen of text.
 
-## 6. What is not claimed
+## 6. The committed generations
+
+The repository publishes one generation from the committed baseline, for the
+`strspn` contract-provenance correction (`docs/CONTRACT_PROVENANCE_MIGRATION.md`):
+
+```text
+generation 0 (genesis)   f47d1bec90d8bba92f441138fc29db77094c9a35420057a5d60c3ee4163bdf73
+                         13 entries, all LegacyV1, from phost/evidence/store/index.json
+generation 1            8e6fafec7b2b66ced51d8699d86fc264983fe2cd501c11b9c316f4d125912ba5
+                         parent = generation 0
+                         14 entries = the 13 carried forward unchanged
+                           + libc:strspn:c-locale:u64:v1 under AutonomousV1
+                         evidence_closure = the successor's autonomous closure
+```
+
+Committed at
+`phost/evidence/phorport/autonomy/libc-strspn-c-locale-u64-v1/store_generation.json`
+and verified by `./verify_supersession.sh` (identity recomputes, parent bound, the
+historical `posix:strspn` leaf carried forward unchanged). Publication is
+**additive**: the committed v1 index is not mutated, the long-lived session verdict
+(`d219be2c…`) is unchanged, existing sessions stay bound to their generation, and a
+new session may open generation 1.
+
+## 7. What is not claimed
 
 Generations provide content-identity and immutable lineage now; external
 signatures are a later layer and are not required by this phase.

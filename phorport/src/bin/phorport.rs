@@ -116,7 +116,7 @@ fn command(args: &[String]) -> Result<i32, String> {
         use phost::porting::autonomous_seal::SealProfile;
         use phost::porting::ident::EvidenceClosureId;
         if args.get(1).map(String::as_str) != Some("generations") {
-            return Err(String::from("usage: phorport store generations [--publish-target <id> --publish-artifact <hash> --closure <id>]"));
+            return Err(String::from("usage: phorport store generations [--publish-target <id> --publish-artifact <hash> --closure <id> --publish-evidence <id> --out <file>]"));
         }
         let index = phost::porting::store::load_default().map_err(|e| e.to_string())?;
         let g0 = phorport::generations::genesis_from_index(&index)?;
@@ -129,18 +129,34 @@ fn command(args: &[String]) -> Result<i32, String> {
             arg_value(args, "--publish-artifact"),
         ) {
             let closure = EvidenceClosureId::new(arg_value(args, "--closure").unwrap_or_default());
+            let evidence = arg_value(args, "--publish-evidence")
+                .unwrap_or_else(|| String::from("phor.autonomous:receipt"));
             let g1 = phorport::generations::publish_port(
                 &g0,
                 &t,
                 &a,
                 SealProfile::AutonomousV1,
-                "phor.autonomous:receipt",
+                &evidence,
                 closure,
             )?;
             println!("generation 1: {}", g1.generation_id.as_str());
             println!("  parent:  {}", g0.generation_id.as_str());
             println!("  entries: {}", g1.entries.len());
             println!("  closure: {}", g1.evidence_closure.as_str());
+            println!("  evidence: {}", evidence);
+            // `--out <file>` writes the published generation as canonical JSON, so
+            // the publication is a committed, re-verifiable artifact rather than a
+            // screen of text. This does **not** mutate the committed store index.
+            if let Some(out) = arg_value(args, "--out") {
+                let path = Path::new(&out);
+                if let Some(dir) = path.parent() {
+                    if !dir.as_os_str().is_empty() {
+                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                    }
+                }
+                std::fs::write(path, g1.to_json()).map_err(|e| e.to_string())?;
+                println!("  written: {}", out);
+            }
         }
         return Ok(0);
     }
