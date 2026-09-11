@@ -27,6 +27,23 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// Every value following `flag` (for repeatable options such as `--source`).
+fn arg_values(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn work_dir(workspace: &Path, symbol: &str) -> PathBuf {
     workspace.join(".phorport").join(symbol)
 }
@@ -68,7 +85,7 @@ fn fs_canonical(p: &str) -> String {
 fn command(args: &[String]) -> Result<i32, String> {
     let Some(cmd) = args.first() else {
         return Err(String::from(
-            "usage: phorport <probe|corpus|fuzz|history> <symbol> --candidate-src <path> …",
+            "usage: phorport <probe|corpus|fuzz|history|campaign> <symbol> --candidate-src <path> …",
         ));
     };
     let symbol = args
@@ -77,6 +94,127 @@ fn command(args: &[String]) -> Result<i32, String> {
         .ok_or_else(|| String::from("missing <symbol>"))?;
     let workspace =
         PathBuf::from(arg_value(args, "--workspace").unwrap_or_else(|| String::from(".")));
+
+    // `campaign` runs the bounded CEGIS loop; it consumes producer *sources*.
+    if cmd == "campaign" {
+        use phorport::cegis::{run_cegis, CampaignManifest, CampaignState, DiscoveryHook};
+        use phorport::producer::{KnownCounterexample, ScriptedProducer};
+
+        let target = resolve_target(&symbol).ok_or_else(|| format!("unknown symbol {symbol}"))?;
+        let spec = phost::porting::portspec::by_target_id(target.id)
+            .ok_or_else(|| format!("no PortSpec for {}", target.id))?;
+        let source_paths = arg_values(args, "--source");
+        if source_paths.is_empty() {
+            return Err(String::from("campaign needs at least one --source <path>"));
+        }
+        let mut sources = Vec::new();
+        for p in &source_paths {
+            sources.push(std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?);
+        }
+        let mut producer = ScriptedProducer::new(sources);
+
+        let frf_fuzz_bin = arg_value(args, "--frf-fuzz-bin");
+        let frf_fuzz_root = arg_value(args, "--frf-fuzz-root");
+        let max_time = arg_value(args, "--max-time")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let out = arg_value(args, "--out").unwrap_or_else(|| {
+            workspace
+                .join("phost/evidence/phorport")
+                .display()
+                .to_string()
+        });
+        let phorport_root = phorport_root(&workspace);
+        let work = workspace.join(".phorport/campaign").join(&symbol);
+        let fuzz_root = workspace.join(".phorport/fuzz");
+
+        // The production discovery hook is Phase 4's bounded FRF-Fuzz campaign.
+        let mut hook = |cfg: &HarnessConfig| -> Vec<KnownCounterexample> {
+            let (Some(bin), Some(root)) = (&frf_fuzz_bin, &frf_fuzz_root) else {
+                return Vec::new();
+            };
+            match explore::campaign(
+                cfg,
+                &target,
+                &symbol,
+                None,
+                "campaign",
+                &fuzz_root,
+                Path::new(root),
+                &phorport_root,
+                Path::new(bin),
+                max_time,
+                &out,
+            ) {
+                Ok(o) => o
+                    .counterexample
+                    .map(|cx| {
+                        vec![KnownCounterexample {
+                            residual: cx.minimal_residual,
+                            input_hex: cx.minimal_hex,
+                            oracle_hex: cx.oracle_hex,
+                            candidate_hex: cx.candidate_output_hex,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let discovery: Option<DiscoveryHook> = if frf_fuzz_bin.is_some() && frf_fuzz_root.is_some()
+        {
+            Some(&mut hook)
+        } else {
+            None
+        };
+
+        let base = HarnessConfig {
+            target_id: target.id.to_string(),
+            candidate_path: String::new(),
+            candidate_hash: String::new(),
+        };
+        let manifest = CampaignManifest {
+            target_id: target.id.to_string(),
+            port_spec_id: "PortSpec".to_string(),
+            design_generator: "registry".to_string(),
+            qualification_policy: "host-observed".to_string(),
+            discovery_budget: arg_value(args, "--budget")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(4),
+            challenge_required: true,
+            seal_profile: "autonomous-v1".to_string(),
+        };
+
+        let report = run_cegis(
+            &mut producer,
+            spec,
+            &target,
+            &base,
+            &work,
+            &manifest,
+            discovery,
+        );
+        println!("=== Candidate CEGIS Campaign ===");
+        println!("manifest:  {}", report.manifest_id);
+        println!("revisions: {}", report.revisions);
+        for line in &report.revision_log {
+            println!("  {line}");
+        }
+        match &report.frozen {
+            Some(id) => {
+                println!("frozen:    {}", id.canonical());
+                println!("state:     {}", CampaignState::CandidateFrozen.as_str());
+            }
+            None => println!(
+                "state:     {}",
+                report
+                    .states
+                    .last()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown")
+            ),
+        }
+        return Ok(if report.frozen.is_some() { 0 } else { 1 });
+    }
 
     // `history` reads Gemel memory and needs no candidate object.
     if cmd == "history" {

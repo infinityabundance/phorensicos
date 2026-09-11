@@ -725,6 +725,23 @@ prior rejection on the second; `phorport history strspn` lists both records).
 Verified by a unit test and the committed campaign evidence. Intents, trajectories
 and cross-compiler revision replay remain. See `docs/GEMEL_MEMORY.md`.
 
+**Phase 6 (core): the candidate producer and the bounded CEGIS loop.**
+`phorport/src/producer.rs` defines the untrusted `CandidateProducer` trait with a
+scripted catalogue and an external-command (agent) adapter; every proposal is
+checked against the `PortSpec`'s constraints (size, leaf policy — comments stripped)
+before compilation. `SynthesisWorkspace` materializes only permitted material and
+audits for qualification leaks (unit-tested with forbidden markers).
+`phorport/src/cegis.rs` drives a monotonic campaign state machine over a bounded
+budget: propose → constrain → compile (a `CandidateIdentity` of source+object hash)
+→ design court → discovery court (Phase 4's FRF-Fuzz campaign is the production
+hook) → revise on failure or freeze on survival. A falsified revision is minimized
+through the same court and remembered as negative knowledge. Demonstrated:
+`phorport campaign strspn --source <always-0> --source examples/jit_port_strspn.phor`
+rejects revision 0 on 305/578 design cases and freezes revision 1. Disagreement
+driven experiment selection and a shipped synthesizer remain; the workspace's
+qualification isolation is structural (the full held-out universe is Phase 7). See
+`docs/CEGIS.md`.
+
 ```sh
 cargo test -p phost --lib porting::composition_ir
 ```

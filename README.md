@@ -517,6 +517,19 @@ failure and stops instead of rediscovering it; `phorport history <symbol>` lists
 what is remembered. Gemel is optional: with no repository every campaign runs
 standalone. See `docs/GEMEL_MEMORY.md`.
 
+### Generating candidates, not replaying them
+
+The foundry's generator is an untrusted `CandidateProducer` behind a trait — a
+deterministic scripted catalogue and an external-command (agent) adapter ship, and
+a synthesizer slots in without changing the loop. Every proposal is checked against
+the port's declared constraints before it is compiled, and compiled inside an
+**isolated synthesis workspace** that contains only permitted material (the public
+contract, discovered counterexamples, bounded negative knowledge) and is audited
+for qualification leaks. The bounded CEGIS loop raises a candidate through the
+design and discovery courts; a falsified revision is minimized, remembered, and
+revised, and only a survivor is **frozen** — by exact source bytes, so any change is
+a new identity. See `docs/CEGIS.md`.
+
 ### Persistent sealed port store
 
 A court *derives* a seal: it observes foreign behavior, compiles the clean-room

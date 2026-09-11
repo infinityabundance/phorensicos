@@ -21,10 +21,13 @@
 //                        turn findings into minimized counterexamples.
 
 pub mod case;
+pub mod cegis;
+pub mod compile;
 pub mod config;
 pub mod counterexample;
 pub mod explore;
 pub mod harness;
 pub mod memory;
 pub mod minimize;
+pub mod producer;
 pub mod residual;

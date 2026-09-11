@@ -298,6 +298,10 @@ pub fn campaign(
 ///
 /// This is how Gate E is stated precisely — a defect the design corpus *misses*
 /// is one for which every design case matches the oracle.
+/// A convenience: does the design corpus alone already reject this candidate?
+///
+/// This is how Gate E is stated precisely — a defect the design corpus *misses*
+/// is one for which every design case matches the oracle.
 pub fn design_corpus_matches(config: &HarnessConfig, target: &PortTarget) -> (u64, u64) {
     let mut ran = 0u64;
     let mut diverged = 0u64;
@@ -312,4 +316,20 @@ pub fn design_corpus_matches(config: &HarnessConfig, target: &PortTarget) -> (u6
         }
     }
     (ran, diverged)
+}
+
+/// The first design case the candidate diverges on, with its encoded input and
+/// outcome — the witness a CEGIS revision is built from.
+pub fn design_first_divergence(
+    config: &HarnessConfig,
+    target: &PortTarget,
+) -> Option<(String, Vec<u8>, crate::harness::ProbeOutcome)> {
+    for case in cases_for(target) {
+        let data = encode_args(target, &case.args);
+        let o = probe(config, &data);
+        if o.valid && !o.matched {
+            return Some((case.case_id, data, o));
+        }
+    }
+    None
 }
