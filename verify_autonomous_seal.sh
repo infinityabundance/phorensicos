@@ -14,6 +14,12 @@
 #      a byte-identical promotion receipt and qualification receipt.
 #
 #  Usage: ./verify_autonomous_seal.sh [--target strspn]
+#         ./verify_autonomous_seal.sh --target strspn \
+#             --target-id libc:strspn:c-locale:u64:v1 \
+#             --evidence-slug libc-strspn-c-locale-u64-v1
+#
+#  With no --target-id the historical invocation is used unchanged (a bare
+#  symbol keeps its symbol-named evidence directory).
 #  Exit status: 0 = ALL CHECKS PASSED, 1 = a check failed, 2 = setup error.
 # ============================================================================
 set -u
@@ -22,14 +28,19 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 TARGET="strspn"
+TARGET_ID=""
+EVID_SLUG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
+        --target-id) TARGET_ID="$2"; shift 2 ;;
+        --evidence-slug) EVID_SLUG="$2"; shift 2 ;;
         *) echo "unknown argument: $1"; exit 2 ;;
     esac
 done
+EVID_SLUG="${EVID_SLUG:-$TARGET}"
 
-EVID="$ROOT/phost/evidence/phorport/autonomy/$TARGET"
+EVID="$ROOT/phost/evidence/phorport/autonomy/$EVID_SLUG"
 PHORPORT="$ROOT/target/debug/phorport"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -97,11 +108,17 @@ grep -q '"frf.receipt:' "$RECEIPT" && pass "FRF receipt ids retained verbatim"
 echo "--- 6. the pipeline reproduces ---"
 WRONG="$ROOT/examples/jit_port_strspn_always_zero.phor"
 [ -f "$WRONG" ] || fail "the committed revision-0 source is missing: $WRONG"
-"$PHORPORT" autonomy "$TARGET" \
-    --source "$WRONG" \
-    --source "$ROOT/examples/jit_port_strspn.phor" \
-    --workspace "$ROOT" \
-    --out "$TMP/out" >/dev/null 2>&1 || true
+RUN_ARGS=(autonomy "$TARGET")
+if [ -n "$TARGET_ID" ]; then
+    RUN_ARGS+=(--target-id "$TARGET_ID")
+fi
+RUN_ARGS+=(
+    --source "$WRONG"
+    --source "$ROOT/examples/jit_port_strspn.phor"
+    --workspace "$ROOT"
+    --out "$TMP/out"
+)
+"$PHORPORT" "${RUN_ARGS[@]}" >/dev/null 2>&1 || true
 [ -f "$TMP/out/autonomous_promotion_receipt.json" ] || fail "the pipeline did not seal on re-run"
 # The qualification receipt is build-independent: it must reproduce byte-for-byte.
 diff -q "$QUAL" "$TMP/out/qualification_receipt.json" >/dev/null \

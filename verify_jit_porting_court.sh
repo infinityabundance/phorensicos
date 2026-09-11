@@ -80,7 +80,11 @@ case "$TARGET" in
         SOURCE="examples/jit_port_strrchr.phor"
         ;;
     strspn)
-        # The second dialect: `strspn` is POSIX, not ISO C.
+        # The committed baseline's historical `strspn` record. `strspn` is an ISO C
+        # surface, but the baseline recorded it as `posix:` on a mistaken provenance
+        # claim (docs/CONTRACT_PROVENANCE_MIGRATION.md). That record and its evidence
+        # are preserved; the corrected `libc:strspn:...` successor is requalified and
+        # verified separately by ./verify_supersession.sh.
         TARGET_ID="posix:strspn:c-locale:u64:v1"
         EXPECTED_COUNT=578
         SOURCE="examples/jit_port_strspn.phor"

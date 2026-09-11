@@ -35,12 +35,13 @@ use crate::porting::candidate::{
     cand_memchr, cand_memcmp, cand_strlen, cand_strrchr, cand_strspn, cand_toupper, CandidateError,
 };
 use crate::porting::portspec::{
-    PortSpec, SPEC_MEMCHR, SPEC_MEMCMP, SPEC_STRLEN, SPEC_STRRCHR, SPEC_STRSPN, SPEC_TOUPPER,
+    PortSpec, SPEC_MEMCHR, SPEC_MEMCMP, SPEC_STRLEN, SPEC_STRRCHR, SPEC_STRSPN, SPEC_STRSPN_ISO_C,
+    SPEC_TOUPPER,
 };
 use crate::porting::target::{
     byte_domain_cases, memchr_corpus, memcmp_corpus, strlen_corpus, strrchr_corpus, strspn_corpus,
-    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
-    POSIX_STRSPN,
+    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_STRSPN,
+    LIBC_TOUPPER, POSIX_STRSPN,
 };
 
 /// One registered leaf target: its spec, its bootstrap record, and its three
@@ -60,8 +61,12 @@ pub struct PortExtension {
     pub abi: AbiFn,
 }
 
-/// The one target table. Order matches the store's canonical leaf order.
-pub const EXTENSIONS: [PortExtension; 6] = [
+/// The one target table. Order matches the store's canonical leaf order, and the
+/// **last** row is the corrected `strspn` successor: because `extension_by_name`
+/// finds the first match, bare-symbol resolution (`"strspn"`) keeps returning the
+/// historical target (baseline preservation), while the successor is addressed by
+/// its full id (`libc:strspn:c-locale:u64:v1`).
+pub const EXTENSIONS: [PortExtension; 7] = [
     PortExtension {
         spec: &SPEC_TOUPPER,
         target: LIBC_TOUPPER,
@@ -104,6 +109,16 @@ pub const EXTENSIONS: [PortExtension; 6] = [
         candidate: cand_strspn,
         abi: abi::strspn,
     },
+    // The corrected `strspn` successor (docs/CONTRACT_PROVENANCE_MIGRATION.md).
+    // Same surface and extension points as the historical row; a different
+    // provenance claim and therefore a different `PortSpecId`.
+    PortExtension {
+        spec: &SPEC_STRSPN_ISO_C,
+        target: LIBC_STRSPN,
+        cases: strspn_corpus,
+        candidate: cand_strspn,
+        abi: abi::strspn,
+    },
 ];
 
 /// Every registered extension, in canonical order.
@@ -135,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_every_spec_has_exactly_one_extension() {
-        assert_eq!(all().len(), 6);
+        assert_eq!(all().len(), 7);
         for spec in crate::porting::portspec::all() {
             let matches = EXTENSIONS
                 .iter()
@@ -160,12 +175,29 @@ mod tests {
     #[test]
     fn test_registry_is_the_source_of_truth_for_names() {
         for e in all() {
-            assert!(extension_by_name(e.spec.symbol).is_some());
-            let t = target::resolve_target(e.spec.symbol).expect("resolves by symbol");
-            assert_eq!(t.id, e.spec.target_id);
+            // Every row resolves by its full id (this is how the store and the
+            // runtime address a port, so a duplicate symbol cannot confuse it).
             let t = target::resolve_target(e.spec.target_id).expect("resolves by id");
             assert_eq!(t.id, e.spec.target_id);
+            // And a row's symbol resolves to *a* registered row with that symbol.
+            let by_symbol = extension_by_name(e.spec.symbol).expect("resolves by symbol");
+            assert_eq!(by_symbol.spec.symbol, e.spec.symbol);
         }
+        // Bare-symbol resolution keeps returning the historical `strspn` target
+        // (the successor is addressed by its full id), so the baseline verifiers
+        // and the committed evidence are unaffected.
+        assert_eq!(
+            target::resolve_target("strspn")
+                .expect("strspn resolves")
+                .id,
+            POSIX_STRSPN.id
+        );
+        assert_eq!(
+            target::resolve_target(LIBC_STRSPN.id)
+                .expect("successor resolves by id")
+                .id,
+            LIBC_STRSPN.id
+        );
         assert!(extension_by_name("strcspn").is_none());
         assert!(target::resolve_target("strcspn").is_none());
     }

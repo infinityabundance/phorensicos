@@ -64,6 +64,7 @@ pub mod replay_court;
 pub mod service;
 pub mod store;
 pub mod store_generation;
+pub mod supersession;
 pub mod target;
 
 pub use behavior_signature::BehaviorSignature;

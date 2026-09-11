@@ -71,6 +71,10 @@ echo "=== Autonomous Porting Foundry (Phase 4) ==="
 echo
 echo "=== Autonomous Porting Foundry (Phase 7) ==="
 ./verify_autonomous_seal.sh
+# Contract provenance: a correction is a new identity, never a silent rename. The
+# historical `posix:strspn` evidence is preserved; the `libc:strspn` successor is
+# requalified and resealed on its own PortSpecId (docs/CONTRACT_PROVENANCE_MIGRATION.md).
+./verify_supersession.sh
 # Phase 3: the court-sensitivity (challenge) court — is the instrument blind?
 for ch in toupper memcmp memchr strlen strrchr strspn toupper_memchr toupper_strlen_memchr toupper_strlen_memchr_pair toupper_each toupper_each_strlen_memchr toupper_memchr_suffix toupper_each_slice_search; do
     ./verify_challenge_court.sh --target "$ch" --check-committed

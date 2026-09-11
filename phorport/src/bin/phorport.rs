@@ -91,6 +91,27 @@ fn command(args: &[String]) -> Result<i32, String> {
 
     // `store generations` — build the genesis generation from the committed
     // index and optionally publish a child generation.
+    // `supersessions` prints the declared contract-provenance corrections. Each is
+    // an evidence-preserving migration: the historical target and its evidence stay
+    // intact, and the corrected successor is requalified on its own identity.
+    if cmd == "supersessions" {
+        use phost::porting::supersession::SUPERSESSIONS;
+        for s in &SUPERSESSIONS {
+            if !s.is_consistent() {
+                return Err(format!(
+                    "declared supersession {} -> {} is inconsistent",
+                    s.historical_target_id, s.successor_target_id
+                ));
+            }
+        }
+        let body: Vec<String> = SUPERSESSIONS.iter().map(|s| s.to_json()).collect();
+        println!(
+            "{{\n  \"schema\": \"phorensic.phorport.supersessions.v1\",\n  \"supersessions\": [\n{}\n  ]\n}}",
+            body.join(",\n")
+        );
+        return Ok(0);
+    }
+
     if cmd == "store" {
         use phost::porting::autonomous_seal::SealProfile;
         use phost::porting::ident::EvidenceClosureId;
@@ -298,7 +319,24 @@ fn command(args: &[String]) -> Result<i32, String> {
         use phorport::pipeline::{run_autonomous, AutonomyInputs};
         use phorport::producer::{KnownCounterexample, ScriptedProducer};
 
-        let target = resolve_target(&symbol).ok_or_else(|| format!("unknown symbol {symbol}"))?;
+        // `--target-id` addresses a target by its full id; this is how a
+        // supersession successor (e.g. `libc:strspn:...`) is run without
+        // disturbing the historical bare-symbol resolution. A bare symbol keeps
+        // its historical evidence directory (the symbol), so the committed
+        // `posix:strspn` evidence and its verifier are unaffected; a full id gets
+        // a path-safe slug (`libc-strspn-c-locale-u64-v1`).
+        let (target, target_slug) = match arg_value(args, "--target-id") {
+            Some(id) => {
+                let t = resolve_target(&id).ok_or_else(|| format!("unknown target id {id}"))?;
+                let slug = t.id.replace(':', "-");
+                (t, slug)
+            }
+            None => {
+                let t =
+                    resolve_target(&symbol).ok_or_else(|| format!("unknown symbol {symbol}"))?;
+                (t, symbol.clone())
+            }
+        };
         let spec = phost::porting::portspec::by_target_id(target.id)
             .ok_or_else(|| format!("no PortSpec for {}", target.id))?;
         let source_paths = arg_values(args, "--source");
@@ -319,13 +357,13 @@ fn command(args: &[String]) -> Result<i32, String> {
         let out_dir = PathBuf::from(arg_value(args, "--out").unwrap_or_else(|| {
             workspace
                 .join("phost/evidence/phorport/autonomy")
-                .join(&symbol)
+                .join(&target_slug)
                 .display()
                 .to_string()
         }));
         std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
         let phorport_root = phorport_root(&workspace);
-        let work = workspace.join(".phorport/autonomy").join(&symbol);
+        let work = workspace.join(".phorport/autonomy").join(&target_slug);
         let fuzz_root = workspace.join(".phorport/fuzz");
         let frf_store = arg_value(args, "--frf-store")
             .map(PathBuf::from)
@@ -339,7 +377,7 @@ fn command(args: &[String]) -> Result<i32, String> {
             match explore::campaign(
                 cfg,
                 &target,
-                &symbol,
+                &target_slug,
                 None,
                 "autonomy",
                 &fuzz_root,

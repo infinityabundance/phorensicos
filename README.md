@@ -100,7 +100,9 @@ A top-level `manifest_claim` states exactly what is and is not asserted.
 ## JIT-Porting Court
 
 Phorensic OS ports *behavior*, not binaries. Six leaf courts have run
-end-to-end at the API boundary — five ISO C surfaces and one POSIX surface:
+end-to-end at the API boundary — all six are ISO C surfaces (the committed baseline
+recorded `strspn` under a historical `posix:` identity, corrected by a successor
+below):
 
 ```text
 foreign behavior → dialect cage       (observe a named specification as a black box)
@@ -127,6 +129,10 @@ foreign behavior → dialect cage       (observe a named specification as a blac
 | `libc:strlen:c-locale:u64:v1` | bounded deterministic corpus (308 cases) | **308/308 pass** | **308/308 pass** | **308/308 native**, 0 fallback |
 | `libc:strrchr:c-locale:index:v1` | bounded deterministic corpus (336 cases) | **336/336 pass** | **336/336 pass** | **336/336 native**, 0 fallback |
 | `posix:strspn:c-locale:u64:v1` | bounded deterministic corpus (578 cases) | **578/578 pass** | **578/578 pass** | **578/578 native**, 0 fallback |
+
+The last row is the committed baseline's **historical** record for `strspn`. `strspn`
+is an ISO C surface; a corrected `libc:strspn:c-locale:u64:v1` successor is requalified
+and sealed independently (see below and `docs/CONTRACT_PROVENANCE_MIGRATION.md`).
 
 The `memcmp` corpus deliberately forces length, buffers and ordering: lengths
 `0..=8`, five patterns, every first-mismatch position, the `n`-boundary around a
@@ -161,21 +167,30 @@ values against a haystack whose tail repeats bytes from the string. A needle of
 bound. `strrchr` returns a pointer, so the observable is normalized to the index;
 `n` is the ABI precondition bound.
 
-### A second dialect: `posix`
+### The `strspn` contract, and a corrected provenance
 
-The five ISO C targets all carry `dialect: libc`. The sixth does not:
+`strspn` is an **ISO C** surface — specified by ISO C (C90 4.11.5.4; C99 and later
+7.21.5.4), with POSIX stating that its `strspn` specification is aligned with and
+defers to ISO C. Its identity is therefore `libc:strspn:c-locale:u64:v1`, like the
+other five leaves.
+
+This repository **historically** recorded `strspn` as
+`posix:strspn:c-locale:u64:v1` on the mistaken claim that ISO C does not specify it.
+That claim was wrong (so was the companion claim about `strcspn`, `strpbrk` and
+`strtok`). The historical target, its `PortSpecId`, its seal and its evidence are
+**preserved unchanged** — the record carries its mistake rather than being rewritten —
+and a corrected successor is requalified and resealed on its own identity:
 
 ```text
-posix:strspn:c-locale:u64:v1
+posix:strspn:c-locale:u64:v1   (historical, preserved)   bc0420f0…
+libc:strspn:c-locale:u64:v1    (successor, requalified)  a4ee309a…
 ```
 
-**ISO C does not specify `strspn`** — it is POSIX (so are `strcspn`, `strpbrk`,
-`strtok`, `strcasecmp`, `strdup`). Recording it as `libc:strspn:…` would conflate two
-standards, which is exactly what the qualified id exists to prevent. The `dialect`
-field names the **specification the contract is drawn from**, not the library that
-implements it.
+Bare-symbol resolution still returns the historical target, so the committed store and
+the verifiers are unaffected; the successor is addressed by its full id. See
+`docs/CONTRACT_PROVENANCE_MIGRATION.md` (and `./verify_supersession.sh`).
 
-The observable is also a new shape next to ordering (`memcmp`), first/last match
+The observable is a shape next to ordering (`memcmp`), first/last match
 (`memchr`/`strrchr`) and length-to-terminator (`strlen`):
 
 ```text
@@ -191,13 +206,13 @@ set can never contain NUL, the terminator always ends the span, which is what ke
 the scan inside one packed word.
 
 The honest limit is stated in the qualification review, `docs/DIALECT_QUALIFICATION.md`:
-`posix:` records the *specification namespace*; the *implementation* observed is still
-the host C library, and the seal binds the observed behavior by oracle hash, so a
+the dialect records the *specification namespace*; the *implementation* observed is
+still the host C library, and the seal binds the observed behavior by oracle hash, so a
 different implementation with different behavior cannot pass silently. Making the
 result implementation-independent is a separate axis, and it is now closed by the
 cross-implementation court described in the next section.
 
-The verifier now requires the sealed package's `dialect` to equal the namespace of
+The verifier requires the sealed package's `dialect` to equal the namespace of
 the target id, so this cannot drift back into an unqualified claim.
 
 ### The implementation axis: a second implementation
@@ -789,7 +804,7 @@ All numbers below were reproduced on a clean checkout.
 | JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, `strlen`: **308/308**, `strrchr`: **336/336**, `strspn` (POSIX): **578/578**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
 | Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**, `strlen` **308/308**, `strrchr` **336/336**, `strspn` **578/578**; executed object == sealed object |
 | Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, `strrchr` **336/336 native**, `strspn` **578/578 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
-| Second dialect | `posix:strspn:c-locale:u64:v1` — a POSIX contract (ISO C does not specify `strspn`) and a new observable shape (a prefix length decided by set membership); the verifier requires the sealed package's `dialect` to match the target id's namespace; see `docs/DIALECT_QUALIFICATION.md` |
+| Corrected provenance | `strspn` is an ISO C surface (C90 4.11.5.4; C99+ 7.21.5.4); the committed baseline historically recorded it as `posix:strspn:c-locale:u64:v1` on a mistaken claim. That record, its `PortSpecId` and its evidence are preserved; the corrected successor `libc:strspn:c-locale:u64:v1` is requalified and sealed under its own identity (`AutonomousV1`, 13/13 obligations); see `docs/CONTRACT_PROVENANCE_MIGRATION.md`, `phorport supersessions`, `./verify_supersession.sh` |
 | Sealed composition | `toupper ∘ memchr` composed from two sealed ports: **560/560**, all three stages native, **0 fallbacks / 0 broken seals**, 4776 sealed dispatches; dispatched objects match the committed leaf seals |
 | Sealed composition (3-stage) | `toupper ∘ strlen ∘ memchr`, where the sealed `strlen` result becomes the search bound: **350/350**, all four stage-accounts native, **0 fallbacks / 0 broken seals**, 3729 sealed dispatches; dispatched objects match the committed leaf seals |
 | Sealed composition (dataflow) | `toupper ∘ strlen ∘ memchr ∘ toupper ∘ memchr`, where **one derived bound is consumed by two searches**, the second non-adjacent to the stage that produced it: **474/474**, all six stage-accounts native, **0 fallbacks / 0 broken seals**, 6102 sealed dispatches; dispatched objects match the committed leaf seals |
@@ -831,7 +846,8 @@ All numbers below were reproduced on a clean checkout.
 ## Documentation
 
 - `docs/PHORENSIC_LANGUAGE.md`, `docs/PHORENSIC_GRAMMAR.md` — the language.
-- `docs/DIALECT_QUALIFICATION.md` — how a `dialect:` namespace is earned (`posix` vs `libc`).
+- `docs/DIALECT_QUALIFICATION.md` — how a `dialect:` namespace is earned, and how a wrong qualification is corrected.
+- `docs/CONTRACT_PROVENANCE_MIGRATION.md` — the `strspn` provenance correction: the mistake, the preserved historical record, the successor identity and its requalification path.
 - `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`, `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md`, `docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md` — Phase 7: held-out qualification, the implementation axis, the evidence model and `AUTONOMOUS-SEAL/v1`.
 - `docs/STORE_GENERATIONS.md` — Phase 8: immutable store generations, generation binding, and demand-driven porting.
 - `docs/COMPOSITION_SYNTHESIS.md`, `docs/ABI_V2.md` — Phase 10: bounded `CompositionIR` synthesis; Phase 11: the guarded-arena memory-effect court and its honest compiler boundary.

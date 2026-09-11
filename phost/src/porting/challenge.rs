@@ -440,6 +440,7 @@ pub fn leaf_mutants(target_id: &str) -> &'static [LeafMutant] {
         x if x == target::LIBC_STRLEN.id => &STRLEN_MUTANTS,
         x if x == target::LIBC_STRRCHR.id => &STRRCHR_MUTANTS,
         x if x == target::POSIX_STRSPN.id => &STRSPN_MUTANTS,
+        x if x == target::LIBC_STRSPN.id => &STRSPN_MUTANTS,
         _ => &[],
     }
 }

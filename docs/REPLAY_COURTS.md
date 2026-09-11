@@ -328,14 +328,17 @@ traces, replays a clean-room native candidate against them, and promotes the
 candidate only on exact, evidence-backed equivalence.
 
 This is **API-surface** porting (byte-in/byte-out and small buffer functions such
-as `toupper`, `memcmp`, `memchr`, `strlen` and `strrchr`, plus the POSIX `strspn`),
+as `toupper`, `memcmp`, `memchr`, `strlen` and `strrchr`, plus `strspn`),
 not arbitrary binary translation.
 
 A target's identity is qualified — `dialect:symbol:locale:contract:version`. The
 `dialect` names the **specification the contract is drawn from**, not the library
-that implements it: the first five targets are ISO C surfaces (`dialect: libc`), and
-`strspn` is POSIX (`dialect: posix`) because ISO C does not specify it. See
-`docs/DIALECT_QUALIFICATION.md` for what that qualification does and does not claim.
+that implements it: all six leaf surfaces (`toupper`, `memcmp`, `memchr`, `strlen`,
+`strrchr`, `strspn`) are ISO C surfaces. The committed baseline historically recorded
+`strspn` as `posix:strspn:…` on a mistaken claim; that record is preserved and a
+corrected `libc:strspn:…` successor is requalified independently. See
+`docs/DIALECT_QUALIFICATION.md` and `docs/CONTRACT_PROVENANCE_MIGRATION.md` for what
+that qualification does and does not claim.
 
 ### Flow
 
@@ -456,11 +459,11 @@ contract:  length of the initial segment of s consisting only of bytes in accept
 corpus:    578 bounded deterministic cases
 ```
 
-A second dialect and a new observable shape. `dialect: posix` is earned, not chosen:
-ISO C does not specify `strspn`, so recording it as `libc:strspn:…` would conflate two
-standards (`docs/DIALECT_QUALIFICATION.md`). The observable is a **prefix length
-decided by set membership** — different from ordering, match index and
-length-to-terminator. Arguments are framed as `s_hex:accept_hex:n_hex`.
+A new observable shape. `strspn` is an ISO C surface; the committed baseline recorded
+it as `dialect: posix` on a mistaken claim, preserved as historical evidence and
+corrected by a `libc:strspn:…` successor (`docs/CONTRACT_PROVENANCE_MIGRATION.md`). The
+observable is a **prefix length decided by set membership** — different from ordering,
+match index and length-to-terminator. Arguments are framed as `s_hex:accept_hex:n_hex`.
 
 ### Target identity is qualified
 
@@ -476,20 +479,21 @@ native candidates are clean-room `phor_toupper` (ASCII `a`..`z` fold),
 `phor_memcmp` (unsigned, `n`-bounded, sign result), `phor_memchr` (unsigned,
 `n`-bounded, first-match index), `phor_strlen` (first-NUL length, `n`-bounded
 and fail-closed at `n`), `phor_strrchr` (last in-string match index, NUL
-needle → length) and `phor_strspn` (POSIX: set-membership span, `n`-bounded, the
+needle → length) and `phor_strspn` (set-membership span, `n`-bounded, the
 terminator always ending the span because a C string set cannot contain NUL).
 Unknown target ids return
 `CandidateError::UnsupportedTarget` and malformed arguments return
 `CandidateError::MalformedArgs`; there is no identity fallback, so an unsupported
 candidate can never pass by accident.
 
-### Second dialect: `posix:strspn`
+### The `strspn` target and its corrected provenance
 
-The five ISO C targets carry `dialect: libc`. `strspn` carries `dialect: posix`
-because **ISO C does not specify it** — it is a POSIX function, like `strcspn`,
-`strpbrk`, `strtok`, `strcasecmp` and `strdup`. The `dialect` field names the
-specification the contract is drawn from, so a POSIX-only contract cannot be recorded
-as a C-library contract without conflating two standards.
+`strspn` carries `dialect: posix` in the committed baseline, which was a **mistaken
+provenance claim**: `strspn` is specified by ISO C (C90 4.11.5.4; C99 and later
+7.21.5.4), and POSIX states its `strspn` specification is aligned with and defers to
+ISO C. The historical record is preserved (with its mistake) and a corrected successor
+`libc:strspn:c-locale:u64:v1` is requalified and sealed on its own identity; see
+`docs/CONTRACT_PROVENANCE_MIGRATION.md`.
 
 The observable is a new shape next to ordering, match index and length-to-terminator:
 

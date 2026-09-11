@@ -25,7 +25,8 @@
 //
 // This module is additive: it does not change `target.rs`, the courts, or any
 // existing evidence. `PortSpec::of_target` derives the spec for a bootstrap
-// target, and `portspec::all()` returns the six leaves. A later subphase removes
+// target, and `portspec::all()` returns the leaves plus the corrected `strspn`
+// successor. A later subphase removes
 // the target-id branches from the generic engine; that migration is versioned and
 // must preserve the baseline (Gate A).
 
@@ -56,7 +57,12 @@ pub struct ArgId(pub u8);
 pub enum ContractSource {
     /// An ISO C surface (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr`).
     IsoC,
-    /// A POSIX surface not specified by ISO C (`strspn`).
+    /// A POSIX-specific surface (a POSIX function not also specified by ISO C).
+    ///
+    /// Note: `strspn` was historically recorded here, which was a **mistaken
+    /// provenance claim** — `strspn` is specified by ISO C and POSIX defers to it.
+    /// The historical spec is preserved and a corrected `IsoC` successor is issued
+    /// (`docs/CONTRACT_PROVENANCE_MIGRATION.md`).
     Posix,
     /// A Phorensic composition over already-sealed ports.
     PhorensicComposition,
@@ -65,7 +71,7 @@ pub enum ContractSource {
 }
 
 impl ContractSource {
-    fn tag(&self) -> u8 {
+    pub fn tag(&self) -> u8 {
         match self {
             ContractSource::IsoC => 1,
             ContractSource::Posix => 2,
@@ -835,14 +841,47 @@ pub const SPEC_STRSPN: PortSpec = PortSpec {
     candidate_source: "examples/jit_port_strspn.phor",
 };
 
-/// Every leaf spec, in the store's canonical order.
-pub const ALL: [PortSpec; 6] = [
+/// `libc:strspn:c-locale:u64:v1` — the **corrected successor** of [`SPEC_STRSPN`].
+///
+/// `strspn` is specified by ISO C (C89 and later); POSIX aligns with and defers to
+/// ISO C for it. The historical spec records `ContractSource::Posix`, which is a
+/// mistaken provenance claim; this successor records `ContractSource::IsoC` and
+/// the `libc` dialect. The historical spec is preserved (its `PortSpecId` and the
+/// evidence that binds it are unchanged); the successor carries its own identity
+/// and evidence chain (`docs/CONTRACT_PROVENANCE_MIGRATION.md`).
+pub const SPEC_STRSPN_ISO_C: PortSpec = PortSpec {
+    target_id: "libc:strspn:c-locale:u64:v1",
+    dialect: "libc",
+    symbol: "strspn",
+    version: "host-observed-v1",
+    locale_contract: "C",
+    contract: ContractSource::IsoC,
+    observable: ObservableSpec::Length,
+    projection: ObservationProjectionSpec::Identity,
+    preconditions: STRSPN_PRECONDITIONS,
+    abi: AbiSpec {
+        symbol: "phor_strspn_len",
+        packing: ArgPacking::LittleEndianPrefix,
+    },
+    case_space: CaseSpaceSpec {
+        kind: CaseSpaceKind::BoundedDeterministic,
+        generator: "strspn_corpus",
+        summary: "the complete (span, n) grid, empty set/string, every set size 1..=8, disjoint set, two exhaustive 0..=255 sweeps",
+    },
+    qualification: QualificationPolicy::HostObserved,
+    candidate: CandidateConstraints::LEAF,
+    candidate_source: "examples/jit_port_strspn.phor",
+};
+
+/// Every leaf spec, in the store's canonical order, followed by the successor.
+pub const ALL: [PortSpec; 7] = [
     SPEC_TOUPPER,
     SPEC_MEMCMP,
     SPEC_MEMCHR,
     SPEC_STRLEN,
     SPEC_STRRCHR,
     SPEC_STRSPN,
+    SPEC_STRSPN_ISO_C,
 ];
 
 /// Every leaf spec, as a slice.
@@ -915,13 +954,34 @@ mod tests {
         }
     }
 
+    /// The corrected successor spec has its own identity and is *not* the historical
+    /// one: the provenance correction is a new identity, never a silent rename.
     #[test]
-    fn test_all_six_leaves_have_distinct_specs_and_ids() {
-        assert_eq!(all().len(), 6);
+    fn test_the_strspn_successor_spec_is_a_distinct_identity() {
+        use crate::porting::target::{LIBC_STRSPN, POSIX_STRSPN};
+        let hist = by_target_id(&POSIX_STRSPN.id).expect("historical spec");
+        let succ = by_target_id(&LIBC_STRSPN.id).expect("successor spec");
+        assert_eq!(hist.contract, ContractSource::Posix);
+        assert_eq!(succ.contract, ContractSource::IsoC);
+        assert_eq!(succ.dialect, "libc");
+        assert_ne!(hist.id(), succ.id());
+        // Everything else about the surface is identical; only the provenance and
+        // the identity differ.
+        assert_eq!(hist.symbol, succ.symbol);
+        assert_eq!(hist.observable, succ.observable);
+        assert_eq!(hist.projection, succ.projection);
+        assert_eq!(hist.abi.symbol, succ.abi.symbol);
+        assert_eq!(hist.candidate_source, succ.candidate_source);
+        assert_eq!(hist.case_space.generator, succ.case_space.generator);
+    }
+
+    #[test]
+    fn test_all_leaves_have_distinct_specs_and_ids() {
+        assert_eq!(all().len(), 7);
         let mut ids: Vec<String> = all().iter().map(|s| s.id()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 6, "spec ids must be unique");
+        assert_eq!(ids.len(), 7, "spec ids must be unique");
 
         // Every spec's dialect is the namespace of its target id.
         for s in all() {
@@ -1091,7 +1151,9 @@ mod tests {
         use crate::porting::target::{cases_for, resolve_target};
 
         for spec in all() {
-            let target = resolve_target(spec.symbol).expect("target resolves");
+            // Resolve by the full id: several specs may share a symbol (the `strspn`
+            // supersession), and the id is the identity.
+            let target = resolve_target(spec.target_id).expect("target resolves by id");
             assert_eq!(target.id, spec.target_id);
             let cases = cases_for(&target);
             assert!(!cases.is_empty(), "{} has no cases", spec.target_id);
@@ -1110,7 +1172,8 @@ mod tests {
     #[test]
     fn test_of_target_bridges_every_bootstrap_target() {
         use crate::porting::target::{
-            LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER, POSIX_STRSPN,
+            LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_STRSPN, LIBC_TOUPPER,
+            POSIX_STRSPN,
         };
         for t in [
             LIBC_TOUPPER,
@@ -1119,6 +1182,7 @@ mod tests {
             LIBC_STRLEN,
             LIBC_STRRCHR,
             POSIX_STRSPN,
+            LIBC_STRSPN,
         ] {
             let s = PortSpec::of_target(&t).expect("every bootstrap target has a spec");
             assert_eq!(s.target_id, t.id);

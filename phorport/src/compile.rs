@@ -54,14 +54,19 @@ pub fn compile_source(
     let src = work_dir.join("candidate.phor");
     std::fs::write(&src, source).map_err(|e| e.to_string())?;
 
-    // Compile from a path **relative to the workspace root** whenever the working
-    // directory is inside it. `phorc` embeds the source path in the object, so a
+    // Compile from a path **relative to the workspace root** whenever the source
+    // lives inside it. `phorc` embeds the source path in the object, so a
     // relative path makes the emitted bytes — and therefore the autonomous seal —
     // independent of the absolute checkout location (`/work` in a container, any
     // path on a host). This is the canonical invocation for byte-reproducible
-    // rebuilds (Phase 7/§22).
+    // rebuilds (Phase 7/§22). Canonicalize first: a `--workspace .` work dir is a
+    // relative path with a `./` prefix, and stripping an absolute root from it
+    // would otherwise fail and leak that prefix into the FILE symbol — so the
+    // object bytes would depend on how the workspace was spelled.
     let root = workspace_root();
-    let source_path = match src.strip_prefix(&root) {
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let src_abs = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+    let source_path = match src_abs.strip_prefix(&root) {
         Ok(rel) => rel.to_string_lossy().into_owned(),
         Err(_) => src.to_string_lossy().into_owned(),
     };

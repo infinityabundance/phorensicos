@@ -505,17 +505,22 @@ Evidence: `phost/evidence/session/session_verdict.json`.
 ./verify_session.sh
 ```
 
-### Second Dialect: `posix:strspn`
+### Corrected Contract Provenance: `strspn`
 
-The five ISO C targets carry `dialect: libc`. The sixth does not, and the difference
-is checkable: **ISO C does not specify `strspn`** — it is a POSIX function (as are
-`strcspn`, `strpbrk`, `strtok`, `strcasecmp`, `strdup`). The `dialect` field names the
-specification the contract is drawn from, so a POSIX-only contract cannot be recorded
-as a C-library contract without conflating two standards.
+`strspn` is an **ISO C** surface — specified by ISO C (C90 4.11.5.4; C99 and later
+7.21.5.4), with POSIX stating that its `strspn` specification is aligned with and
+defers to ISO C. The committed baseline nevertheless recorded it as
+`posix:strspn:c-locale:u64:v1` on the mistaken claim that ISO C does not specify it
+(so were `strcspn`, `strpbrk` and `strtok`). That claim was wrong. The historical
+target, its `PortSpecId`, its seal and its evidence are **preserved unchanged**; the
+correction is an evidence-preserving **successor**, requalified and resealed on its own
+identity. See `docs/CONTRACT_PROVENANCE_MIGRATION.md`.
+
+The committed baseline's sealed `strspn` leaf (historical record, preserved):
 
 | Aspect | Result |
 |--------|--------|
-| Qualified id | `posix:strspn:c-locale:u64:v1` (dialect `posix`, symbol `strspn`, locale `C`) |
+| Qualified id | `posix:strspn:c-locale:u64:v1` (historical record; dialect `posix`, symbol `strspn`, locale `C`) |
 | Observable | the length of the initial segment of `s` consisting only of bytes in `accept` — a prefix length decided by **set membership** |
 | Corpus | 578 cases: the complete `(span, n)` grid (36), the empty set and empty string, a stop byte before the terminator, every set size 1..=8, a disjoint set, the terminator at the bound, and two exhaustive 0..=255 sweeps (the accepted byte and the stopping byte) |
 | Replay | **578/578 pass**, 0 failed |
@@ -525,16 +530,32 @@ as a C-library contract without conflating two standards.
 | Oracle hash | `ab62795e45833c41d2feab54c13379ef670c1ee25f9f9325bbb9bc166f32591d` |
 | Candidate object hash | `c93271d069fd998e6de8c2cd07e665bd098f6fb64072cdd98fb44ae1375dbafc` |
 
-Why this is a real qualification and not a rename:
+The corrected successor `libc:strspn:c-locale:u64:v1` re-earns its authority rather
+than inheriting the historical seal: bounded CEGIS (an incorrect first revision is
+falsified and minimized before the survivor is frozen), a 498-case held-out universe
+built **after** the freeze (997 isolation markers, 0 leaks), a sensitivity challenge,
+the FRF outer court, ordinary uninstrumented execution, native dispatch, and
+`AUTONOMOUS-SEAL/v1` with **13/13 obligations**. Its `PortSpecId` is `a4ee309a…` and its
+evidence closure is `b7ec423a…`; the historical `PortSpecId` `bc0420f0…` is unchanged.
 
-- the corpus falsifies a *single-byte compare* standing in for a set test (set sizes
-  1..=8 are all present), and falsifies a scan that forgets that the terminator is
-  never a set member (accepted bytes are placed after the terminator);
-- `verify_jit_porting_court.sh` now requires the sealed package's `dialect` to equal
-  the **namespace of the target id** (`posix:strspn…` must seal as `dialect: posix`),
-  so the qualification cannot drift back into an unqualified claim.
+Why this is a correction and not a rename:
 
-The honest limit, stated in **`docs/DIALECT_QUALIFICATION.md`**: `posix:` records the
+- the historical target, its golden `PortSpecId` and its evidence are unchanged, and
+  bare-symbol resolution (`strspn`) still returns the historical target;
+- the successor is a **distinct** `PortSpecId` with its own autonomous seal and its own
+  evidence closure (no identity collapse);
+- the corpus still falsifies a *single-byte compare* standing in for a set test (set
+  sizes 1..=8 are all present) and a scan that forgets that the terminator is never a
+  set member;
+- `verify_jit_porting_court.sh` requires the sealed package's `dialect` to equal the
+  **namespace of the target id** (`posix:strspn…` seals as `dialect: posix`), so the
+  historical qualification is preserved exactly rather than silently rewritten.
+
+`./verify_supersession.sh` asserts all of the above: the correction record is
+consistent, the historical evidence still verifies, the successor carries its own seal,
+and the two closures differ.
+
+The honest limit, stated in **`docs/DIALECT_QUALIFICATION.md`**: the dialect records the
 *specification namespace*. The implementation observed for the seal is the host C
 library, and the seal binds the observed behavior by oracle hash, so a differing
 implementation cannot pass silently. Implementation-independence is a **separate axis**,

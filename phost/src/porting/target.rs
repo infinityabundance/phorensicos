@@ -4,17 +4,21 @@
 // identity is qualified (`dialect:symbol:locale:contract:version`) so behavior
 // that depends on locale or ABI can never be silently conflated later.
 //
-// Six targets exist:
+// Six surfaces are sealed in the bootstrap store; a seventh record is the
+// corrected successor of `strspn` (see the provenance correction below).
 //   - libc:toupper:c-locale:u8:v1     exhaustive byte domain, 256 cases
 //   - libc:memcmp:c-locale:sign:v1    bounded deterministic corpus, ordering (312)
 //   - libc:memchr:c-locale:index:v1   bounded deterministic corpus, first-match index (482)
 //   - libc:strlen:c-locale:u64:v1     bounded deterministic corpus, NUL-terminated length (308)
 //   - libc:strrchr:c-locale:index:v1  bounded deterministic corpus, last-match index (336)
 //   - posix:strspn:c-locale:u64:v1    bounded deterministic corpus, set-membership span (558)
+//   - libc:strspn:c-locale:u64:v1     the corrected successor of the above
 //
-// The dialect names the *specification the contract is drawn from*: the first five
-// are ISO C surfaces, the sixth is POSIX (`strspn` is not in ISO C). See
-// docs/DIALECT_QUALIFICATION.md.
+// The dialect names the *specification the contract is drawn from*. `strspn` is
+// an ISO C surface (C89 and later), so its corrected identity is `libc:`; the
+// historical `posix:` record carries a mistaken provenance claim and is preserved
+// rather than rewritten. See docs/DIALECT_QUALIFICATION.md and
+// docs/CONTRACT_PROVENANCE_MIGRATION.md.
 //
 // The corpus for a target is deterministic and bounded; it is enumerated in a
 // fixed order so the court is reproducible and the verdict does not depend on
@@ -156,21 +160,22 @@ pub const LIBC_STRRCHR: PortTarget = PortTarget {
     abi_symbol: "phor_strrchr_index",
 };
 
-/// The **POSIX** function `strspn` — a second dialect, and a new observable shape.
+/// The **historical** record for `strspn`, kept verbatim.
 ///
-/// ISO C does not specify `strspn`; it is a POSIX function. The `dialect` field
-/// names the *specification the contract is drawn from*, so this target cannot be
-/// recorded as a C-library contract without silently conflating two standards
-/// (`docs/DIALECT_QUALIFICATION.md`). The observed implementation is still the host
-/// C library — the cage is the boundary — and the seal binds the *observed*
-/// behavior, so a different implementation with different behavior cannot pass.
+/// This record carries a **mistaken provenance claim**: it asserts that ISO C does
+/// not specify `strspn`. That is false — `strspn` is specified by ISO C (C89 and
+/// every later edition), and POSIX states its `strspn` specification is aligned
+/// with and defers to ISO C. The seal built from this record binds the *observed
+/// behavior*, which is correct; only the dialect/provenance metadata is wrong.
+///
+/// The record is **preserved as historical evidence** rather than rewritten. Its
+/// successor is [`LIBC_STRSPN`], issued through an explicit contract-provenance
+/// correction (`docs/CONTRACT_PROVENANCE_MIGRATION.md`).
 ///
 /// The observable is the **length of the initial segment of `s` consisting only of
-/// bytes in `accept`** — a prefix length decided by set membership. That is a new
-/// shape next to `memcmp` (order), `memchr`/`strrchr` (first/last match index) and
-/// `strlen` (length to the terminator). `accept` is a C string, so it can never
-/// contain NUL; the terminator is therefore always a byte outside the set, which is
-/// what ends the span.
+/// bytes in `accept`** — a prefix length decided by set membership. `accept` is a C
+/// string, so it can never contain NUL; the terminator is therefore always a byte
+/// outside the set, which is what ends the span.
 ///
 /// `n` is the ABI precondition bound: the terminator of `s` lies within its first
 /// `n` bytes, so the foreign observation never reads past the caller's window and
@@ -189,6 +194,28 @@ pub const POSIX_STRSPN: PortTarget = PortTarget {
     // and the whole accept set are packed LITTLE-ENDIAN (byte i in bits 8*i).
     // Unused accept lanes are zero and are inert because membership requires a
     // non-NUL byte.
+    abi_symbol: "phor_strspn_len",
+};
+
+/// The **successor** record for `strspn`, with corrected contract provenance.
+///
+/// `strspn` is an ISO C surface (C89 and later), so the dialect is `libc`, not
+/// `posix`; POSIX defers to ISO C for it. This successor is issued through an
+/// explicit correction of [`POSIX_STRSPN`]'s mistaken provenance: the historical
+/// record and its evidence stay intact, and this successor is requalified and
+/// resealed on its own (`docs/CONTRACT_PROVENANCE_MIGRATION.md`). The observed
+/// implementation is still the host C library — the cage is the boundary — and the
+/// seal binds the observed behavior.
+pub const LIBC_STRSPN: PortTarget = PortTarget {
+    id: "libc:strspn:c-locale:u64:v1",
+    dialect: "libc",
+    symbol: "strspn",
+    version: "host-observed-v1",
+    locale_contract: "C",
+    input_schema: "(u8[] s, u8[] accept, usize n) — a buffer whose NUL terminator lies within the first n bytes, a NUL-free accept set, and the bound",
+    output_schema: "u64 span length (index of the first byte not in accept; the terminator is never in accept)",
+    domain_summary: "bounded deterministic corpus: the complete (span, n) grid with the whole prefix in the set, empty set and empty string, a stop byte before the terminator, every set size 1..=8, a disjoint set, the unsigned edge bytes, and two exhaustive 0..=255 sweeps (the accepted byte value and the stopping byte value)",
+    candidate_source: "examples/jit_port_strspn.phor",
     abi_symbol: "phor_strspn_len",
 };
 

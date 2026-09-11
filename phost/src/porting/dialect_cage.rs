@@ -24,8 +24,8 @@ use crate::porting::composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX;
 use crate::porting::composition_toupper_each::COMPOSITION_TOUPPER_EACH;
 use crate::porting::oracle_trace::OracleTrace;
 use crate::porting::target::{
-    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER,
-    POSIX_STRSPN,
+    PortTarget, TestCase, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_STRSPN,
+    LIBC_TOUPPER, POSIX_STRSPN,
 };
 use crate::porting::{PortError, PortingAuthority};
 
@@ -170,7 +170,10 @@ pub fn observe_target(
             .collect());
     }
 
-    if target.id == POSIX_STRSPN.id {
+    // The historical `posix:` record and its corrected `libc:` successor observe
+    // the same C function; the dialect correction is a provenance change, not a
+    // change of the observed surface.
+    if target.id == POSIX_STRSPN.id || target.id == LIBC_STRSPN.id {
         return Ok(cases
             .iter()
             .map(|case| {
