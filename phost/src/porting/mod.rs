@@ -32,6 +32,7 @@ use crate::kernel::CapabilitySet;
 pub mod abi;
 pub mod behavior_signature;
 pub mod candidate;
+pub mod challenge;
 pub mod compiled;
 pub mod composition;
 pub mod composition_engine;
@@ -1636,6 +1637,38 @@ pub fn run_ir_composition_court(
 /// The committed v2 evidence directory for a composition name.
 pub fn ir_evidence_dir(name: &str) -> String {
     format!("phost/evidence/composition_ir/{}", name)
+}
+
+/// Run the **court-sensitivity** court (Phase 3) for a leaf symbol or a
+/// composition name, and write its evidence.
+///
+/// This asks whether the court can actually *see* the declared defect families,
+/// over the same corpus and oracle the real court uses. A leaf is observed through
+/// the cage; a composition is challenged against the persistent store.
+pub fn run_challenge_court(
+    name: &str,
+    auth: &PortingAuthority,
+    out_dir: &str,
+) -> Result<challenge::ChallengeReport, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+    let report = if let Some(target) = target::resolve_target(name) {
+        challenge::run_leaf_challenge(&target, auth)?
+    } else if composition_registry::by_name(name).is_some() {
+        let index = store::load_default().map_err(|e| PortError::Io(e.to_string()))?;
+        challenge::run_composition_challenge(name, &index, auth)?
+    } else {
+        return Err(PortError::UnknownTarget(name.to_string()));
+    };
+    evidence::write_challenge_evidence(out_dir, &report)
+        .map_err(|e| PortError::Io(format!("{}", e)))?;
+    Ok(report)
+}
+
+/// The committed challenge-evidence directory for a target name.
+pub fn challenge_evidence_dir(name: &str) -> String {
+    format!("phost/evidence/challenge/{}", name)
 }
 
 /// One composed call, as reported to the CLI.

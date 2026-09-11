@@ -459,6 +459,29 @@ recorded separately as two chain hashes, `fold_composition_chain_hash`
 `d00bdf26…`), each cross-checked by the verifier against the committed inner verdict —
 a seal of a seal.
 
+### Making the court falsifiable
+
+A passing candidate is weak evidence if the measuring instrument is blind. The
+**court-sensitivity (challenge) court** runs a bounded profile of intentionally
+wrong implementations against the *same corpus and oracle the real court uses*: a
+wrong `strlen` that returns the last NUL, a wrong chain that searches before the
+slice, a wrong `memcmp` that compares signed bytes. For all six leaves and all seven
+compositions every declared defect family is detected, so the courts are
+demonstrably not blind to them — a bounded statement over a declared profile, never
+"proves all bugs detectable".
+
+Equivalent mutants are handled honestly: a mutant that is equal to the correct
+implementation on every *valid* input is recorded as equivalent (with the reason)
+and is never counted as killed or missed — e.g. `strlen`'s "ignore the bound" mutant
+is equivalent because the precondition guarantees a NUL within the bound.
+
+```sh
+cargo run -p phost -- port challenge strlen     # one profile
+./verify_challenge_court.sh --target strlen --check-committed
+```
+
+See `docs/CHALLENGE.md`.
+
 ### Persistent sealed port store
 
 A court *derives* a seal: it observes foreign behavior, compiles the clean-room

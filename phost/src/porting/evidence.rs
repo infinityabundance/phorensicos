@@ -289,6 +289,19 @@ pub fn write_session_evidence(dir: &str, verdict: &SessionVerdict) -> io::Result
     Ok(path.display().to_string())
 }
 
+/// Write the **court-sensitivity** (challenge) evidence: the mutation profile and
+/// whether the court detected each declared defect family. Returns the path.
+pub fn write_challenge_evidence(
+    dir: &str,
+    report: &crate::porting::challenge::ChallengeReport,
+) -> io::Result<String> {
+    let base = PathBuf::from(dir);
+    fs::create_dir_all(&base)?;
+    let path = base.join("challenge_verdict.json");
+    fs::write(&path, report.to_json())?;
+    Ok(path.display().to_string())
+}
+
 /// Write the **cross-implementation** evidence: the same sealed corpus observed
 /// through a second, independent implementation. Returns the verdict path.
 ///

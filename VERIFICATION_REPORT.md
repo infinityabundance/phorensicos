@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 274 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path |
+| phost reach | 279 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -675,6 +675,25 @@ lives in `phost/evidence/composition_ir/` verified by
 (`test_ir_court_agrees_with_the_legacy_court_for_every_composition`) and by the
 unchanged v1 evidence under the legacy verifier. See `docs/COMPOSITION_IR.md`.
 
+**Phase 3 (complete): the court-sensitivity (challenge) court.**
+`phost/src/porting/challenge.rs` makes the measuring instrument falsifiable. A
+bounded `MutationProfile` of intentionally wrong implementations is run against the
+**same corpus and oracle the real court uses**: leaf mutants are wrong observable
+implementations, composition mutants are wrong `CompositionIR`s evaluated over the
+sealed store against the correct chain's committed oracle. For all six leaves and
+all seven compositions **every declared family is detected** — e.g. `strlen`
+`last_nul` on 30/308 cases, `treat_0x80` on 22/308, `off_by_one` on 308/308;
+`strspn.omit_lane` on 297/578; `toupper_memchr.no_fold` on 40/560;
+`slice_search.unfolded` on 149/688. Detection is recorded as *specific* (localized)
+or *coarse*, and never collapsed into one score. An equivalent mutant (equal to the
+correct implementation on every valid input under the declared preconditions) is
+recorded as equivalent with its reason and is never counted as killed or missed —
+the `strlen` "ignore the bound" mutant is equivalent because the precondition
+guarantees a NUL within `n`. The evidence is committed at
+`phost/evidence/challenge/<name>/challenge_verdict.json` and verified by
+`verify_challenge_court.sh` (schema, counts, no blind spots, equivalence notes,
+canonical residual, determinism). See `docs/CHALLENGE.md`.
+
 ```sh
 cargo test -p phost --lib porting::composition_ir
 ```
@@ -747,6 +766,9 @@ cargo run -p phost -- port compose --target toupper_each_slice_search 62617862:6
 # Phase 2: the generic (IR) composition court — composition as data.
 ./verify_composition_ir_court.sh --check-committed                     # composition #1 (560)
 ./verify_composition_ir_court.sh --target toupper_each_slice_search --check-committed
+# Phase 3: the court-sensitivity (challenge) court.
+./verify_challenge_court.sh --target strlen --check-committed
+./verify_challenge_court.sh --target toupper_memchr_suffix --check-committed
 # The store-backed composition court: no compiler, no nested replay.
 cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
 cargo run -p phost -- port compose --target toupper_memchr --ir --store --phorc /nonexistent/phorc

@@ -77,7 +77,7 @@ versioned, and the documentation states exactly what was demonstrated.
 | **0** | Compatibility reconciliation (frf-fuzz → frf 0.1.86 / gemel 0.11.1) and the executable baseline seal | **done** — see below |
 | **1** | Canonical typed `PortSpec`; migrate all existing leaves. No new leaf ports. | **done** — typed spec + content identity + all six leaf specs + precondition validator + registry-driven generic machinery (`docs/PORT_SPEC.md`) |
 | **2** | Typed `CompositionIR` + one generic interpreter; migrate every existing composition | **done** — the seven chains are IR data, evaluated by one interpreter on both the foreign and sealed side; the `composition_runner` branch is removed and the runtime resolves compositions as data; artifact identities versioned v2; equivalence to the legacy court and the committed v1 evidence is proven (`docs/COMPOSITION_IR.md`) |
-| **3** | Court sensitivity/challenge + semantic mutation profiles | not started |
+| **3** | Court sensitivity/challenge + semantic mutation profiles | **done** — bounded mutation profiles for all six leaves and all seven compositions, an equivalent-mutant discipline, committed evidence and a verifier (`docs/CHALLENGE.md`); every declared family is detected, so the courts are demonstrably not blind |
 | **4** | FRF-Fuzz differential exploration + residual semantic bank + court-verified minimization | not started |
 | **5** | Gemel longitudinal memory + failed-attempt/negative-knowledge integration | not started |
 | **6** | `CandidateProducer` + isolated synthesis workspace + bounded CEGIS + disagreement-driven experiment selection | not started |
@@ -160,6 +160,26 @@ stage's seal cross-checked against the committed store — a seal of a seal).
 Equivalence is proven two ways: the in-test cross-check
 (`test_ir_court_agrees_with_the_legacy_court_for_every_composition`) and the
 byte-identical v1 evidence under the legacy verifier. See `docs/COMPOSITION_IR.md`.
+
+### Phase 3 — done
+
+`phost/src/porting/challenge.rs` makes the measuring instrument falsifiable. A
+bounded `MutationProfile` of intentionally wrong implementations is run against the
+**same corpus and oracle the real court uses**: leaf mutants are wrong observable
+implementations, composition mutants are wrong `CompositionIR`s evaluated over the
+sealed store against the correct chain's committed oracle. Every declared family is
+detected, so the courts are demonstrably not blind to them.
+
+The equivalent/undetermined discipline is enforced: an equivalent mutant (equal to
+the correct implementation on every valid input under the declared preconditions) is
+recorded as equivalent with its reason and is never counted as killed or missed;
+an undetermined mutant fails closed. `court-sensitive` is a bounded statement over
+the declared profile and corpus.
+
+Evidence is committed at `phost/evidence/challenge/<name>/challenge_verdict.json`
+and verified by `verify_challenge_court.sh` (schema, counts, no blind spots,
+equivalence notes, canonical residual). This is the local instrument check the
+autonomous qualification profile (Phase 7) requires. See `docs/CHALLENGE.md`.
 
 ---
 

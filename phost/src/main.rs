@@ -208,6 +208,7 @@ fn port_cli(args: &[String]) -> i32 {
         eprintln!("       phost port store [--check|--write] [PATH]");
         eprintln!("       phost port session [--out DIR] [--no-capability]");
         eprintln!("       phost port cross <symbol> [--out DIR] [--probe PATH]");
+        eprintln!("       phost port challenge <symbol|composition> [--out DIR]");
         return 2;
     }
 
@@ -240,6 +241,12 @@ fn port_cli(args: &[String]) -> i32 {
     // ports, executed through the dispatcher.
     if stage == "compose" {
         return compose_cli(&args[1..]);
+    }
+
+    // Court-sensitivity (challenge) court: does the court see the declared defect
+    // families? A leaf or a composition.
+    if stage == "challenge" {
+        return challenge_cli(&args[1..]);
     }
     let depth = match PortDepth::parse(stage) {
         Some(d) => d,
@@ -400,6 +407,80 @@ fn native_cli(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("port native {}: {}", symbol, e);
+            1
+        }
+    }
+}
+
+/// `phost port challenge <symbol|composition> [--out DIR]`
+///
+/// The Court-Sensitivity (Challenge) Court: it runs a bounded profile of
+/// intentionally wrong implementations against the same corpus and oracle the real
+/// court uses, and reports whether the court detects each declared defect family.
+/// An equivalent-under-domain mutant is recorded as such (never counted as killed
+/// or missed); a valid, undetected mutant is a blind spot.
+fn challenge_cli(args: &[String]) -> i32 {
+    use phost::porting::{self, PortingAuthority};
+
+    let mut name: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" if i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                name = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let name = match name {
+        Some(n) => n,
+        None => {
+            eprintln!("port challenge: expected a symbol or composition name");
+            return 2;
+        }
+    };
+    let out = out.unwrap_or_else(|| porting::challenge_evidence_dir(&name));
+
+    match porting::run_challenge_court(&name, &PortingAuthority::granted(), &out) {
+        Ok(r) => {
+            println!("=== Court-Sensitivity (Challenge) Court ===");
+            println!("Target:      {}", r.target);
+            println!("Court:       {}", r.court);
+            println!(
+                "Families:    {} detected / {} undetected / {} equivalent / {} invalid (of {})",
+                r.families_detected,
+                r.families_undetected,
+                r.families_equivalent,
+                r.families_invalid,
+                r.families_total
+            );
+            for o in &r.outcomes {
+                let status = if o.equivalent {
+                    "equiv"
+                } else if o.detected {
+                    "detected"
+                } else if o.valid {
+                    "MISSED"
+                } else {
+                    "invalid"
+                };
+                println!(
+                    "  {:<30} {:<9} {:>5}/{:<5}",
+                    o.id, status, o.detected_cases, o.total_cases
+                );
+            }
+            println!("Verdict:     {}", r.verdict);
+            println!("Residual:    {}", r.residual_hash());
+            println!("Evidence:    {}", out);
+            0
+        }
+        Err(e) => {
+            eprintln!("port challenge: {}", e);
             1
         }
     }
