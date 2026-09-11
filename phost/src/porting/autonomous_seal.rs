@@ -55,6 +55,14 @@ impl SealProfile {
         }
     }
 
+    /// The stable tag used in canonical encodings (never renumber these).
+    pub fn as_tag(self) -> u8 {
+        match self {
+            SealProfile::LegacyV1 => 1,
+            SealProfile::AutonomousV1 => 2,
+        }
+    }
+
     /// The obligations this profile requires.
     pub fn required_obligations(self) -> &'static [Obligation] {
         match self {

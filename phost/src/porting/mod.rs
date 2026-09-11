@@ -46,6 +46,7 @@ pub mod composition_strlen_memchr;
 pub mod composition_suffix;
 pub mod composition_toupper_each;
 pub mod cross_impl;
+pub mod demand;
 pub mod dialect_cage;
 pub mod dispatch;
 pub mod evidence;
@@ -60,6 +61,7 @@ pub mod registry;
 pub mod replay_court;
 pub mod service;
 pub mod store;
+pub mod store_generation;
 pub mod target;
 
 pub use behavior_signature::BehaviorSignature;

@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 306 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses and the `AUTONOMOUS-SEAL/v1` obligation profile |
+| phost reach | 315 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations and the demand model |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -651,6 +651,17 @@ byte-for-byte. Committed identities:
 Details: `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`,
 `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md`,
 `docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md`.
+
+### Phase 8 — immutable store generations and demand-driven porting
+
+`StoreGeneration`/`GenerationLedger` make publication immutable: a new qualified
+port is generation `N+1` derived from `N`, with a content identity over
+`(schema, parent, sorted entries, closure)` and fail-closed verification. A
+session binds a generation and refuses to serve an artifact that generation did
+not bind. A runtime miss emits a bounded, non-blocking `PortDemand`; the host
+ranks pending demands with fixed integer weights and a recorded breakdown. See
+`docs/STORE_GENERATIONS.md`. `phorport store generations` and `phorport demand
+rank` expose both.
 
 ```sh
 ./scripts/integration_baseline.sh

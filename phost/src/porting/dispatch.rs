@@ -18,9 +18,11 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::porting::demand::{DemandSink, PortDemand};
 use crate::porting::exec::{ExecError, SealedObjectHandle};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::promotion::TrustState;
@@ -124,6 +126,11 @@ pub struct NativeDispatcher {
     /// seal into many consumers.
     per_port_dispatches: BTreeMap<String, u64>,
     dispatches: u64,
+    /// The generation this dispatcher serves (recorded on a demand).
+    store_generation: Option<String>,
+    /// A bounded, non-blocking sink for runtime misses. Absent by default, so the
+    /// existing courts and counts are unchanged.
+    demand_sink: Option<Rc<DemandSink>>,
 }
 
 impl NativeDispatcher {
@@ -134,7 +141,38 @@ impl NativeDispatcher {
             dispatched_compositions: BTreeSet::new(),
             per_port_dispatches: BTreeMap::new(),
             dispatches: 0,
+            store_generation: None,
+            demand_sink: None,
         }
+    }
+
+    /// Attach a non-blocking demand sink and the generation this dispatcher
+    /// serves. A runtime miss then emits data instead of blocking.
+    pub fn with_demand_sink(mut self, sink: Rc<DemandSink>, generation: impl Into<String>) -> Self {
+        self.demand_sink = Some(sink);
+        self.store_generation = Some(generation.into());
+        self
+    }
+
+    /// Record a runtime miss (non-blocking; never fails the call).
+    fn record_fallback(&self, port_id: &str, reason: &'static str) {
+        let Some(sink) = &self.demand_sink else {
+            return;
+        };
+        let mut available_dependencies: Vec<String> = self
+            .index
+            .entries()
+            .iter()
+            .map(|e| e.target.clone())
+            .collect();
+        available_dependencies.sort();
+        sink.record(PortDemand {
+            requested_surface: port_id.to_string(),
+            callsite_family: String::from(reason),
+            demand_count: 1,
+            store_generation: self.store_generation.clone().unwrap_or_default(),
+            available_dependencies,
+        });
     }
 
     /// A dispatcher over a single sealed entry (the path a promoted target takes).
@@ -218,6 +256,7 @@ impl NativeDispatcher {
 
         // No ambient authority: without PORTING the sealed store reveals nothing.
         if !auth.can_observe() {
+            self.record_fallback(port_id, "capability denied (no ambient authority)");
             return Ok(DispatchOutcome::fallback(
                 port_id,
                 "capability denied (no ambient authority)",
@@ -227,14 +266,16 @@ impl NativeDispatcher {
         let entry = match self.index.lookup_gated(port_id, auth) {
             Some(e) => e.clone(),
             None => {
+                self.record_fallback(port_id, "no sealed artifact in the store");
                 return Ok(DispatchOutcome::fallback(
                     port_id,
                     "no sealed artifact in the store",
-                ))
+                ));
             }
         };
 
         if entry.trust != TrustState::Sealed {
+            self.record_fallback(port_id, "artifact is not sealed");
             return Ok(DispatchOutcome::fallback(port_id, "artifact is not sealed"));
         }
 
@@ -665,5 +706,27 @@ mod tests {
         );
         assert_eq!(verdict.verdict, CourtVerdict::Inconclusive);
         assert!(!verdict.is_sealed_eligible());
+    }
+
+    /// A runtime miss emits data (a non-blocking demand), it does not block and
+    /// does not change the fallback behavior.
+    #[test]
+    fn test_a_runtime_miss_emits_a_demand_without_blocking() {
+        let sink = alloc::rc::Rc::new(crate::porting::demand::DemandSink::new(8));
+        let mut d =
+            NativeDispatcher::new(SealedPortIndex::new()).with_demand_sink(sink.clone(), "gen-1");
+        let out = d
+            .dispatch_port(
+                "libc:atoi:c-locale:index:v1",
+                &alloc::vec![alloc::vec![b'1']],
+                &PortingAuthority::granted(),
+            )
+            .unwrap();
+        assert!(!out.source.is_native());
+        let demands = sink.snapshot();
+        assert_eq!(demands.len(), 1);
+        assert_eq!(demands[0].requested_surface, "libc:atoi:c-locale:index:v1");
+        assert_eq!(demands[0].store_generation, "gen-1");
+        assert_eq!(demands[0].demand_count, 1);
     }
 }

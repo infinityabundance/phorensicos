@@ -85,9 +85,84 @@ fn fs_canonical(p: &str) -> String {
 fn command(args: &[String]) -> Result<i32, String> {
     let Some(cmd) = args.first() else {
         return Err(String::from(
-            "usage: phorport <probe|corpus|fuzz|history|campaign|autonomy> <symbol> --candidate-src <path> …",
+            "usage: phorport <probe|corpus|fuzz|history|campaign|autonomy|store|demand> <symbol> --candidate-src <path> …",
         ));
     };
+
+    // `store generations` — build the genesis generation from the committed
+    // index and optionally publish a child generation.
+    if cmd == "store" {
+        use phost::porting::autonomous_seal::SealProfile;
+        use phost::porting::ident::EvidenceClosureId;
+        if args.get(1).map(String::as_str) != Some("generations") {
+            return Err(String::from("usage: phorport store generations [--publish-target <id> --publish-artifact <hash> --closure <id>]"));
+        }
+        let index = phost::porting::store::load_default().map_err(|e| e.to_string())?;
+        let g0 = phorport::generations::genesis_from_index(&index)?;
+        println!("generation 0: {}", g0.generation_id.as_str());
+        println!("  parent:  (genesis)");
+        println!("  entries: {}", g0.entries.len());
+        println!("  closure: {}", g0.evidence_closure.as_str());
+        if let (Some(t), Some(a)) = (
+            arg_value(args, "--publish-target"),
+            arg_value(args, "--publish-artifact"),
+        ) {
+            let closure = EvidenceClosureId::new(arg_value(args, "--closure").unwrap_or_default());
+            let g1 = phorport::generations::publish_port(
+                &g0,
+                &t,
+                &a,
+                SealProfile::AutonomousV1,
+                "phor.autonomous:receipt",
+                closure,
+            )?;
+            println!("generation 1: {}", g1.generation_id.as_str());
+            println!("  parent:  {}", g0.generation_id.as_str());
+            println!("  entries: {}", g1.entries.len());
+            println!("  closure: {}", g1.evidence_closure.as_str());
+        }
+        return Ok(0);
+    }
+
+    // `demand rank <surface>…` — deterministic prioritization of runtime misses.
+    if cmd == "demand" {
+        use phost::porting::demand::PortDemand;
+        if args.get(1).map(String::as_str) != Some("rank") {
+            return Err(String::from("usage: phorport demand rank <surface>…"));
+        }
+        let surfaces: Vec<String> = args
+            .iter()
+            .skip(2)
+            .filter(|a| !a.starts_with("--"))
+            .cloned()
+            .collect();
+        if surfaces.is_empty() {
+            return Err(String::from("demand rank needs at least one surface id"));
+        }
+        fn zero(_: &str) -> u64 {
+            0
+        }
+        let empty: Vec<String> = Vec::new();
+        let ctx = phorport::demand::RankContext {
+            sealed_fanin: &zero,
+            sealed_dependencies: &empty,
+            historical_failures: &zero,
+        };
+        let demands: Vec<PortDemand> = surfaces
+            .iter()
+            .map(|s| PortDemand {
+                requested_surface: s.clone(),
+                callsite_family: String::from("dispatch"),
+                demand_count: 1,
+                store_generation: String::from("current"),
+                available_dependencies: Vec::new(),
+            })
+            .collect();
+        let scores = phorport::demand::rank(&demands, &ctx);
+        let body: Vec<String> = scores.iter().map(|s| s.to_json()).collect();
+        println!("[\n{}\n]", body.join(",\n"));
+        return Ok(0);
+    }
     let symbol = args
         .get(1)
         .cloned()

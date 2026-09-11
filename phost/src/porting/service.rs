@@ -39,6 +39,9 @@ pub struct SealedNativeService {
     broken_seal_calls: u64,
     /// `(port, source, output_hex)` per call, in call order (the session residual).
     log: Vec<(String, &'static str, String)>,
+    /// The immutable generation this session is bound to (§19). When present, the
+    /// service refuses to serve an artifact that its generation did not bind.
+    generation: Option<crate::porting::store_generation::GenerationBinding>,
 }
 
 impl SealedNativeService {
@@ -64,7 +67,24 @@ impl SealedNativeService {
             fallback_calls: 0,
             broken_seal_calls: 0,
             log: Vec::new(),
+            generation: None,
         })
+    }
+
+    /// Bind this session to an immutable store generation. The binding is not
+    /// part of the session hash (existing evidence is unchanged); it is a runtime
+    /// guard that the artifacts served are exactly the generation's.
+    pub fn with_generation(
+        mut self,
+        binding: crate::porting::store_generation::GenerationBinding,
+    ) -> Self {
+        self.generation = Some(binding);
+        self
+    }
+
+    /// The generation this session is bound to, if any.
+    pub fn generation_id(&self) -> Option<&crate::porting::ident::StoreGenerationId> {
+        self.generation.as_ref().map(|g| &g.generation_id)
     }
 
     /// Open the service over the committed store ([`store::STORE_PATH`]).
@@ -94,7 +114,22 @@ impl SealedNativeService {
             }
         };
         match outcome.source {
-            DispatchSource::SealedObject => self.native_calls += 1,
+            DispatchSource::SealedObject => {
+                // A bound generation must have licensed exactly this artifact.
+                if let Some(binding) = &self.generation {
+                    if binding
+                        .assert_serves(port_id, &outcome.object_hash)
+                        .is_err()
+                    {
+                        self.broken_seal_calls += 1;
+                        return Err(DispatchError::SealBroken(format!(
+                            "port {} was served an artifact its generation did not bind",
+                            port_id
+                        )));
+                    }
+                }
+                self.native_calls += 1;
+            }
             DispatchSource::ForeignFallback => self.fallback_calls += 1,
         }
         self.log.push((
@@ -636,6 +671,59 @@ mod tests {
         assert_eq!(a.session_hash, b.session_hash);
         assert_eq!(a.residual_hash(), b.residual_hash());
         assert_eq!(a.to_json(), b.to_json());
+    }
+
+    #[test]
+    fn test_a_session_bound_to_a_generation_serves_only_its_bound_artifacts() {
+        use crate::porting::autonomous_seal::SealProfile;
+        use crate::porting::ident::EvidenceClosureId;
+        use crate::porting::store_generation::{
+            GenerationBinding, GenerationEntry, StoreGeneration,
+        };
+
+        // The real object hash, from the committed store.
+        let index = crate::porting::store::load_default().expect("committed store");
+        let real = index
+            .lookup(LIBC_TOUPPER.id)
+            .expect("toupper entry")
+            .artifact_hash()
+            .to_string();
+
+        // A generation binding the real artifact serves the call.
+        let good = StoreGeneration::genesis(
+            alloc::vec![GenerationEntry::new(
+                LIBC_TOUPPER.id,
+                real,
+                SealProfile::LegacyV1,
+                "legacy",
+            )],
+            EvidenceClosureId::new("baseline"),
+        )
+        .unwrap();
+        let mut svc = SealedNativeService::open_default(&granted())
+            .unwrap()
+            .with_generation(GenerationBinding::bind(&good).unwrap());
+        assert!(svc.generation_id().is_some());
+        assert!(svc
+            .call(LIBC_TOUPPER.id, &alloc::vec![alloc::vec![0x61]], &granted())
+            .is_ok());
+
+        // A generation that binds a different artifact refuses (fail closed).
+        let bad = StoreGeneration::genesis(
+            alloc::vec![GenerationEntry::new(
+                LIBC_TOUPPER.id,
+                "not-the-sealed-object",
+                SealProfile::LegacyV1,
+                "legacy",
+            )],
+            EvidenceClosureId::new("baseline"),
+        )
+        .unwrap();
+        let mut svc2 = SealedNativeService::open_default(&granted())
+            .unwrap()
+            .with_generation(GenerationBinding::bind(&bad).unwrap());
+        let err = svc2.call(LIBC_TOUPPER.id, &alloc::vec![alloc::vec![0x61]], &granted());
+        assert!(matches!(err, Err(DispatchError::SealBroken(_))), "{err:?}");
     }
 
     #[test]
