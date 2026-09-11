@@ -27,6 +27,13 @@ cargo build -q -p phost -p phorc
 # The implementation axis: the same sealed corpora through a second implementation.
 ./verify_cross_implementation.sh
 
+# --- Foundry Phase 0: the executable baseline receipt --------------------------
+# Derive the four-repository baseline from the executable courts. Writes to a
+# temp path here so the committed receipt (the baseline record) is not touched.
+echo
+echo "=== Foundry baseline (Phase 0) ==="
+./scripts/integration_baseline.sh /tmp/integration_baseline_receipt.json
+
 echo
 echo "=== JIT-Porting Court ==="
 cargo build -q -p phost -p phorc

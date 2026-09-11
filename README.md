@@ -712,6 +712,7 @@ All numbers below were reproduced on a clean checkout.
 | Sealed native service | one verified store load serves many consumers: **13 ports from 6 mapped objects**, **68** sealed-port resolutions including nested stages, **0 fallbacks / 0 broken seals**; `toupper` fan-in 39, `memchr` 10, `strlen` 4, `toupper_each` 5, `toupper_memchr` 2; the session reproduces from a copy of the store at another path, a missing store fails closed, and without `PORTING` the store is never read |
 | Cross-implementation | every sealed leaf observed through a **second, independent implementation** (musl, statically linked, `libc=musl` from its own check, no `PT_INTERP`): `toupper` 256, `memcmp` 312, `memchr` 482, `strlen` 308, `strrchr` 336, `strspn` 578 — **2272 cases, 0 disagreements**; `secondary_oracle_hash == primary_oracle_hash ==` the committed sealed oracle hash; agreements on a bounded corpus are evidence, not proof |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
+| Foundry baseline (Phase 0) | the four-repository epistemic stack (phorensicos, `frf` 0.1.86, `frf-fuzz` 0.8.0, `gemel` 0.11.1) is pinned in `foundry/baseline/dependency_pins.json` and sealed by `foundry/baseline/integration_baseline_receipt.json`; `scripts/integration_baseline.sh` derives the receipt from the executable courts and verifies the external pins when their working copies are present; see `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` |
 
 ### Known gaps
 
@@ -743,6 +744,8 @@ All numbers below were reproduced on a clean checkout.
 - `docs/PHORENSIC_COMPILER.md` — pipeline and artifact tiers.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.
+- `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` — the autonomous foundry: invariants, phase plan, acceptance gates.
+- `foundry/` — the foundry baseline (`dependency_pins.json`, the integration baseline receipt).
 - `docker-compose.yml`, `docker/` — reproducible host + kernel containers.
 - `docs/REVIEWER_PROTOCOL.md` — how to review claims in this repo.
 - `VERIFICATION_REPORT.md` — detailed build/boot verification notes.

@@ -555,6 +555,47 @@ is absent, because a cross-implementation claim that cannot observe a second
 implementation must never pass quietly. The honest limit is unchanged: **agreement on a
 bounded corpus is evidence, not proof of equivalence.**
 
+### Autonomous Porting Foundry — Phase 0
+
+The autonomous JIT-porting foundry integrates this repository's courts with
+**FRF** (the epistemic outer court), **FRF-Fuzz** (the counterexample engine) and
+**Gemel** (longitudinal memory). The normative architecture, invariants, phase
+plan and acceptance gates are in `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md`.
+
+Phase 0 has two parts, both complete:
+
+**Compatibility reconciliation.** `frf-fuzz 0.8.0` pinned `frf =0.1.72` and
+`gemel =0.11.0`, while the current released repositories are `frf` 0.1.86 and
+`gemel` 0.11.1. Every FRF/Gemel surface FRF-Fuzz consumes was compared symbol for
+symbol against the new sources; **no semantic mismatch was found**, so nothing
+had to be adapted. The reconciliation is committed in `frf-fuzz` (`610b688`) with
+`docs/DEPENDENCY_RECONCILIATION.md`. All FRF-Fuzz gates pass: 350 coordinator
+tests, 124 target-runtime tests, the I15 dependency closure (`libc` + `memmap2`
+only), fmt, clippy `-D warnings`, the golden demo (a real FRF receipt + three
+Gemel boundaries on the pinned nightly) and the Phase-8 ablation demo.
+
+**Executable baseline seal.** `foundry/baseline/dependency_pins.json` pins the
+four repositories; `scripts/integration_baseline.sh` runs the courts and writes
+`foundry/baseline/integration_baseline_receipt.json`. The receipt records the
+four commits, the toolchain, the `phorc` identity, the phorc/phost test counts,
+the sealed leaf/composition counts, the store residual identity, the session
+identity and the evidence roots. It uses this repository's asserted/observed
+split — environment-bound build bytes are excluded from the residual hash — and
+is byte-reproducible at a given toolchain (no wall-clock value enters the hash).
+
+| Aspect | Result |
+|--------|--------|
+| Pinned stack | `frf` 0.1.86, `frf-fuzz` 0.8.0, `gemel` 0.11.1, phorensicos `11ee334` |
+| Sealed ports | **13** (6 leaf objects + 7 compositions) |
+| Store residual | `181ace8308112f04dea51dee34eeb90059d6a8a639743d63597c35f32aaada1d` |
+| Session | 13 calls, 13 native, 68 dispatches, 6 objects, `d219be2c…` |
+| Tests | phorc 50, phost 241 (4 ignored), 0 failures |
+| Baseline residual | `1c52a04bf43283d2367c74a6266246a101b67125ea752330e3d61d05b7f121d1` |
+
+```sh
+./scripts/integration_baseline.sh
+```
+
 ### Test Results (reproduced on `main`)
 - phost: 241 passed, 0 failed, 4 ignored (245 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
