@@ -930,7 +930,8 @@ docker compose run --rm host     # cargo test + store, session, court and compos
 docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 ```
 
-**Gate L (clean-room reproduction) is verified at `2d6496e`.** From a clean checkout,
+**Gate L (clean-room reproduction) is verified.** From a clean checkout of the final
+tree,
 `docker compose build host && docker compose run --rm host` exits 0 (74 verifier
 blocks — including the new `./verify_supersession.sh` — with 0 failures) and
 `docker compose build kernel && docker compose run --rm kernel` exits 0 (13/13

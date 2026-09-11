@@ -196,7 +196,7 @@ equivalence. The correction does not extend the automation claim.
 
 ## Gate L — clean-room reproduction (verified)
 
-From a clean checkout at `2d6496e`:
+From a clean checkout of the final tree:
 
 ```text
 docker compose build host   && docker compose run --rm host     # exit 0 — 74 verifier blocks, 0 failures

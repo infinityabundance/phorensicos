@@ -263,8 +263,8 @@ H by the blind `strlen` regeneration and the `strspn` campaign; I by the executi
 and dispatch courts; J by the sealed service opening with no external machinery;
 K by the generation ledger and generation-bound service; L below).
 
-**Gate L — clean-room reproduction (verified).** From a clean checkout at
-`2d6496e`, `docker compose build host` + `docker compose run --rm host` and
+**Gate L — clean-room reproduction (verified).** From a clean checkout (re-run on
+the final tree), `docker compose build host` + `docker compose run --rm host` and
 `docker compose build kernel` + `docker compose run --rm kernel` both exit 0. The
 host image runs the full `scripts/ci_host.sh` (74 verifier blocks, including the
 new `./verify_supersession.sh`, 0 failures) inside the container; the kernel image
