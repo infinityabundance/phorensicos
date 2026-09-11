@@ -507,6 +507,16 @@ Running the harness under the instrumented worker also exposed a real ABI bug in
 the executor's call trampoline, so no emitted object and no committed seal
 changed. See `docs/AUTONOMOUS_PORTING.md`.
 
+### What earlier attempts already taught us
+
+A foundry that re-runs the same search is not learning. `phorport` records each
+counterexample and each rejected candidate in **Gemel** — using Gemel's own object
+model and content-addressed store, not a private journal — keyed by the candidate
+source identity. A later campaign for an identical source retrieves the recorded
+failure and stops instead of rediscovering it; `phorport history <symbol>` lists
+what is remembered. Gemel is optional: with no repository every campaign runs
+standalone. See `docs/GEMEL_MEMORY.md`.
+
 ### Persistent sealed port store
 
 A court *derives* a seal: it observes foreign behavior, compiles the clean-room

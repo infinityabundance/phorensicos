@@ -25,6 +25,7 @@ use crate::case::encode_args;
 use crate::config::HarnessConfig;
 use crate::counterexample::{self, Counterexample};
 use crate::harness::probe;
+use crate::memory::{MemoryRecord, PortMemory};
 use crate::minimize;
 
 /// The generated fuzz-target source.
@@ -69,6 +70,13 @@ pub struct CampaignOutcome {
     pub findings: u64,
     pub campaign_log: String,
     pub counterexample: Option<Counterexample>,
+    /// Prior rejections of this exact candidate retrieved from Gemel, if any.
+    pub prior_rejections: Vec<MemoryRecord>,
+    /// True when the campaign was not re-run because the memory already recorded
+    /// this candidate's failure (already-failed work is not new work).
+    pub skipped_due_to_memory: bool,
+    /// The Gid of the durable memory record written, when a repository is present.
+    pub memory_gid: Option<String>,
 }
 
 /// Where the generated project lives for a target.
@@ -165,6 +173,8 @@ pub fn campaign(
     config: &HarnessConfig,
     target: &PortTarget,
     name: &str,
+    memory: Option<&PortMemory>,
+    source_hash: &str,
     fuzz_root: &Path,
     frf_fuzz_root: &Path,
     phorport_root: &Path,
@@ -172,6 +182,25 @@ pub fn campaign(
     max_time: u64,
     out_dir: &str,
 ) -> io::Result<CampaignOutcome> {
+    // Long-term memory first: an identical candidate that already failed is not
+    // new work, and its reason is retrieved rather than rediscovered.
+    let prior_rejections = memory
+        .map(|m| m.prior_rejections(source_hash))
+        .unwrap_or_default();
+    if !prior_rejections.is_empty() {
+        return Ok(CampaignOutcome {
+            target: config.target_id.clone(),
+            findings: 0,
+            campaign_log: String::from(
+                "skipped: the memory already records this candidate's failure",
+            ),
+            counterexample: None,
+            prior_rejections,
+            skipped_due_to_memory: true,
+            memory_gid: None,
+        });
+    }
+
     let dir = project_dir(fuzz_root, name);
     generate_project(&dir, frf_fuzz_root, phorport_root, name)?;
     let seeds = write_seeds(&dir, target)?;
@@ -206,6 +235,7 @@ pub fn campaign(
 
     // Obtain one concrete counterexample from the store and minimize it.
     let mut counterexample = None;
+    let mut memory_gid = None;
     if findings > 0 {
         let (_, report) = run(Command::new(frf_fuzz_bin)
             .args(["report", "--json"])
@@ -227,6 +257,26 @@ pub fn campaign(
                         &m,
                     );
                     counterexample::write(out_dir, &cx)?;
+                    if let Some(mem) = memory {
+                        let detail = format!(
+                            "{} -> {} (minimal {})",
+                            cx.original_residual, cx.minimal_residual, cx.minimal_hex
+                        );
+                        let _ = mem.record_counterexample(
+                            &config.target_id,
+                            source_hash,
+                            &cx.minimal_residual,
+                            &detail,
+                        );
+                        if let Ok(gid) = mem.record_candidate_rejected(
+                            &config.target_id,
+                            source_hash,
+                            &cx.minimal_residual,
+                            &detail,
+                        ) {
+                            memory_gid = Some(gid.to_string());
+                        }
+                    }
                     counterexample = Some(cx);
                 }
             }
@@ -238,6 +288,9 @@ pub fn campaign(
         findings,
         campaign_log: log,
         counterexample,
+        prior_rejections,
+        skipped_due_to_memory: false,
+        memory_gid,
     })
 }
 

@@ -25,5 +25,6 @@ pub mod config;
 pub mod counterexample;
 pub mod explore;
 pub mod harness;
+pub mod memory;
 pub mod minimize;
 pub mod residual;

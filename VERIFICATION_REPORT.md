@@ -712,6 +712,19 @@ save); it is fixed in the executor's register-preserving call trampoline, so no
 emitted object, seal, verdict or session hash changed. Verified by
 `verify_phorport.sh`. See `docs/AUTONOMOUS_PORTING.md`.
 
+**Phase 5 (core): Gemel longitudinal memory.** `phorport/src/memory.rs` publishes
+durable boundaries into Gemel — discovered counterexamples and rejected
+candidates — using Gemel's own object model (`Family::Residual`, `Field`, `Value`),
+content-addressed store and opaque Gids (never merged with Phorensicos hashes or
+FRF ids). Records are keyed by the candidate **source** identity, so an identical
+source that already failed is retrieved rather than rediscovered: a second campaign
+for the same source reports "already known" and does not build or run the target at
+all. Gemel is optional (standalone mode when no repository is discoverable). Gate F
+is demonstrated end-to-end (`findings: 463` and a memory Gid on the first run; the
+prior rejection on the second; `phorport history strspn` lists both records).
+Verified by a unit test and the committed campaign evidence. Intents, trajectories
+and cross-compiler revision replay remain. See `docs/GEMEL_MEMORY.md`.
+
 ```sh
 cargo test -p phost --lib porting::composition_ir
 ```

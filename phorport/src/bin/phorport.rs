@@ -68,17 +68,41 @@ fn fs_canonical(p: &str) -> String {
 fn command(args: &[String]) -> Result<i32, String> {
     let Some(cmd) = args.first() else {
         return Err(String::from(
-            "usage: phorport <probe|corpus|fuzz> <symbol> --candidate-src <path> …",
+            "usage: phorport <probe|corpus|fuzz|history> <symbol> --candidate-src <path> …",
         ));
     };
     let symbol = args
         .get(1)
         .cloned()
         .ok_or_else(|| String::from("missing <symbol>"))?;
-    let candidate_src = arg_value(args, "--candidate-src")
-        .ok_or_else(|| String::from("missing --candidate-src"))?;
     let workspace =
         PathBuf::from(arg_value(args, "--workspace").unwrap_or_else(|| String::from(".")));
+
+    // `history` reads Gemel memory and needs no candidate object.
+    if cmd == "history" {
+        let target = resolve_target(&symbol).ok_or_else(|| format!("unknown symbol {symbol}"))?;
+        let memory = match arg_value(args, "--gemel") {
+            Some(p) => phorport::memory::PortMemory::at(Path::new(&p))
+                .map_err(|e| format!("gemel: {e}"))?,
+            None => match phorport::memory::PortMemory::open(&workspace) {
+                Some(m) => m,
+                None => {
+                    println!("no Gemel repository (standalone mode)");
+                    return Ok(0);
+                }
+            },
+        };
+        let records = memory.history(target.id);
+        println!("memory root: {}", memory.root().display());
+        println!("records for {}: {}", target.id, records.len());
+        for r in records {
+            println!("  {} {} {} ({})", r.kind, r.residual, r.gid, r.detail);
+        }
+        return Ok(0);
+    }
+
+    let candidate_src = arg_value(args, "--candidate-src")
+        .ok_or_else(|| String::from("missing --candidate-src"))?;
     let candidate_src = PathBuf::from(candidate_src);
 
     let (candidate_path, candidate_hash) = compile(&symbol, &candidate_src, &workspace)?;
@@ -132,10 +156,26 @@ fn command(args: &[String]) -> Result<i32, String> {
             let fuzz_root = workspace.join(".phorport/fuzz");
             std::fs::create_dir_all(&fuzz_root).map_err(|e| e.to_string())?;
 
+            // The candidate's **source** identity is the memory key: an identical
+            // source that already failed is not new work.
+            let source_hash = sha256_file(&candidate_src)?;
+
+            // Long-term memory: an explicit `--gemel <path>` (created if absent) or
+            // a repository discovered by walking up from the workspace.
+            let memory = match arg_value(args, "--gemel") {
+                Some(p) => Some(
+                    phorport::memory::PortMemory::at(Path::new(&p))
+                        .map_err(|e| format!("gemel: {e}"))?,
+                ),
+                None => phorport::memory::PortMemory::open(&workspace),
+            };
+
             let outcome = explore::campaign(
                 &config,
                 &target,
                 &symbol,
+                memory.as_ref(),
+                &source_hash,
                 &fuzz_root,
                 Path::new(&frf_fuzz_root),
                 &phorport_root,
@@ -146,6 +186,14 @@ fn command(args: &[String]) -> Result<i32, String> {
             .map_err(|e| e.to_string())?;
 
             println!("target:      {}", outcome.target);
+            println!("source hash: {source_hash}");
+            if outcome.skipped_due_to_memory {
+                println!("already known: this candidate's failure is in Gemel memory");
+                for r in &outcome.prior_rejections {
+                    println!("  prior rejection {}: {} ({})", r.gid, r.residual, r.detail);
+                }
+                return Ok(0);
+            }
             println!("findings:    {}", outcome.findings);
             match &outcome.counterexample {
                 Some(cx) => {
@@ -158,6 +206,9 @@ fn command(args: &[String]) -> Result<i32, String> {
                         "reductions:          {} accepted / {} refused",
                         cx.accepted_reductions, cx.refused_reductions
                     );
+                    if let Some(gid) = &outcome.memory_gid {
+                        println!("memory:               {gid}");
+                    }
                     println!("evidence:            {out}");
                     Ok(0)
                 }
@@ -178,8 +229,21 @@ fn command(args: &[String]) -> Result<i32, String> {
                 }
             }
         }
+        "history" => {
+            // Handled before compilation; unreachable here.
+            Ok(0)
+        }
         other => Err(format!("unknown command {other}")),
     }
+}
+
+/// SHA-256 of a file's bytes (the candidate source identity).
+fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Ok(hex::encode(h.finalize()))
 }
 
 /// Locate this crate's directory (for the generated project's path dependency).
