@@ -1,10 +1,13 @@
 # Autonomous Porting Architecture
 
-**Status: normative architecture + Phase 0 implemented.** This document is the
-contract for the residual-native, evidence-first, increasingly autonomous
-behavioral reconstruction foundry. Sections marked *normative* describe the
-target architecture; the **Status** section records what is actually
-implemented, and no planned mechanism is described there as shipped.
+**Status: normative architecture + an implemented reference instantiation (Phases
+0–11).** This document is the contract for the residual-native, evidence-first,
+increasingly autonomous behavioral reconstruction foundry. Sections marked
+*normative* describe the target architecture; the **Status** section records what is
+actually implemented, and no planned mechanism is described there as shipped. The
+implemented reference instantiation is exercised by executable courts and committed
+evidence; the honest limits of what it demonstrates are recorded in
+`docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md`.
 
 The division of labour is fixed:
 
