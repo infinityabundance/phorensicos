@@ -689,7 +689,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **241 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **252 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | every corpus source emits a non-empty object: **369 / 369, 0 failures** (`src/` 232, `examples/` 51, `tests/` 83 incl. 46 `compile-pass`, `fixtures/` 2, `README.phor`) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -713,6 +713,7 @@ All numbers below were reproduced on a clean checkout.
 | Cross-implementation | every sealed leaf observed through a **second, independent implementation** (musl, statically linked, `libc=musl` from its own check, no `PT_INTERP`): `toupper` 256, `memcmp` 312, `memchr` 482, `strlen` 308, `strrchr` 336, `strspn` 578 — **2272 cases, 0 disagreements**; `secondary_oracle_hash == primary_oracle_hash ==` the committed sealed oracle hash; agreements on a bounded corpus are evidence, not proof |
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
 | Foundry baseline (Phase 0) | the four-repository epistemic stack (phorensicos, `frf` 0.1.86, `frf-fuzz` 0.8.0, `gemel` 0.11.1) is pinned in `foundry/baseline/dependency_pins.json` and sealed by `foundry/baseline/integration_baseline_receipt.json`; `scripts/integration_baseline.sh` derives the receipt from the executable courts and verifies the external pins when their working copies are present; see `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` |
+| Canonical `PortSpec` (Phase 1 core) | the typed port specification replaces the stringly `PortTarget`: `ContractSource` separates the contract from the implementation observed, `ObservableSpec`/`ObservationProjectionSpec` make normalisation explicit, `PreconditionSpec` is machine-checked (`validate_case` → `ValidatedCase`; only a validated case reaches the foreign oracle), and `PortSpecId = SHA-256("PHOR/PORTSPEC/v1\0" ‖ canonical_bytes)` is a domain-separated content identity; all six leaves are expressed and their identities pinned; see `docs/PORT_SPEC.md` |
 
 ### Known gaps
 
@@ -745,6 +746,7 @@ All numbers below were reproduced on a clean checkout.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.
 - `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` — the autonomous foundry: invariants, phase plan, acceptance gates.
+- `docs/PORT_SPEC.md` — the canonical typed `PortSpec`: content identity, preconditions, the six pinned leaf specs.
 - `foundry/` — the foundry baseline (`dependency_pins.json`, the integration baseline receipt).
 - `docker-compose.yml`, `docker/` — reproducible host + kernel containers.
 - `docs/REVIEWER_PROTOCOL.md` — how to review claims in this repo.

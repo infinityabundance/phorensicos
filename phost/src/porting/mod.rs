@@ -46,6 +46,7 @@ pub mod evidence;
 pub mod exec;
 pub mod json;
 pub mod oracle_trace;
+pub mod portspec;
 pub mod promotion;
 pub mod replay_court;
 pub mod service;

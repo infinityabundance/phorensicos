@@ -75,7 +75,7 @@ versioned, and the documentation states exactly what was demonstrated.
 | Phase | Content | Status |
 |---|---|---|
 | **0** | Compatibility reconciliation (frf-fuzz → frf 0.1.86 / gemel 0.11.1) and the executable baseline seal | **done** — see below |
-| **1** | Canonical typed `PortSpec`; migrate all existing leaves. No new leaf ports. | not started |
+| **1** | Canonical typed `PortSpec`; migrate all existing leaves. No new leaf ports. | **core done** — typed spec + content identity + all six leaf specs + precondition validator (`docs/PORT_SPEC.md`); the generic-engine branch removal remains |
 | **2** | Typed `CompositionIR` + one generic interpreter; migrate every existing composition | not started |
 | **3** | Court sensitivity/challenge + semantic mutation profiles | not started |
 | **4** | FRF-Fuzz differential exploration + residual semantic bank + court-verified minimization | not started |
@@ -108,6 +108,20 @@ versioned, and the documentation states exactly what was demonstrated.
   Baseline at `11ee334`: **6 sealed leaves + 7 sealed compositions = 13 ports**;
   store residual `181ace83…`; session `13 calls / 68 dispatches / 6 objects`,
   hash `d219be2c…`; phorc 50 tests, phost 241 tests (4 ignored), 0 failures.
+
+### Phase 1 — core done
+
+`phost/src/porting/portspec.rs` defines the typed `PortSpec`, the domain-separated
+canonical encoding (`PortSpecId = SHA-256("PHOR/PORTSPEC/v1\0" || canonical_bytes)`),
+all six leaf specs, and the precondition validator (`validate_case` →
+`ValidatedCase`; only a validated case may reach the foreign oracle). The six
+content identities are pinned by a golden test, and a test proves every existing
+leaf corpus satisfies its own declared preconditions. `PortSpec::of_target`
+bridges every bootstrap target. See `docs/PORT_SPEC.md`.
+
+The Phase 1 remainder is the generic-engine migration: removing the target-id
+branches from the generic machinery so target-specific behaviour lives only at
+extension boundaries, with the baseline preserved (Gate A).
 
 ---
 

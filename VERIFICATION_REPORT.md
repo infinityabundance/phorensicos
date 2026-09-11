@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 241 pass, 4 ignored | 245 total: 184 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
+| All tests (phost) | ✅ 252 pass, 4 ignored | 256 total: 195 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 241 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court |
+| phost reach | 252 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical `PortSpec` |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -596,8 +596,23 @@ is byte-reproducible at a given toolchain (no wall-clock value enters the hash).
 ./scripts/integration_baseline.sh
 ```
 
+**Phase 1 (core): the canonical `PortSpec`.** `phost/src/porting/portspec.rs`
+replaces the stringly `PortTarget` with a typed spec that separates the contract
+from the implementation observed (`ContractSource`), makes normalisation explicit
+(`ObservableSpec` + `ObservationProjectionSpec`), validates cases against declared
+`PreconditionSpec`s (`validate_case` → `ValidatedCase`; only a validated case
+reaches the foreign oracle), and carries a domain-separated content identity
+`PortSpecId = SHA-256("PHOR/PORTSPEC/v1\0" ‖ canonical_bytes)`. All six leaves are
+expressed; their identities are pinned by a golden test, and a test proves every
+existing leaf corpus satisfies its own declared preconditions. See `docs/PORT_SPEC.md`.
+The Phase 1 remainder is the generic-engine branch removal.
+
+```sh
+cargo test -p phost --lib porting::portspec
+```
+
 ### Test Results (reproduced on `main`)
-- phost: 241 passed, 0 failed, 4 ignored (245 total). The ignored tests read
+- phost: 252 passed, 0 failed, 4 ignored (256 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests
