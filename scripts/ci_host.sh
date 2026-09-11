@@ -60,6 +60,11 @@ cargo build -q -p phost -p phorc
 ./verify_composition_ir_court.sh --target toupper_each_strlen_memchr --check-committed
 ./verify_composition_ir_court.sh --target toupper_memchr_suffix --check-committed
 ./verify_composition_ir_court.sh --target toupper_each_slice_search --check-committed
+
+# --- Foundry Phase 4: the differential counterexample engine -------------------
+echo
+echo "=== Autonomous Porting Foundry (Phase 4) ==="
+./verify_phorport.sh
 # Phase 3: the court-sensitivity (challenge) court — is the instrument blind?
 for ch in toupper memcmp memchr strlen strrchr strspn toupper_memchr toupper_strlen_memchr toupper_strlen_memchr_pair toupper_each toupper_each_strlen_memchr toupper_memchr_suffix toupper_each_slice_search; do
     ./verify_challenge_court.sh --target "$ch" --check-committed

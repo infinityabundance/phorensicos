@@ -482,6 +482,31 @@ cargo run -p phost -- port challenge strlen     # one profile
 
 See `docs/CHALLENGE.md`.
 
+### Differential exploration: the counterexample engine
+
+Designed cases are bounded; the gaps between them are not. The `phorport` host
+crate (outside the sealed runtime's dependency closure) turns the gap into a
+counterexample engine. A probe validates a fuzz input against the port's declared
+preconditions, observes the foreign oracle through the cage, executes the
+**uninstrumented compiled `.phor` object**, and classifies any divergence into a
+structural residual family (`PORT.LENGTH`, `PORT.FIRST_VS_LAST`, …). FRF-Fuzz
+drives exploration and its crash ledger reproduces a divergence exactly; the
+minimizer then shrinks it — but only the same comparison court decides whether a
+reduction is accepted ("the minimizer proposes, the court decides").
+
+The demonstration is a defect the design corpus provably misses: a `strspn`
+whose set-membership fold is an XOR instead of an OR (equivalent for distinct
+accept bytes, wrong on a duplicate). The corpus reports **578 cases, 0
+divergences**; a 90-second FRF-Fuzz campaign finds **246 findings**; the first is
+minimized from 15 bytes to 7 and replays on the ordinary uninstrumented object
+with the same residual lineage. The record is committed under
+`phost/evidence/phorport/` and replayed by `verify_phorport.sh`.
+
+Running the harness under the instrumented worker also exposed a real ABI bug in
+`phorc`'s emitted objects (they clobbered callee-saved registers); it is fixed in
+the executor's call trampoline, so no emitted object and no committed seal
+changed. See `docs/AUTONOMOUS_PORTING.md`.
+
 ### Persistent sealed port store
 
 A court *derives* a seal: it observes foreign behavior, compiles the clean-room

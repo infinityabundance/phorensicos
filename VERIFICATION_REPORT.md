@@ -694,6 +694,24 @@ guarantees a NUL within `n`. The evidence is committed at
 `verify_challenge_court.sh` (schema, counts, no blind spots, equivalence notes,
 canonical residual, determinism). See `docs/CHALLENGE.md`.
 
+**Phase 4 (core): the FRF-Fuzz counterexample engine.** `phorport/` is the one
+host-only orchestration crate, outside the sealed runtime's dependency closure. It
+provides the differential comparison harness (precondition gate → foreign oracle →
+**uninstrumented compiled `.phor` object** → normalized comparison → structural
+residual), the `PORT.*` residual bank, **court-verified minimization** (the
+minimizer proposes, the same court decides), durable content-addressed
+counterexample records, and an FRF-Fuzz campaign bridge that generates a
+differential target, seeds it with the design corpus, runs a bounded campaign, and
+shrinks the finding. Gate E is demonstrated: a `strspn` candidate whose
+set-membership fold is XOR instead of OR is **missed by the whole design corpus
+(578 cases, 0 divergences)**; a 90-second FRF-Fuzz campaign records 246 findings
+and the first is minimized from 15 to 7 bytes and replayed on the uninstrumented
+object with the same `PORT.LENGTH` lineage. The campaign also exposed a real ABI
+violation in phorc's emitted objects (callee-saved registers clobbered without a
+save); it is fixed in the executor's register-preserving call trampoline, so no
+emitted object, seal, verdict or session hash changed. Verified by
+`verify_phorport.sh`. See `docs/AUTONOMOUS_PORTING.md`.
+
 ```sh
 cargo test -p phost --lib porting::composition_ir
 ```

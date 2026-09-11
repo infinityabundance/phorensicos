@@ -184,6 +184,69 @@ fn execution_behavior_hash(outputs: &[(String, Vec<u8>)]) -> String {
 // ABI harness
 // ============================================================================
 
+// A register-preserving invocation trampoline.
+//
+// The phorc codegen uses RBX and R12–R15 as scratch registers without saving
+// them — a genuine ABI violation in the emitted object (a leaf function may not
+// clobber a callee-saved register without restoring it). It went unnoticed because
+// at low optimisation levels the Rust caller happened not to keep a live value in
+// those registers across the call; at higher optimisation (e.g. an instrumented
+// build) RBX is live and the corruption segfaults the caller.
+//
+// The executor therefore saves and restores the callee-saved registers around
+// every JIT call, so an object cannot corrupt its caller no matter what phorc
+// emits. This is a *runtime* fix: no emitted object changes, so every committed
+// seal and every committed verdict stays byte-identical.
+//
+// `phor_invoke3(rdi=a, rsi=b, rdx=c, rcx=entry) -> rax`. The three argument
+// registers pass through untouched, so one trampoline serves every leaf ABI
+// (toupper uses one, strlen two, memcmp/memchr/strrchr/strspn three).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    ".section .text",
+    ".globl phor_invoke3",
+    ".hidden phor_invoke3",
+    ".type phor_invoke3,@function",
+    "phor_invoke3:",
+    "push rbp",
+    "mov rbp, rsp",
+    "push rbx",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "sub rsp, 8",
+    "mov rax, rcx",
+    "call rax",
+    "add rsp, 8",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbx",
+    "pop rbp",
+    "ret",
+    ".size phor_invoke3, .-phor_invoke3",
+);
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" {
+    fn phor_invoke3(a: u64, b: u64, c: u64, entry: *const u8) -> u64;
+}
+
+/// Invoke a relocation-free entry point with up to three integer arguments,
+/// preserving the SysV callee-saved registers across the call.
+///
+/// # Safety
+///
+/// `entry` must point at the start of an executable function whose ABI is
+/// `(u64, u64, u64) -> u64` (extra arguments are harmless for callees that read
+/// fewer). Only the first `arity` argument registers are meaningful.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub unsafe fn invoke(entry: *const u8, a: u64, b: u64, c: u64) -> u64 {
+    phor_invoke3(a, b, c, entry)
+}
+
 /// Run the compiled entry point for one case, returning the encoded output bytes
 /// in the same encoding the court seals (`toupper`: one byte; `memcmp`: a 4-byte
 /// little-endian sign).

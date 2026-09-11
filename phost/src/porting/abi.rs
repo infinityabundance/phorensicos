@@ -71,8 +71,8 @@ pub fn toupper(
         .and_then(|a| a.first())
         .copied()
         .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
-    let f: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute(entry) };
-    Ok(alloc::vec![(f(b as u64) & 0xff) as u8])
+    let raw = unsafe { crate::porting::exec::invoke(entry, b as u64, 0, 0) };
+    Ok(alloc::vec![(raw & 0xff) as u8])
 }
 
 /// `memcmp`: `(u64 wa, u64 wb, u64 n) -> u64` sign; each compared prefix is
@@ -107,8 +107,7 @@ pub fn memcmp(
     }
     let wa = pack_be(&a[..n]);
     let wb = pack_be(&b[..n]);
-    let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-    let raw = f(wa, wb, n as u64) as u32 as i32;
+    let raw = unsafe { crate::porting::exec::invoke(entry, wa, wb, n as u64) } as u32 as i32;
     Ok(encode_sign(raw))
 }
 
@@ -137,8 +136,8 @@ pub fn memchr(
         )));
     }
     let wh = pack_le_prefix(&hay[..n]);
-    let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-    let raw = f(wh, needle as u64, n as u64) as u32 as i32;
+    let raw =
+        unsafe { crate::porting::exec::invoke(entry, wh, needle as u64, n as u64) } as u32 as i32;
     Ok(encode_index(raw))
 }
 
@@ -163,8 +162,7 @@ pub fn strlen(
         )));
     }
     let w = pack_le_prefix(&buf[..n]);
-    let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-    let len = f(w, n as u64);
+    let len = unsafe { crate::porting::exec::invoke(entry, w, n as u64, 0) };
     Ok(encode_usize(len as usize))
 }
 
@@ -201,8 +199,7 @@ pub fn strrchr(
         )));
     }
     let w = pack_le_prefix(&buf[..n]);
-    let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-    let raw = f(w, needle as u64) as u32 as i32;
+    let raw = unsafe { crate::porting::exec::invoke(entry, w, needle as u64, 0) } as u32 as i32;
     Ok(encode_index(raw))
 }
 
@@ -246,8 +243,7 @@ pub fn strspn(
     }
     let ws = pack_le_prefix(&s[..n]);
     let wa = pack_le_prefix(accept);
-    let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-    let span = f(ws, wa, n as u64);
+    let span = unsafe { crate::porting::exec::invoke(entry, ws, wa, n as u64) };
     Ok(encode_usize(span as usize))
 }
 
