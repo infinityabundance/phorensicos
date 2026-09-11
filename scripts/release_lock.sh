@@ -154,13 +154,17 @@ if check:
     if committed.get("residual_hash") != residual:
         errors.append("the committed lock's residual hash does not recompute")
     # The tag binds the revision (git). Inside the container the build context has
-    # no `.git`, so this is informational only; the identity comparison above is
-    # the check that matters and it needs only committed evidence.
-    tag_commit = subprocess.run(
-        ["git", "rev-parse", f"{tag}^{{commit}}"], capture_output=True, text=True
-    )
-    if tag_commit.returncode == 0:
-        print("    tag %s -> %s" % (tag, tag_commit.stdout.strip()[:12]))
+    # no `.git` (and the rust-slim image has no `git` binary), so this is
+    # informational only; the identity comparison above is the check that matters
+    # and it needs only committed evidence.
+    try:
+        tag_commit = subprocess.run(
+            ["git", "rev-parse", f"{tag}^{{commit}}"], capture_output=True, text=True
+        )
+        if tag_commit.returncode == 0:
+            print("    tag %s -> %s" % (tag, tag_commit.stdout.strip()[:12]))
+    except OSError:
+        pass
     if errors:
         print("Status: LOCK CHECK FAILED")
         for e in errors:
