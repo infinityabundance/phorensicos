@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 326 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations, the demand model, bounded `CompositionIR` synthesis and the guarded-arena memory-effect court |
+| phost reach | 331 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + `strspn`, the last recorded under a historical `posix:` identity and corrected by a `libc:strspn` successor via evidence-preserving supersession) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path + the court-sensitivity (challenge) court + the autonomous identity namespaces, evidence closure, oracle witnesses, `AUTONOMOUS-SEAL/v1` obligation profile, immutable store generations, the demand model, bounded `CompositionIR` synthesis, the guarded-arena memory-effect court and the contract-provenance supersession record |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -464,7 +464,7 @@ loads and verifies it.
 
 | Aspect | Result |
 |--------|--------|
-| Ports covered | 13 — 6 leaf objects (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr` — ISO C — plus POSIX `strspn`) and 7 compositions (incl. the nested `toupper_each_strlen_memchr`, the buffer-slicing `toupper_memchr_suffix`, and the derived-buffer-consuming `toupper_each_slice_search`) |
+| Ports covered | 13 — 6 leaf objects (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr` — ISO C — plus `strspn`, recorded historically as `posix:` and corrected to `libc:` by a successor) and 7 compositions (incl. the nested `toupper_each_strlen_memchr`, the buffer-slicing `toupper_memchr_suffix`, and the derived-buffer-consuming `toupper_each_slice_search`) |
 | Leaf artifact | the committed `candidate.o` bytes; its SHA-256 equals the recorded `object_hash` and the committed `candidate_signature.json` object hash |
 | Composition artifact | the `chain_hash` read from the committed `composition_verdict.json` — not re-derived by re-running the inner court |
 | Load verification | schema + residual hash; unique sealed targets; object bytes hashed against the seal; composition stages resolved in the same store; **fails closed** on any failure |
@@ -564,8 +564,8 @@ now closed by the cross-implementation court below.
 ### Cross-Implementation Court
 
 A seal binds an observation of *one* implementation: the host C library. So
-"the POSIX contract for `strspn`" is really "the POSIX contract as this host implements
-it". The cross-implementation court (`phost/src/porting/cross_impl.rs`,
+the dialect cage's contract for `strspn` is really that contract *as this host
+implements it*. The cross-implementation court (`phost/src/porting/cross_impl.rs`,
 `phost/foreign/musl_probe.c`) closes that gap by observing the **same sealed corpus**
 through a **second, independent implementation** and requiring agreement on every case.
 
@@ -598,7 +598,7 @@ Reproduce:
 
 ```sh
 cargo run -p phost -- port cross toupper      # 256 cases, 0 disagreements
-cargo run -p phost -- port cross strspn       # 578 cases, the POSIX dialect
+cargo run -p phost -- port cross strspn       # 578 cases, the historical posix: surface
 ./verify_cross_implementation.sh              # rebuild the probe + verify all six
 ```
 
@@ -865,7 +865,7 @@ cargo run -p phost -- port promote memcmp        # JIT-porting court (312)
 cargo run -p phost -- port promote memchr        # JIT-porting court (482)
 cargo run -p phost -- port promote strlen        # JIT-porting court (308)
 cargo run -p phost -- port promote strrchr       # JIT-porting court (336)
-cargo run -p phost -- port promote strspn        # JIT-porting court (578, POSIX dialect)
+cargo run -p phost -- port promote strspn        # JIT-porting court (578, historical posix: record)
 cargo run -p phost -- port cross toupper          # cross-implementation court (256, musl)
 cargo run -p phost -- port cross strspn           # cross-implementation court (578, musl)
 cargo run -p phost -- port store                # load + verify the committed store
@@ -889,7 +889,7 @@ cargo run -p phost -- port compose --target toupper_each_slice_search 62617862:6
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
-./verify_jit_porting_court.sh --target strspn                     # the POSIX dialect
+./verify_jit_porting_court.sh --target strspn                     # the historical posix: record
 ./verify_jit_porting_court.sh --target memcmp --check-committed   # fresh == checked-in
 ./verify_composition_court.sh                                    # composition #1 (560)
 ./verify_composition_court.sh --check-committed
@@ -929,6 +929,14 @@ Everything above also runs in containers:
 docker compose run --rm host     # cargo test + store, session, court and composition verifiers
 docker compose run --rm kernel   # build kernel + QEMU boot + evidence verify
 ```
+
+**Gate L (clean-room reproduction) is verified at `2d6496e`.** From a clean checkout,
+`docker compose build host && docker compose run --rm host` exits 0 (74 verifier
+blocks — including the new `./verify_supersession.sh` — with 0 failures) and
+`docker compose build kernel && docker compose run --rm kernel` exits 0 (13/13
+boot-evidence checks, all five captured artifacts byte-reproducible against the
+committed manifest). The Docker build context excludes host-local foundry state, so
+the in-container workspace is exactly the committed tree.
 
 Boot evidence (hashes, ABI address, commands, toolchain) is committed as
 `phost_kernel/evidence_manifest.json`. The manifest's claim is two-tier:

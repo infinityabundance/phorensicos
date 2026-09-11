@@ -88,7 +88,8 @@ mis-declared.
 ## 4. Status
 
 **Implemented (Phase 1 complete):** the typed `PortSpec`, the domain-separated
-canonical encoding and `PortSpecId`, all six leaf specs, the precondition
+canonical encoding and `PortSpecId`, all six leaf specs plus the corrected `strspn`
+successor spec (`docs/CONTRACT_PROVENANCE_MIGRATION.md`), the precondition
 validator, the pinned golden identities, and `PortSpec::of_target`.
 
 The generic machinery is now registry-driven (`phost/src/porting/registry.rs`),

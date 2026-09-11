@@ -449,7 +449,7 @@ and an exhaustive sweep of all 256 needle values against a haystack whose tail
 repeats bytes from the string. Arguments are framed in the trace as
 `buf_hex:needle_hex:n_hex` (little-endian `n`).
 
-### Sixth target: POSIX `strspn`
+### Sixth target: `strspn`
 
 ```text
 target id: posix:strspn:c-locale:u64:v1
@@ -564,7 +564,7 @@ Reproduce:
 
 ```sh
 phost port cross toupper      # 256 cases, 0 disagreements
-phost port cross strspn       # 578 cases, the POSIX dialect
+phost port cross strspn       # 578 cases, the historical posix: surface
 ./verify_cross_implementation.sh
 ```
 
@@ -1139,7 +1139,7 @@ examples/jit_port_memcmp.phor     memcmp native candidate, in Phorensic
 examples/jit_port_memchr.phor     memchr native candidate, in Phorensic
 examples/jit_port_strlen.phor     strlen native candidate, in Phorensic
 examples/jit_port_strrchr.phor    strrchr native candidate, in Phorensic
-examples/jit_port_strspn.phor     POSIX strspn native candidate, in Phorensic
+examples/jit_port_strspn.phor     strspn native candidate (historical posix: record)
 phost/evidence/porting/toupper/   toupper evidence set (256 cases) + candidate.o
 phost/evidence/porting/memcmp/    memcmp evidence set (312 cases) + candidate.o
 phost/evidence/porting/memchr/    memchr evidence set (482 cases) + candidate.o

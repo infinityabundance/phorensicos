@@ -72,10 +72,14 @@ artifact being the ordinary compiled `.phor` ELF.
 ## Test suites at this phase
 
 ```text
-phost     326 passed, 0 failed, 4 ignored
+phost     331 passed, 0 failed, 4 ignored
 phorc      50 passed, 0 failed
 phorport   37 passed, 0 failed
 ```
+
+(The `phost` count rose from 326 to 331 with the contract-provenance correction,
+which added the successor spec, its registry row, and the supersession record and
+tests.)
 
 New hostile tests include: precondition enforcement in the qualification
 generator; universe determinism and independence (novelty over the design
@@ -164,3 +168,42 @@ forward `memcpy` from an overlap-correct `memmove` in both directions. **Honest
 boundary:** `phorc` does not yet emit pointer/region arguments, so no
 memory-effect port is executed or sealed; this is the court-side contract only.
 `memset`, `memcpy` and `memmove` remain future work.
+
+## Contract provenance — the `strspn` supersession
+
+`strspn` is specified by ISO C (C90 4.11.5.4; C99 and later 7.21.5.4), and POSIX
+defers to ISO C for it. The committed baseline recorded it as
+`posix:strspn:c-locale:u64:v1` on the mistaken claim that ISO C does not specify it.
+The correction is an evidence-preserving **supersession**, never a rename:
+
+* the historical target, its golden `PortSpecId` (`bc0420f0…`) and its committed
+evidence are preserved unchanged, and bare-symbol resolution (`strspn`) still returns
+the historical target, so the committed store and the JIT-porting court verifier are
+unaffected (Gate A holds);
+* the successor `libc:strspn:c-locale:u64:v1` (`PortSpecId` `a4ee309a…`) was
+requalified and sealed on its own identity through the full Phase 7 pipeline: a
+498-case held-out universe built after the freeze (997 isolation markers, 0 leaks), a
+sensitivity challenge, the FRF outer court, ordinary uninstrumented execution, native
+dispatch, and **13/13** `AUTONOMOUS-SEAL/v1` obligations (evidence closure
+`b7ec423a…`, promotion receipt `3b93f1d7…`);
+* `./verify_supersession.sh` asserts the correction record, the preserved historical
+seal, the successor's own seal, and that the two evidence closures differ.
+
+**Bounded claim.** The observed behavior was never in question; only the provenance
+metadata was wrong. The successor is the same observed surface with corrected
+provenance, and its seal is bounded evidence over its declared corpus — not a proof of
+equivalence. The correction does not extend the automation claim.
+
+## Gate L — clean-room reproduction (verified)
+
+From a clean checkout at `2d6496e`:
+
+```text
+docker compose build host   && docker compose run --rm host     # exit 0 — 74 verifier blocks, 0 failures
+docker compose build kernel && docker compose run --rm kernel   # exit 0 — 13/13 boot checks, 5/5 artifacts reproducible
+```
+
+The host container runs `scripts/ci_host.sh` (every `cargo test` suite plus every
+verifier, including `verify_supersession.sh`); the kernel container builds the
+`no_std` kernel, boots it under QEMU and verifies the captured boot evidence against
+the committed manifest.

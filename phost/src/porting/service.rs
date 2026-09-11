@@ -281,7 +281,7 @@ pub fn session_plan() -> Vec<SessionCall> {
             ],
             expect_hex: "01000000",
         },
-        // The POSIX dialect: "abc\0" against the set {"ab"} spans 2.
+        // The historical `posix:` record for strspn: "abc\0" against the set {"ab"} spans 2.
         SessionCall {
             label: "strspn(\"abc\\0\",\"ab\",4)",
             port: crate::porting::target::POSIX_STRSPN.id,

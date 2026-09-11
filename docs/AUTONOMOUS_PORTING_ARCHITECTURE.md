@@ -253,15 +253,22 @@ K  immutable publication        a successful campaign creates a new store genera
 L  clean-room reproduction      the host integration reproduces from a clean checkout
 ```
 
-Status at Phase 11: **A–K** are demonstrated by executable courts and committed
+Status at Phase 11: **A–L** are demonstrated by executable courts and committed
 evidence (A by the byte-identical baseline and `ci_host.sh`; D by the challenge
 court; E by the Phase 4 campaign; F by the Gemel memory; G by the isolation audit;
 H by the blind `strlen` regeneration and the `strspn` campaign; I by the execution
 and dispatch courts; J by the sealed service opening with no external machinery;
-K by the generation ledger and generation-bound service). **L** — the Docker
-clean-room host/kernel courts — is run on the host changes; a Docker rerun of the
-Phase 8–11 additions has not been performed in this session and is therefore not
-claimed.
+K by the generation ledger and generation-bound service; L below).
+
+**Gate L — clean-room reproduction (verified).** From a clean checkout at
+`2d6496e`, `docker compose build host` + `docker compose run --rm host` and
+`docker compose build kernel` + `docker compose run --rm kernel` both exit 0. The
+host image runs the full `scripts/ci_host.sh` (74 verifier blocks, including the
+new `./verify_supersession.sh`, 0 failures) inside the container; the kernel image
+builds the `no_std` kernel, boots it in QEMU, and verifies the five captured
+boot-evidence artifacts as byte-reproducible against the committed manifest. The
+Docker build context excludes host-local foundry state, so the in-container
+workspace is the committed tree.
 
 ---
 

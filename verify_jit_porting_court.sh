@@ -394,8 +394,8 @@ if SYMBOL == "strrchr":
         errors.append("strrchr corpus does not have the complete 28-case unique-occurrence grid")
 
 if SYMBOL == "strspn":
-    # The POSIX dialect's corpus: (s, accept, n) with the terminator of `s` inside
-    # the bound and a NUL-free accept set of at most 8 bytes.
+    # The historical posix: record's corpus: (s, accept, n) with the terminator of `s`
+    # inside the bound and a NUL-free accept set of at most 8 bytes.
     for t in traces:
         a = args_of(t)
         if len(a) != 3:

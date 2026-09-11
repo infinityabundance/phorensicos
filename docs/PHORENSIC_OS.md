@@ -324,7 +324,8 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   `strrchr` (a bounded deterministic corpus forcing *last*-match semantics inside
   the string: unique and repeated occurrences, needles that occur only after the
   terminator, needles straddling it, and an exhaustive 256-value needle sweep), and
-  POSIX `strspn` (a prefix length decided by set membership; a second dialect).
+  `strspn` (a prefix length decided by set membership; recorded historically as a
+  `posix:` second dialect, corrected to `libc:` by an evidence-preserving successor).
   `memchr`/`strrchr` pointer results are normalized to indexes, which is the
   portable part of their contracts. No foreign source is read or copied.
 - **Court session** — replays a clean-room native candidate against sealed oracle
@@ -387,8 +388,8 @@ foreign behavior → dialect cage → oracle traces → behavior signature
   deriving it, so the committed verdict reproduces with no compiler at all.
 
 - **Cross-implementation court** — a seal binds an observation of *one*
-  implementation, so the dialect cage's "the POSIX contract for `strspn`" is really
-  "as this host implements it". This court observes the same sealed corpus through a
+  implementation, so the dialect cage's contract for `strspn` is really "as this
+  host implements it". This court observes the same sealed corpus through a
   **second, independent implementation** (musl, out-of-process through a statically
   linked `musl-gcc` probe) and requires agreement on every case. Independence is
   checked, not asserted: the probe must report `libc=musl` from its own check and its

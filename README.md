@@ -586,7 +586,7 @@ One store holds thirteen ports:
 
 | Kind | Ports |
 |------|-------|
-| Leaf objects | the six compiled `.phor` candidates (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr` — ISO C — and `strspn` — POSIX) |
+| Leaf objects | the six compiled `.phor` candidates (`toupper`, `memcmp`, `memchr`, `strlen`, `strrchr` — ISO C — and `strspn`, recorded historically as `posix:` and corrected to `libc:` by a successor) |
 | Compositions | `toupper_memchr`, `toupper_strlen_memchr`, `toupper_strlen_memchr_pair`, `toupper_each`, `toupper_each_strlen_memchr`, `toupper_memchr_suffix`, `toupper_each_slice_search` |
 
 This is what makes the store a real artifact rather than a cache: the committed leaf
@@ -618,7 +618,7 @@ once: `open` is the only place with a path to `store`, and `call` has access to
 nothing but the dispatcher it already holds.
 
 A **session** is a deterministic plan that serves every sealed port in the store —
-six leaves (one of them POSIX) and seven compositions — through that one service, with a recorded
+six leaves (one recorded historically as `posix:`) and seven compositions — through that one service, with a recorded
 expected result for each. Thirteen ports, one load, **six mapped objects**, and the
 same leaf reused by every chain that consumes it:
 
@@ -656,9 +656,9 @@ cargo run -p phost -- port promote memcmp
 cargo run -p phost -- port promote memchr
 cargo run -p phost -- port promote strlen
 cargo run -p phost -- port promote strrchr
-cargo run -p phost -- port promote strspn     # the POSIX dialect
+cargo run -p phost -- port promote strspn     # the historical posix: record
 cargo run -p phost -- port cross toupper      # the same sealed corpus through musl
-cargo run -p phost -- port cross strspn       # the POSIX dialect, second implementation
+cargo run -p phost -- port cross strspn       # the historical posix: surface, second implementation
 cargo run -p phost -- port native toupper 61              # call site: run the sealed object
 cargo run -p phost -- port native memcmp 616263:616264:0300000000000000
 cargo run -p phost -- port native memchr 616263:62:0300000000000000
@@ -684,7 +684,7 @@ cargo run -p phost -- port compose --target toupper_each_slice_search 62617862:6
 ./verify_jit_porting_court.sh --target memchr
 ./verify_jit_porting_court.sh --target strlen
 ./verify_jit_porting_court.sh --target strrchr
-./verify_jit_porting_court.sh --target strspn                 # the POSIX dialect
+./verify_jit_porting_court.sh --target strspn                 # the historical posix: record
 ./verify_jit_porting_court.sh --target memchr --check-committed   # fresh == checked-in
 ./verify_composition_court.sh                     # composition #1 court
 ./verify_composition_court.sh --check-committed
@@ -801,7 +801,7 @@ All numbers below were reproduced on a clean checkout.
 | Kernel | builds a valid Multiboot v1 image (magic `02 b0 ad 1b`) |
 | Kernel boot (QEMU) | `Ph` on COM1 and `0xE9`; 1024×768 boot GUI rendered to the LFB |
 | Boot evidence | `verify_evidence.sh`: **13 / 13 checks pass**; manifest committed; evidence byte-reproducible |
-| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, `strlen`: **308/308**, `strrchr`: **336/336**, `strspn` (POSIX): **578/578**, hashes MATCH, source+object+receipt bound, promotion `Sealed` |
+| JIT-porting court | `toupper`: **256/256**, `memcmp`: **312/312**, `memchr`: **482/482**, `strlen`: **308/308**, `strrchr`: **336/336**, `strspn`: **578/578** (historical `posix:` record, corrected by a `libc:` successor), hashes MATCH, source+object+receipt bound, promotion `Sealed` |
 | Sealed-object execution | the sealed ELF64 object is loaded and called: `toupper` **256/256**, `memcmp` **312/312**, `memchr` **482/482**, `strlen` **308/308**, `strrchr` **336/336**, `strspn` **578/578**; executed object == sealed object |
 | Sealed native dispatch | the runtime serves calls from the sealed object: `toupper` **256/256 native**, `memcmp` **312/312 native**, `memchr` **482/482 native**, `strlen` **308/308 native**, `strrchr` **336/336 native**, `strspn` **578/578 native**, **0 fallbacks / 0 broken seals**; no capability → foreign fallback |
 | Corrected provenance | `strspn` is an ISO C surface (C90 4.11.5.4; C99+ 7.21.5.4); the committed baseline historically recorded it as `posix:strspn:c-locale:u64:v1` on a mistaken claim. That record, its `PortSpecId` and its evidence are preserved; the corrected successor `libc:strspn:c-locale:u64:v1` is requalified and sealed under its own identity (`AutonomousV1`, 13/13 obligations); see `docs/CONTRACT_PROVENANCE_MIGRATION.md`, `phorport supersessions`, `./verify_supersession.sh` |
@@ -815,7 +815,7 @@ All numbers below were reproduced on a clean checkout.
 | Persistent sealed port store | `phost/evidence/store/index.json` commits all **13** sealed ports (6 leaf object hashes + 7 composition chain hashes); loading verifies every object's bytes against its seal and fails closed on a missing/broken entry, and rejects a composition cycle; the composition court reproduces its committed verdict from the store with an impossible `--phorc` path, and a fresh index from committed evidence is byte-identical |
 | Sealed native service | one verified store load serves many consumers: **13 ports from 6 mapped objects**, **68** sealed-port resolutions including nested stages, **0 fallbacks / 0 broken seals**; `toupper` fan-in 39, `memchr` 10, `strlen` 4, `toupper_each` 5, `toupper_memchr` 2; the session reproduces from a copy of the store at another path, a missing store fails closed, and without `PORTING` the store is never read |
 | Cross-implementation | every sealed leaf observed through a **second, independent implementation** (musl, statically linked, `libc=musl` from its own check, no `PT_INTERP`): `toupper` 256, `memcmp` 312, `memchr` 482, `strlen` 308, `strrchr` 336, `strspn` 578 — **2272 cases, 0 disagreements**; `secondary_oracle_hash == primary_oracle_hash ==` the committed sealed oracle hash; agreements on a bounded corpus are evidence, not proof |
-| Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
+| Docker (Gate L) | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot — verified from a clean checkout at `2d6496e`: **host 74 verifier blocks, 0 failures; kernel 13/13 boot checks, 5/5 evidence artifacts byte-reproducible** |
 | Foundry baseline (Phase 0) | the four-repository epistemic stack (phorensicos, `frf` 0.1.86, `frf-fuzz` 0.8.0, `gemel` 0.11.1) is pinned in `foundry/baseline/dependency_pins.json` and sealed by `foundry/baseline/integration_baseline_receipt.json`; `scripts/integration_baseline.sh` derives the receipt from the executable courts and verifies the external pins when their working copies are present; see `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` |
 | Canonical `PortSpec` (Phase 1) | the typed port specification replaces the stringly `PortTarget`: `ContractSource` separates the contract from the implementation observed, `ObservableSpec`/`ObservationProjectionSpec` make normalisation explicit, `PreconditionSpec` is machine-checked (`validate_case` → `ValidatedCase`; only a validated case reaches the foreign oracle), and `PortSpecId = SHA-256("PHOR/PORTSPEC/v1\0" ‖ canonical_bytes)` is a domain-separated content identity; the generic machinery is registry-driven (`registry.rs`: spec + CaseGenerator + candidate adapter + ABI adapter), so a new leaf target needs no engine change, and a static audit fails the build if a `.id ==` target branch reappears; see `docs/PORT_SPEC.md` |
 | Composition IR (Phase 2 core) | `composition_ir.rs` makes composition **data**: a typed, bounded, acyclic `CompositionIR` (SSA-like values; `Call`/`MapBytes`/`Slice`/`Compare`/`Select`/`FoldBytes`) with a domain-separated `CompositionIrId` and **one** `eval` over a `PortBackend`, so the oracle side and the sealed side run the same graph and cannot drift; a test expresses `toupper ∘ memchr` as IR and reproduces the foreign oracle over the whole corpus; see `docs/COMPOSITION_IR.md` |
@@ -856,7 +856,7 @@ All numbers below were reproduced on a clean checkout.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.
 - `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` — the autonomous foundry: invariants, phase plan, acceptance gates.
-- `docs/PORT_SPEC.md` — the canonical typed `PortSpec`: content identity, preconditions, the six pinned leaf specs.
+- `docs/PORT_SPEC.md` — the canonical typed `PortSpec`: content identity, preconditions, the six pinned leaf specs plus the corrected `strspn` successor.
 - `docs/COMPOSITION_IR.md` — the typed `CompositionIR`: nodes, validation, content identity, the generic interpreter.
 - `foundry/` — the foundry baseline (`dependency_pins.json`, the integration baseline receipt).
 - `docker-compose.yml`, `docker/` — reproducible host + kernel containers.
