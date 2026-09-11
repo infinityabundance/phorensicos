@@ -34,9 +34,11 @@ pub mod behavior_signature;
 pub mod candidate;
 pub mod compiled;
 pub mod composition;
+pub mod composition_engine;
 pub mod composition_ir;
 pub mod composition_nested;
 pub mod composition_pair;
+pub mod composition_registry;
 pub mod composition_slice_search;
 pub mod composition_strlen_memchr;
 pub mod composition_suffix;
@@ -70,40 +72,15 @@ pub use service::{SealedNativeService, SessionVerdict};
 pub use target::{resolve_target, PortTarget, TestCase};
 
 /// A chain runner, callable with the raw stage arguments and returning the encoded
-/// stage output. A sealed **composition** port resolves to one of these by id, which
-/// is what makes a composition a first-class port a nested chain can dispatch.
+/// stage output.
+///
+/// Phase 2 no longer resolves a sealed composition to one of these by id: a
+/// composition is now **data** (`composition_registry`), evaluated by one
+/// interpreter (`composition_ir::eval`) through `composition_engine`. The type is
+/// retained only so the legacy Phase 1 courts (the historical `v1` evidence model)
+/// keep compiling; the runtime never uses it.
 pub type CompositionRunner =
     fn(&mut NativeDispatcher, &[Vec<u8>], &PortingAuthority) -> Result<Vec<u8>, DispatchError>;
-
-/// Resolve the runner for a sealed composition id.
-///
-/// The runtime knows how to run the compositions it ships; an unknown id is a broken
-/// seal, never an implicit fallback. Every composition the store publishes is here,
-/// so each sealed port in the index is actually dispatchable.
-pub fn composition_runner(id: &str) -> Option<CompositionRunner> {
-    if id == composition::COMPOSITION_TOUPPER_MEMCHR.id {
-        return Some(composition::run_chain_encoded);
-    }
-    if id == composition_strlen_memchr::COMPOSITION_TOUPPER_STRLEN_MEMCHR.id {
-        return Some(composition_strlen_memchr::run_chain_encoded);
-    }
-    if id == composition_pair::COMPOSITION_TOUPPER_STRLEN_MEMCHR_PAIR.id {
-        return Some(composition_pair::run_chain_encoded);
-    }
-    if id == composition_suffix::COMPOSITION_TOUPPER_MEMCHR_SUFFIX.id {
-        return Some(composition_suffix::run_chain_encoded);
-    }
-    if id == composition_slice_search::COMPOSITION_TOUPPER_EACH_SLICE_SEARCH.id {
-        return Some(composition_slice_search::run_chain_encoded);
-    }
-    if id == composition_toupper_each::COMPOSITION_TOUPPER_EACH.id {
-        return Some(composition_toupper_each::run_chain_encoded);
-    }
-    if id == composition_nested::COMPOSITION_TOUPPER_EACH_STRLEN_MEMCHR.id {
-        return Some(composition_nested::run_chain_encoded);
-    }
-    None
-}
 
 /// SHA-256, lowercase hex. The strongest hash already used by the repo
 /// (phorc's `receipts::hash_bytes`); no weak bootstrap hashes in court evidence.
@@ -1571,6 +1548,96 @@ pub fn run_composition_court(
     }
 }
 
+/// Run the **generic** (Phase 2) Sealed Composition Dispatch Court for a named
+/// composition.
+///
+/// This is the same court as [`run_composition_court`], but it is driven entirely
+/// by the composition's `CompositionIR`: the oracle and the implementation are the
+/// *same* graph evaluated through the foreign and sealed backends. It writes the
+/// **v2** evidence schema (four identities), in its own evidence directory, so the
+/// historical v1 evidence is never touched.
+pub fn run_ir_composition_court(
+    name: &str,
+    auth: &PortingAuthority,
+    out_dir: &str,
+    phorc: Option<&str>,
+    source: IndexSource,
+) -> Result<CompositionReport, PortError> {
+    if !auth.can_observe() {
+        return Err(PortError::CapabilityDenied);
+    }
+    let def = composition_registry::by_name(name)
+        .ok_or_else(|| PortError::UnknownTarget(name.to_string()))?;
+
+    // The seal index is derived the same way the legacy court derives it
+    // (deterministic compile of every leaf; a nested composition sealed with its
+    // own committed chain hash), or loaded from the persistent store.
+    let kind = CompositionKind::parse(def.target.id)
+        .ok_or_else(|| PortError::UnknownTarget(def.target.id.to_string()))?;
+    let index = build_composition_index(kind, auth, phorc, source)?;
+
+    let cases = (def.cases)();
+    let traces = (def.observe)(&cases, auth)?;
+    let (v, mismatches) = composition_engine::run_ir_court(def, &traces, &index, auth);
+    let evidence_dir = evidence::write_ir_composition_evidence(out_dir, &traces, &v, &mismatches)
+        .map_err(|e| PortError::Io(format!("{}", e)))?;
+
+    let stage_reports: Vec<StageReport> = v
+        .stages
+        .iter()
+        .map(|s| StageReport {
+            label: format!("{}#{}", s.port, s.node),
+            leaf: s.port.clone(),
+            native_cases: s.native_cases,
+            object_hash: s.seal.clone(),
+            elf_symbol: s.symbol.clone(),
+        })
+        .collect();
+
+    let mut notes: Vec<String> = Vec::new();
+    for s in &v.stages {
+        if s.not_reached_cases > 0 {
+            notes.push(format!(
+                "{} is data-dependent: it did not run on {} of {} cases",
+                s.port, s.not_reached_cases, v.cases_run
+            ));
+        }
+    }
+    notes.push(format!("composition_ir_hash={}", v.composition_ir_hash));
+    notes.push(format!(
+        "dependency_binding_hash={}",
+        v.dependency_binding_hash
+    ));
+    notes.push(format!("behavior_hash={}", v.behavior_hash));
+    notes.push(format!(
+        "composition_artifact_hash={}",
+        v.composition_artifact_hash
+    ));
+
+    Ok(CompositionReport {
+        target: v.target.clone(),
+        stages: def.target.stages.iter().map(|s| (*s).to_string()).collect(),
+        cases_run: v.cases_run,
+        stage_reports,
+        notes,
+        fallback_cases: v.fallback_cases,
+        broken_seal_cases: v.broken_seal_cases,
+        cases_passed: v.cases_passed,
+        cases_failed: v.cases_failed,
+        dispatches_run: v.dispatches_run,
+        oracle_hash: v.oracle_hash.clone(),
+        chain_hash: v.composition_artifact_hash.clone(),
+        verdict: v.verdict.as_str().to_string(),
+        sealed: v.is_sealed_eligible(),
+        evidence_dir,
+    })
+}
+
+/// The committed v2 evidence directory for a composition name.
+pub fn ir_evidence_dir(name: &str) -> String {
+    format!("phost/evidence/composition_ir/{}", name)
+}
+
 /// One composed call, as reported to the CLI.
 #[derive(Clone, Debug)]
 pub struct CompositionCallReport {
@@ -2086,5 +2153,164 @@ mod tests {
             .sealed_chain("phor:compose:toupper_each:c-locale:u8s:v1", &auth)
             .is_some());
         assert!(index.sealed_chain(target::LIBC_MEMCHR.id, &auth).is_none());
+    }
+
+    /// Phase 2 acceptance: the generic IR court and the legacy bespoke court agree
+    /// on **every** composition — the same external answers, the same
+    /// native/fallback accounting, and the same dispatch count. This is the
+    /// equivalence proof that lets the runtime use the IR and lets the legacy
+    /// court remain only as the historical v1 evidence model.
+    #[test]
+    fn test_ir_court_agrees_with_the_legacy_court_for_every_composition() {
+        let auth = PortingAuthority::granted();
+        for def in crate::porting::composition_registry::ALL.iter() {
+            let kind = CompositionKind::parse(def.target.id).expect("known kind");
+            let index = load_persistent_index(kind).expect("persistent index");
+            let cases = (def.cases)();
+            let traces = (def.observe)(&cases, &auth).expect("oracle");
+
+            // Legacy v1 court (bespoke runner).
+            let legacy = match kind {
+                CompositionKind::ToupperMemchr => {
+                    let (v, _) = composition::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+                CompositionKind::ToupperStrlenMemchr => {
+                    let (v, _) =
+                        composition_strlen_memchr::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+                CompositionKind::ToupperStrlenMemchrPair => {
+                    let (v, _) = composition_pair::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+                CompositionKind::ToupperEach => {
+                    let (v, _) =
+                        composition_toupper_each::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+                CompositionKind::ToupperEachStrlenMemchr => {
+                    let (v, _) = composition_nested::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+                CompositionKind::ToupperMemchrSuffix => {
+                    let (v, _) = composition_suffix::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+                CompositionKind::ToupperEachSliceSearch => {
+                    let (v, _) =
+                        composition_slice_search::run_composition_court(&traces, &index, &auth);
+                    legacy_tuple(
+                        v.cases_run,
+                        v.fallback_cases,
+                        v.broken_seal_cases,
+                        v.cases_passed,
+                        v.cases_failed,
+                        v.dispatches_run,
+                        v.is_sealed_eligible(),
+                    )
+                }
+            };
+
+            let (v2, mismatches) = composition_engine::run_ir_court(def, &traces, &index, &auth);
+            let generic = legacy_tuple(
+                v2.cases_run,
+                v2.fallback_cases,
+                v2.broken_seal_cases,
+                v2.cases_passed,
+                v2.cases_failed,
+                v2.dispatches_run,
+                v2.is_sealed_eligible(),
+            );
+
+            // A chain that dispatches a nested **composition** stage has two
+            // legitimate dispatch-count definitions: the legacy court counts only
+            // the chain's own stage calls, the generic court counts every stage
+            // including the nested composition's internals (the runtime/service
+            // definition). Compare behavior and non-dispatch accounting always, and
+            // the dispatch count only where the two definitions coincide.
+            let nested = def
+                .target
+                .stages
+                .iter()
+                .any(|s| s.starts_with("phor:compose:"));
+            let (lc, lf, lb, lp, lfa, ld, ls) = legacy;
+            let (gc, gf, gb, gp, gfa, gd, gs) = generic;
+            assert_eq!(
+                (lc, lf, lb, lp, lfa, ls),
+                (gc, gf, gb, gp, gfa, gs),
+                "{}: legacy and generic courts disagree ({:?})",
+                def.target.id,
+                mismatches
+            );
+            if nested {
+                // The generic count includes the nested composition's internals.
+                assert!(gd >= ld, "{}: generic dispatches < legacy", def.target.id);
+            } else {
+                assert_eq!(ld, gd, "{}: dispatch count differs", def.target.id);
+            }
+        }
+    }
+
+    /// `(cases_run, fallback, broken, passed, failed, dispatches, sealed)`.
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_tuple(
+        cases: u64,
+        fallback: u64,
+        broken: u64,
+        passed: u64,
+        failed: u64,
+        dispatches: u64,
+        sealed: bool,
+    ) -> (u64, u64, u64, u64, u64, u64, bool) {
+        (cases, fallback, broken, passed, failed, dispatches, sealed)
     }
 }

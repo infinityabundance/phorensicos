@@ -531,10 +531,12 @@ toupper_memchr 2 (its own call + the slice-search chain's stage)   others 1
 ```
 
 Every composition in the store is also a **dispatchable port**, not just a court
-result: `composition_runner` resolves all seven chain ids, so `dispatch_port` on
-`phor:compose:toupper_memchr:…` runs the sealed chain — and the nested chains
-resolve the sealed compositions `toupper_each` and `toupper_memchr` through the same
-index.
+result: the dispatcher resolves a composition id to its typed `CompositionIR`
+(Phase 2 — a composition is *data*, evaluated by one interpreter), so
+`dispatch_port` on `phor:compose:toupper_memchr:…` runs the sealed chain — and the
+nested chains resolve the sealed compositions `toupper_each` and `toupper_memchr`
+through the same index. The committed session verdict is byte-identical under the
+IR runtime: the mechanism changed, not the behavior. See `docs/COMPOSITION_IR.md`.
 
 ```sh
 cargo run -p phost -- port session                 # one load, thirteen ports, six objects

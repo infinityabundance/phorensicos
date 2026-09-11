@@ -76,7 +76,7 @@ versioned, and the documentation states exactly what was demonstrated.
 |---|---|---|
 | **0** | Compatibility reconciliation (frf-fuzz → frf 0.1.86 / gemel 0.11.1) and the executable baseline seal | **done** — see below |
 | **1** | Canonical typed `PortSpec`; migrate all existing leaves. No new leaf ports. | **done** — typed spec + content identity + all six leaf specs + precondition validator + registry-driven generic machinery (`docs/PORT_SPEC.md`) |
-| **2** | Typed `CompositionIR` + one generic interpreter; migrate every existing composition | **core done** — typed IR + validation + content identity + generic interpreter, with `toupper ∘ memchr` proven equivalent to the foreign oracle (`docs/COMPOSITION_IR.md`); migrating the six runners remains |
+| **2** | Typed `CompositionIR` + one generic interpreter; migrate every existing composition | **done** — the seven chains are IR data, evaluated by one interpreter on both the foreign and sealed side; the `composition_runner` branch is removed and the runtime resolves compositions as data; artifact identities versioned v2; equivalence to the legacy court and the committed v1 evidence is proven (`docs/COMPOSITION_IR.md`) |
 | **3** | Court sensitivity/challenge + semantic mutation profiles | not started |
 | **4** | FRF-Fuzz differential exploration + residual semantic bank + court-verified minimization | not started |
 | **5** | Gemel longitudinal memory + failed-attempt/negative-knowledge integration | not started |
@@ -132,21 +132,34 @@ module and fails if a `.id ==` target branch reappears.
 The refactor is behavior-preserving: all committed leaf, composition, store,
 session and cross-implementation evidence is byte-identical (Gate A).
 
-### Phase 2 — core done
+### Phase 2 — done
 
 `phost/src/porting/composition_ir.rs` defines the typed `CompositionIR` (SSA-like
-values, `Call`/`MapBytes`/`Slice`/`Compare`/`Select`/`FoldBytes` nodes), validation
-(bounded, typed, and acyclic because every operand must reference an earlier node),
-the domain-separated content identity
+values; `Input`/`ConstantScalar`/`Call`/`MapBytes`/`PackUsize`/`Observe`/`Slice`/
+`Compare`/`Binary`/`Select` nodes), validation (bounded, typed, and acyclic because
+every operand must reference an earlier node), the domain-separated content identity
 `CompositionIrId = SHA-256("PHOR/COMPOSITION-IR/v1\0" || canonical_bytes)`, and one
-generic `eval` over a `PortBackend` trait so the oracle side and the sealed side
-run the *same* graph. A test expresses `toupper ∘ memchr` as IR and reproduces the
-foreign oracle over the whole 560-case corpus. See `docs/COMPOSITION_IR.md`.
+lazy generic `eval` over a `PortBackend` so the oracle side and the sealed side run
+the *same* graph.
 
-The remainder of Phase 2 is migrating the six bespoke runners onto the IR,
-providing `ForeignBackend`/`SealedBackend`, removing the `CompositionKind`
-dispatch, and versioning the artifact identities (behavior / IR / dependency
-binding / artifact hashes) without faking byte equality with the pre-IR verdicts.
+`phost/src/porting/composition_registry.rs` is the one composition table: each of
+the seven chains is IR data plus a deterministic corpus. Adding a composition is new
+data, not a new runner. `phost/src/porting/composition_engine.rs` provides the
+`ForeignBackend` (the cage) and `SealedBackend` (`NativeDispatcher`), the generic
+court, and `eval_composition_port` — the runtime path. The `composition_runner(id)`
+branch is gone; `NativeDispatcher` resolves a composition port to its IR and
+recurses through the same dispatcher, so every leaf-seal check and dispatch count is
+preserved (the committed session verdict `d219be2c…` is byte-identical).
+
+A composed artifact binds four v2 identities — `composition_ir_hash`,
+`dependency_binding_hash`, `behavior_hash`, `composition_artifact_hash` — and the
+historical v1 `chain_hash` remains the seal the store publishes. The v2 evidence
+lives in `phost/evidence/composition_ir/<name>/` and is verified by
+`verify_composition_ir_court.sh` (four identities, per-stage accounting, and each
+stage's seal cross-checked against the committed store — a seal of a seal).
+Equivalence is proven two ways: the in-test cross-check
+(`test_ir_court_agrees_with_the_legacy_court_for_every_composition`) and the
+byte-identical v1 evidence under the legacy verifier. See `docs/COMPOSITION_IR.md`.
 
 ---
 

@@ -255,6 +255,27 @@ pub fn write_composition_evidence(
     Ok(verdict_path.display().to_string())
 }
 
+/// Write the **v2** composition evidence set: the oracle traces and the generic
+/// `IrVerdict` (the four identities plus per-stage accounting). The schema string
+/// is `…composition_verdict.v2`, so a v2 artifact can never be mistaken for the
+/// historical v1 schema, and it lives in its own evidence directory.
+pub fn write_ir_composition_evidence(
+    dir: &str,
+    traces: &[OracleTrace],
+    verdict: &crate::porting::composition_engine::IrVerdict,
+    mismatches: &[Mismatch],
+) -> io::Result<String> {
+    let base = PathBuf::from(dir);
+    fs::create_dir_all(&base)?;
+    fs::write(
+        base.join("composition_oracle_traces.json"),
+        oracle_trace::traces_to_json(traces),
+    )?;
+    let verdict_path = base.join("composition_verdict.json");
+    fs::write(&verdict_path, verdict.to_json(mismatches))?;
+    Ok(verdict_path.display().to_string())
+}
+
 /// Write the sealed native **session** evidence: many consumers served from one
 /// verified store load. Returns the verdict path.
 ///

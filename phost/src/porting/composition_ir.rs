@@ -17,7 +17,7 @@
 // versioned because it must preserve every committed composition verdict.
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// The identity domain tag for canonical encoding.
@@ -104,8 +104,18 @@ pub enum Node {
     /// A call to a sealed port, returning its observable as a typed value.
     Call { port: String, args: Vec<ValueId> },
     /// Apply a unary byte-to-byte port (e.g. `toupper`) across every byte of a
-    /// buffer. The registered `MapBytes` port must return a `Scalar` byte.
+    /// buffer. The registered port takes a one-byte buffer and returns a one-byte
+    /// buffer, matching the court ABI (`toupper` takes `[byte]`).
     MapBytes { port: String, input: ValueId },
+    /// Encode a scalar as an 8-byte little-endian buffer. This is the ABI packing
+    /// boundary made explicit: a derived length or index that is passed to a port
+    /// as an argument must first become the byte buffer that port's ABI expects.
+    PackUsize { value: ValueId },
+    /// Observe a value for its **effect**: force evaluation of `value` (so a stage
+    /// whose *status* is observed runs even when its result is not consumed on this
+    /// path) and yield `Bool(true)`. A `Bool` output is a non-observable effect
+    /// marker: it is never encoded into the port's observable bytes.
+    Observe { value: ValueId },
     /// A sub-slice of a byte buffer: `input[origin .. origin+length]`.
     Slice {
         input: ValueId,
@@ -118,6 +128,14 @@ pub enum Node {
         op: CompareOp,
         rhs: ValueId,
     },
+    /// Integer arithmetic on scalars, used to derive a slice's length from the
+    /// producer's output (`window - origin`). Saturating, so a window that a
+    /// correct `memchr` never violates still cannot panic.
+    Binary {
+        op: BinOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    },
     /// A conditional value. This is how a data-dependent *non-execution* is
     /// represented explicitly: `Select` is a value choice, and only the taken
     /// branch is evaluated, so "a stage did not run" is never confused with "a
@@ -126,12 +144,6 @@ pub enum Node {
         condition: ValueId,
         then_value: ValueId,
         else_value: ValueId,
-    },
-    /// Fold a buffer with a binary port: `acc = port(acc, item)` for each byte.
-    FoldBytes {
-        port: String,
-        init: ValueId,
-        input: ValueId,
     },
 }
 
@@ -165,6 +177,31 @@ impl CompareOp {
             CompareOp::Le => l <= r,
             CompareOp::Gt => l > r,
             CompareOp::Ge => l >= r,
+        }
+    }
+}
+
+/// Integer arithmetic on scalars. Only the two operations the real chains need
+/// are admitted; a node earns its place by being load-bearing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+}
+
+impl BinOp {
+    fn tag(&self) -> u8 {
+        match self {
+            BinOp::Add => 1,
+            BinOp::Sub => 2,
+        }
+    }
+
+    fn eval(self, l: i64, r: i64) -> i64 {
+        match self {
+            // Saturating: a length cannot go negative, and an overflow cannot panic.
+            BinOp::Add => l.saturating_add(r),
+            BinOp::Sub => l.saturating_sub(r),
         }
     }
 }
@@ -263,6 +300,14 @@ pub fn canonical_bytes(ir: &CompositionIR) -> Vec<u8> {
                 c.str(port);
                 c.u32(input.0);
             }
+            Node::PackUsize { value } => {
+                c.u8(8);
+                c.u32(value.0);
+            }
+            Node::Observe { value } => {
+                c.u8(10);
+                c.u32(value.0);
+            }
             Node::Slice {
                 input,
                 origin,
@@ -285,6 +330,12 @@ pub fn canonical_bytes(ir: &CompositionIR) -> Vec<u8> {
                 c.u8(op.tag());
                 c.u32(rhs.0);
             }
+            Node::Binary { op, lhs, rhs } => {
+                c.u8(9);
+                c.u8(op.tag());
+                c.u32(lhs.0);
+                c.u32(rhs.0);
+            }
             Node::Select {
                 condition,
                 then_value,
@@ -294,12 +345,6 @@ pub fn canonical_bytes(ir: &CompositionIR) -> Vec<u8> {
                 c.u32(condition.0);
                 c.u32(then_value.0);
                 c.u32(else_value.0);
-            }
-            Node::FoldBytes { port, init, input } => {
-                c.u8(8);
-                c.str(port);
-                c.u32(init.0);
-                c.u32(input.0);
             }
         }
     }
@@ -442,6 +487,21 @@ pub fn validate(ir: &CompositionIR) -> Result<Vec<Type>, IrError> {
                     }
                 }
             }
+            Node::PackUsize { value } => match ty_of(&types, *value, i)? {
+                Type::Scalar => Type::Bytes,
+                other => {
+                    return Err(IrError::TypeError {
+                        node: i,
+                        expected: "scalar",
+                        found: other.name(),
+                    })
+                }
+            },
+            Node::Observe { value } => {
+                // Any value may be observed; the node forces its evaluation.
+                ty_of(&types, *value, i)?;
+                Type::Bool
+            }
             Node::Slice {
                 input,
                 origin,
@@ -496,6 +556,21 @@ pub fn validate(ir: &CompositionIR) -> Result<Vec<Type>, IrError> {
                 }
                 Type::Bool
             }
+            Node::Binary { op: _, lhs, rhs } => {
+                for v in [lhs, rhs] {
+                    match ty_of(&types, *v, i)? {
+                        Type::Scalar => {}
+                        other => {
+                            return Err(IrError::TypeError {
+                                node: i,
+                                expected: "scalar",
+                                found: other.name(),
+                            })
+                        }
+                    }
+                }
+                Type::Scalar
+            }
             Node::Select {
                 condition,
                 then_value,
@@ -521,32 +596,6 @@ pub fn validate(ir: &CompositionIR) -> Result<Vec<Type>, IrError> {
                     });
                 }
                 a
-            }
-            Node::FoldBytes { port, init, input } => {
-                if port.is_empty() {
-                    return Err(IrError::EmptyPort { node: i });
-                }
-                match ty_of(&types, *input, i)? {
-                    Type::Bytes => {}
-                    other => {
-                        return Err(IrError::TypeError {
-                            node: i,
-                            expected: "bytes",
-                            found: other.name(),
-                        })
-                    }
-                }
-                match ty_of(&types, *init, i)? {
-                    Type::Scalar => {}
-                    other => {
-                        return Err(IrError::TypeError {
-                            node: i,
-                            expected: "scalar",
-                            found: other.name(),
-                        })
-                    }
-                }
-                Type::Scalar
             }
         };
         types.push(t);
@@ -578,22 +627,65 @@ pub fn validate(ir: &CompositionIR) -> Result<Vec<Type>, IrError> {
 // The generic interpreter
 // ---------------------------------------------------------------------------
 
+/// Identifies the IR node that made a call. A chain may call the same port from
+/// more than one stage (the haystack fold and the needle fold both call
+/// `toupper`), so per-stage accounting keys on the *site*, not the port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SiteId(pub usize);
+
 /// The port backend the interpreter runs against. `ForeignBackend` routes to the
 /// dialect cage (the oracle); `SealedBackend` routes through `NativeDispatcher`.
 /// Because both implement the same trait and the *same* IR is evaluated on both,
 /// the oracle implementation and the native implementation cannot drift.
 pub trait PortBackend {
-    /// Call a sealed port with typed arguments, returning its observable.
-    fn call(&mut self, port: &str, args: &[Value]) -> Result<Value, BackendError>;
+    /// Notify the backend that IR `site` was **reached** and is about to dispatch,
+    /// even if it turns out to make no calls (a byte map over an empty buffer is
+    /// vacuously native, not unreached). The default is a no-op.
+    fn enter(&mut self, _site: SiteId) {}
+
+    /// Call a port at IR `site` with typed arguments, returning its observable.
+    fn call(&mut self, site: SiteId, port: &str, args: &[Value]) -> Result<Value, BackendError>;
 }
 
-/// A backend refusal.
+/// How a backend call failed. The distinction is load-bearing: a foreign
+/// fallback is not a broken seal, and neither is a refused call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendFailure {
+    /// The port resolved to the foreign implementation instead of a sealed one.
+    Fallback,
+    /// A sealed entry existed but failed to load, verify, or execute.
+    Broken,
+    /// The backend could not answer (unknown port, malformed argument).
+    Refused,
+}
+
+/// A backend refusal, tagged with its failure class.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackendError(pub String);
+pub struct BackendError {
+    pub kind: BackendFailure,
+    pub message: String,
+}
 
 impl BackendError {
     pub fn new(m: impl Into<String>) -> Self {
-        BackendError(m.into())
+        BackendError {
+            kind: BackendFailure::Refused,
+            message: m.into(),
+        }
+    }
+
+    pub fn fallback(m: impl Into<String>) -> Self {
+        BackendError {
+            kind: BackendFailure::Fallback,
+            message: m.into(),
+        }
+    }
+
+    pub fn broken(m: impl Into<String>) -> Self {
+        BackendError {
+            kind: BackendFailure::Broken,
+            message: m.into(),
+        }
     }
 }
 
@@ -606,19 +698,65 @@ pub enum EvalError {
     RuntimeType { node: usize, expected: &'static str },
     /// A slice went out of bounds.
     SliceOutOfBounds { node: usize },
-    /// A backend refused.
-    Backend { node: usize, error: String },
+    /// A backend call failed, carrying the failure class.
+    Backend {
+        node: usize,
+        kind: BackendFailure,
+        error: String,
+    },
     /// The evaluation recursion exceeded the bound.
     DepthExceeded,
     /// An output reference was out of range.
     OutputOutOfRange,
 }
 
+/// Per-node evaluation state, so a shared value is evaluated once and a cycle is
+/// rejected rather than recursed into.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    Idle,
+    InProgress,
+    Done,
+}
+
+fn expect_bytes(v: Value, node: usize) -> Result<Vec<u8>, EvalError> {
+    match v {
+        Value::Bytes(b) => Ok(b),
+        _ => Err(EvalError::RuntimeType {
+            node,
+            expected: "bytes",
+        }),
+    }
+}
+
+fn expect_scalar(v: Value, node: usize) -> Result<i64, EvalError> {
+    match v {
+        Value::Scalar(s) => Ok(s),
+        _ => Err(EvalError::RuntimeType {
+            node,
+            expected: "scalar",
+        }),
+    }
+}
+
+fn expect_bool(v: Value, node: usize) -> Result<bool, EvalError> {
+    match v {
+        Value::Bool(b) => Ok(b),
+        _ => Err(EvalError::RuntimeType {
+            node,
+            expected: "bool",
+        }),
+    }
+}
+
 /// Evaluate a validated IR against `inputs`, returning the declared outputs.
 ///
-/// The graph is acyclic by validation, so this is a single forward pass; only the
-/// taken branch of a `Select` is evaluated, which is what makes a data-dependent
-/// non-execution explicit rather than implicit.
+/// Evaluation is **lazy**: only nodes reachable from an output through the taken
+/// branch of each `Select` are evaluated. That is what makes a data-dependent
+/// *non-execution* real rather than nominal — a stage on the untaken branch is
+/// never dispatched, so "a stage did not run" can never be confused with "a stage
+/// succeeded". The graph is acyclic by validation; a shared node is evaluated once
+/// (memoized) so no port is called twice for one logical value.
 pub fn eval(
     ir: &CompositionIR,
     backend: &mut dyn PortBackend,
@@ -632,148 +770,246 @@ pub fn eval(
         });
     }
 
-    let mut values: Vec<Value> = Vec::with_capacity(ir.nodes.len());
-
-    for (i, node) in ir.nodes.iter().enumerate() {
-        let v = match node {
-            Node::Input { index } => inputs[*index as usize].clone(),
-            Node::ConstantScalar { value } => Value::Scalar(*value),
-            Node::Call { port, args } => {
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    vals.push(values[a.0 as usize].clone());
-                }
-                backend.call(port, &vals).map_err(|e| EvalError::Backend {
-                    node: i,
-                    error: e.0,
-                })?
-            }
-            Node::MapBytes { port, input } => {
-                let bytes = values[input.0 as usize]
-                    .as_bytes()
-                    .ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "bytes",
-                    })?;
-                let mut out = Vec::with_capacity(bytes.len());
-                for b in bytes {
-                    let r = backend
-                        .call(port, &[Value::Scalar(*b as i64)])
-                        .map_err(|e| EvalError::Backend {
-                            node: i,
-                            error: e.0,
-                        })?;
-                    out.push(r.as_scalar().ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "scalar byte",
-                    })? as u8);
-                }
-                Value::Bytes(out)
-            }
-            Node::Slice {
-                input,
-                origin,
-                length,
-            } => {
-                let bytes = values[input.0 as usize]
-                    .as_bytes()
-                    .ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "bytes",
-                    })?;
-                let o = values[origin.0 as usize]
-                    .as_scalar()
-                    .ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "scalar",
-                    })?;
-                let o = if o < 0 { 0usize } else { o as usize };
-                let end = match length {
-                    Some(l) => {
-                        let len =
-                            values[l.0 as usize]
-                                .as_scalar()
-                                .ok_or(EvalError::RuntimeType {
-                                    node: i,
-                                    expected: "scalar",
-                                })?;
-                        let len = if len < 0 { 0usize } else { len as usize };
-                        o.saturating_add(len)
-                    }
-                    None => bytes.len(),
-                };
-                let end = end.min(bytes.len());
-                if o > bytes.len() {
-                    return Err(EvalError::SliceOutOfBounds { node: i });
-                }
-                Value::Bytes(bytes[o..end].to_vec())
-            }
-            Node::Compare { lhs, op, rhs } => {
-                let l = values[lhs.0 as usize]
-                    .as_scalar()
-                    .ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "scalar",
-                    })?;
-                let r = values[rhs.0 as usize]
-                    .as_scalar()
-                    .ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "scalar",
-                    })?;
-                Value::Bool(op.eval(l, r))
-            }
-            Node::Select {
-                condition,
-                then_value,
-                else_value,
-            } => {
-                let c = match values[condition.0 as usize] {
-                    Value::Bool(b) => b,
-                    _ => {
-                        return Err(EvalError::RuntimeType {
-                            node: i,
-                            expected: "bool",
-                        })
-                    }
-                };
-                // Only the taken branch is materialized; both were evaluated in the
-                // single forward pass (the IR is not lazy), but the *value* choice is
-                // explicit and hashed, so a skipped stage is observable.
-                values[(if c { *then_value } else { *else_value }).0 as usize].clone()
-            }
-            Node::FoldBytes { port, init, input } => {
-                let mut acc = values[init.0 as usize].clone();
-                let bytes = values[input.0 as usize]
-                    .as_bytes()
-                    .ok_or(EvalError::RuntimeType {
-                        node: i,
-                        expected: "bytes",
-                    })?;
-                for b in bytes {
-                    acc = backend
-                        .call(port, &[acc, Value::Scalar(*b as i64)])
-                        .map_err(|e| EvalError::Backend {
-                            node: i,
-                            error: e.0,
-                        })?;
-                }
-                acc
-            }
-        };
-        values.push(v);
-    }
+    let n = ir.nodes.len();
+    let mut cache: Vec<Option<Value>> = alloc::vec![None; n];
+    let mut visit: Vec<Visit> = alloc::vec![Visit::Idle; n];
 
     let mut out = Vec::with_capacity(ir.outputs.len());
     for o in &ir.outputs {
-        out.push(
-            values
-                .get(o.value.0 as usize)
-                .ok_or(EvalError::OutputOutOfRange)?
-                .clone(),
-        );
+        let idx = o.value.0 as usize;
+        if idx >= n {
+            return Err(EvalError::OutputOutOfRange);
+        }
+        out.push(eval_node(
+            ir, backend, inputs, &mut cache, &mut visit, idx, 0,
+        )?);
     }
     Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_node(
+    ir: &CompositionIR,
+    backend: &mut dyn PortBackend,
+    inputs: &[Value],
+    cache: &mut [Option<Value>],
+    visit: &mut [Visit],
+    i: usize,
+    depth: usize,
+) -> Result<Value, EvalError> {
+    if depth > MAX_DEPTH {
+        return Err(EvalError::DepthExceeded);
+    }
+    match visit[i] {
+        Visit::Done => return Ok(cache[i].clone().expect("Done implies cached")),
+        Visit::InProgress => {
+            return Err(EvalError::Invalid(IrError::ForwardReference {
+                node: i,
+                value: i as u32,
+            }))
+        }
+        Visit::Idle => {}
+    }
+    visit[i] = Visit::InProgress;
+
+    let node = &ir.nodes[i];
+    let v = match node {
+        Node::Input { index } => inputs[*index as usize].clone(),
+        Node::ConstantScalar { value } => Value::Scalar(*value),
+        Node::Call { port, args } => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_node(
+                    ir,
+                    backend,
+                    inputs,
+                    cache,
+                    visit,
+                    a.0 as usize,
+                    depth + 1,
+                )?);
+            }
+            backend.enter(SiteId(i));
+            backend
+                .call(SiteId(i), port, &vals)
+                .map_err(|e| EvalError::Backend {
+                    node: i,
+                    kind: e.kind,
+                    error: e.message,
+                })?
+        }
+        Node::MapBytes { port, input } => {
+            let bytes = expect_bytes(
+                eval_node(
+                    ir,
+                    backend,
+                    inputs,
+                    cache,
+                    visit,
+                    input.0 as usize,
+                    depth + 1,
+                )?,
+                i,
+            )?;
+            backend.enter(SiteId(i));
+            let mut out = Vec::with_capacity(bytes.len());
+            for b in bytes {
+                // The unit port is called with a one-byte buffer, matching the court
+                // ABI (`toupper` takes `[byte]`), not a packed scalar.
+                let r = backend
+                    .call(SiteId(i), port, &[Value::Bytes(alloc::vec![b])])
+                    .map_err(|e| EvalError::Backend {
+                        node: i,
+                        kind: e.kind,
+                        error: e.message,
+                    })?;
+                match r {
+                    Value::Bytes(v) => out.push(v.first().copied().unwrap_or(b)),
+                    _ => {
+                        return Err(EvalError::RuntimeType {
+                            node: i,
+                            expected: "bytes byte",
+                        })
+                    }
+                }
+            }
+            Value::Bytes(out)
+        }
+        Node::PackUsize { value } => {
+            let s = expect_scalar(
+                eval_node(
+                    ir,
+                    backend,
+                    inputs,
+                    cache,
+                    visit,
+                    value.0 as usize,
+                    depth + 1,
+                )?,
+                i,
+            )?;
+            // A negative length or index cannot be a legitimate argument; encode it
+            // as 0 rather than wrapping to an enormous u64.
+            Value::Bytes((s.max(0) as u64).to_le_bytes().to_vec())
+        }
+        Node::Observe { value } => {
+            // Force the observed value's evaluation (and hence its dispatch), then
+            // yield a non-observable effect marker.
+            eval_node(
+                ir,
+                backend,
+                inputs,
+                cache,
+                visit,
+                value.0 as usize,
+                depth + 1,
+            )?;
+            Value::Bool(true)
+        }
+        Node::Slice {
+            input,
+            origin,
+            length,
+        } => {
+            let bytes = expect_bytes(
+                eval_node(
+                    ir,
+                    backend,
+                    inputs,
+                    cache,
+                    visit,
+                    input.0 as usize,
+                    depth + 1,
+                )?,
+                i,
+            )?;
+            let o = expect_scalar(
+                eval_node(
+                    ir,
+                    backend,
+                    inputs,
+                    cache,
+                    visit,
+                    origin.0 as usize,
+                    depth + 1,
+                )?,
+                i,
+            )?;
+            let o = if o < 0 { 0usize } else { o as usize };
+            let end = match length {
+                Some(l) => {
+                    let len = expect_scalar(
+                        eval_node(ir, backend, inputs, cache, visit, l.0 as usize, depth + 1)?,
+                        i,
+                    )?;
+                    let len = if len < 0 { 0usize } else { len as usize };
+                    o.saturating_add(len)
+                }
+                None => bytes.len(),
+            };
+            let end = end.min(bytes.len());
+            if o > bytes.len() {
+                return Err(EvalError::SliceOutOfBounds { node: i });
+            }
+            Value::Bytes(bytes[o..end].to_vec())
+        }
+        Node::Compare { lhs, op, rhs } => {
+            let l = expect_scalar(
+                eval_node(ir, backend, inputs, cache, visit, lhs.0 as usize, depth + 1)?,
+                i,
+            )?;
+            let r = expect_scalar(
+                eval_node(ir, backend, inputs, cache, visit, rhs.0 as usize, depth + 1)?,
+                i,
+            )?;
+            Value::Bool(op.eval(l, r))
+        }
+        Node::Binary { op, lhs, rhs } => {
+            let l = expect_scalar(
+                eval_node(ir, backend, inputs, cache, visit, lhs.0 as usize, depth + 1)?,
+                i,
+            )?;
+            let r = expect_scalar(
+                eval_node(ir, backend, inputs, cache, visit, rhs.0 as usize, depth + 1)?,
+                i,
+            )?;
+            Value::Scalar(op.eval(l, r))
+        }
+        Node::Select {
+            condition,
+            then_value,
+            else_value,
+        } => {
+            let c = expect_bool(
+                eval_node(
+                    ir,
+                    backend,
+                    inputs,
+                    cache,
+                    visit,
+                    condition.0 as usize,
+                    depth + 1,
+                )?,
+                i,
+            )?;
+            // Only the taken branch is evaluated: the other branch (and everything
+            // it depends on) is never dispatched.
+            let taken = if c { *then_value } else { *else_value };
+            eval_node(
+                ir,
+                backend,
+                inputs,
+                cache,
+                visit,
+                taken.0 as usize,
+                depth + 1,
+            )?
+        }
+    };
+
+    cache[i] = Some(v.clone());
+    visit[i] = Visit::Done;
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -809,10 +1045,19 @@ mod tests {
 
     struct UpperBackend;
     impl PortBackend for UpperBackend {
-        fn call(&mut self, port: &str, args: &[Value]) -> Result<Value, BackendError> {
+        fn call(
+            &mut self,
+            _site: SiteId,
+            port: &str,
+            args: &[Value],
+        ) -> Result<Value, BackendError> {
             if port == LIBC_TOUPPER.id {
-                let b = args[0].as_scalar().unwrap_or(0) as u8;
-                Ok(Value::Scalar((b.to_ascii_uppercase()) as i64))
+                let b = args[0]
+                    .as_bytes()
+                    .and_then(|b| b.first())
+                    .copied()
+                    .unwrap_or(0);
+                Ok(Value::Bytes(alloc::vec![b.to_ascii_uppercase()]))
             } else {
                 Err(BackendError::new("unknown port"))
             }
@@ -944,50 +1189,65 @@ mod tests {
         let ir = CompositionIR {
             id: String::from("phor:compose:toupper_memchr:c-locale:index:v1"),
             locale_contract: String::from("C"),
-            inputs: alloc::vec![Type::Bytes, Type::Scalar, Type::Scalar],
+            inputs: alloc::vec![Type::Bytes, Type::Bytes, Type::Scalar],
             outputs: alloc::vec![Output {
                 ty: Type::Scalar,
-                value: ValueId(7),
+                value: ValueId(8),
             }],
             nodes: alloc::vec![
-                Node::Input { index: 0 },          // 0 haystack
-                Node::Input { index: 1 },          // 1 needle
-                Node::Input { index: 2 },          // 2 n
-                Node::ConstantScalar { value: 0 }, // 3 origin
-                // 4: slice first n bytes of the haystack
-                Node::Slice {
-                    input: ValueId(0),
-                    origin: ValueId(3),
-                    length: Some(ValueId(2)),
-                },
-                // 5: fold the slice with toupper
+                Node::Input { index: 0 }, // 0 haystack
+                Node::Input { index: 1 }, // 1 needle (one byte)
+                Node::Input { index: 2 }, // 2 n
+                // 3: fold the whole haystack with toupper
                 Node::MapBytes {
                     port: String::from(LIBC_TOUPPER.id),
-                    input: ValueId(4),
+                    input: ValueId(0),
                 },
-                // 6: fold the needle
-                Node::Call {
+                // 4: fold the needle with the same port
+                Node::MapBytes {
                     port: String::from(LIBC_TOUPPER.id),
-                    args: alloc::vec![ValueId(1)],
+                    input: ValueId(1),
                 },
-                // 7: search
+                // 5: pack n as the search bound
+                Node::PackUsize { value: ValueId(2) },
+                // 6: search the folded haystack for the folded needle
                 Node::Call {
                     port: String::from(LIBC_MEMCHR.id),
-                    args: alloc::vec![ValueId(5), ValueId(6), ValueId(2)],
+                    args: alloc::vec![ValueId(3), ValueId(4), ValueId(5)],
                 },
             ],
         };
+        // The output reference is the memchr call.
+        let mut ir = ir;
+        ir.outputs[0].value = ValueId(6);
 
         struct MirrorBackend;
         impl PortBackend for MirrorBackend {
-            fn call(&mut self, port: &str, args: &[Value]) -> Result<Value, BackendError> {
+            fn call(
+                &mut self,
+                _site: SiteId,
+                port: &str,
+                args: &[Value],
+            ) -> Result<Value, BackendError> {
                 if port == LIBC_TOUPPER.id {
-                    let b = args[0].as_scalar().unwrap_or(0) as u8;
-                    Ok(Value::Scalar(phor_toupper(b) as i64))
+                    let b = args[0]
+                        .as_bytes()
+                        .and_then(|b| b.first())
+                        .copied()
+                        .unwrap_or(0);
+                    Ok(Value::Bytes(alloc::vec![phor_toupper(b)]))
                 } else if port == LIBC_MEMCHR.id {
                     let hay = args[0].as_bytes().ok_or(BackendError::new("bytes"))?;
-                    let needle = args[1].as_scalar().unwrap_or(0) as u8;
-                    let n = args[2].as_scalar().unwrap_or(0) as usize;
+                    let needle = args[1]
+                        .as_bytes()
+                        .and_then(|b| b.first())
+                        .copied()
+                        .unwrap_or(0);
+                    let n = args[2]
+                        .as_bytes()
+                        .and_then(|b| b.first())
+                        .copied()
+                        .unwrap_or(0) as usize;
                     Ok(Value::Scalar(phor_memchr(hay, needle, n) as i64))
                 } else {
                     Err(BackendError::new("unknown port"))
@@ -995,25 +1255,23 @@ mod tests {
             }
         }
 
-        let comp = crate::porting::composition::COMPOSITION_TOUPPER_MEMCHR;
         let cases = crate::porting::composition::composition_corpus();
         let traces =
             dialect_cage::observe_composition(&cases, &crate::porting::PortingAuthority::granted())
                 .unwrap();
         assert!(!traces.is_empty());
-        let _ = comp;
 
         let mut backend = MirrorBackend;
         for (case, trace) in cases.iter().zip(traces.iter()) {
             let hay = case.args[0].clone();
-            let needle = case.args[1][0];
+            let needle = alloc::vec![case.args[1][0]];
             let n = crate::porting::candidate::decode_usize(&case.args[2]);
             let out = eval(
                 &ir,
                 &mut backend,
                 &[
                     Value::Bytes(hay),
-                    Value::Scalar(needle as i64),
+                    Value::Bytes(needle),
                     Value::Scalar(n as i64),
                 ],
             )
@@ -1023,5 +1281,117 @@ mod tests {
                 crate::porting::candidate::decode_index(&hex::decode(&trace.output_hex).unwrap());
             assert_eq!(got, want, "case {} diverged from the oracle", case.case_id);
         }
+    }
+
+    /// A `Select` on an untaken branch must not evaluate that branch, so a stage
+    /// that should not run is never dispatched. This is the interpreter property
+    /// that makes data-dependent non-execution real.
+    #[test]
+    fn test_select_is_lazy_and_does_not_evaluate_the_untaken_branch() {
+        use core::cell::Cell;
+
+        // (condition_scalar) -> scalar: if cond >= 0 { call(a) } else { -1 }
+        let ir = CompositionIR {
+            id: String::from("phor:compose:lazy-test:v1"),
+            locale_contract: String::from("C"),
+            inputs: alloc::vec![Type::Scalar],
+            outputs: alloc::vec![Output {
+                ty: Type::Scalar,
+                value: ValueId(5),
+            }],
+            nodes: alloc::vec![
+                Node::Input { index: 0 },          // 0 cond
+                Node::ConstantScalar { value: 0 }, // 1 zero
+                Node::Compare {
+                    lhs: ValueId(0),
+                    op: CompareOp::Ge,
+                    rhs: ValueId(1),
+                }, // 2 cond >= 0
+                Node::Call {
+                    port: String::from("counting"),
+                    args: alloc::vec![ValueId(0)],
+                }, // 3 the side-effecting stage
+                Node::ConstantScalar { value: -1 }, // 4 else value
+                Node::Select {
+                    condition: ValueId(2),
+                    then_value: ValueId(3),
+                    else_value: ValueId(4),
+                }, // 5 result
+            ],
+        };
+
+        struct CountingBackend<'a>(&'a Cell<u64>);
+        impl PortBackend for CountingBackend<'_> {
+            fn call(
+                &mut self,
+                _site: SiteId,
+                _port: &str,
+                _args: &[Value],
+            ) -> Result<Value, BackendError> {
+                self.0.set(self.0.get() + 1);
+                Ok(Value::Scalar(7))
+            }
+        }
+
+        let calls = Cell::new(0u64);
+        let mut b = CountingBackend(&calls);
+        let out = eval(&ir, &mut b, &[Value::Scalar(-1)]).unwrap();
+        assert_eq!(out, alloc::vec![Value::Scalar(-1)]);
+        assert_eq!(calls.get(), 0, "the untaken branch must not be dispatched");
+
+        let out = eval(&ir, &mut b, &[Value::Scalar(3)]).unwrap();
+        assert_eq!(out, alloc::vec![Value::Scalar(7)]);
+        assert_eq!(calls.get(), 1, "the taken branch must be dispatched once");
+    }
+
+    /// A shared node is memoized: a fan-in value dispatches once, not once per
+    /// consumer.
+    #[test]
+    fn test_a_shared_node_is_evaluated_once() {
+        use core::cell::Cell;
+
+        // (n) -> (call(n), call(n)) as a tuple of two outputs sharing one node.
+        let ir = CompositionIR {
+            id: String::from("phor:compose:share-test:v1"),
+            locale_contract: String::from("C"),
+            inputs: alloc::vec![Type::Scalar],
+            outputs: alloc::vec![
+                Output {
+                    ty: Type::Scalar,
+                    value: ValueId(2),
+                },
+                Output {
+                    ty: Type::Scalar,
+                    value: ValueId(2),
+                },
+            ],
+            nodes: alloc::vec![
+                Node::Input { index: 0 },
+                Node::PackUsize { value: ValueId(0) },
+                Node::Call {
+                    port: String::from("counting"),
+                    args: alloc::vec![ValueId(1)],
+                },
+            ],
+        };
+
+        struct CountingBackend<'a>(&'a Cell<u64>);
+        impl PortBackend for CountingBackend<'_> {
+            fn call(
+                &mut self,
+                _site: SiteId,
+                _port: &str,
+                _args: &[Value],
+            ) -> Result<Value, BackendError> {
+                self.0.set(self.0.get() + 1);
+                Ok(Value::Scalar(1))
+            }
+        }
+
+        let calls = Cell::new(0u64);
+        let mut b = CountingBackend(&calls);
+        let out = eval(&ir, &mut b, &[Value::Scalar(4)]).unwrap();
+        assert_eq!(out, alloc::vec![Value::Scalar(1), Value::Scalar(1)]);
+        assert_eq!(calls.get(), 1, "a shared node must be evaluated once");
     }
 }

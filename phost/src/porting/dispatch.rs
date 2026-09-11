@@ -292,11 +292,12 @@ impl NativeDispatcher {
                     }
                 }
 
-                let runner =
-                    crate::porting::composition_runner(&composition_id).ok_or_else(|| {
-                        DispatchError::SealBroken(format!("unknown composition {}", composition_id))
-                    })?;
-                let output = runner(self, args, auth)?;
+                let output = crate::porting::composition_engine::eval_composition_port(
+                    self,
+                    &composition_id,
+                    args,
+                    auth,
+                )?;
                 self.dispatched_compositions.insert(port_id.to_string());
 
                 Ok(DispatchOutcome {

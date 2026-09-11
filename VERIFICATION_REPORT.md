@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 265 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` |
+| phost reach | 274 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` and one generic IR composition engine on the runtime path |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -425,6 +425,37 @@ the verifier cross-checks both nested seals against the committed inner verdicts
 Bound in
 `phost/evidence/composition/toupper_each_slice_search/composition_verdict.json`.
 
+#### Generic (IR) composition court — Phase 2
+
+The seven chains above are now also driven by the **generic** court: each is a
+typed `CompositionIR` (data) evaluated by one interpreter on both the foreign and
+the sealed side. This is the court that would run for a *new* composition, since a
+new chain is data rather than a new runner. The v2 evidence lives in
+`phost/evidence/composition_ir/<name>/composition_verdict.json` (schema
+`…composition_verdict.v2`) and binds four identities:
+
+| Identity | Meaning |
+|---|---|
+| `composition_ir_hash` | the graph itself (canonical content identity) |
+| `dependency_binding_hash` | every dependency + the seal it published |
+| `behavior_hash` | normalized observed behavior over the corpus |
+| `composition_artifact_hash` | the bound composition artifact |
+
+All seven pass **over the persistent store with no compiler**: e.g. `toupper_memchr`
+560/560, `toupper_strlen_memchr` 350/350, `toupper_strlen_memchr_pair` 474/474,
+`toupper_each` 267/267, `toupper_each_strlen_memchr` 350/350, `toupper_memchr_suffix`
+688/688, `toupper_each_slice_search` 688/688 — 0 fallbacks, 0 broken seals. The two
+data-dependent chains report the skipped stage explicitly (`not_reached_cases` 254 of
+688 for the suffix search / the consumer composition), never as a native success.
+
+Two independent equivalence proofs tie the generic engine to the legacy court:
+`test_ir_court_agrees_with_the_legacy_court_for_every_composition` asserts identical
+external answers, fallback/broken accounting, and dispatch counts (where the
+definition coincides), and the runtime migration leaves every committed v1 verdict
+byte-identical. `verify_composition_ir_court.sh` checks the four identities, that
+every stage accounts for exactly `cases_run` cases, and that each stage's seal equals
+the committed store's seal for that port — a seal of a seal.
+
 ### Persistent Sealed Port Store
 
 The courts derive a seal; the runtime loads one. `phost/evidence/store/index.json`
@@ -463,7 +494,7 @@ lifetime, so no call re-reads the store.
 | Objects mapped | **6** — the leaf objects are mapped once and reused by every chain |
 | Sealed-port resolutions | **68**, including the stages a chain dispatches from inside its runner |
 | Fan-in | `toupper` **39**, `memchr` **10**, `strlen` **4**, `memcmp` **1**, `strrchr` **1**, `strspn` **1**; `toupper_each` **5** (its own call plus four nested fold stages); `toupper_memchr` **2** (its own call plus the slice-search chain's stage); the other chains **1** |
-| Every port dispatchable | `composition_runner` resolves all seven chain ids, so `dispatch_port` on a composition runs the sealed chain — and the nested chains resolve the sealed compositions `toupper_each` and `toupper_memchr` through the same index |
+| Every port dispatchable | the dispatcher resolves a composition id to its typed `CompositionIR` (Phase 2: a composition is data), so `dispatch_port` on a composition runs the sealed chain — and the nested chains resolve the sealed compositions `toupper_each` and `toupper_memchr` through the same index. The IR runtime reproduces this verdict byte-for-byte (`d219be2c…`) |
 | Cycle safety | a composition cycle in the index is rejected at load (recurring through the index could never terminate) |
 | Independent of path | the same verdict reproduces from a copy of the store at another path |
 
@@ -622,17 +653,27 @@ cargo test -p phost --lib porting::portspec
 cargo test -p phost --lib porting::registry
 ```
 
-**Phase 2 (core): the typed `CompositionIR`.** `phost/src/porting/composition_ir.rs`
-turns composition from bespoke Rust runners into **data**: a typed, bounded,
-acyclic graph over sealed ports with a domain-separated content identity
+**Phase 2 (complete): the typed `CompositionIR` and one generic engine.**
+`phost/src/porting/composition_ir.rs` turns composition from bespoke Rust runners
+into **data**: a typed, bounded, acyclic graph over sealed ports with a
+domain-separated content identity
 `CompositionIrId = SHA-256("PHOR/COMPOSITION-IR/v1\0" ‖ canonical_bytes)` and one
-generic `eval` over a `PortBackend` trait. Because the oracle side and the sealed
+lazy `eval` over a site-aware `PortBackend`. Because the oracle side and the sealed
 side evaluate the *same* graph, a composition has exactly one meaning and cannot
-drift. Validation is structural — bounded counts, correct operand types, and
-acyclicity guaranteed by requiring every operand to reference an earlier node. A
-test expresses `toupper ∘ memchr` as IR and reproduces the foreign oracle over the
-whole 560-case corpus. See `docs/COMPOSITION_IR.md`. Migrating the six bespoke
-runners onto the IR is the remainder of Phase 2.
+drift. `composition_registry.rs` is the one table binding each of the seven chains
+to its IR and corpus; `composition_engine.rs` provides `ForeignBackend` (the cage),
+`SealedBackend` (`NativeDispatcher`), the generic court, and the runtime path
+`eval_composition_port`. The `composition_runner(id)` branch is removed; the runtime
+resolves a composition port to its IR and recurses through the same dispatcher, so
+every seal check and dispatch count is preserved — the committed session verdict
+(`d219be2c…`, 13 calls / 68 dispatches / 6 objects) is byte-identical. A composed
+artifact binds four v2 identities (`composition_ir_hash`,
+`dependency_binding_hash`, `behavior_hash`, `composition_artifact_hash`); the
+historical v1 `chain_hash` remains the seal the store publishes, and the v2 evidence
+lives in `phost/evidence/composition_ir/` verified by
+`verify_composition_ir_court.sh`. Equivalence is proven by an in-test cross-check
+(`test_ir_court_agrees_with_the_legacy_court_for_every_composition`) and by the
+unchanged v1 evidence under the legacy verifier. See `docs/COMPOSITION_IR.md`.
 
 ```sh
 cargo test -p phost --lib porting::composition_ir
@@ -703,8 +744,12 @@ cargo run -p phost -- port compose --target toupper_each_slice_search 62617862:6
 ./verify_composition_court.sh --target toupper_memchr_suffix --check-committed
 ./verify_composition_court.sh --target toupper_each_slice_search      # composition #7 (688)
 ./verify_composition_court.sh --target toupper_each_slice_search --check-committed
+# Phase 2: the generic (IR) composition court — composition as data.
+./verify_composition_ir_court.sh --check-committed                     # composition #1 (560)
+./verify_composition_ir_court.sh --target toupper_each_slice_search --check-committed
 # The store-backed composition court: no compiler, no nested replay.
 cargo run -p phost -- port compose --target toupper_memchr --store --phorc /nonexistent/phorc
+cargo run -p phost -- port compose --target toupper_memchr --ir --store --phorc /nonexistent/phorc
 cargo run -p phost -- port compose --target toupper_each_strlen_memchr --store --phorc /nonexistent/phorc
 ./verify_store.sh                                # persistent store verifier
 ./verify_session.sh                              # sealed native service verifier

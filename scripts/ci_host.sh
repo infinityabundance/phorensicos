@@ -52,6 +52,14 @@ cargo build -q -p phost -p phorc
 ./verify_composition_court.sh --target toupper_each_strlen_memchr --check-committed
 ./verify_composition_court.sh --target toupper_memchr_suffix --check-committed
 ./verify_composition_court.sh --target toupper_each_slice_search --check-committed
+# Phase 2: the generic (IR) composition court — composition as data.
+./verify_composition_ir_court.sh --check-committed
+./verify_composition_ir_court.sh --target toupper_strlen_memchr --check-committed
+./verify_composition_ir_court.sh --target toupper_strlen_memchr_pair --check-committed
+./verify_composition_ir_court.sh --target toupper_each --check-committed
+./verify_composition_ir_court.sh --target toupper_each_strlen_memchr --check-committed
+./verify_composition_ir_court.sh --target toupper_memchr_suffix --check-committed
+./verify_composition_ir_court.sh --target toupper_each_slice_search --check-committed
 ./verify_jit_porting_court.sh --target toupper
 ./verify_jit_porting_court.sh --target memcmp
 ./verify_jit_porting_court.sh --target memchr
@@ -65,3 +73,10 @@ cargo build -q -p phost -p phorc
 ./verify_composition_court.sh --target toupper_each_strlen_memchr
 ./verify_composition_court.sh --target toupper_memchr_suffix
 ./verify_composition_court.sh --target toupper_each_slice_search
+./verify_composition_ir_court.sh
+./verify_composition_ir_court.sh --target toupper_strlen_memchr
+./verify_composition_ir_court.sh --target toupper_strlen_memchr_pair
+./verify_composition_ir_court.sh --target toupper_each
+./verify_composition_ir_court.sh --target toupper_each_strlen_memchr
+./verify_composition_ir_court.sh --target toupper_memchr_suffix
+./verify_composition_ir_court.sh --target toupper_each_slice_search

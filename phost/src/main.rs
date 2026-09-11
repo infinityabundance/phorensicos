@@ -203,7 +203,7 @@ fn port_cli(args: &[String]) -> i32 {
         );
         eprintln!("       phost port native <symbol> [ARGS_HEX] [--no-capability] [--store PATH]");
         eprintln!(
-            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix|toupper_each_slice_search] [ARGS_HEX] [--no-capability] [--store|--derive] [--out DIR] [--phorc PATH]"
+            "       phost port compose [--target toupper_memchr|toupper_strlen_memchr|toupper_strlen_memchr_pair|toupper_each|toupper_each_strlen_memchr|toupper_memchr_suffix|toupper_each_slice_search] [ARGS_HEX] [--no-capability] [--store|--derive] [--ir] [--out DIR] [--phorc PATH]"
         );
         eprintln!("       phost port store [--check|--write] [PATH]");
         eprintln!("       phost port session [--out DIR] [--no-capability]");
@@ -429,12 +429,19 @@ fn compose_cli(args: &[String]) -> i32 {
     let mut phorc: Option<String> = None;
     let mut index_source = IndexSource::Derived;
     let mut dispatch_auth = PortingAuthority::granted();
+    // `--ir` selects the Phase 2 generic court (the composition is data, evaluated
+    // by one interpreter); the default is the historical v1 court.
+    let mut ir = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--no-capability" => {
                 dispatch_auth = PortingAuthority::none();
+                i += 1;
+            }
+            "--ir" => {
+                ir = true;
                 i += 1;
             }
             "--store" => {
@@ -475,72 +482,91 @@ fn compose_cli(args: &[String]) -> i32 {
             }
         }
     }
-    let out = out.unwrap_or_else(|| kind.evidence_dir().to_string());
+    let out = out.unwrap_or_else(|| {
+        if ir {
+            porting::ir_evidence_dir(kind.name())
+        } else {
+            kind.evidence_dir().to_string()
+        }
+    });
 
     match call {
-        None => match porting::run_composition_court(
-            kind,
-            &PortingAuthority::granted(),
-            &out,
-            phorc.as_deref(),
-            index_source,
-        ) {
-            Ok(r) => {
-                println!("=== Sealed Composition Dispatch Court ===");
-                println!("Target:        {}", r.target);
-                println!("Stages:        {}", r.stages.join(" -> "));
-                println!("Cases:         {}", r.cases_run);
-                for s in &r.stage_reports {
+        None => {
+            let result = if ir {
+                porting::run_ir_composition_court(
+                    kind.name(),
+                    &PortingAuthority::granted(),
+                    &out,
+                    phorc.as_deref(),
+                    index_source,
+                )
+            } else {
+                porting::run_composition_court(
+                    kind,
+                    &PortingAuthority::granted(),
+                    &out,
+                    phorc.as_deref(),
+                    index_source,
+                )
+            };
+            match result {
+                Ok(r) => {
+                    println!("=== Sealed Composition Dispatch Court ===");
+                    println!("Target:        {}", r.target);
+                    println!("Stages:        {}", r.stages.join(" -> "));
+                    println!("Cases:         {}", r.cases_run);
+                    for s in &r.stage_reports {
+                        println!(
+                            "{:<22} {} native / {} cases",
+                            format!("{}:", s.label),
+                            s.native_cases,
+                            r.cases_run
+                        );
+                    }
                     println!(
-                        "{:<22} {} native / {} cases",
-                        format!("{}:", s.label),
-                        s.native_cases,
-                        r.cases_run
+                        "Fallback:      {}   Broken seal: {}",
+                        r.fallback_cases, r.broken_seal_cases
                     );
-                }
-                println!(
-                    "Fallback:      {}   Broken seal: {}",
-                    r.fallback_cases, r.broken_seal_cases
-                );
-                println!("Passed:        {}", r.cases_passed);
-                println!("Failed:        {}", r.cases_failed);
-                println!("Dispatches:    {}", r.dispatches_run);
-                // Deduplicate the object lines: a leaf used twice in a chain (e.g.
-                // toupper for the haystack and the needle) is one object.
-                let mut seen: Vec<(&str, &str)> = Vec::new();
-                for s in &r.stage_reports {
-                    if s.object_hash.is_empty() {
-                        continue;
+                    println!("Passed:        {}", r.cases_passed);
+                    println!("Failed:        {}", r.cases_failed);
+                    println!("Dispatches:    {}", r.dispatches_run);
+                    // Deduplicate the object lines: a leaf used twice in a chain (e.g.
+                    // toupper for the haystack and the needle) is one object.
+                    let mut seen: Vec<(&str, &str)> = Vec::new();
+                    for s in &r.stage_reports {
+                        if s.object_hash.is_empty() {
+                            continue;
+                        }
+                        let key = (s.leaf.as_str(), s.object_hash.as_str());
+                        if seen.contains(&key) {
+                            continue;
+                        }
+                        seen.push(key);
+                        println!("{:<22} {}", format!("{} object:", s.label), s.object_hash);
                     }
-                    let key = (s.leaf.as_str(), s.object_hash.as_str());
-                    if seen.contains(&key) {
-                        continue;
+                    println!("Chain hash:    {}", r.chain_hash);
+                    println!("Oracle hash:   {}", r.oracle_hash);
+                    println!("Verdict:       {}", r.verdict);
+                    println!("Sealed:        {}", if r.sealed { "yes" } else { "no" });
+                    for note in &r.notes {
+                        println!("Note:          {}", note);
                     }
-                    seen.push(key);
-                    println!("{:<22} {}", format!("{} object:", s.label), s.object_hash);
+                    println!(
+                        "Index source:  {}",
+                        match index_source {
+                            IndexSource::Derived => "derived (compiled fresh)",
+                            IndexSource::Persistent => "persistent store",
+                        }
+                    );
+                    println!("Evidence:      {}", r.evidence_dir);
+                    0
                 }
-                println!("Chain hash:    {}", r.chain_hash);
-                println!("Oracle hash:   {}", r.oracle_hash);
-                println!("Verdict:       {}", r.verdict);
-                println!("Sealed:        {}", if r.sealed { "yes" } else { "no" });
-                for note in &r.notes {
-                    println!("Note:          {}", note);
+                Err(e) => {
+                    eprintln!("port compose: {}", e);
+                    1
                 }
-                println!(
-                    "Index source:  {}",
-                    match index_source {
-                        IndexSource::Derived => "derived (compiled fresh)",
-                        IndexSource::Persistent => "persistent store",
-                    }
-                );
-                println!("Evidence:      {}", r.evidence_dir);
-                0
             }
-            Err(e) => {
-                eprintln!("port compose: {}", e);
-                1
-            }
-        },
+        }
         Some(framed) => {
             let args = match porting::parse_hex_args(&framed) {
                 Ok(a) => a,
