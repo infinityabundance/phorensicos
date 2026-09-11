@@ -81,6 +81,11 @@ echo "=== Autonomous Porting Foundry (Phase 7) ==="
 echo
 echo "=== Generation Session Court (Phase 8 consumption) ==="
 ./verify_generation_session.sh
+
+# --- Release lock: the empirical identities frozen at the tagged revision ---------
+echo
+echo "=== Release lock (identity freeze) ==="
+./scripts/release_lock.sh --check autonomous-porting-v1 foundry/releases/autonomous-porting-v1.json
 # Phase 3: the court-sensitivity (challenge) court — is the instrument blind?
 for ch in toupper memcmp memchr strlen strrchr strspn toupper_memchr toupper_strlen_memchr toupper_strlen_memchr_pair toupper_each toupper_each_strlen_memchr toupper_memchr_suffix toupper_each_slice_search; do
     ./verify_challenge_court.sh --target "$ch" --check-committed

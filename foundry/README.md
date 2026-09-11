@@ -26,6 +26,25 @@ build bytes (the `phorc` binary hash, the `rustc` commit hash) are recorded as
 observed and excluded from the residual hash. No wall-clock value enters the
 hash, so the receipt is byte-reproducible at a given toolchain.
 
+## Releases
+
+| File | Purpose |
+|------|---------|
+| `releases/<tag>.json` | A **release lock**: the empirical identities and tables of the autonomous-porting disclosure at a tagged revision, derived from committed evidence by `scripts/release_lock.sh`. |
+
+A release tag binds the revision; the lock binds the identities. Regenerate and
+verify with:
+
+```sh
+./scripts/release_lock.sh autonomous-porting-v1 foundry/releases/autonomous-porting-v1.json
+./scripts/release_lock.sh --check autonomous-porting-v1 foundry/releases/autonomous-porting-v1.json
+```
+
+The check asserts the committed lock's asserted identities and residual hash still
+recompute from committed evidence (the tag binding is reported, and is not needed
+inside the container, whose build context has no `.git`). `scripts/ci_host.sh` runs
+it, so the lock cannot drift from the courts silently.
+
 ## Architecture
 
 The normative architecture, the non-negotiable invariants, the phase plan and

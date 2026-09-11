@@ -941,6 +941,18 @@ boot-evidence checks, all five captured artifacts byte-reproducible against the
 committed manifest). The Docker build context excludes host-local foundry state, so
 the in-container workspace is exactly the committed tree.
 
+### Release lock
+
+The disclosure is frozen at the tag **`autonomous-porting-v1`**. The tag binds the
+revision; `foundry/releases/autonomous-porting-v1.json` binds the empirical
+identities and tables at that revision — the committed store and baseline session,
+the provenance correction, the successor's `AutonomousV1` seal, the child
+generation, and the generation session (including the served artifact for every
+port) — all **derived from committed evidence** by `scripts/release_lock.sh`, never
+from prose. `scripts/ci_host.sh` runs `./scripts/release_lock.sh --check …`, which
+recomputes the lock's asserted identities and residual hash and fails if it has
+drifted from the courts.
+
 Boot evidence (hashes, ABI address, commands, toolchain) is committed as
 `phost_kernel/evidence_manifest.json`. The manifest's claim is two-tier:
 `asserted_reproducible_evidence` holds the five boot-evidence artifacts

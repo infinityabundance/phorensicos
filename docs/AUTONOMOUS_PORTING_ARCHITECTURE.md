@@ -7,7 +7,10 @@ increasingly autonomous behavioral reconstruction foundry. Sections marked
 actually implemented, and no planned mechanism is described there as shipped. The
 implemented reference instantiation is exercised by executable courts and committed
 evidence; the honest limits of what it demonstrates are recorded in
-`docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md`.
+`docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md`. The disclosure is frozen at the tag
+`autonomous-porting-v1`, and `foundry/releases/autonomous-porting-v1.json` locks its
+empirical identities and tables (checked by `scripts/ci_host.sh` via
+`scripts/release_lock.sh --check`).
 
 The division of labour is fixed:
 
