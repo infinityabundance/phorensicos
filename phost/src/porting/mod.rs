@@ -29,6 +29,7 @@ use core::fmt;
 
 use crate::kernel::CapabilitySet;
 
+pub mod abi;
 pub mod behavior_signature;
 pub mod candidate;
 pub mod compiled;
@@ -48,6 +49,7 @@ pub mod json;
 pub mod oracle_trace;
 pub mod portspec;
 pub mod promotion;
+pub mod registry;
 pub mod replay_court;
 pub mod service;
 pub mod store;

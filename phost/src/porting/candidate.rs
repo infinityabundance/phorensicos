@@ -226,62 +226,79 @@ pub fn phor_strspn(s: &[u8], accept: &[u8], n: usize) -> usize {
 }
 
 pub fn run_candidate(target_id: &str, args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
-    if target_id == LIBC_TOUPPER.id {
-        let b = args
-            .first()
-            .and_then(|a| a.first())
-            .copied()
-            .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
-        return Ok(alloc::vec![phor_toupper(b)]);
+    match crate::porting::registry::extension_for(target_id) {
+        Some(e) => (e.candidate)(args),
+        None => Err(CandidateError::UnsupportedTarget(target_id.to_string())),
     }
+}
 
-    if target_id == LIBC_MEMCMP.id {
-        if args.len() < 3 {
-            return Err(CandidateError::MalformedArgs(target_id.to_string()));
-        }
-        let sign = phor_memcmp(&args[0], &args[1], decode_usize(&args[2]));
-        return Ok(encode_sign(sign));
+// ---------------------------------------------------------------------------
+// Per-target candidate adapters (the candidate extension boundary)
+//
+// Each is a leaf adapter with no target-id branching; the registry names them.
+// ---------------------------------------------------------------------------
+
+pub fn cand_toupper(args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
+    let b = args
+        .first()
+        .and_then(|a| a.first())
+        .copied()
+        .ok_or_else(|| CandidateError::MalformedArgs(LIBC_TOUPPER.id.to_string()))?;
+    Ok(alloc::vec![phor_toupper(b)])
+}
+
+pub fn cand_memcmp(args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
+    if args.len() < 3 {
+        return Err(CandidateError::MalformedArgs(LIBC_MEMCMP.id.to_string()));
     }
+    let sign = phor_memcmp(&args[0], &args[1], decode_usize(&args[2]));
+    Ok(encode_sign(sign))
+}
 
-    if target_id == LIBC_MEMCHR.id {
-        if args.len() < 3 {
-            return Err(CandidateError::MalformedArgs(target_id.to_string()));
-        }
-        let needle = *args[1]
-            .first()
-            .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
-        let index = phor_memchr(&args[0], needle, decode_usize(&args[2]));
-        return Ok(encode_index(index));
+pub fn cand_memchr(args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
+    if args.len() < 3 {
+        return Err(CandidateError::MalformedArgs(LIBC_MEMCHR.id.to_string()));
     }
+    let needle = *args[1]
+        .first()
+        .ok_or_else(|| CandidateError::MalformedArgs(LIBC_MEMCHR.id.to_string()))?;
+    Ok(encode_index(phor_memchr(
+        &args[0],
+        needle,
+        decode_usize(&args[2]),
+    )))
+}
 
-    if target_id == LIBC_STRLEN.id {
-        if args.len() < 2 {
-            return Err(CandidateError::MalformedArgs(target_id.to_string()));
-        }
-        let len = phor_strlen(&args[0], decode_usize(&args[1]));
-        return Ok(encode_usize(len));
+pub fn cand_strlen(args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
+    if args.len() < 2 {
+        return Err(CandidateError::MalformedArgs(LIBC_STRLEN.id.to_string()));
     }
+    Ok(encode_usize(phor_strlen(&args[0], decode_usize(&args[1]))))
+}
 
-    if target_id == LIBC_STRRCHR.id {
-        if args.len() < 3 {
-            return Err(CandidateError::MalformedArgs(target_id.to_string()));
-        }
-        let needle = *args[1]
-            .first()
-            .ok_or_else(|| CandidateError::MalformedArgs(target_id.to_string()))?;
-        let index = phor_strrchr(&args[0], needle, decode_usize(&args[2]));
-        return Ok(encode_index(index));
+pub fn cand_strrchr(args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
+    if args.len() < 3 {
+        return Err(CandidateError::MalformedArgs(LIBC_STRRCHR.id.to_string()));
     }
+    let needle = *args[1]
+        .first()
+        .ok_or_else(|| CandidateError::MalformedArgs(LIBC_STRRCHR.id.to_string()))?;
+    Ok(encode_index(phor_strrchr(
+        &args[0],
+        needle,
+        decode_usize(&args[2]),
+    )))
+}
 
-    if target_id == POSIX_STRSPN.id {
-        if args.len() < 3 {
-            return Err(CandidateError::MalformedArgs(target_id.to_string()));
-        }
-        let span = phor_strspn(&args[0], &args[1], decode_usize(&args[2]));
-        return Ok(encode_usize(span));
+pub fn cand_strspn(args: &[Vec<u8>]) -> Result<Vec<u8>, CandidateError> {
+    if args.len() < 3 {
+        return Err(CandidateError::MalformedArgs(POSIX_STRSPN.id.to_string()));
     }
-
-    Err(CandidateError::UnsupportedTarget(target_id.to_string()))
+    Ok(encode_usize(phor_strspn(
+        &args[0],
+        &args[1],
+        decode_usize(&args[2]),
+    )))
 }
 
 /// SHA-256 over `case_id:candidate_output_hex` per case, in corpus order. Cases

@@ -830,29 +830,20 @@ pub fn strspn_corpus() -> Vec<TestCase> {
 }
 
 /// The deterministic case set for a target.
+///
+/// Registry-driven: the generator is an extension point named by the target's
+/// registered extension, so a new target never edits this function.
 pub fn cases_for(target: &PortTarget) -> Vec<TestCase> {
-    match target.id {
-        id if id == LIBC_TOUPPER.id => byte_domain_cases(),
-        id if id == LIBC_MEMCMP.id => memcmp_corpus(),
-        id if id == LIBC_MEMCHR.id => memchr_corpus(),
-        id if id == LIBC_STRLEN.id => strlen_corpus(),
-        id if id == LIBC_STRRCHR.id => strrchr_corpus(),
-        id if id == POSIX_STRSPN.id => strspn_corpus(),
-        _ => Vec::new(),
-    }
+    crate::porting::registry::extension_for(target.id)
+        .map(|e| (e.cases)())
+        .unwrap_or_default()
 }
 
 /// Resolve a symbol or qualified target id to a known port target.
+///
+/// Registry-driven: the name table is the extension registry, not a `match`.
 pub fn resolve_target(name: &str) -> Option<PortTarget> {
-    match name {
-        "toupper" | "libc:toupper:c-locale:u8:v1" => Some(LIBC_TOUPPER),
-        "memcmp" | "libc:memcmp:c-locale:sign:v1" => Some(LIBC_MEMCMP),
-        "memchr" | "libc:memchr:c-locale:index:v1" => Some(LIBC_MEMCHR),
-        "strlen" | "libc:strlen:c-locale:u64:v1" => Some(LIBC_STRLEN),
-        "strrchr" | "libc:strrchr:c-locale:index:v1" => Some(LIBC_STRRCHR),
-        "strspn" | "posix:strspn:c-locale:u64:v1" => Some(POSIX_STRSPN),
-        _ => None,
-    }
+    crate::porting::registry::extension_by_name(name).map(|e| e.target)
 }
 
 #[cfg(test)]

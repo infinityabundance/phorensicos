@@ -29,12 +29,9 @@ use alloc::vec::Vec;
 
 use core::ffi::c_void;
 
-use crate::porting::candidate::{decode_usize, encode_index, encode_sign, encode_usize};
 use crate::porting::oracle_trace::{combined_oracle_hash, OracleTrace};
 use crate::porting::replay_court::{CourtVerdict, Mismatch};
-use crate::porting::target::{
-    PortTarget, LIBC_MEMCHR, LIBC_MEMCMP, LIBC_STRLEN, LIBC_STRRCHR, LIBC_TOUPPER, POSIX_STRSPN,
-};
+use crate::porting::target::PortTarget;
 use crate::porting::{json_escape, sha256_hex, PortingAuthority};
 
 /// Why the execution court could not run (or refused to).
@@ -200,183 +197,12 @@ fn call_target(
     entry: *const u8,
     args: &[Vec<u8>],
 ) -> Result<Vec<u8>, ExecError> {
-    if target.id == LIBC_TOUPPER.id {
-        let b = args
-            .first()
-            .and_then(|a| a.first())
-            .copied()
-            .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
-        let f: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute(entry) };
-        return Ok(alloc::vec![(f(b as u64) & 0xff) as u8]);
+    // Generic: the ABI adapter is an extension point named by the registry, so
+    // this workflow never branches on a target id.
+    match crate::porting::registry::extension_for(target.id) {
+        Some(e) => (e.abi)(target, entry, args),
+        None => Err(ExecError::UnsupportedTarget(target.id.to_string())),
     }
-
-    if target.id == LIBC_MEMCMP.id {
-        if args.len() < 3 {
-            return Err(ExecError::MalformedArgs(target.id.to_string()));
-        }
-        let (a, b) = (&args[0], &args[1]);
-        let n = decode_usize(&args[2]);
-        // The candidate packs each *compared prefix* big-endian into a u64, so the
-        // corpus is contracted to at most 8 compared bytes. `memcmp` examines
-        // exactly `n` bytes, so bytes past `n` are irrelevant and are not packed
-        // (a buffer may legitimately be longer than the compared prefix).
-        if n > 8 {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: compared length {} exceeds the 8-byte packed-word contract",
-                target.id, n
-            )));
-        }
-        if a.len() < n || b.len() < n {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: compared length {} exceeds a buffer",
-                target.id, n
-            )));
-        }
-        let wa = pack_be(&a[..n]);
-        let wb = pack_be(&b[..n]);
-        let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-        let raw = f(wa, wb, n as u64) as u32 as i32;
-        return Ok(encode_sign(raw));
-    }
-
-    if target.id == LIBC_MEMCHR.id {
-        if args.len() < 3 {
-            return Err(ExecError::MalformedArgs(target.id.to_string()));
-        }
-        let hay = &args[0];
-        let needle = *args[1]
-            .first()
-            .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
-        let n = decode_usize(&args[2]);
-        // The candidate packs the searched prefix little-endian into a u64 and
-        // scans it branchlessly, so the corpus is contracted to at most 8 compared
-        // bytes. Bytes past `n` are never examined.
-        if n > 8 || hay.len() < n {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: searched length {} exceeds the 8-byte packed-word contract or the haystack",
-                target.id, n
-            )));
-        }
-        let wh = pack_le_prefix(&hay[..n]);
-        let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-        let raw = f(wh, needle as u64, n as u64) as u32 as i32;
-        return Ok(encode_index(raw));
-    }
-
-    if target.id == LIBC_STRLEN.id {
-        if args.len() < 2 {
-            return Err(ExecError::MalformedArgs(target.id.to_string()));
-        }
-        let buf = &args[0];
-        let n = decode_usize(&args[1]);
-        // The candidate scans the first `n` bytes packed little-endian into a u64,
-        // so the corpus is contracted to at most 8 bytes with a NUL terminator
-        // inside them. Bytes past `n` are never examined.
-        if n > 8 || buf.len() < n {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: scanned length {} exceeds the 8-byte packed-word contract or the buffer",
-                target.id, n
-            )));
-        }
-        let w = pack_le_prefix(&buf[..n]);
-        let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-        let len = f(w, n as u64);
-        return Ok(encode_usize(len as usize));
-    }
-
-    if target.id == LIBC_STRRCHR.id {
-        if args.len() < 3 {
-            return Err(ExecError::MalformedArgs(target.id.to_string()));
-        }
-        let buf = &args[0];
-        let needle = *args[1]
-            .first()
-            .ok_or_else(|| ExecError::MalformedArgs(target.id.to_string()))?;
-        let n = decode_usize(&args[2]);
-        if n > 8 || buf.len() < n {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: scanned length {} exceeds the 8-byte packed-word contract or the buffer",
-                target.id, n
-            )));
-        }
-        // The ABI precondition: a NUL terminator lies within the packed window, so
-        // the word encodes the whole C string and the candidate never reads on.
-        if !buf[..n].contains(&0) {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: no NUL terminator within the {}-byte bound",
-                target.id, n
-            )));
-        }
-        // The candidate scans the zero-extended word and finds the last in-string
-        // match, so only the needle crosses the ABI.
-        let w = pack_le_prefix(&buf[..n]);
-        let f: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-        let raw = f(w, needle as u64) as u32 as i32;
-        return Ok(encode_index(raw));
-    }
-
-    if target.id == POSIX_STRSPN.id {
-        if args.len() < 3 {
-            return Err(ExecError::MalformedArgs(target.id.to_string()));
-        }
-        let s = &args[0];
-        let accept = &args[1];
-        let n = decode_usize(&args[2]);
-        if n > 8 || s.len() < n {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: scanned length {} exceeds the 8-byte packed-word contract or the string",
-                target.id, n
-            )));
-        }
-        // The ABI precondition: a NUL terminator lies within the packed window, so
-        // the word encodes the whole C string and the candidate never reads on.
-        if !s[..n].contains(&0) {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: no NUL terminator within the {}-byte bound",
-                target.id, n
-            )));
-        }
-        // The accept set travels as its own packed word. A C string set cannot
-        // contain NUL, and an interior NUL would silently change the set, so it is
-        // rejected rather than normalized.
-        if accept.len() > 8 || accept.contains(&0) {
-            return Err(ExecError::MalformedArgs(format!(
-                "{}: the accept set must be at most 8 NUL-free bytes",
-                target.id
-            )));
-        }
-        let ws = pack_le_prefix(&s[..n]);
-        let wa = pack_le_prefix(accept);
-        let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(entry) };
-        let span = f(ws, wa, n as u64);
-        return Ok(encode_usize(span as usize));
-    }
-
-    Err(ExecError::UnsupportedTarget(target.id.to_string()))
-}
-
-/// Pack up to 8 bytes **little-endian** — i.e. the machine word you get by
-/// loading the first 8 bytes of the buffer on x86-64. Byte `i` occupies bits
-/// `8*i`, which is the convention the compiled `phor_memchr_index` reads.
-fn pack_le_prefix(buf: &[u8]) -> u64 {
-    let mut w = [0u8; 8];
-    let n = buf.len().min(8);
-    w[..n].copy_from_slice(&buf[..n]);
-    u64::from_le_bytes(w)
-}
-
-/// Pack up to 8 bytes big-endian into a u64 (byte 0 in the most-significant
-/// position), matching the compiled `phor_memcmp_sign` contract.
-///
-/// Each byte is placed at its left-aligned position (`byte i` at bit
-/// `8*(7-i)`), so the packing is independent of the buffer length and never
-/// shifts by 64.
-fn pack_be(buf: &[u8]) -> u64 {
-    let mut w: u64 = 0;
-    for (i, &byte) in buf.iter().take(8).enumerate() {
-        w |= (byte as u64) << (8 * (7 - i));
-    }
-    w
 }
 
 // ============================================================================
@@ -887,14 +713,6 @@ mod tests {
         )
         .expect("compile candidate");
         Some((c.object_path, c.object_hash))
-    }
-
-    #[test]
-    fn test_pack_be_left_aligns_bytes() {
-        assert_eq!(pack_be(&[]), 0);
-        assert_eq!(pack_be(&[0x61]), 0x6100_0000_0000_0000);
-        assert_eq!(pack_be(&[0x01, 0x02]), 0x0102_0000_0000_0000);
-        assert_eq!(pack_be(&[1, 2, 3, 4, 5, 6, 7, 8]), 0x0102_0304_0506_0708);
     }
 
     #[test]

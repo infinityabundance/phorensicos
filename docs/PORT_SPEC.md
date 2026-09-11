@@ -1,6 +1,6 @@
 # Port Specification (`PortSpec`)
 
-**Status: Phase 1 core implemented** (`phost/src/porting/portspec.rs`). This
+**Status: Phase 1 complete** (`phost/src/porting/portspec.rs`,`registry.rs`, `abi.rs`). This
 document is normative for the `PortSpec` type; the *Status* section records
 exactly what is and is not shipped.
 
@@ -87,15 +87,28 @@ mis-declared.
 
 ## 4. Status
 
-**Implemented (Phase 1 core):** the typed `PortSpec`, the domain-separated
+**Implemented (Phase 1 complete):** the typed `PortSpec`, the domain-separated
 canonical encoding and `PortSpecId`, all six leaf specs, the precondition
-validator, the pinned golden identities, and `PortSpec::of_target` which bridges
-every bootstrap `PortTarget` (returning `None` for a target without a spec, so a
-new target cannot enter the engine without one).
+validator, the pinned golden identities, and `PortSpec::of_target`.
 
-**Not yet done (Phase 1 remainder):** the generic engine still contains
-target-id branches (`resolve_target`, `cases_for`, `candidate::run_candidate`);
-Phase 1 is complete only when the generic machinery is driven by `PortSpec` and
-target-specific behaviour lives solely at extension boundaries, with the baseline
-preserved (Gate A). `MutationProfile`, `OracleWitness` binding and the broader
-`QualificationPolicy` variants are introduced in Phases 3, 6 and 7 respectively.
+The generic machinery is now registry-driven (`phost/src/porting/registry.rs`),
+not branch-driven:
+
+* `target::cases_for` and `target::resolve_target` look the target up in the
+extension registry instead of matching on an id;
+* `candidate::run_candidate` dispatches to the registered candidate adapter;
+* the execution court's `call_target` dispatches to the registered ABI adapter
+(`abi.rs`) instead of a chain of `if target.id == …`;
+* the foreign oracle remains `dialect_cage.rs`, a separate `OracleAdapter`
+extension boundary.
+
+Adding a leaf target is therefore a new `PortSpec` plus three narrowly scoped
+extension points (**CaseGenerator**, candidate adapter, ABI adapter) and one row in
+the registry — and **no** change to the generic engine. A static audit,
+`registry::tests::test_generic_machinery_has_no_target_branches`, reads the source
+of every generic `porting/` module and fails if a `.id ==` target branch
+reappears, so another central `match target.id` cannot creep back in.
+
+**Later phases:** `MutationProfile` (Phase 3), `OracleWitness` binding and the
+broader `QualificationPolicy` variants (Phases 6–7), and `CompositionIR`
+(Phase 2, which replaces the remaining `CompositionKind` dispatch).
