@@ -689,7 +689,7 @@ All numbers below were reproduced on a clean checkout.
 | Check | Result |
 |-------|--------|
 | `cargo test` (phorc) | **50 / 50 pass** (44 unit + 6 lowering-integration) |
-| `cargo test` (phost) | **257 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
+| `cargo test` (phost) | **265 pass, 0 fail, 4 ignored** (the 4 ignored read privileged CR0/CR2/CR3/CR4 and require ring 0) |
 | `.phor` / `.ph` → ELF64 | every corpus source emits a non-empty object: **369 / 369, 0 failures** (`src/` 232, `examples/` 51, `tests/` 83 incl. 46 `compile-pass`, `fixtures/` 2, `README.phor`) |
 | Compiler pipeline | `hello.phor` → 6960-byte ELF64 relocatable + receipts + sealed package |
 | Seal verification | source hash **MATCH**, object hash **MATCH** |
@@ -714,6 +714,7 @@ All numbers below were reproduced on a clean checkout.
 | Docker | `docker compose run --rm host` / `kernel` reproduce the tests, the store, the courts, and the QEMU boot |
 | Foundry baseline (Phase 0) | the four-repository epistemic stack (phorensicos, `frf` 0.1.86, `frf-fuzz` 0.8.0, `gemel` 0.11.1) is pinned in `foundry/baseline/dependency_pins.json` and sealed by `foundry/baseline/integration_baseline_receipt.json`; `scripts/integration_baseline.sh` derives the receipt from the executable courts and verifies the external pins when their working copies are present; see `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` |
 | Canonical `PortSpec` (Phase 1) | the typed port specification replaces the stringly `PortTarget`: `ContractSource` separates the contract from the implementation observed, `ObservableSpec`/`ObservationProjectionSpec` make normalisation explicit, `PreconditionSpec` is machine-checked (`validate_case` → `ValidatedCase`; only a validated case reaches the foreign oracle), and `PortSpecId = SHA-256("PHOR/PORTSPEC/v1\0" ‖ canonical_bytes)` is a domain-separated content identity; the generic machinery is registry-driven (`registry.rs`: spec + CaseGenerator + candidate adapter + ABI adapter), so a new leaf target needs no engine change, and a static audit fails the build if a `.id ==` target branch reappears; see `docs/PORT_SPEC.md` |
+| Composition IR (Phase 2 core) | `composition_ir.rs` makes composition **data**: a typed, bounded, acyclic `CompositionIR` (SSA-like values; `Call`/`MapBytes`/`Slice`/`Compare`/`Select`/`FoldBytes`) with a domain-separated `CompositionIrId` and **one** `eval` over a `PortBackend`, so the oracle side and the sealed side run the same graph and cannot drift; a test expresses `toupper ∘ memchr` as IR and reproduces the foreign oracle over the whole corpus; see `docs/COMPOSITION_IR.md` |
 
 ### Known gaps
 
@@ -747,6 +748,7 @@ All numbers below were reproduced on a clean checkout.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.
 - `docs/AUTONOMOUS_PORTING_ARCHITECTURE.md` — the autonomous foundry: invariants, phase plan, acceptance gates.
 - `docs/PORT_SPEC.md` — the canonical typed `PortSpec`: content identity, preconditions, the six pinned leaf specs.
+- `docs/COMPOSITION_IR.md` — the typed `CompositionIR`: nodes, validation, content identity, the generic interpreter.
 - `foundry/` — the foundry baseline (`dependency_pins.json`, the integration baseline receipt).
 - `docker-compose.yml`, `docker/` — reproducible host + kernel containers.
 - `docs/REVIEWER_PROTOCOL.md` — how to review claims in this repo.

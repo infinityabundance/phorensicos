@@ -19,7 +19,7 @@
 |-----------|--------|-------|
 | `phorc` (Rust compiler) | ✅ Builds | 0 errors, 0 warnings |
 | `phost` (kernel runtime) | ✅ Builds | 0 errors (pre-existing `static mut` reference lints) |
-| All tests (phost) | ✅ 257 pass, 4 ignored | 261 total: 200 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
+| All tests (phost) | ✅ 265 pass, 4 ignored | 269 total: 208 porting + 49 nucleus + 8 drivers + 4 kernel (the 4 ignored are the ring-0 control-register reads) |
 | All tests (phorc) | ✅ 50 pass | 44 unit (parser/checker/lower/codegen) + 6 integration lowering regressions |
 | Full pipeline (`.ph` → ELF64) | ✅ Works | lex → parse → check → lower → codegen → emit |
 | `canvas` module | ✅ | Shapes, text, compositing primitives |
@@ -88,7 +88,7 @@ GUI compositor → window manager → surface management → inspector
 | Keyboard→compositor routing | Focus-aware input dispatch, Tab focus cycling |
 | Self-consuming impl methods | `ReturnType::SelfConsuming` pattern for builder-style methods |
 | `residual emit` checker | Type-checking for residual emit field expressions |
-| phost reach | 257 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` |
+| phost reach | 265 tests, loader, compositor, phorc_bridge, keyboard, serial, canvas, shell, JIT-porting court (toupper + memcmp + memchr + strlen + strrchr + POSIX strspn) + sealed-object execution + sealed native dispatch + seven sealed composition courts (incl. nested ones, a buffer-slicing one and one where a composition consumes a derived buffer) + persistent sealed port store + sealed native service + cross-implementation court + canonical registry-driven `PortSpec` + typed `CompositionIR` |
 
 ### JIT-Porting Court
 | Aspect | `toupper` | `memcmp` | `memchr` | `strlen` | `strrchr` |
@@ -622,8 +622,24 @@ cargo test -p phost --lib porting::portspec
 cargo test -p phost --lib porting::registry
 ```
 
+**Phase 2 (core): the typed `CompositionIR`.** `phost/src/porting/composition_ir.rs`
+turns composition from bespoke Rust runners into **data**: a typed, bounded,
+acyclic graph over sealed ports with a domain-separated content identity
+`CompositionIrId = SHA-256("PHOR/COMPOSITION-IR/v1\0" ‖ canonical_bytes)` and one
+generic `eval` over a `PortBackend` trait. Because the oracle side and the sealed
+side evaluate the *same* graph, a composition has exactly one meaning and cannot
+drift. Validation is structural — bounded counts, correct operand types, and
+acyclicity guaranteed by requiring every operand to reference an earlier node. A
+test expresses `toupper ∘ memchr` as IR and reproduces the foreign oracle over the
+whole 560-case corpus. See `docs/COMPOSITION_IR.md`. Migrating the six bespoke
+runners onto the IR is the remainder of Phase 2.
+
+```sh
+cargo test -p phost --lib porting::composition_ir
+```
+
 ### Test Results (reproduced on `main`)
-- phost: 257 passed, 0 failed, 4 ignored (261 total). The ignored tests read
+- phost: 265 passed, 0 failed, 4 ignored (269 total). The ignored tests read
   privileged control registers (CR0/CR2/CR3/CR4) and fault outside ring 0;
   run them under a kernel harness with `cargo test -- --ignored`.
 - phorc: 44 unit + 6 integration tests passed (0 warnings). The integration tests

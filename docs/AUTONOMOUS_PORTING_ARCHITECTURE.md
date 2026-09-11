@@ -76,7 +76,7 @@ versioned, and the documentation states exactly what was demonstrated.
 |---|---|---|
 | **0** | Compatibility reconciliation (frf-fuzz → frf 0.1.86 / gemel 0.11.1) and the executable baseline seal | **done** — see below |
 | **1** | Canonical typed `PortSpec`; migrate all existing leaves. No new leaf ports. | **done** — typed spec + content identity + all six leaf specs + precondition validator + registry-driven generic machinery (`docs/PORT_SPEC.md`) |
-| **2** | Typed `CompositionIR` + one generic interpreter; migrate every existing composition | not started |
+| **2** | Typed `CompositionIR` + one generic interpreter; migrate every existing composition | **core done** — typed IR + validation + content identity + generic interpreter, with `toupper ∘ memchr` proven equivalent to the foreign oracle (`docs/COMPOSITION_IR.md`); migrating the six runners remains |
 | **3** | Court sensitivity/challenge + semantic mutation profiles | not started |
 | **4** | FRF-Fuzz differential exploration + residual semantic bank + court-verified minimization | not started |
 | **5** | Gemel longitudinal memory + failed-attempt/negative-knowledge integration | not started |
@@ -131,6 +131,22 @@ module and fails if a `.id ==` target branch reappears.
 
 The refactor is behavior-preserving: all committed leaf, composition, store,
 session and cross-implementation evidence is byte-identical (Gate A).
+
+### Phase 2 — core done
+
+`phost/src/porting/composition_ir.rs` defines the typed `CompositionIR` (SSA-like
+values, `Call`/`MapBytes`/`Slice`/`Compare`/`Select`/`FoldBytes` nodes), validation
+(bounded, typed, and acyclic because every operand must reference an earlier node),
+the domain-separated content identity
+`CompositionIrId = SHA-256("PHOR/COMPOSITION-IR/v1\0" || canonical_bytes)`, and one
+generic `eval` over a `PortBackend` trait so the oracle side and the sealed side
+run the *same* graph. A test expresses `toupper ∘ memchr` as IR and reproduces the
+foreign oracle over the whole 560-case corpus. See `docs/COMPOSITION_IR.md`.
+
+The remainder of Phase 2 is migrating the six bespoke runners onto the IR,
+providing `ForeignBackend`/`SealedBackend`, removing the `CompositionKind`
+dispatch, and versioning the artifact identities (behavior / IR / dependency
+binding / artifact hashes) without faking byte equality with the pre-IR verdicts.
 
 ---
 

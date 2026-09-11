@@ -34,6 +34,7 @@ pub mod behavior_signature;
 pub mod candidate;
 pub mod compiled;
 pub mod composition;
+pub mod composition_ir;
 pub mod composition_nested;
 pub mod composition_pair;
 pub mod composition_slice_search;
