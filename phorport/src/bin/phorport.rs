@@ -473,6 +473,27 @@ fn command(args: &[String]) -> Result<i32, String> {
         };
     }
 
+    // `ablation` runs the controlled experiment arms and needs no candidate.
+    if cmd == "ablation" {
+        let budget = arg_value(args, "--budget")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256);
+        let reports =
+            phorport::ablation::run(&symbol, budget).map_err(|e| format!("ablation: {e}"))?;
+        let body: Vec<String> = reports.iter().map(|r| r.to_json()).collect();
+        let json = format!(
+            "{{\n  \"schema\": \"phorensic.phorport.ablation.v1\",\n  \"target\": \"{}\",\n  \"seed\": \"{:016x}\",\n  \"arms\": [\n{}\n  ]\n}}\n",
+            symbol,
+            phorport::ablation::ABLATION_SEED,
+            body.join(",\n")
+        );
+        if let Some(out) = arg_value(args, "--out") {
+            std::fs::write(&out, &json).map_err(|e| e.to_string())?;
+        }
+        print!("{json}");
+        return Ok(0);
+    }
+
     // `history` reads Gemel memory and needs no candidate object.
     if cmd == "history" {
         let target = resolve_target(&symbol).ok_or_else(|| format!("unknown symbol {symbol}"))?;

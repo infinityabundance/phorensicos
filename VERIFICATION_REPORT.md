@@ -663,6 +663,19 @@ ranks pending demands with fixed integer weights and a recorded breakdown. See
 `docs/STORE_GENERATIONS.md`. `phorport store generations` and `phorport demand
 rank` expose both.
 
+### Phase 9 — blind regeneration and controlled ablation
+
+A bounded enumerative Phor synthesizer (`phorport/src/synth.rs`) reconstructs
+`strlen` from the public `PortSpec` alone — falsifying a wrong-first lane-scan
+family, then qualifying, challenging, FRF-verifying, executing, dispatching and
+sealing it — without ever reading the withheld candidate source (`memchr` is
+supported by the same family). A five-arm controlled ablation measures
+executions-to-first-distinguishing-input with a shared seed and a fixed budget;
+on the declared `strspn` families it is an honest negative (all arms distinguish
+4/4, because the design corpus already suffices). See
+`docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md` and
+`phost/evidence/phorport/ablation/strspn.json`.
+
 ```sh
 ./scripts/integration_baseline.sh
 ```

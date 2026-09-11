@@ -72,9 +72,9 @@ artifact being the ordinary compiled `.phor` ELF.
 ## Test suites at this phase
 
 ```text
-phost     306 passed, 0 failed, 4 ignored
+phost     317 passed, 0 failed, 4 ignored
 phorc      50 passed, 0 failed
-phorport   27 passed, 0 failed
+phorport   37 passed, 0 failed
 ```
 
 New hostile tests include: precondition enforcement in the qualification
@@ -83,5 +83,61 @@ corpus); receipt redaction; the isolation audit detecting an injected marker; th
 contained worker agreeing with the in-process court, rejecting a corrupted
 object, and recovering from a killed worker; the FRF court verifying a real
 divergence and preserving a parity receipt; every autonomous obligation failing
-closed when absent or inconsistent; and the pipeline refusing to seal a
-never-frozen candidate.
+closed when absent or inconsistent; the pipeline refusing to seal a
+never-frozen candidate; store-generation tamper/rollback/artifact-substitution
+refusal; a session bound to a generation refusing an unbound artifact; a runtime
+miss emitting a demand without blocking; and the ablation being deterministic.
+
+## Phase 9 — blind regeneration and controlled ablation
+
+### Blind regeneration (Gate H, two shapes)
+
+`phorport/src/synth.rs` is a **bounded enumerative Phor synthesizer** behind the
+`CandidateProducer` trait. It sees only the public `PortSpec` — the ABI symbol and
+the declared observable — and enumerates the branchless lane-scan family the
+lowerer requires, varying the genuinely algorithmic axes (lane order, lane
+masking). It never reads the withheld candidate source, the held-out corpus or
+the challenge expectations.
+
+For `strlen` the family declares four variants, offered wrong-first (a low→high
+last-match scan), so the CEGIS loop must falsify it and revise. The test
+`test_blind_regeneration_of_strlen_seals` runs the whole Phase 7 pipeline with the
+synthesizer and seals under `AutonomousV1`, with at least one rejected revision —
+so the reconstruction went through qualification, challenge, multi-oracle, FRF,
+uninstructed execution, dispatch and the 13 obligations from the spec alone.
+`memchr` is supported by the same family.
+
+**Bounded claim.** Under the declared target contract, candidate language, oracle
+set, experiment budgets and qualification policy, the integrated foundry
+autonomously reconstructed a native Phor candidate for `strlen` (and supports
+`memchr`) through the complete declared evidence pipeline without being given the
+original implementation. The family is deliberately small: no arbitrary API has
+been synthesized, and the harder semantic shapes (NUL termination in the
+composed chains, set membership as a *set*) are not synthesized by this family.
+
+### Controlled ablation
+
+`phorport/src/ablation.rs` runs five arms (A design-only, B + random, C +
+role-lattice guided, D C with precedent suppression, E D with disagreement
+selection) against the declared `strspn` defect families with a shared seed
+(`0x41424c4154494f4e`) and a fixed budget.
+
+Result at budget 256:
+
+```text
+A-design       4/4 families, median 9 executions, IQR [1, 9], 4 residual classes
+B-random       4/4 families, median 9 executions, IQR [1, 9], 4 residual classes
+C-guided       4/4 families, median 9 executions, IQR [1, 9], 4 residual classes
+D-precedent    4/4 families, median 9 executions, IQR [1, 9], 4 residual classes
+E-disagreement 4/4 families, median 9 executions, IQR [1, 9], 4 residual classes
+```
+
+**This is a negative result, reported as such.** Every declared `strspn` defect
+family is already distinguished by the design corpus, so the exploration arms add
+nothing measurable on them. That is evidence that for these families the *challenge
+profile*, not more exploration, is the binding constraint — consistent with the
+Phase 3 finding that the court detects every declared family. Exploration matters
+for defects the design corpus *misses*; that case is Phase 4's Gate E (the
+`strspn` XOR-fold defect: 578 design cases, 0 divergences, then an FRF-Fuzz
+campaign) and is measured there, not here. No p-value is converted into a
+correctness claim.

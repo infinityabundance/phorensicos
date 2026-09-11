@@ -20,6 +20,7 @@
 //                        seed it with the design corpus, run a bounded campaign,
 //                        turn findings into minimized counterexamples.
 
+pub mod ablation;
 pub mod case;
 pub mod cegis;
 pub mod compile;
@@ -37,4 +38,5 @@ pub mod pipeline;
 pub mod producer;
 pub mod qualification;
 pub mod residual;
+pub mod synth;
 pub mod worker;

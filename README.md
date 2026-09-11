@@ -834,6 +834,7 @@ All numbers below were reproduced on a clean checkout.
 - `docs/DIALECT_QUALIFICATION.md` — how a `dialect:` namespace is earned (`posix` vs `libc`).
 - `docs/QUALIFICATION_POLICY.md`, `docs/EVIDENCE_MODEL.md`, `docs/THREAT_MODEL_AUTONOMOUS_PORTING.md`, `docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md` — Phase 7: held-out qualification, the implementation axis, the evidence model and `AUTONOMOUS-SEAL/v1`.
 - `docs/STORE_GENERATIONS.md` — Phase 8: immutable store generations, generation binding, and demand-driven porting.
+- `docs/AUTONOMOUS_PORTING_VERIFICATION_REPORT.md` — Phase 7/9 empirical results, including the blind-regeneration demonstration and the controlled ablation.
 - `docs/PHORENSIC_COMPILER.md` — pipeline and artifact tiers.
 - `docs/FORENSIC_STORE.md`, `docs/REPLAY_COURTS.md` — evidence store and courts.
 - `docs/PHORENSIC_OS.md`, `docs/FORENSIC_OS_VISION.md` — the OS.
