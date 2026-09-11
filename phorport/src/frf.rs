@@ -227,26 +227,6 @@ pub fn emit_manifest(
     out
 }
 
-/// A guard pinning the cwd for the duration of an FRF court (FRF records the
-/// cwd in the run identity).
-struct CwdGuard {
-    original: PathBuf,
-}
-
-impl CwdGuard {
-    fn pin_to(root: &Path) -> Result<CwdGuard, String> {
-        let original = std::env::current_dir().map_err(|e| e.to_string())?;
-        std::env::set_current_dir(root).map_err(|e| e.to_string())?;
-        Ok(CwdGuard { original })
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.original);
-    }
-}
-
 fn open_frf_store(store_root: &Path) -> Result<frf::store::Store, String> {
     let root = std::path::absolute(store_root.join(FRF_ROOT_DIR)).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -445,20 +425,20 @@ pub fn run_counterexample_court(
     );
     std::fs::write(&manifest_path, manifest).map_err(|e| e.to_string())?;
 
-    // Run the court with a pinned cwd.
-    let run = {
-        let _guard = CwdGuard::pin_to(&frf_root)?;
-        match frf::commands::court::run_once(&store, &manifest_path, None, None, true, None) {
-            Ok(run) => run,
-            Err(e) => {
-                return Ok(CourtOutcome {
-                    outcome: VerificationOutcome::Failed,
-                    run: None,
-                    receipt: None,
-                    claim: None,
-                    note: Some(bound_text(&format!("FRF court refused: {e}"), MAX_NOTE_LEN)),
-                })
-            }
+    // Run the court. The manifest uses absolute paths everywhere, so no process
+    // cwd mutation is needed; FRF's environment digest then records the caller's
+    // (stable) cwd rather than a globally-pinned one — which would race with
+    // concurrent work in the same process.
+    let run = match frf::commands::court::run_once(&store, &manifest_path, None, None, true, None) {
+        Ok(run) => run,
+        Err(e) => {
+            return Ok(CourtOutcome {
+                outcome: VerificationOutcome::Failed,
+                run: None,
+                receipt: None,
+                claim: None,
+                note: Some(bound_text(&format!("FRF court refused: {e}"), MAX_NOTE_LEN)),
+            })
         }
     };
 

@@ -11,10 +11,11 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
 
 cd "$(dirname "$0")/.."
 
-echo "=== cargo test (phorc + phost) ==="
-# Build the compiler binary first: the host-side execution court tests and the
-# verifier both need `target/debug/phorc` to be present.
-cargo build -q -p phorc -p phost
+echo "=== cargo test (phorc + phost + phorport) ==="
+# Build the compiler and the foundry binaries first: the host-side execution
+# court tests, the containment worker and the verifier all need `phorc` and
+# `phorport` to be present alongside the test binaries.
+cargo build -q -p phorc -p phost -p phorport
 cargo test
 
 echo
